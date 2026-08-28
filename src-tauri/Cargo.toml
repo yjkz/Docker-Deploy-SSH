@@ -26,3 +26,11 @@ tauri = { version = "2.11.3" }
 tauri-plugin-log = "2"
 flate2 = "1"
 chrono = "0.4"
+# Task 3: SSH/SFTP(russh 0.46 起 re-export russh_keys 为 russh::keys)
+tokio = { version = "1", features = ["full"] }
+russh = "0.46"
+russh-sftp = "2"
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

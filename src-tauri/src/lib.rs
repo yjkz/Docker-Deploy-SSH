@@ -1,5 +1,6 @@
 pub mod config;
 pub mod docker;
+pub mod ssh;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
