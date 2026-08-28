@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DockerDeploy SSH</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="layout">
+    <!-- 左侧固定导航 -->
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <span class="brand-icon">&#128038;</span>
+        <span class="brand-text">DockerDeploy</span>
+      </div>
+      <nav class="nav">
+        <button class="nav-item active" type="button" data-nav="check">
+          <span class="nav-icon">&#129658;</span><span class="nav-text">环境检测</span>
+        </button>
+        <button class="nav-item disabled" type="button" data-nav="images" title="环境检测未通过" aria-disabled="true">
+          <span class="nav-icon">&#128230;</span><span class="nav-text">镜像列表</span>
+        </button>
+        <button class="nav-item disabled" type="button" data-nav="servers" title="环境检测未通过" aria-disabled="true">
+          <span class="nav-icon">&#128421;</span><span class="nav-text">服务器管理</span>
+        </button>
+        <button class="nav-item disabled" type="button" data-nav="deploy" title="环境检测未通过" aria-disabled="true">
+          <span class="nav-icon">&#128640;</span><span class="nav-text">部署向导</span>
+        </button>
+      </nav>
+      <div class="sidebar-footer">v0.1.0</div>
+    </aside>
+
+    <!-- 右侧内容区 -->
+    <main class="content">
+      <!-- 环境检测页(默认显示) -->
+      <section data-page="check" class="page active">
+        <div id="check-banner" class="banner banner-wait">正在检测本机环境…</div>
+        <header class="page-header">
+          <h1 class="page-title">环境检测</h1>
+          <p class="page-desc">检测本机 Docker 环境是否满足部署条件</p>
+        </header>
+        <div id="check-error" class="check-error hidden"></div>
+        <div id="check-list" class="check-list">
+          <div class="check-item"><span class="badge badge-info">待检测</span></div>
+        </div>
+        <div class="check-footer">
+          <button id="recheck-btn" class="btn" type="button">重新检测</button>
+        </div>
+      </section>
+
+      <!-- 镜像列表页(占位) -->
+      <section data-page="images" class="page">
+        <div class="placeholder">
+          <div class="placeholder-icon">&#128230;</div>
+          <div class="placeholder-title">镜像列表</div>
+          <div class="placeholder-desc">该功能将在后续任务中提供</div>
+        </div>
+      </section>
+
+      <!-- 服务器管理页(占位) -->
+      <section data-page="servers" class="page">
+        <div class="placeholder">
+          <div class="placeholder-icon">&#128421;</div>
+          <div class="placeholder-title">服务器管理</div>
+          <div class="placeholder-desc">该功能将在后续任务中提供</div>
+        </div>
+      </section>
+
+      <!-- 部署向导页(占位) -->
+      <section data-page="deploy" class="page">
+        <div class="placeholder">
+          <div class="placeholder-icon">&#128640;</div>
+          <div class="placeholder-title">部署向导</div>
+          <div class="placeholder-desc">该功能将在后续任务中提供</div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- 全站 Toast 容器 -->
+  <div id="toast-container" class="toast-container"></div>
+
+  <script src="app.js"></script>
+  <script src="check.js"></script>
+</body>
+</html>
