@@ -266,6 +266,100 @@ body {
 .placeholder-title { font-size: 16px; font-weight: 600; color: var(--text-main); }
 .placeholder-desc { margin-top: 6px; font-size: 13px; }
 
+/* ===== 镜像列表页 ===== */
+.images-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.text-input {
+  flex: 1;
+  max-width: 320px;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card-bg);
+  color: var(--text-main);
+  font-size: 13.5px;
+  font-family: inherit;
+  outline: none;
+  transition: border-color .15s, box-shadow .15s;
+}
+.text-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, .12);
+}
+.text-input::placeholder { color: #9aa3b2; }
+
+.images-count {
+  margin-bottom: 10px;
+  color: var(--text-sub);
+  font-size: 12.5px;
+}
+
+/* 加载失败错误框(含重试按钮) */
+.images-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  background: #fdeaea;
+  color: #b91c1c;
+  border: 1px solid #f5c6c6;
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  font-size: 13px;
+}
+.images-error-text { flex: 1; word-break: break-all; }
+
+.table-wrap {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.data-table th,
+.data-table td { padding: 10px 14px; text-align: left; }
+.data-table thead th {
+  background: #f8fafc;
+  color: var(--text-sub);
+  font-weight: 600;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+/* 行间分隔线 + 斑马纹 */
+.data-table tbody tr + tr { border-top: 1px solid var(--border); }
+.data-table tbody tr:nth-child(even) { background: #fafbfd; }
+/* 悬停高亮(置于斑马纹之后,同优先级下覆盖) */
+.data-table tbody tr:hover { background: #eef4fe; }
+
+/* 操作列右对齐 */
+.data-table .col-action { text-align: right; white-space: nowrap; }
+
+.data-table .mono { font-family: Consolas, "Courier New", monospace; word-break: break-all; }
+.data-table .none-text { color: #9aa3b2; }
+.data-table .nowrap { white-space: nowrap; }
+.data-table td.empty-cell {
+  text-align: center;
+  color: var(--text-sub);
+  padding: 26px 14px;
+}
+
+.btn-sm {
+  padding: 4px 12px;
+  font-size: 12.5px;
+  border-radius: 6px;
+}
+
 /* ===== Toast(右下角) ===== */
 .toast-container {
   position: fixed;

@@ -82,6 +82,11 @@
     for (i = 0; i < items.length; i++) {
       items[i].classList.toggle('active', items[i].getAttribute('data-nav') === name);
     }
+
+    // 派发页面切换事件(window 上的 'pagechange',detail.page = 页面名),
+    // 供各页面脚本在进入页面时执行加载(如镜像页首次自动加载镜像列表)。
+    // 仅在切换成功后派发;被锁定页面在上方的提前 return 中不会到达此处。
+    window.dispatchEvent(new CustomEvent('pagechange', { detail: { page: name } }));
   };
 
   // ===== 导航禁用态:hostOk=false 时其余 3 项灰置并带 tooltip =====

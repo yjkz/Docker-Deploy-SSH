@@ -49,12 +49,34 @@
         </div>
       </section>
 
-      <!-- 镜像列表页(占位) -->
+      <!-- 镜像列表页 -->
       <section data-page="images" class="page">
-        <div class="placeholder">
-          <div class="placeholder-icon">&#128230;</div>
-          <div class="placeholder-title">镜像列表</div>
-          <div class="placeholder-desc">该功能将在后续任务中提供</div>
+        <header class="page-header">
+          <h1 class="page-title">镜像列表</h1>
+          <p class="page-desc">列出本机 Docker 镜像,选择镜像后进入部署向导</p>
+        </header>
+        <div class="images-toolbar">
+          <input id="images-search" class="text-input" type="search"
+                 placeholder="搜索仓库名或标签…" autocomplete="off">
+          <button id="images-refresh-btn" class="btn" type="button">刷新</button>
+        </div>
+        <div id="images-count" class="images-count">尚未加载</div>
+        <div id="images-error" class="images-error hidden"></div>
+        <div id="images-table-wrap" class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>仓库</th>
+                <th>TAG</th>
+                <th>大小</th>
+                <th>创建时间</th>
+                <th class="col-action">操作</th>
+              </tr>
+            </thead>
+            <tbody id="images-tbody">
+              <tr><td class="empty-cell" colspan="5">尚未加载</td></tr>
+            </tbody>
+          </table>
         </div>
       </section>
 
@@ -83,5 +105,6 @@
 
   <script src="app.js"></script>
   <script src="check.js"></script>
+  <script src="images.js"></script>
 </body>
 </html>
