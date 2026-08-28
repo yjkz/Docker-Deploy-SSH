@@ -89,6 +89,20 @@ impl From<serde_json::Error> for ConfigError {
     }
 }
 
+/// Returns the portable application folder that hosts the `config/` (and
+/// `logs/`) subdirectories: the directory of the running executable, or the
+/// path given by `DD_CONFIG_DIR` (test injection / portable override).
+pub fn app_dir() -> PathBuf {
+    match std::env::var("DD_CONFIG_DIR") {
+        Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => {
+            let mut exe = std::env::current_exe().expect("failed to locate current executable");
+            exe.pop();
+            exe
+        }
+    }
+}
+
 /// Returns the directory that holds `servers.json` / `projects.json`.
 ///
 /// When the `DD_CONFIG_DIR` environment variable is set (test injection /
@@ -96,15 +110,7 @@ impl From<serde_json::Error> for ConfigError {
 /// appended; otherwise the `config/` subdirectory next to the running
 /// executable is used.
 pub fn config_dir() -> PathBuf {
-    let base = match std::env::var("DD_CONFIG_DIR") {
-        Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => {
-            let mut exe = std::env::current_exe().expect("failed to locate current executable");
-            exe.pop();
-            exe
-        }
-    };
-    base.join("config")
+    app_dir().join("config")
 }
 
 /// Loads the whole application config.

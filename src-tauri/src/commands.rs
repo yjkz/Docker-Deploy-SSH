@@ -14,9 +14,13 @@
 //! 前置(找 server/project、解析密码)→ 打标签 → 导出压缩 → 上传镜像
 //! → 同步文件 → 服务器部署(docker load → compose up -d → 清理远端 tar)。
 
+use std::any::Any;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -34,6 +38,10 @@ use crate::ssh::{
 
 /// 取消提示文案(取消导致的失败统一用它,便于前端识别)。
 const CANCELLED_MSG: &str = "部署已取消";
+/// SSH 建连超时(秒):russh 对不可达地址可能长时间挂起且自身不带超时,统一兜底。
+const SSH_CONNECT_TIMEOUT_SECS: u64 = 15;
+/// SSH 检测/建目录类命令的执行超时(秒)(安装 Docker 固定 1800 秒,另行指定)。
+const SSH_EXEC_TIMEOUT_SECS: u64 = 60;
 /// 导出进度日志的汇报粒度:每 ≥5MB 变化汇报一次。
 const LOG_PROGRESS_STEP: u64 = 5 * 1024 * 1024;
 
@@ -154,8 +162,36 @@ async fn connect_and_check(
         password_plain.as_deref(),
         server.auth.password_enc.as_deref(),
     )?;
-    let mut client = SshClient::connect(&server, password.as_deref()).await?;
-    check_server_env(&mut client, &server.remote_dir).await
+    let mut client = with_timeout(
+        SSH_CONNECT_TIMEOUT_SECS,
+        "连接超时",
+        "请检查服务器地址与网络",
+        SshClient::connect(&server, password.as_deref()),
+    )
+    .await?;
+    with_timeout(
+        SSH_EXEC_TIMEOUT_SECS,
+        "环境检查超时",
+        "请检查服务器网络后重试",
+        check_server_env(&mut client, &server.remote_dir),
+    )
+    .await
+}
+
+/// 给可能长时间无响应的 SSH future 整体套一层超时(兜底 russh 自身不带连接超时)。
+///
+/// 超时错误格式 `{desc}({secs} 秒):{hint}`,如
+/// “连接超时(15 秒):请检查服务器地址与网络”。
+async fn with_timeout<T>(
+    secs: u64,
+    desc: &str,
+    hint: &str,
+    fut: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    match tokio::time::timeout(Duration::from_secs(secs), fut).await {
+        Ok(res) => res,
+        Err(_) => Err(format!("{}({} 秒):{}", desc, secs, hint)),
+    }
 }
 
 /// 在远端执行官方脚本安装 Docker(最长 1800 秒),输出逐行 emit `server-log`。
@@ -204,12 +240,26 @@ pub async fn create_remote_dir(
         password_plain.as_deref(),
         server.auth.password_enc.as_deref(),
     )?;
-    let mut client = SshClient::connect(&server, password.as_deref()).await?;
+    let mut client = with_timeout(
+        SSH_CONNECT_TIMEOUT_SECS,
+        "连接超时",
+        "请检查服务器地址与网络",
+        SshClient::connect(&server, password.as_deref()),
+    )
+    .await?;
     let cmd = mkdir_p_cmd(&server.remote_dir);
-    let code = client
-        .exec(&cmd, &mut |_| {})
-        .await
-        .map_err(|e| format!("远端创建目录失败: {}", e))?;
+    let code = with_timeout(
+        SSH_EXEC_TIMEOUT_SECS,
+        "创建目录超时",
+        "请检查服务器网络后重试",
+        async {
+            client
+                .exec(&cmd, &mut |_| {})
+                .await
+                .map_err(|e| format!("远端创建目录失败: {}", e))
+        },
+    )
+    .await?;
     if code != 0 {
         return Err(format!(
             "远端创建目录 {} 失败(退出码 {},常见原因:无写入权限)",
@@ -225,7 +275,15 @@ pub async fn create_remote_dir(
 #[tauri::command]
 pub fn deploy(req: DeployRequest, app: AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn(async move {
-        let result = run_deploy(&app, req).await;
+        // panic 兜底:run_deploy 内部任何 panic 都转成失败结果,
+        // 保证任何路径下 deploy-done 恰好 emit 一次(不会静默丢失)。
+        let result = match CatchPanic::new(run_deploy(&app, req)).await {
+            Ok(result) => result,
+            Err(panic_info) => {
+                log::error!("部署管线发生 panic: {}", panic_info);
+                Err("部署过程发生内部错误,详情见日志".to_string())
+            }
+        };
         match result {
             Ok(()) => {
                 let _ = app.emit(
@@ -243,6 +301,41 @@ pub fn deploy(req: DeployRequest, app: AppHandle) -> Result<(), String> {
         }
     });
     Ok(())
+}
+
+/// Future 的 panic 兜底包装:被包裹 future 在 poll 中 panic 时返回 `Err(panic 信息)`,
+/// 而不是让整个后台任务静默消失(配合 [`deploy`] 保证 `deploy-done` 恰好 emit 一次)。
+struct CatchPanic<F: std::future::Future>(Pin<Box<F>>);
+
+impl<F: std::future::Future> CatchPanic<F> {
+    fn new(fut: F) -> Self {
+        Self(Box::pin(fut))
+    }
+}
+
+impl<F: std::future::Future> std::future::Future for CatchPanic<F> {
+    type Output = Result<F::Output, String>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let inner = self.get_mut().0.as_mut();
+        match std::panic::catch_unwind(AssertUnwindSafe(|| inner.poll(cx))) {
+            Ok(Poll::Ready(v)) => Poll::Ready(Ok(v)),
+            Ok(Poll::Pending) => Poll::Pending,
+            // panic 后 inner 已不可恢复,直接以错误收尾,不再 poll
+            Err(payload) => Poll::Ready(Err(panic_message(&payload))),
+        }
+    }
+}
+
+/// 从 panic payload 提取可读信息(&str / String / 其他)。
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "未知 panic".to_string()
+    }
 }
 
 /// 取消当前部署(置位 AtomicBool;管线在各步骤间检查后中止)。
@@ -530,6 +623,11 @@ async fn exec_forwarded(
     }
     if code != 0 {
         return Err(format!("远端命令执行失败(退出码 {}): {}", code, cmd));
+    }
+    // 末尾取消复查:命令可能全程无输出、回调一次都未触发,
+    // 结束后再查一次取消标志,保证取消后不会把该步误报为成功。
+    if is_cancelled(app) {
+        return Err(CANCELLED_MSG.to_string());
     }
     Ok(())
 }

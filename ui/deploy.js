@@ -532,6 +532,7 @@
     refreshControls();
 
     if (success) {
+      renderProgress(6, ''); // step > 5:全部 5 个节点置为完成态
       showBanner('ok', '部署完成');
       window.toast('部署完成', 'ok');
     } else if (message === '部署已取消') {
