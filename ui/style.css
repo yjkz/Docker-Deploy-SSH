@@ -666,3 +666,131 @@ body {
   cursor: pointer;
 }
 .mapping-add { margin-top: 8px; }
+
+/* ===== 部署向导页 ===== */
+
+/* 配置表单卡片(三列栅格,窄屏退化为单列) */
+.deploy-form {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px 18px;
+}
+.deploy-form-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px 16px;
+}
+@media (max-width: 980px) {
+  .deploy-form-grid { grid-template-columns: 1fr; }
+}
+.deploy-form .form-input { width: 100%; }
+
+/* 打日期标签勾选框 */
+.deploy-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 0;
+  font-size: 13.5px;
+  cursor: pointer;
+  user-select: none;
+}
+
+/* 操作按钮行:开始部署 + 取消部署 */
+.deploy-actions {
+  margin-top: 14px;
+  display: flex;
+  gap: 10px;
+}
+
+/* 五步进度条(节点:打标签/导出压缩/上传镜像/同步文件/服务器部署) */
+.deploy-steps {
+  display: flex;
+  align-items: flex-start;
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px 10px 12px;
+  margin-bottom: 12px;
+}
+.deploy-step {
+  flex: 1;
+  min-width: 0;
+  text-align: center;
+  position: relative;
+}
+/* 节点间连接线(挂在后续节点上,横跨前一列的中点) */
+.deploy-step + .deploy-step::before {
+  content: "";
+  position: absolute;
+  top: 13px;
+  left: -50%;
+  width: 100%;
+  height: 2px;
+  background: var(--border);
+  z-index: 0;
+}
+.deploy-step-dot {
+  position: relative;
+  z-index: 1;
+  width: 26px;
+  height: 26px;
+  line-height: 22px;
+  margin: 0 auto 6px;
+  border-radius: 50%;
+  border: 2px solid #cbd5e1;
+  background: #ffffff;
+  color: #94a3b8;
+  font-size: 12px;
+  font-weight: 700;
+}
+.deploy-step-name { font-size: 12.5px; color: var(--text-sub); }
+.deploy-step-msg {
+  margin-top: 2px;
+  min-height: 15px;
+  font-size: 11.5px;
+  color: var(--text-sub);
+  word-break: break-all;
+}
+
+/* 已完成节点:绿色实心 + 对勾 */
+.deploy-step.done .deploy-step-dot {
+  border-color: var(--ok);
+  background: var(--ok);
+  color: #ffffff;
+}
+.deploy-step.done .deploy-step-name { color: var(--ok); }
+/* 前一节点完成后,衔接线变绿 */
+.deploy-step.done + .deploy-step::before { background: var(--ok); }
+
+/* 当前节点:蓝色实心 + 步骤文案 */
+.deploy-step.current .deploy-step-dot {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #ffffff;
+}
+.deploy-step.current .deploy-step-name {
+  color: var(--accent);
+  font-weight: 700;
+}
+.deploy-step.current .deploy-step-msg { color: var(--accent); }
+
+/* 部署日志(深底等宽,自动滚底) */
+.deploy-log {
+  margin: 0 0 24px;
+  padding: 12px 14px;
+  height: 260px;
+  overflow-y: auto;
+  background: #101827;
+  color: #d7dee9;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.deploy-log::-webkit-scrollbar { width: 8px; }
+.deploy-log::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }

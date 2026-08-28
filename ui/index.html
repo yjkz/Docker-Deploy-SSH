@@ -127,13 +127,90 @@
         </div>
       </section>
 
-      <!-- 部署向导页(占位) -->
+      <!-- 部署向导页 -->
       <section data-page="deploy" class="page">
-        <div class="placeholder">
-          <div class="placeholder-icon">&#128640;</div>
-          <div class="placeholder-title">部署向导</div>
-          <div class="placeholder-desc">该功能将在后续任务中提供</div>
+        <!-- 结束横幅(成功/失败/已取消),下次点击「开始部署」时清空 -->
+        <div id="deploy-banner" class="banner banner-ok hidden"></div>
+
+        <header class="page-header">
+          <h1 class="page-title">部署向导</h1>
+          <p class="page-desc">选择本地镜像、目标服务器与部署项目,一键部署到远程服务器</p>
+        </header>
+
+        <!-- 预检未通过 / 预检失败 / 数据加载失败错误框(内容由 deploy.js 构建) -->
+        <div id="deploy-error" class="check-error hidden"></div>
+
+        <div class="section-head">
+          <h2 class="section-title">部署配置</h2>
         </div>
+        <div class="deploy-form">
+          <div class="deploy-form-grid">
+            <div class="form-row">
+              <label class="form-label" for="deploy-image">本地镜像</label>
+              <select id="deploy-image" class="form-input"></select>
+              <div id="deploy-images-hint" class="form-hint hidden"></div>
+            </div>
+            <div class="form-row">
+              <label class="form-label" for="deploy-server">目标服务器</label>
+              <select id="deploy-server" class="form-input"></select>
+              <div class="form-hint">在「服务器管理」页维护</div>
+            </div>
+            <div class="form-row">
+              <label class="form-label" for="deploy-project">部署项目</label>
+              <select id="deploy-project" class="form-input"></select>
+              <div class="form-hint">在「服务器管理」页维护</div>
+            </div>
+            <div class="form-row">
+              <span class="form-label">标签选项</span>
+              <label class="deploy-checkbox">
+                <input type="checkbox" id="deploy-date-tag" checked>
+                <span>打日期标签(推荐,便于回滚)</span>
+              </label>
+              <div class="form-hint">为镜像追加「仓库名:日期时间」标签,出问题可快速回滚</div>
+            </div>
+          </div>
+          <div class="deploy-actions">
+            <button id="deploy-start-btn" class="btn btn-primary" type="button">开始部署</button>
+            <button id="deploy-cancel-btn" class="btn btn-danger" type="button" disabled>取消部署</button>
+          </div>
+        </div>
+
+        <!-- 服务器环境预检结果条(点击「开始部署」后显示) -->
+        <div id="deploy-check" class="server-check hidden"></div>
+
+        <div class="section-head">
+          <h2 class="section-title">部署进度</h2>
+        </div>
+        <div id="deploy-steps" class="deploy-steps">
+          <div class="deploy-step" id="deploy-step-1">
+            <div class="deploy-step-dot">1</div>
+            <div class="deploy-step-name">打标签</div>
+            <div class="deploy-step-msg"></div>
+          </div>
+          <div class="deploy-step" id="deploy-step-2">
+            <div class="deploy-step-dot">2</div>
+            <div class="deploy-step-name">导出压缩</div>
+            <div class="deploy-step-msg"></div>
+          </div>
+          <div class="deploy-step" id="deploy-step-3">
+            <div class="deploy-step-dot">3</div>
+            <div class="deploy-step-name">上传镜像</div>
+            <div class="deploy-step-msg"></div>
+          </div>
+          <div class="deploy-step" id="deploy-step-4">
+            <div class="deploy-step-dot">4</div>
+            <div class="deploy-step-name">同步文件</div>
+            <div class="deploy-step-msg"></div>
+          </div>
+          <div class="deploy-step" id="deploy-step-5">
+            <div class="deploy-step-dot">5</div>
+            <div class="deploy-step-name">服务器部署</div>
+            <div class="deploy-step-msg"></div>
+          </div>
+        </div>
+
+        <!-- 部署日志(深底等宽,自动滚底;上限 2000 行,超出丢弃最旧) -->
+        <pre id="deploy-log" class="deploy-log"></pre>
       </section>
     </main>
   </div>
@@ -156,5 +233,6 @@
   <script src="check.js"></script>
   <script src="images.js"></script>
   <script src="servers.js"></script>
+  <script src="deploy.js"></script>
 </body>
 </html>
