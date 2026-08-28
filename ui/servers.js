@@ -641,8 +641,8 @@
       appendField(body, '主机(IP 或域名)', 'srvf-host', 'text',
         prev ? prev.host : '', '如:192.168.1.100');
       appendField(body, '端口', 'srvf-port', 'number',
-        prev ? prev.port : 22, '', '取值范围 1 - 65555,默认 22',
-        { min: '1', max: '65555', step: '1' });
+        prev ? prev.port : 22, '', '取值范围 1 - 65535,默认 22',
+        { min: '1', max: '65535', step: '1' });
       appendField(body, '用户名', 'srvf-username', 'text',
         prev ? prev.username : '', '如:root');
 
@@ -747,8 +747,8 @@
 
     if (!name) return formFail('srvf-error', '请填写名称');
     if (!host) return formFail('srvf-error', '请填写主机地址');
-    if (!/^\d+$/.test(portRaw) || Number(portRaw) < 1 || Number(portRaw) > 65555) {
-      return formFail('srvf-error', '端口需为 1 - 65555 之间的整数');
+    if (!/^\d+$/.test(portRaw) || Number(portRaw) < 1 || Number(portRaw) > 65535) {
+      return formFail('srvf-error', '端口需为 1 - 65535 之间的整数');
     }
     if (!username) return formFail('srvf-error', '请填写用户名');
     if (!remoteDir) return formFail('srvf-error', '请填写远程部署目录');
