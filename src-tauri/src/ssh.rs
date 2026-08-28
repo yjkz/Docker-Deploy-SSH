@@ -18,6 +18,7 @@ use russh::client::{self, Handle};
 use russh::ChannelMsg;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
+use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::{AuthType, ServerConfig};
@@ -156,7 +157,7 @@ impl SshClient {
         local: &Path,
         remote_dir: &str,
         remote_name: &str,
-        on_progress: &dyn Fn(u64, u64),
+        on_progress: &(dyn Fn(u64, u64) + Send + Sync),
     ) -> Result<(), String> {
         let total = tokio::fs::metadata(local)
             .await
@@ -178,7 +179,7 @@ impl SshClient {
         &mut self,
         local_dir: &Path,
         remote_dir: &str,
-        on_progress: &dyn Fn(u64, u64),
+        on_progress: &(dyn Fn(u64, u64) + Send + Sync),
     ) -> Result<(), String> {
         // 1. 预扫描本地目录:收集文件(local 路径、远端路径、大小)与全部子目录
         let top_remote = normalize_remote(remote_dir);
@@ -258,7 +259,7 @@ async fn exec_collect(client: &mut SshClient, cmd: &str) -> Result<(i32, String)
 }
 
 /// 远端环境检查报告。
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize)]
 pub struct ServerCheckReport {
     pub docker: bool,
     pub compose: bool,
@@ -403,7 +404,7 @@ async fn copy_file_to_remote(
     remote_path: &str,
     sent: &mut u64,
     total: u64,
-    on_progress: &dyn Fn(u64, u64),
+    on_progress: &(dyn Fn(u64, u64) + Send + Sync),
 ) -> Result<(), String> {
     let mut local_file = tokio::fs::File::open(local)
         .await

@@ -26,13 +26,16 @@ pub enum DockerCheck {
 }
 
 /// 宿主机检测结果报告。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// (f64 字段无法 derive `Eq`,故此处只保留 `PartialEq`。)
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct HostCheckReport {
     pub docker_installed: bool,
     pub daemon_running: bool,
     pub compose_ok: bool,
     pub docker_version: Option<String>,
     pub arch: Option<String>,
+    /// 系统临时目录所在盘剩余空间(GB);查询失败记 None(非关键信息)
+    pub disk_free_gb: Option<f64>,
     pub error: Option<String>,
 }
 
@@ -101,6 +104,7 @@ pub fn check_host() -> HostCheckReport {
         compose_ok: false,
         docker_version: None,
         arch: None,
+        disk_free_gb: None,
         error: None,
     };
 
@@ -140,6 +144,19 @@ pub fn check_host() -> HostCheckReport {
             report.error = Some(format!("docker compose 插件不可用:{}", e));
         }
     }
+
+    // 5) 系统临时目录所在盘剩余空间(fs4,Task 5 部署导出空间检查同源);
+    //    非关键信息,查询失败记 None 不影响整体检测
+    report.disk_free_gb = {
+        let dir = std::env::temp_dir();
+        match fs4::free_space(&dir) {
+            Ok(bytes) => Some(bytes as f64 / 1024.0 / 1024.0 / 1024.0),
+            Err(e) => {
+                log::warn!("获取磁盘剩余空间失败 ({}): {}", dir.display(), e);
+                None
+            }
+        }
+    };
 
     report
 }
@@ -210,6 +227,29 @@ pub fn tag_image(image: &str, new_tag: &str) -> Result<(), String> {
     run_docker(&["tag", image, new_tag])
         .map(|_| ())
         .map_err(|e| format!("打标签失败: {}", e))
+}
+
+/// 判断本地是否存在指定镜像/标签:`docker image inspect` 退出码 0 即存在。
+pub fn image_exists(image: &str) -> bool {
+    new_command("docker")
+        .args(["image", "inspect", image])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// 获取本地镜像大小(字节):`docker image inspect --format {{.Size}}`。
+/// 镜像不存在或输出解析失败返回 None。
+pub fn image_size(image: &str) -> Option<u64> {
+    let output = new_command("docker")
+        .args(["image", "inspect", "--format", "{{.Size}}", image])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.trim().parse::<u64>().ok()
 }
 
 /// `docker images --format {{json .}}` 的原始 JSON 行结构
