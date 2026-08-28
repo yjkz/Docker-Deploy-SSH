@@ -24,3 +24,5 @@ uuid = { version = "1", features = ["v4"] }
 log = "0.4"
 tauri = { version = "2.11.3" }
 tauri-plugin-log = "2"
+flate2 = "1"
+chrono = "0.4"
