@@ -13,8 +13,8 @@
   'use strict';
 
   var HOST_OK_KEY = 'dd_hostOk';
-  /** 环境检测未通过时禁用的页面 */
-  var LOCKED_PAGES = ['images', 'servers', 'deploy'];
+  /** 环境检测未通过时禁用的页面(服务器管理页除外:配置编辑不依赖 Docker) */
+  var LOCKED_PAGES = ['images', 'deploy'];
 
   // ===== 全局状态:hostOk 变更时自动镜像到 localStorage =====
   window.AppState = {};
@@ -67,8 +67,9 @@
     var section = document.querySelector('section[data-page="' + name + '"]');
     if (!section) return;
 
-    // 未通过环境检测时禁止进入其余页面
-    if (name !== 'check' && !window.AppState.hostOk) {
+    // 未通过环境检测时禁止进入被锁定的页面
+    // (服务器管理页不在 LOCKED_PAGES 中:配置编辑不需要本机 Docker)
+    if (LOCKED_PAGES.indexOf(name) !== -1 && !window.AppState.hostOk) {
       window.toast('环境检测未通过,请先完成环境检测', 'warn');
       return;
     }

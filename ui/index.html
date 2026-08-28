@@ -21,7 +21,8 @@
         <button class="nav-item disabled" type="button" data-nav="images" title="环境检测未通过" aria-disabled="true">
           <span class="nav-icon">&#128230;</span><span class="nav-text">镜像列表</span>
         </button>
-        <button class="nav-item disabled" type="button" data-nav="servers" title="环境检测未通过" aria-disabled="true">
+        <!-- 服务器管理:配置编辑不依赖本机 Docker,始终可进入(hostOk=false 时页面顶部有黄色横幅) -->
+        <button class="nav-item" type="button" data-nav="servers">
           <span class="nav-icon">&#128421;</span><span class="nav-text">服务器管理</span>
         </button>
         <button class="nav-item disabled" type="button" data-nav="deploy" title="环境检测未通过" aria-disabled="true">
@@ -80,12 +81,49 @@
         </div>
       </section>
 
-      <!-- 服务器管理页(占位) -->
+      <!-- 服务器管理页 -->
       <section data-page="servers" class="page">
-        <div class="placeholder">
-          <div class="placeholder-icon">&#128421;</div>
-          <div class="placeholder-title">服务器管理</div>
-          <div class="placeholder-desc">该功能将在后续任务中提供</div>
+        <div id="servers-banner" class="banner banner-warn hidden"></div>
+        <header class="page-header">
+          <h1 class="page-title">服务器管理</h1>
+          <p class="page-desc">维护 SSH 服务器连接与部署项目配置</p>
+        </header>
+
+        <div id="servers-error" class="check-error hidden"></div>
+
+        <div class="section-head">
+          <h2 class="section-title">服务器</h2>
+          <button id="servers-add-btn" class="btn btn-primary" type="button">新增服务器</button>
+        </div>
+        <div id="servers-list" class="server-list">
+          <div class="list-hint">正在加载配置…</div>
+        </div>
+
+        <div class="section-head">
+          <h2 class="section-title">部署项目</h2>
+          <button id="projects-add-btn" class="btn btn-primary" type="button">新增项目</button>
+        </div>
+        <div id="projects-table-wrap" class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>镜像过滤</th>
+                <th>compose 文件</th>
+                <th>映射数</th>
+                <th class="col-action">操作</th>
+              </tr>
+            </thead>
+            <tbody id="projects-tbody">
+              <tr><td class="empty-cell" colspan="5">尚未加载</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- 运行日志(折叠面板,默认收起):install / create 等远端命令输出 -->
+        <div class="log-panel">
+          <button id="servers-log-toggle" class="log-toggle" type="button">运行日志(点击展开,安装/检测输出在此显示)</button>
+          <pre id="servers-log-body" class="log-body hidden"></pre>
         </div>
       </section>
 
@@ -103,8 +141,20 @@
   <!-- 全站 Toast 容器 -->
   <div id="toast-container" class="toast-container"></div>
 
+  <!-- 自绘模态框(服务器/项目编辑表单,内容由 servers.js 构建) -->
+  <div id="servers-modal" class="modal-overlay hidden">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="servers-modal-title">
+      <div class="modal-head">
+        <div id="servers-modal-title" class="modal-title"></div>
+        <button id="servers-modal-close" class="modal-close" type="button" title="关闭">×</button>
+      </div>
+      <div id="servers-modal-body" class="modal-body"></div>
+    </div>
+  </div>
+
   <script src="app.js"></script>
   <script src="check.js"></script>
   <script src="images.js"></script>
+  <script src="servers.js"></script>
 </body>
 </html>

@@ -120,6 +120,7 @@ body {
 }
 .banner-ok   { background: #e8f7ee; color: #15803d; border-color: #bbe7cb; }
 .banner-fail { background: #fdeaea; color: #b91c1c; border-color: #f5c6c6; }
+.banner-warn { background: #fdf3e3; color: #b45309; border-color: #f3ddb0; }
 .banner-wait { background: #e8f0fe; color: #1d4ed8; border-color: #c7d8fb; }
 
 /* ===== 环境检测列表 ===== */
@@ -199,6 +200,8 @@ body {
   margin-bottom: 14px;
   font-size: 13px;
 }
+.servers-error-text { word-break: break-all; }
+.check-error .btn { margin-left: 10px; }
 
 .check-footer {
   margin-top: 16px;
@@ -391,3 +394,275 @@ body {
 .toast-fail { border-left-color: var(--fail); }
 .toast-warn { border-left-color: var(--warn); }
 .toast-info { border-left-color: var(--accent); }
+
+/* ===== 服务器管理页 ===== */
+
+/* 分区标题 + 右侧新增按钮 */
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 20px 0 10px;
+}
+.section-title { font-size: 15px; font-weight: 700; }
+
+/* 空列表 / 加载中提示条 */
+.list-hint {
+  padding: 18px;
+  text-align: center;
+  color: var(--text-sub);
+  background: var(--card-bg);
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  font-size: 13px;
+}
+
+/* 服务器卡片 */
+.server-list { display: flex; flex-direction: column; gap: 12px; }
+
+.server-card {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+}
+
+.server-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.server-name { font-weight: 700; font-size: 14.5px; }
+.server-addr {
+  font-family: Consolas, "Courier New", monospace;
+  color: var(--text-sub);
+  word-break: break-all;
+}
+.server-meta {
+  margin-top: 6px;
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  color: var(--text-sub);
+  font-size: 12.5px;
+  word-break: break-all;
+}
+.server-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* 卡片内嵌环境检测结果区 */
+.server-check {
+  margin-top: 12px;
+  border-top: 1px dashed var(--border);
+  padding-top: 10px;
+}
+.server-check-title { font-size: 12px; color: var(--text-sub); margin-bottom: 6px; }
+.server-check-hint { color: var(--text-sub); font-size: 12.5px; }
+.server-check-badges { display: flex; gap: 8px; flex-wrap: wrap; }
+.server-error-line { word-break: break-all; }
+.server-errors {
+  margin-top: 8px;
+  color: var(--fail);
+  font-size: 12.5px;
+  line-height: 1.6;
+  word-break: break-all;
+}
+.server-check-actions {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* 自绘确认条(替代 confirm()) */
+.confirm-bar {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  background: #fdf3e3;
+  border: 1px solid #f3ddb0;
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 12.5px;
+  color: #b45309;
+}
+.confirm-text { flex: 1; min-width: 220px; }
+
+/* 运行日志折叠面板(默认收起) */
+.log-panel {
+  margin-top: 24px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--card-bg);
+  overflow: hidden;
+}
+.log-toggle {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 10px 14px;
+  border: none;
+  background: #f8fafc;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-sub);
+  cursor: pointer;
+}
+.log-toggle:hover { background: #f1f5f9; }
+.log-body {
+  margin: 0;
+  padding: 12px 14px;
+  min-height: 60px;
+  max-height: 260px;
+  overflow-y: auto;
+  background: #101827;
+  color: #d7dee9;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.log-body::-webkit-scrollbar { width: 8px; }
+.log-body::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+
+/* ===== 自绘模态框(服务器/项目编辑表单) ===== */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 900;
+  background: rgba(15, 23, 42, .45);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 48px 16px;
+  overflow-y: auto;
+}
+.modal-card {
+  background: var(--card-bg);
+  border-radius: 10px;
+  width: 560px;
+  max-width: 100%;
+  box-shadow: 0 12px 32px rgba(15, 23, 42, .25);
+}
+.modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+}
+.modal-title { font-size: 15px; font-weight: 700; }
+.modal-close {
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  color: var(--text-sub);
+  padding: 2px 6px;
+}
+.modal-close:hover { color: var(--text-main); }
+.modal-body { padding: 16px 18px; }
+
+/* ===== 表单(模态框内) ===== */
+.form-row { margin-bottom: 12px; }
+.form-label {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 5px;
+}
+.form-input {
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #ffffff;
+  color: var(--text-main);
+  font-size: 13.5px;
+  font-family: inherit;
+  outline: none;
+  transition: border-color .15s, box-shadow .15s;
+}
+.form-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, .12);
+}
+.form-input::placeholder { color: #9aa3b2; }
+.form-hint {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-sub);
+  line-height: 1.5;
+}
+.form-error {
+  background: #fdeaea;
+  color: #b91c1c;
+  border: 1px solid #f5c6c6;
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 12px;
+  font-size: 12.5px;
+}
+.form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 16px;
+}
+.radio-row { display: flex; align-items: center; gap: 20px; }
+.radio-row label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13.5px;
+  cursor: pointer;
+}
+
+/* 文件映射编辑表格(模态框内) */
+.mapping-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+.mapping-table th {
+  padding: 6px;
+  text-align: left;
+  font-weight: 600;
+  color: var(--text-sub);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.mapping-table td {
+  padding: 6px 6px 6px 0;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+.mapping-input {
+  width: 100%;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12.5px;
+  font-family: inherit;
+  outline: none;
+}
+.mapping-input:focus { border-color: var(--accent); }
+.mapping-dir {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.mapping-add { margin-top: 8px; }
