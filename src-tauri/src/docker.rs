@@ -7,7 +7,7 @@
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde::{Deserialize, Serialize};
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -47,10 +47,27 @@ pub struct ImageInfo {
     pub id: String,
 }
 
+/// Windows 进程创建标志:CREATE_NO_WINDOW,避免 GUI 子系统下每次 spawn
+/// 控制台程序(docker/powershell)时短暂闪出黑色控制台窗口。
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// 统一的子进程命令构造入口:Windows 下附加 CREATE_NO_WINDOW。
+/// 所有 `docker` / `powershell` / Docker Desktop 的 spawn 都必须经过这里。
+fn new_command<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 /// 执行 `docker <args>`,成功返回 (stdout, stderr) 文本;
 /// 失败返回面向用户可读的中文错误信息(优先取子进程 stderr)。
 fn run_docker(args: &[&str]) -> Result<(String, String), String> {
-    let output = Command::new("docker")
+    let output = new_command("docker")
         .args(args)
         .output()
         .map_err(|e| {
@@ -138,7 +155,7 @@ pub fn start_daemon() -> Result<(), String> {
     }
 
     // 1) 尝试启动 Windows 服务(失败不致命)
-    let _ = Command::new("powershell")
+    let _ = new_command("powershell")
         .args(["-NoProfile", "-Command", "Start-Service com.docker.service"])
         .output();
 
@@ -147,7 +164,7 @@ pub fn start_daemon() -> Result<(), String> {
         .map(|pf| PathBuf::from(pf).join(r"Docker\Docker\Docker Desktop.exe"))
         .map_err(|_| "未找到 ProgramFiles 环境变量,无法自动启动 Docker Desktop".to_string())?;
     if desktop.exists() {
-        if let Err(e) = Command::new(&desktop).spawn() {
+        if let Err(e) = new_command(&desktop).spawn() {
             log::warn!("启动 Docker Desktop 失败: {}", e);
         }
     } else {
@@ -296,7 +313,7 @@ pub fn save_gzip(image: &str, out_path: &Path, progress_cb: impl Fn(u64)) -> Res
     let file = std::fs::File::create(out_path)
         .map_err(|e| format!("无法创建输出文件 {}: {}", out_path.display(), e))?;
 
-    let mut child = Command::new("docker")
+    let mut child = new_command("docker")
         .args(["save", image])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -309,11 +326,12 @@ pub fn save_gzip(image: &str, out_path: &Path, progress_cb: impl Fn(u64)) -> Res
     // 后台线程持续排空 stderr,避免管道写满导致子进程阻塞
     let stderr_pipe = child.stderr.take();
     let stderr_thread = std::thread::spawn(move || {
-        let mut buf = String::new();
+        let mut buf = Vec::new();
         if let Some(mut s) = stderr_pipe {
-            let _ = Read::read_to_string(&mut s, &mut buf);
+            // 用 read_to_end + from_utf8_lossy,避免非 UTF-8 输出导致读取中断
+            let _ = Read::read_to_end(&mut s, &mut buf);
         }
-        buf
+        String::from_utf8_lossy(&buf).to_string()
     });
 
     let stdout_pipe = child
@@ -341,6 +359,7 @@ pub fn save_gzip(image: &str, out_path: &Path, progress_cb: impl Fn(u64)) -> Res
                 }
                 progress_cb(counter.load(Ordering::Relaxed));
             }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue, // 被信号打断,重试
             Err(e) => {
                 copy_err = Some(format!("读取 docker save 输出失败: {}", e));
                 break;
