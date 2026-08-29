@@ -17,9 +17,9 @@
 //! 健康检查 → 部署后钩子 → 清理远端 tar)。
 //!
 //! 整栈部署管线(`deploy_stack`,六步,progress step 1..6):
-//! 前置(找 server/project、解析密码)→ 分类确认 → 打包(逐镜像 save_gzip)
-//! → 上传(compose 副本 + releases/<时间戳>/ 镜像包 + 文件映射)→ 部署前钩子
-//! → 装载(逐包 docker load)→ 拉取(compose pull)→ 启动(compose up -d)
+//! 前置(找 server/project、解析密码)→ 分类确认 → 打包(本地镜像并发 save_gzip)
+//! → 上传(compose 副本 + releases/<时间戳>/ 镜像包 + 文件映射,镜像包支持断点续传)
+//! → 部署前钩子 → 装载(逐包 docker load)→ 拉取(compose pull)→ 启动(compose up -d)
 //! → 健康检查 → 部署后钩子 → 清理旧 releases(仅留最新 5 个)。
 
 use std::any::Any;
@@ -57,6 +57,8 @@ const SSH_CONNECT_TIMEOUT_SECS: u64 = 15;
 const SSH_EXEC_TIMEOUT_SECS: u64 = 60;
 /// 导出进度日志的汇报粒度:每 ≥5MB 变化汇报一次。
 const LOG_PROGRESS_STEP: u64 = 5 * 1024 * 1024;
+/// 整栈部署:并行打包的并发度上限(实际取 `min(本值, 可用并行度)`)。
+const PACK_CONCURRENCY_CAP: usize = 3;
 /// 整栈部署:单包 `docker load` 的执行超时(秒)。
 const STACK_LOAD_TIMEOUT_SECS: u64 = 600;
 /// 整栈部署:`docker compose pull` / `up -d` 的执行超时(秒)。
@@ -724,6 +726,7 @@ async fn run_deploy_steps(
     // (镜像大小未知 → 告警跳过;不足 → 中文报错中止)
     let need_bytes = image_bytes.map(|size| (size as f64 * 1.5) as u64);
     remote_disk_precheck(app, &mut client, need_bytes).await?;
+    // 镜像包同名即同内容(uuid 命名),启用断点续传
     upload_tar(app, &mut client, &out_path, &tar_name).await?;
     emit_log(app, "镜像上传完成");
 
@@ -791,27 +794,16 @@ fn check_export_disk_space(image_bytes: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// 步骤 2:`docker save` → gzip 流式压缩导出到 `out_path`。
-///
-/// 阻塞型 `save_gzip` 放入 blocking 线程池;progress_cb 用 `AtomicU64`
-/// 累计压缩后字节数,每 ≥5MB 变化 emit 一次 `deploy-log`(“已导出 X MB”)。
-/// 返回压缩后的总字节数。
-async fn export_image(app: &AppHandle, image_ref: &str, out_path: &Path) -> Result<u64, String> {
-    let last_reported = Arc::new(AtomicU64::new(0));
-    let app_for_cb = app.clone();
+/// 把阻塞型 `save_gzip`(`docker save` → gzip 流式压缩)放入 blocking 线程池
+/// 执行,返回压缩后的总字节数;进度回调由调用方提供(并行打包传空回调)。
+/// 内层 blocking 任务 panic 也被转换为 `Err`,不会向上传播 panic。
+async fn run_save_gzip<F>(image_ref: &str, out_path: &Path, progress_cb: F) -> Result<u64, String>
+where
+    F: Fn(u64) + Send + 'static,
+{
     let image = image_ref.to_string();
     let path = out_path.to_path_buf();
-    let last = Arc::clone(&last_reported);
-
-    let handle = tauri::async_runtime::spawn_blocking(move || {
-        save_gzip(&image, &path, move |n| {
-            let prev = last.load(Ordering::Relaxed);
-            if n >= prev.saturating_add(LOG_PROGRESS_STEP) {
-                last.store(n, Ordering::Relaxed);
-                emit_log(&app_for_cb, &format!("已导出 {} MB", n / 1024 / 1024));
-            }
-        })
-    });
+    let handle = tauri::async_runtime::spawn_blocking(move || save_gzip(&image, &path, progress_cb));
     match handle.await {
         Ok(Ok(total)) => Ok(total),
         Ok(Err(e)) => Err(e),
@@ -819,7 +811,33 @@ async fn export_image(app: &AppHandle, image_ref: &str, out_path: &Path) -> Resu
     }
 }
 
+/// 步骤 2(单镜像管线):`docker save` → gzip 流式压缩导出到 `out_path`。
+///
+/// progress_cb 用 `AtomicU64` 累计压缩后字节数,每 ≥5MB 变化 emit 一次
+/// `deploy-log`(“已导出 X MB”)。
+async fn export_image(app: &AppHandle, image_ref: &str, out_path: &Path) -> Result<u64, String> {
+    let last_reported = Arc::new(AtomicU64::new(0));
+    let app_for_cb = app.clone();
+    let last = Arc::clone(&last_reported);
+
+    run_save_gzip(image_ref, out_path, move |n| {
+        let prev = last.load(Ordering::Relaxed);
+        if n >= prev.saturating_add(LOG_PROGRESS_STEP) {
+            last.store(n, Ordering::Relaxed);
+            emit_log(&app_for_cb, &format!("已导出 {} MB", n / 1024 / 1024));
+        }
+    })
+    .await
+}
+
+/// 静默导出(无逐块进度日志):并行打包时多个镜像交叉输出逐块日志没有意义,
+/// 进度改为按「完成镜像数」汇报(见 [`pack_local_images`])。
+async fn export_image_silent(image_ref: &str, out_path: &Path) -> Result<u64, String> {
+    run_save_gzip(image_ref, out_path, |_| {}).await
+}
+
 /// 步骤 3:上传镜像 tar 到远端固定 `/tmp` 目录,按每 10% 进度 emit `deploy-log`。
+/// 镜像包 uuid 命名、同名即同内容 → 启用断点续传(中断后重试不必重传已传部分)。
 async fn upload_tar(
     app: &AppHandle,
     client: &mut SshClient,
@@ -831,7 +849,7 @@ async fn upload_tar(
     let last = Arc::clone(&last_pct);
 
     client
-        .sftp_upload(tar_path, "/tmp", tar_name, &move |sent, total| {
+        .sftp_upload(tar_path, "/tmp", tar_name, true, &move |sent, total| {
             if total == 0 {
                 return;
             }
@@ -875,7 +893,10 @@ async fn sync_files(
         } else {
             let (dir, name) = split_remote_file(&full_remote);
             emit_log(app, &format!("同步文件: {} -> {}/{}", mapping.local, dir, name));
-            client.sftp_upload(&local, &dir, &name, &|_, _| {}).await?;
+            // 文件映射内容可变、远端同名未必同内容,不做断点续传(全新写)
+            client
+                .sftp_upload(&local, &dir, &name, false, &|_, _| {})
+                .await?;
         }
     }
     Ok(())
@@ -1438,16 +1459,28 @@ async fn run_deploy_stack_steps(
 
 /// 步骤 2 打包出的本地镜像包集合。
 struct LocalTars {
-    /// `(本地路径, 远端文件名)`,按打包顺序排列
+    /// `(本地路径, 远端文件名)`,按服务顺序排列(与串行打包时的顺序一致)
     files: Vec<(PathBuf, String)>,
     /// Drop 守卫:管线函数返回(成功或失败)时删除全部本地 tar
     _guards: Vec<TempFileGuard>,
 }
 
-/// 步骤 2:把 Local 类镜像逐个导出为 gzip 压缩包(`temp_dir/<uuid>.tar.gz`)。
+/// 步骤 2:把 Local 类镜像并发导出为 gzip 压缩包(`temp_dir/<uuid>.tar.gz`)。
 ///
-/// 先做磁盘预检:全部 Local 镜像大小求和 ×1.5(复用 [`check_export_disk_space`];
-/// 有镜像大小未知则跳过预检并告警)。列表为空(全 Pull)时返回空集合。
+/// 磁盘预检保持打包前一次性(全部 Local 镜像大小求和 ×1.5,复用
+/// [`check_export_disk_space`];有镜像大小未知则跳过预检并告警)。
+/// 列表为空(全 Pull)时返回空集合。
+///
+/// 并发打包:并发度 = [`PACK_CONCURRENCY_CAP`] 与可用并行度的较小值,
+/// 用 `tokio::task::JoinSet` 保活至多 N 个任务、完成一个补位一个
+/// (阻塞型 `save_gzip` 经 [`export_image_silent`] 在 blocking 线程池执行);
+/// 结果按服务顺序回填,`files` 顺序与串行版一致。
+///
+/// 进度与取消:每完成一个镜像 emit 一次 `deploy-log`(“打包完成 (i/n)”)并
+/// 检查一次取消;取消或出错后不再启动新任务,但**已启动的阻塞 `docker save`
+/// 无法中断**,只能等其在途任务自然结束后以“部署已取消”/首个错误中止。
+/// 输出路径的 [`TempFileGuard`] 预先建立,任何返回路径(成功/失败/取消)下
+/// 半成品 tar 都随管线返回统一删除。
 async fn pack_local_images(
     app: &AppHandle,
     local: &[&StackServiceChoice],
@@ -1467,27 +1500,101 @@ async fn pack_local_images(
     }
 
     let n = local.len();
-    let mut files = Vec::with_capacity(n);
-    let mut guards = Vec::with_capacity(n);
-    for (i, svc) in local.iter().enumerate() {
-        ensure_not_cancelled(app)?;
+    // guard 先建:导出失败的半成品文件同样会在管线返回时删除
+    let mut outputs: Vec<(PathBuf, String)> = Vec::with_capacity(n);
+    for _ in 0..n {
         let tar_name = format!("{}.tar.gz", uuid::Uuid::new_v4());
         let out_path = std::env::temp_dir().join(&tar_name);
-        // guard 先建:导出失败的半成品文件同样会在管线返回时删除
-        let guard = TempFileGuard(out_path.clone());
-        emit_log(app, &format!("打包镜像 ({}/{}): {}", i + 1, n, svc.image));
-        let total_bytes = export_image(app, &svc.image, &out_path).await?;
-        emit_log(
-            app,
-            &format!("打包完成: {} (共 {} MB)", svc.image, total_bytes / 1024 / 1024),
-        );
-        guards.push(guard);
-        files.push((out_path, tar_name));
+        outputs.push((out_path, tar_name));
+    }
+    let guards: Vec<TempFileGuard> = outputs.iter().map(|(p, _)| TempFileGuard(p.clone())).collect();
+    let images: Vec<String> = local.iter().map(|s| s.image.clone()).collect();
+
+    let available = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1);
+    let concurrency = PACK_CONCURRENCY_CAP.min(available).max(1);
+    emit_log(
+        app,
+        &format!("并行打包 {} 个本地镜像包(并发 {})", n, concurrency),
+    );
+
+    let mut set: tokio::task::JoinSet<(usize, Result<u64, String>)> = tokio::task::JoinSet::new();
+    // 启动第一批(至多 concurrency 个);此后每完成一个补位一个
+    let mut next = 0usize;
+    while next < n && set.len() < concurrency {
+        set.spawn(spawn_pack_job(next, images[next].clone(), outputs[next].0.clone()));
+        next += 1;
+    }
+
+    let mut first_error: Option<String> = None;
+    let mut cancelled = false;
+    let mut done = 0usize;
+    while let Some(joined) = set.join_next().await {
+        let (idx, res) = match joined {
+            Ok(pair) => pair,
+            // 外层包装任务自身 panic(理论上不可能,防御性兜底)
+            Err(e) => (usize::MAX, Err(format!("打包任务异常终止: {}", e))),
+        };
+        match res {
+            Ok(bytes) => {
+                done += 1;
+                if let Some(name) = images.get(idx) {
+                    emit_log(
+                        app,
+                        &format!(
+                            "打包完成 ({}/{}): {} (共 {} MB)",
+                            done,
+                            n,
+                            name,
+                            bytes / 1024 / 1024
+                        ),
+                    );
+                }
+            }
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+        // 每完成一个检查一次取消;取消/出错后不再启动新任务
+        if is_cancelled(app) {
+            cancelled = true;
+        }
+        if cancelled || first_error.is_some() {
+            continue;
+        }
+        if next < n {
+            set.spawn(spawn_pack_job(next, images[next].clone(), outputs[next].0.clone()));
+            next += 1;
+        }
+    }
+
+    if cancelled {
+        return Err(CANCELLED_MSG.to_string());
+    }
+    if let Some(e) = first_error {
+        return Err(e);
     }
     Ok(LocalTars {
-        files,
+        files: outputs,
         _guards: guards,
     })
+}
+
+/// 启动一个静默打包任务:并发导出 `image` 到 `out_path`,返回 `(任务序号, 结果)`。
+/// (外层 async 任务包装保证内层 blocking 任务 panic 也带序号转为 `Err`,
+/// 便于定位失败的是哪个镜像。)
+fn spawn_pack_job(
+    idx: usize,
+    image: String,
+    out_path: PathBuf,
+) -> impl std::future::Future<Output = (usize, Result<u64, String>)> + Send + 'static {
+    async move {
+        let res = export_image_silent(&image, &out_path).await;
+        (idx, res)
+    }
 }
 
 /// 步骤 3 子步:上传 compose 副本(及同目录 `.env`,若存在)到远端根目录。
@@ -1510,14 +1617,15 @@ async fn upload_compose_files(
             remote_join(&server.remote_dir, compose_name)
         ),
     );
+    // compose 副本 / .env 内容可变且远端同名,不做续传(全新写覆盖)
     client
-        .sftp_upload(&compose_local, &server.remote_dir, compose_name, &|_, _| {})
+        .sftp_upload(&compose_local, &server.remote_dir, compose_name, false, &|_, _| {})
         .await?;
     if let Some(env_path) = compose_local.parent().map(|p| p.join(".env")) {
         if env_path.is_file() {
             emit_log(app, "上传 compose 同目录 .env 文件");
             client
-                .sftp_upload(&env_path, &server.remote_dir, ".env", &|_, _| {})
+                .sftp_upload(&env_path, &server.remote_dir, ".env", false, &|_, _| {})
                 .await?;
         }
     }
@@ -1525,7 +1633,7 @@ async fn upload_compose_files(
 }
 
 /// 步骤 3 子步:逐包上传本地镜像包到远端 releases 目录(进度:包序号 + 字节,
-/// 每 ≥5MB 变化汇报一次)。
+/// 每 ≥5MB 变化汇报一次;镜像包 uuid 命名、同名即同内容 → 启用断点续传)。
 async fn upload_local_tars(
     app: &AppHandle,
     client: &mut SshClient,
@@ -1545,7 +1653,7 @@ async fn upload_local_tars(
         let last = Arc::new(AtomicU64::new(0));
         let last_cb = Arc::clone(&last);
         client
-            .sftp_upload(path, release_dir, name, &move |sent, total| {
+            .sftp_upload(path, release_dir, name, true, &move |sent, total| {
                 if total == 0 {
                     return;
                 }
