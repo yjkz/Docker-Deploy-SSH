@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.1.0"
+version = "0.2.0"
 description = "A Tauri App"
 authors = ["you"]
 license = ""
@@ -15,11 +15,39 @@ name = "app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2.6.3" }
+tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
 log = "0.4"
-tauri = { version = "2.11.3" }
+tauri = { version = "2.11.3", features = [] }
 tauri-plugin-log = "2"
+flate2 = "1"
+chrono = "0.4"
+# Task 3: SSH/SFTP(russh 0.46 起 re-export russh_keys 为 russh::keys)
+tokio = { version = "1", features = ["full"] }
+russh = "0.46"
+russh-sftp = "2"
+async-trait = "0.1"
+# Task 4: base64 编码(DPAPI 密文存入 JSON 配置用)
+base64 = "0.22"
+# Task 5: 本地磁盘剩余空间查询(host_check 磁盘信息 / 部署导出前空间检查)
+fs4 = "0.12"
+# compose 整栈部署:compose YAML 解析
+serde_yaml = "0.9"
+
+# Task 4: Windows DPAPI 密码加密(CurrentUser 作用域),仅 Windows 构建
+[target.'cfg(windows)'.dependencies]
+windows-dpapi = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+
+# Task 10: release 轻量化(体积优先)
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+opt-level = "s"
