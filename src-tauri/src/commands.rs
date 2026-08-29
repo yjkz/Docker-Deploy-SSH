@@ -13,13 +13,14 @@
 //! 部署管线(`deploy` 命令同步返回 `Ok(())`,后台任务执行,严格顺序,
 //! 任一步失败即中止并 emit `deploy-done` failure):
 //! 前置(找 server/project、解析密码)→ 打标签 → 导出压缩 → 上传镜像
-//! → 同步文件 → 服务器部署(docker load → compose up -d → 清理远端 tar)。
+//! → 同步文件 → 部署前钩子 → 服务器部署(docker load → compose up -d →
+//! 健康检查 → 部署后钩子 → 清理远端 tar)。
 //!
 //! 整栈部署管线(`deploy_stack`,六步,progress step 1..6):
 //! 前置(找 server/project、解析密码)→ 分类确认 → 打包(逐镜像 save_gzip)
-//! → 上传(compose 副本 + releases/<时间戳>/ 镜像包 + 文件映射)
+//! → 上传(compose 副本 + releases/<时间戳>/ 镜像包 + 文件映射)→ 部署前钩子
 //! → 装载(逐包 docker load)→ 拉取(compose pull)→ 启动(compose up -d)
-//! → 清理旧 releases(仅留最新 5 个)。
+//! → 健康检查 → 部署后钩子 → 清理旧 releases(仅留最新 5 个)。
 
 use std::any::Any;
 use std::panic::AssertUnwindSafe;
@@ -62,6 +63,12 @@ const STACK_LOAD_TIMEOUT_SECS: u64 = 600;
 const STACK_COMPOSE_TIMEOUT_SECS: u64 = 900;
 /// 服务器清理(`prune_server`)的执行超时(秒)。
 const PRUNE_TIMEOUT_SECS: u64 = 300;
+/// 部署前/后钩子命令的执行超时(秒)。
+const HOOK_TIMEOUT_SECS: u64 = 600;
+/// 健康检查:轮询间隔(秒)。
+const HEALTH_POLL_INTERVAL_SECS: u64 = 5;
+/// 健康检查:单轮 `compose ps` 状态查询的执行超时(秒)。
+const HEALTH_PS_TIMEOUT_SECS: u64 = 60;
 
 /// 部署运行状态:`cancel_deploy` 置位 `cancelled`,
 /// 部署管线在各步骤之间以及 exec 输出行回调中检查后中止。
@@ -725,6 +732,8 @@ async fn run_deploy_steps(
     ensure_not_cancelled(app)?;
     sync_files(app, &mut client, &server, &project).await?;
     emit_log(app, "项目文件同步完成");
+    // 部署前钩子(归入步骤 4:装载前执行,旧容器仍在运行;失败即中止部署)
+    run_hook(app, &mut client, &project, HookKind::Pre, &server.remote_dir).await?;
 
     // ---- 步骤 5:服务器部署 ----
     emit_progress(app, 5, 5, "服务器部署");
@@ -872,11 +881,13 @@ async fn sync_files(
     Ok(())
 }
 
-/// 步骤 5:服务器部署 —— `docker load` → [`docker tag` 同步原标签] → `compose up -d` → 删除远端 tar。
+/// 步骤 5:服务器部署 —— `docker load` → 同步原标签 → `compose up -d` → 健康检查 → 部署后钩子 → 删除远端 tar。
 ///
 /// 每条命令超时 600 秒(清理 60 秒),输出实时转发到 `deploy-log`,收到输出行时检查取消标志。
 /// `retag` 为 `Some((日期tag, 原引用))` 时,装载后把原引用(如 myapp:latest)也指向
 /// 新镜像,否则 compose 引用原 tag 时感知不到变化、不会重建容器。
+/// up 之后先做健康检查(未启用则跳过),再执行部署后钩子(失败仅告警),
+/// 最后清理远端 tar。
 async fn server_deploy(
     app: &AppHandle,
     client: &mut SshClient,
@@ -914,12 +925,195 @@ async fn server_deploy(
     );
     exec_forwarded(app, client, &up_cmd, 600).await?;
 
-    // 5.4 清理远端 tar(尽力而为,失败不影响部署结果)
+    // 5.4 健康检查(up 后按预算轮询服务状态;health_wait_secs=0 时跳过)
+    health_check(app, client, project, &server.remote_dir, &project.compose_file).await?;
+
+    // 5.5 部署后钩子(健康检查通过后执行;失败仅告警,不影响部署结果)
+    run_hook(app, client, project, HookKind::Post, &server.remote_dir).await?;
+
+    // 5.6 清理远端 tar(尽力而为,失败不影响部署结果)
     let rm_cmd = format!("rm -f {}", shell_single_quote(&remote_tar));
     if let Err(e) = exec_forwarded(app, client, &rm_cmd, 60).await {
         emit_log(app, &format!("警告:清理远端临时文件失败: {}", e));
     }
     Ok(())
+}
+
+// ===== 部署钩子 + 健康检查(Task 3)=====
+
+/// 部署钩子类型:`Pre` = 部署前(装载前,旧容器仍在运行,失败中止部署),
+/// `Post` = 部署后(健康检查通过后,失败仅告警)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookKind {
+    Pre,
+    Post,
+}
+
+impl HookKind {
+    /// 日志中的中文名称。
+    fn label(self) -> &'static str {
+        match self {
+            HookKind::Pre => "部署前钩子",
+            HookKind::Post => "部署后钩子",
+        }
+    }
+
+    /// 项目配置里对应的钩子命令(未配置为 `None`)。
+    fn cmd_of<'a>(self, project: &'a ProjectConfig) -> Option<&'a str> {
+        match self {
+            HookKind::Pre => project.pre_deploy_cmd.as_deref(),
+            HookKind::Post => project.post_deploy_cmd.as_deref(),
+        }
+    }
+}
+
+/// 执行项目的部署前/后钩子命令(远端执行,可选)。
+///
+/// - 未配置或空白 → 直接返回 `Ok(())`;
+/// - 命令以 [`hook_cmd`](`cd '<remote_dir>' && ( <cmd> )`)执行,超时
+///   [`HOOK_TIMEOUT_SECS`] 秒,输出实时转发到 `deploy-log`;
+/// - `Pre` 失败 → `Err` 中止部署(此时旧容器仍在运行,尚未 load/up);
+/// - `Post` 失败 → 仅告警并返回 `Ok(())`(不影响部署结果);取消除外。
+async fn run_hook(
+    app: &AppHandle,
+    client: &mut SshClient,
+    project: &ProjectConfig,
+    which: HookKind,
+    remote_dir: &str,
+) -> Result<(), String> {
+    let cmd = match which.cmd_of(project).map(str::trim) {
+        Some(c) if !c.is_empty() => c,
+        _ => return Ok(()),
+    };
+    let full_cmd = hook_cmd(remote_dir, cmd);
+    emit_log(app, &format!("执行{}: {}", which.label(), cmd));
+    match exec_forwarded(app, client, &full_cmd, HOOK_TIMEOUT_SECS).await {
+        Ok(()) => {
+            emit_log(app, &format!("{}执行完成", which.label()));
+            Ok(())
+        }
+        Err(e) => match which {
+            HookKind::Pre => Err(format!("{}执行失败,部署中止: {}", which.label(), e)),
+            HookKind::Post => {
+                if e == CANCELLED_MSG {
+                    Err(e)
+                } else {
+                    emit_log(
+                        app,
+                        &format!("警告:{}执行失败(不影响部署结果): {}", which.label(), e),
+                    );
+                    Ok(())
+                }
+            }
+        },
+    }
+}
+
+/// up 之后的健康检查:`health_wait_secs > 0` 时,每 [`HEALTH_POLL_INTERVAL_SECS`]
+/// 秒轮询一次 [`compose_ps_json_cmd`](`docker compose ps --format json`),
+/// 预算为 `health_wait_secs` 秒;判定见 [`health_verdict`]。
+///
+/// - 全部服务 running 且(无 healthcheck 或 healthy)→ 通过;
+/// - 任一服务 Exited/Restarting/Dead → 立即失败;
+/// - 解析不出状态(旧版 compose 输出、查询暂时失败等)→ 继续轮询至预算耗尽;
+/// - 失败时先经 [`dump_compose_logs`] 拉取各服务最近日志进部署日志,再以中文
+///   错误中止(`健康检查未通过:<服务> <状态>`)。
+/// - `health_wait_secs == 0` → 未启用,直接跳过。
+async fn health_check(
+    app: &AppHandle,
+    client: &mut SshClient,
+    project: &ProjectConfig,
+    remote_dir: &str,
+    compose_file: &str,
+) -> Result<(), String> {
+    if project.health_wait_secs == 0 {
+        emit_log(app, "健康检查未启用,跳过");
+        return Ok(());
+    }
+    let budget = Duration::from_secs(project.health_wait_secs as u64);
+    let started = std::time::Instant::now();
+    let ps_cmd = compose_ps_json_cmd(remote_dir, compose_file);
+    emit_log(
+        app,
+        &format!(
+            "健康检查:开始轮询服务状态(每 {} 秒一轮,预算 {} 秒)",
+            HEALTH_POLL_INTERVAL_SECS, project.health_wait_secs
+        ),
+    );
+    // 最近一轮"尚未就绪"的服务与状态(预算耗尽时报错展示)
+    let mut last_pending: Option<(String, String)> = None;
+    loop {
+        ensure_not_cancelled(app)?;
+        // 单轮查询:60 秒超时;查询超时或 SSH 传输失败都按"无法判定"
+        // 继续轮询(不直接失败,与解析不出的处理一致)
+        let out = match with_timeout(
+            HEALTH_PS_TIMEOUT_SECS,
+            "健康检查状态查询超时",
+            "请检查服务器网络后重试",
+            exec_collect(client, &ps_cmd),
+        )
+        .await
+        {
+            Ok((_, out)) => out,
+            Err(e) => {
+                emit_log(app, &format!("警告:{}(继续等待)", e));
+                String::new()
+            }
+        };
+        let lines: Vec<&str> = out.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        match health_verdict(&lines) {
+            HealthVerdict::Pass => {
+                emit_log(
+                    app,
+                    &format!("健康检查通过(耗时 {} 秒)", started.elapsed().as_secs()),
+                );
+                return Ok(());
+            }
+            HealthVerdict::Unhealthy { service, state } => {
+                dump_compose_logs(app, client, remote_dir, compose_file).await;
+                return Err(format!("健康检查未通过:{} {}", service, state));
+            }
+            HealthVerdict::Indeterminate { pending } => {
+                if let Some(p) = pending {
+                    if last_pending.as_ref() != Some(&p) {
+                        emit_log(app, &format!("健康检查:{} 尚未就绪({})", p.0, p.1));
+                    }
+                    last_pending = Some(p);
+                }
+            }
+        }
+        if started.elapsed() >= budget {
+            dump_compose_logs(app, client, remote_dir, compose_file).await;
+            return Err(match last_pending {
+                Some((service, state)) => format!(
+                    "健康检查未通过:{} {}(等待 {} 秒超时)",
+                    service, state, project.health_wait_secs
+                ),
+                None => format!(
+                    "健康检查未通过:无法获取服务状态(等待 {} 秒超时)",
+                    project.health_wait_secs
+                ),
+            });
+        }
+        // 轮间取消检查后按固定间隔进入下一轮
+        ensure_not_cancelled(app)?;
+        tokio::time::sleep(Duration::from_secs(HEALTH_POLL_INTERVAL_SECS)).await;
+    }
+}
+
+/// 健康检查失败时,拉取各服务最近 50 行日志并逐行转发到 `deploy-log`
+/// (尽力而为:获取失败仅告警,不掩盖原始的健康检查错误)。
+async fn dump_compose_logs(
+    app: &AppHandle,
+    client: &mut SshClient,
+    remote_dir: &str,
+    compose_file: &str,
+) {
+    emit_log(app, "正在获取服务最近日志(最后 50 行):");
+    let cmd = compose_logs_cmd(remote_dir, compose_file);
+    if let Err(e) = exec_forwarded(app, client, &cmd, SSH_EXEC_TIMEOUT_SECS).await {
+        emit_log(app, &format!("警告:获取服务日志失败: {}", e));
+    }
 }
 
 /// 执行远端命令并把输出逐行转发到 `deploy-log`,带超时与取消检查。
@@ -1153,6 +1347,8 @@ async fn run_deploy_stack_steps(
     upload_local_tars(app, &mut client, &tars, &release_dir).await?;
     sync_files(app, &mut client, &server, &project).await?;
     emit_log(app, "上传完成");
+    // 部署前钩子(归入步骤 3:装载/拉取前执行,旧容器仍在运行;失败即中止部署)
+    run_hook(app, &mut client, &project, HookKind::Pre, &server.remote_dir).await?;
 
     // ---- 步骤 4:装载 ----
     emit_progress(app, 4, 6, "装载");
@@ -1221,6 +1417,12 @@ async fn run_deploy_stack_steps(
         ),
     );
     exec_forwarded(app, &mut client, &up_cmd, STACK_COMPOSE_TIMEOUT_SECS).await?;
+
+    // 健康检查(up 后按预算轮询服务状态;health_wait_secs=0 时跳过)
+    health_check(app, &mut client, &project, &server.remote_dir, &remote_compose).await?;
+
+    // 部署后钩子(健康检查通过后执行;失败仅告警,不影响部署结果)
+    run_hook(app, &mut client, &project, HookKind::Post, &server.remote_dir).await?;
 
     // ---- 收尾:清理旧 releases(仅留最新 5 个,尽力而为,失败仅告警)----
     ensure_not_cancelled(app)?;
@@ -1468,6 +1670,146 @@ pub fn docker_tag_cmd(source: &str, target: &str) -> String {
         shell_single_quote(source),
         shell_single_quote(target)
     )
+}
+
+// ===== 钩子/健康检查纯逻辑(便于单测,Task 3)=====
+
+/// 拼装钩子命令:`cd '<remote_dir>' && ( <cmd> )`。
+///
+/// `cmd` 是用户在项目配置里自己填写的**可信复合命令**(可含 `&&`/`;`/重定向/
+/// 管道等),原样拼入、不加引号 —— 相当于用户在本机执行自定义脚本,`cmd`
+/// 内容不是防注入边界;`remote_dir` 是程序拼装的路径,单引号转义防注入。
+pub fn hook_cmd(remote_dir: &str, cmd: &str) -> String {
+    format!("cd {} && ( {} )", shell_single_quote(remote_dir), cmd)
+}
+
+/// 拼装查询 compose 服务状态的命令(每容器一行 JSON,含 Service/State/Health)。
+pub fn compose_ps_json_cmd(remote_dir: &str, compose_file: &str) -> String {
+    format!(
+        "cd {} && docker compose -f {} ps --format json",
+        shell_single_quote(remote_dir),
+        shell_single_quote(compose_file)
+    )
+}
+
+/// 拼装查看 compose 各服务最近日志的命令(最后 50 行)。
+pub fn compose_logs_cmd(remote_dir: &str, compose_file: &str) -> String {
+    format!(
+        "cd {} && docker compose -f {} logs --tail 50",
+        shell_single_quote(remote_dir),
+        shell_single_quote(compose_file)
+    )
+}
+
+/// 单轮健康检查判定结果(见 [`health_verdict`])。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HealthVerdict {
+    /// 全部服务 running 且健康检查通过(或无 healthcheck)
+    Pass,
+    /// 任一服务进入失败终态(Exited/Restarting/Dead),立即中止
+    Unhealthy { service: String, state: String },
+    /// 尚无法判定(解析失败、服务仍在启动/健康检查进行中等),继续轮询;
+    /// `pending` 携带最近观察到的未就绪服务与状态,供预算耗尽时报错展示。
+    Indeterminate { pending: Option<(String, String)> },
+}
+
+/// 对 `docker compose ps --format json` 的输出行做单轮健康判定(纯函数)。
+///
+/// - 逐行解析 JSON(容忍旧版 compose 一次性输出 JSON 数组;非 JSON 行忽略);
+///   解析不出任何服务记录 → `Indeterminate`;
+/// - 任一服务 state 为 Exited/Restarting/Dead(不区分大小写)→ 立即
+///   `Unhealthy{ service, state }`;
+/// - 全部服务 state=="running" 且(无 Health 字段/为空 或 "healthy")→ `Pass`;
+/// - 其余(服务仍在启动、health 为 starting/unhealthy 等)→ `Indeterminate`,
+///   `pending` 取第一个未就绪服务(有 Health 且非 healthy 时展示 Health,
+///   否则展示容器 state)。
+pub fn health_verdict(lines: &[&str]) -> HealthVerdict {
+    // 收集解析出的 (服务名, 容器状态, 健康状态)
+    let mut entries: Vec<(String, String, Option<String>)> = Vec::new();
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(line) {
+            // 旧版 compose 一次性输出 JSON 数组
+            Ok(serde_json::Value::Array(items)) => {
+                for item in &items {
+                    if let Some(e) = parse_ps_entry(item) {
+                        entries.push(e);
+                    }
+                }
+            }
+            Ok(v) => {
+                if let Some(e) = parse_ps_entry(&v) {
+                    entries.push(e);
+                }
+            }
+            // 非 JSON 行(警告、日志前缀等)忽略
+            Err(_) => {}
+        }
+    }
+    if entries.is_empty() {
+        return HealthVerdict::Indeterminate { pending: None };
+    }
+    // 失败终态:立即失败(取先出现者)
+    for (service, state, _) in &entries {
+        if matches!(
+            state.to_ascii_lowercase().as_str(),
+            "exited" | "restarting" | "dead"
+        ) {
+            return HealthVerdict::Unhealthy {
+                service: service.clone(),
+                state: state.clone(),
+            };
+        }
+    }
+    // 逐服务判定 running + 健康
+    let mut pending: Option<(String, String)> = None;
+    for (service, state, health) in &entries {
+        let state_ok = state.eq_ignore_ascii_case("running");
+        let health_ok = match health.as_deref() {
+            None => true, // 无 healthcheck(或输出为空)
+            Some(h) => h.eq_ignore_ascii_case("healthy"),
+        };
+        if state_ok && health_ok {
+            continue;
+        }
+        if pending.is_none() {
+            // 展示口径:健康检查未通过时优先展示 Health(如 starting/unhealthy),
+            // 否则展示容器状态(如 created/paused)
+            let shown = health.clone().unwrap_or_else(|| state.clone());
+            pending = Some((service.clone(), shown));
+        }
+    }
+    match pending {
+        None => HealthVerdict::Pass,
+        Some(p) => HealthVerdict::Indeterminate {
+            pending: Some(p),
+        },
+    }
+}
+
+/// 从单条 `compose ps --format json` 记录提取 `(服务名, 容器状态, 健康状态)`。
+///
+/// 服务名优先 `Service` 字段,缺失时回退容器 `Name`;State 缺失视为无效记录;
+/// Health 兼容三种形态:缺失/`null`/空串 → `None`(视为无 healthcheck)、
+/// 字符串原样、嵌套对象取其 `Status` 字段。
+fn parse_ps_entry(v: &serde_json::Value) -> Option<(String, String, Option<String>)> {
+    let state = v.get("State")?.as_str()?.to_string();
+    let service = v
+        .get("Service")
+        .and_then(|s| s.as_str())
+        .or_else(|| v.get("Name").and_then(|s| s.as_str()))
+        .unwrap_or("<unknown>")
+        .to_string();
+    let health = match v.get("Health") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) if s.is_empty() => None,
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(other) => other.get("Status").and_then(|s| s.as_str()).map(String::from),
+    };
+    Some((service, state, health))
 }
 
 // ===== 管线辅助 =====
@@ -2081,5 +2423,189 @@ mod tests {
             prune_cmd(),
             "docker image prune -f; docker container prune -f"
         );
+    }
+
+    // ===== Task 3:钩子命令拼装 =====
+
+    #[test]
+    fn test_hook_cmd() {
+        assert_eq!(
+            hook_cmd("/opt/app", "docker image prune -f"),
+            "cd '/opt/app' && ( docker image prune -f )"
+        );
+    }
+
+    #[test]
+    fn test_hook_cmd_escapes_remote_dir_quote() {
+        // remote_dir 单引号转义;钩子命令是用户配置的可信复合命令,原样拼入
+        // (支持 && / ; / 重定向,不整体加引号 —— 非防注入边界,见 hook_cmd 文档)
+        assert_eq!(
+            hook_cmd("/op't", "a && b; c > /tmp/log"),
+            "cd '/op'\\''t' && ( a && b; c > /tmp/log )"
+        );
+    }
+
+    // ===== Task 3:compose ps / logs 命令拼装 =====
+
+    #[test]
+    fn test_compose_ps_json_cmd() {
+        assert_eq!(
+            compose_ps_json_cmd("/opt/app", "/opt/app/docker-compose.yml"),
+            "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' ps --format json"
+        );
+    }
+
+    #[test]
+    fn test_compose_ps_json_cmd_escapes_quote() {
+        // 路径内嵌单引号被 '\'' 转义,无法逃出引号注入额外命令
+        assert_eq!(
+            compose_ps_json_cmd("/opt/app", "/op't.yml"),
+            "cd '/opt/app' && docker compose -f '/op'\\''t.yml' ps --format json"
+        );
+    }
+
+    #[test]
+    fn test_compose_logs_cmd() {
+        assert_eq!(
+            compose_logs_cmd("/opt/app", "./docker-compose.yml"),
+            "cd '/opt/app' && docker compose -f './docker-compose.yml' logs --tail 50"
+        );
+    }
+
+    // ===== Task 3:health_verdict 判定 =====
+
+    /// 构造一行 `compose ps --format json` 输出(health 传 None 表示不带该字段)。
+    fn ps_line(service: &str, state: &str, health: Option<&str>) -> String {
+        let mut json = format!(r#"{{"Service":"{}","State":"{}""#, service, state);
+        if let Some(h) = health {
+            json.push_str(&format!(r#","Health":"{}""#, h));
+        }
+        json.push('}');
+        json
+    }
+
+    /// String 行列表转 `&str` 切片(临时 String 需先绑定再借用)。
+    fn as_lines(raw: &[String]) -> Vec<&str> {
+        raw.iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn test_health_verdict_all_running_pass() {
+        let raw = vec![
+            ps_line("web", "running", None),
+            ps_line("db", "running", Some("")),
+            ps_line("cache", "running", Some("healthy")),
+        ];
+        assert_eq!(health_verdict(&as_lines(&raw)), HealthVerdict::Pass);
+    }
+
+    #[test]
+    fn test_health_verdict_exited_fails_fast() {
+        let raw = vec![ps_line("web", "running", None), ps_line("db", "exited", None)];
+        assert_eq!(
+            health_verdict(&as_lines(&raw)),
+            HealthVerdict::Unhealthy {
+                service: "db".to_string(),
+                state: "exited".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_health_verdict_restarting_and_dead_fail_fast() {
+        for state in ["restarting", "dead"] {
+            let raw = vec![ps_line("db", state, None)];
+            assert_eq!(
+                health_verdict(&as_lines(&raw)),
+                HealthVerdict::Unhealthy {
+                    service: "db".to_string(),
+                    state: state.to_string()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn test_health_verdict_blank_or_garbage_indeterminate() {
+        // 空行 / 全空白 / 非 JSON 输出(旧版 compose、警告行等)→ 无法判定,继续轮询
+        assert_eq!(
+            health_verdict(&[""]),
+            HealthVerdict::Indeterminate { pending: None }
+        );
+        assert_eq!(
+            health_verdict(&["   "]),
+            HealthVerdict::Indeterminate { pending: None }
+        );
+        assert_eq!(
+            health_verdict(&[r#"time="2026-08-30" level=warning msg="x""#]),
+            HealthVerdict::Indeterminate { pending: None }
+        );
+    }
+
+    #[test]
+    fn test_health_verdict_health_three_states() {
+        // 无 Health 字段(无 healthcheck)→ Pass
+        let raw = vec![ps_line("web", "running", None)];
+        assert_eq!(health_verdict(&as_lines(&raw)), HealthVerdict::Pass);
+        // Health="healthy" → Pass
+        let raw = vec![ps_line("web", "running", Some("healthy"))];
+        assert_eq!(health_verdict(&as_lines(&raw)), HealthVerdict::Pass);
+        // Health="starting" → 尚未就绪,继续轮询(pending 展示 Health)
+        let raw = vec![ps_line("web", "running", Some("starting"))];
+        assert_eq!(
+            health_verdict(&as_lines(&raw)),
+            HealthVerdict::Indeterminate {
+                pending: Some(("web".to_string(), "starting".to_string()))
+            }
+        );
+        // Health="unhealthy" → 未通过,继续轮询(预算耗尽时报错展示该状态)
+        let raw = vec![ps_line("web", "running", Some("unhealthy"))];
+        assert_eq!(
+            health_verdict(&as_lines(&raw)),
+            HealthVerdict::Indeterminate {
+                pending: Some(("web".to_string(), "unhealthy".to_string()))
+            }
+        );
+    }
+
+    #[test]
+    fn test_health_verdict_not_running_pending() {
+        // 非终态且非 running(created/paused)→ 继续轮询,带出服务与容器状态
+        let raw = vec![ps_line("web", "created", None)];
+        assert_eq!(
+            health_verdict(&as_lines(&raw)),
+            HealthVerdict::Indeterminate {
+                pending: Some(("web".to_string(), "created".to_string()))
+            }
+        );
+    }
+
+    #[test]
+    fn test_health_verdict_json_array_format() {
+        // 旧版 compose 一次性输出 JSON 数组 → 同样可解析
+        let lines = vec![
+            r#"[{"Service":"web","State":"running"},{"Service":"db","State":"running","Health":"healthy"}]"#,
+        ];
+        assert_eq!(health_verdict(&lines), HealthVerdict::Pass);
+    }
+
+    #[test]
+    fn test_health_verdict_falls_back_to_name_field() {
+        // 缺 Service 字段时回退容器 Name
+        let lines = vec![r#"{"Name":"app-db-1","State":"exited"}"#];
+        assert_eq!(
+            health_verdict(&lines),
+            HealthVerdict::Unhealthy {
+                service: "app-db-1".to_string(),
+                state: "exited".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_health_verdict_health_object_status() {
+        // Health 为嵌套对象时取其 Status 字段
+        let lines = vec![r#"{"Service":"web","State":"running","Health":{"Status":"healthy"}}"#];
+        assert_eq!(health_verdict(&lines), HealthVerdict::Pass);
     }
 }
