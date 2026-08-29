@@ -572,7 +572,14 @@ async fn run_deploy(app: &AppHandle, req: DeployRequest) -> Result<(), String> {
     // ---- 步骤 5:服务器部署 ----
     emit_progress(app, 5, 5, "服务器部署");
     ensure_not_cancelled(app)?;
-    server_deploy(app, &mut client, &server, &project, &tar_name).await?;
+    let retag = if req.use_date_tag {
+        // 勾选日期标签时,save/load 的是日期 tag;必须把原引用(如 myapp:latest)
+        // 也指到新镜像上,compose 引用原 tag 才能感知变化并重建容器。
+        Some((image_ref.clone(), req.image.clone()))
+    } else {
+        None
+    };
+    server_deploy(app, &mut client, &server, &project, &tar_name, retag).await?;
 
     emit_log(app, "部署完成");
     Ok(())
@@ -708,15 +715,18 @@ async fn sync_files(
     Ok(())
 }
 
-/// 步骤 5:服务器部署 —— `docker load` → `docker compose up -d` → 删除远端 tar。
+/// 步骤 5:服务器部署 —— `docker load` → [`docker tag` 同步原标签] → `compose up -d` → 删除远端 tar。
 ///
-/// 每条命令超时 600 秒,输出实时转发到 `deploy-log`,收到输出行时检查取消标志。
+/// 每条命令超时 600 秒(清理 60 秒),输出实时转发到 `deploy-log`,收到输出行时检查取消标志。
+/// `retag` 为 `Some((日期tag, 原引用))` 时,装载后把原引用(如 myapp:latest)也指向
+/// 新镜像,否则 compose 引用原 tag 时感知不到变化、不会重建容器。
 async fn server_deploy(
     app: &AppHandle,
     client: &mut SshClient,
     server: &ServerConfig,
     project: &ProjectConfig,
     tar_name: &str,
+    retag: Option<(String, String)>,
 ) -> Result<(), String> {
     let remote_tar = remote_join("/tmp", tar_name);
 
@@ -725,7 +735,14 @@ async fn server_deploy(
     let load_cmd = format!("docker load -i {}", shell_single_quote(&remote_tar));
     exec_forwarded(app, client, &load_cmd, 600).await?;
 
-    // 5.2 启动服务(cd 到远端目录后按相对 compose 文件启动)
+    // 5.2 同步原标签(仅勾选日期标签时):零拷贝的指针移动,让 compose 的变更检测生效
+    if let Some((date_tag, original)) = &retag {
+        let tag_cmd = docker_tag_cmd(date_tag, original);
+        emit_log(app, &format!("同步原标签: {}", tag_cmd));
+        exec_forwarded(app, client, &tag_cmd, 60).await?;
+    }
+
+    // 5.3 启动服务(cd 到远端目录后按相对 compose 文件启动)
     let up_cmd = format!(
         "cd {} && docker compose -f {} up -d",
         shell_single_quote(&server.remote_dir),
@@ -740,7 +757,7 @@ async fn server_deploy(
     );
     exec_forwarded(app, client, &up_cmd, 600).await?;
 
-    // 5.3 清理远端 tar(尽力而为,失败不影响部署结果)
+    // 5.4 清理远端 tar(尽力而为,失败不影响部署结果)
     let rm_cmd = format!("rm -f {}", shell_single_quote(&remote_tar));
     if let Err(e) = exec_forwarded(app, client, &rm_cmd, 60).await {
         emit_log(app, &format!("警告:清理远端临时文件失败: {}", e));
@@ -1171,6 +1188,16 @@ pub fn compose_up_cmd(remote_dir: &str, compose_file: &str) -> String {
         "cd {} && docker compose -f {} up -d",
         shell_single_quote(remote_dir),
         shell_single_quote(compose_file)
+    )
+}
+
+/// 组装 `docker tag` 指针移动命令:让 target 引用与 source 引用指向同一镜像。
+/// (零拷贝;target 已存在时覆盖其指向,旧镜像失去全部标签后成为悬空镜像。)
+pub fn docker_tag_cmd(source: &str, target: &str) -> String {
+    format!(
+        "docker tag {} {}",
+        shell_single_quote(source),
+        shell_single_quote(target)
     )
 }
 
@@ -1678,6 +1705,24 @@ mod tests {
         assert_eq!(
             cleanup_releases_cmd("/op't"),
             "ls -1dt '/op'\\''t/releases'/*/ | tail -n +6 | xargs -r rm -rf"
+        );
+    }
+
+    // ===== 单镜像步骤 5.2:docker_tag_cmd =====
+
+    #[test]
+    fn test_docker_tag_cmd() {
+        assert_eq!(
+            docker_tag_cmd("myapp:20260829-143000", "myapp:latest"),
+            "docker tag 'myapp:20260829-143000' 'myapp:latest'"
+        );
+    }
+
+    #[test]
+    fn test_docker_tag_cmd_escapes_quote() {
+        assert_eq!(
+            docker_tag_cmd("my'app:20260829", "my'app:latest"),
+            "docker tag 'my'\\''app:20260829' 'my'\\''app:latest'"
         );
     }
 }
