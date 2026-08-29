@@ -236,6 +236,8 @@
           <div id="deploy-stack-panel" class="deploy-stack-panel hidden">
             <div class="deploy-stack-bar">
               <button id="deploy-stack-parse-btn" class="btn btn-sm" type="button">解析服务</button>
+              <!-- 部署预览:独立 dry-run(不自动触发,不影响开始部署) -->
+              <button id="deploy-stack-preview-btn" class="btn btn-sm" type="button">部署预览</button>
               <div id="deploy-stack-status" class="deploy-stack-status"></div>
               <button id="deploy-stack-save-btn" class="btn btn-sm" type="button">保存为默认分类</button>
             </div>
@@ -255,6 +257,26 @@
                 </tbody>
               </table>
             </div>
+
+            <!-- 部署预览结果(点击「部署预览」后由 deploy.js 渲染;hidden 由 deploy.js 切换) -->
+            <div id="deploy-preview-box" class="deploy-preview-box hidden">
+              <div class="server-check-title">变更预览 CHANGE PREVIEW</div>
+              <div id="deploy-preview-wrap" class="table-wrap">
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th>服务 SERVICE</th>
+                      <th>镜像 IMAGE</th>
+                      <th>变更 CHANGE</th>
+                    </tr>
+                  </thead>
+                  <tbody id="deploy-preview-tbody">
+                    <tr><td class="empty-cell" colspan="3">尚未预览</td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <div id="deploy-preview-errors" class="check-error hidden"></div>
+            </div>
           </div>
 
           <div class="deploy-actions">
@@ -265,6 +287,34 @@
 
         <!-- 服务器环境预检结果条(点击「开始部署」后显示) -->
         <div id="deploy-check" class="server-check hidden"></div>
+
+        <!-- 部署历史(折叠面板,默认收起;进入页面自动刷新,部署结束后亦刷新) -->
+        <div class="history-panel">
+          <button id="deploy-history-toggle" class="log-toggle" type="button">+ 部署历史</button>
+          <div id="deploy-history-body" class="hidden">
+            <div class="deploy-history-bar">
+              <span id="deploy-history-count" class="deploy-history-count"></span>
+              <button id="deploy-history-refresh-btn" class="btn btn-sm" type="button">刷新</button>
+            </div>
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>时间 TIME</th>
+                    <th>模式 MODE</th>
+                    <th>项目 / 服务器 TARGET</th>
+                    <th>镜像 IMAGES</th>
+                    <th>结果 RESULT</th>
+                    <th>耗时 DURATION</th>
+                  </tr>
+                </thead>
+                <tbody id="deploy-history-tbody">
+                  <tr><td class="empty-cell" colspan="6">尚未加载</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
 
         <div class="section-head">
           <h2 class="section-title">部署进度<span class="section-en">PROGRESS</span></h2>
