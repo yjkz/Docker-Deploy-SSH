@@ -1031,11 +1031,13 @@ async fn run_hook(
 }
 
 /// up 之后的健康检查:`health_wait_secs > 0` 时,每 [`HEALTH_POLL_INTERVAL_SECS`]
-/// 秒轮询一次 [`compose_ps_json_cmd`](`docker compose ps --format json`),
+/// 秒轮询一次 [`compose_ps_json_cmd`](`docker compose ps --all --format json`),
 /// 预算为 `health_wait_secs` 秒;判定见 [`health_verdict`]。
 ///
 /// - 全部服务 running 且(无 healthcheck 或 healthy)→ 通过;
-/// - 任一服务 Exited/Restarting/Dead → 立即失败;
+/// - 任一服务 Restarting/Dead(或 Exited 且退出码非零/字段缺失)→ 立即失败;
+///   Exited 且退出码 0(一次性服务正常退出)→ 不算失败,继续轮询,预算耗尽
+///   报错并注明"若为一次性初始化服务请关闭健康检查";
 /// - 解析不出状态(旧版 compose 输出、查询暂时失败等)→ 继续轮询至预算耗尽;
 /// - 失败时先经 [`dump_compose_logs`] 拉取各服务最近日志进部署日志,再以中文
 ///   错误中止(`健康检查未通过:<服务> <状态>`)。
@@ -1061,8 +1063,10 @@ async fn health_check(
             HEALTH_POLL_INTERVAL_SECS, project.health_wait_secs
         ),
     );
-    // 最近一轮"尚未就绪"的服务与状态(预算耗尽时报错展示)
+    // 最近一轮"尚未就绪"的服务与状态(预算耗尽时报错展示);
+    // last_exited_zero:该服务是否"已退出(退出码 0)"(一次性服务提示)
     let mut last_pending: Option<(String, String)> = None;
+    let mut last_exited_zero = false;
     loop {
         ensure_not_cancelled(app)?;
         // 单轮查询:60 秒超时;查询超时或 SSH 传输失败都按"无法判定"
@@ -1094,23 +1098,29 @@ async fn health_check(
                 dump_compose_logs(app, client, remote_dir, compose_file).await;
                 return Err(format!("健康检查未通过:{} {}", service, state));
             }
-            HealthVerdict::Indeterminate { pending } => {
+            HealthVerdict::Indeterminate { pending, exited_zero } => {
                 if let Some(p) = pending {
                     if last_pending.as_ref() != Some(&p) {
                         emit_log(app, &format!("健康检查:{} 尚未就绪({})", p.0, p.1));
                     }
                     last_pending = Some(p);
+                    last_exited_zero = exited_zero;
                 }
             }
         }
         if started.elapsed() >= budget {
             dump_compose_logs(app, client, remote_dir, compose_file).await;
-            return Err(match last_pending {
-                Some((service, state)) => format!(
+            return Err(match (&last_pending, last_exited_zero) {
+                // 一次性服务已正常退出:报错注明,提示关闭健康检查
+                (Some((service, state)), true) => format!(
+                    "健康检查未通过:{} {},若为一次性初始化服务请关闭健康检查(等待 {} 秒超时)",
+                    service, state, project.health_wait_secs
+                ),
+                (Some((service, state)), false) => format!(
                     "健康检查未通过:{} {}(等待 {} 秒超时)",
                     service, state, project.health_wait_secs
                 ),
-                None => format!(
+                (None, _) => format!(
                     "健康检查未通过:无法获取服务状态(等待 {} 秒超时)",
                     project.health_wait_secs
                 ),
@@ -1791,10 +1801,14 @@ pub fn hook_cmd(remote_dir: &str, cmd: &str) -> String {
     format!("cd {} && ( {} )", shell_single_quote(remote_dir), cmd)
 }
 
-/// 拼装查询 compose 服务状态的命令(每容器一行 JSON,含 Service/State/Health)。
+/// 拼装查询 compose 服务状态的命令(`--all` 含已退出/未启动容器,每容器一行
+/// JSON,含 Service/State/Health/ExitCode)。
+///
+/// 必须带 `--all`:默认的 `docker compose ps` 只列 running 容器,"启动即退出
+/// 且其余服务健康"的多服务栈会因故障服务缺席而被误判通过。
 pub fn compose_ps_json_cmd(remote_dir: &str, compose_file: &str) -> String {
     format!(
-        "cd {} && docker compose -f {} ps --format json",
+        "cd {} && docker compose -f {} ps --all --format json",
         shell_single_quote(remote_dir),
         shell_single_quote(compose_file)
     )
@@ -1814,26 +1828,36 @@ pub fn compose_logs_cmd(remote_dir: &str, compose_file: &str) -> String {
 pub enum HealthVerdict {
     /// 全部服务 running 且健康检查通过(或无 healthcheck)
     Pass,
-    /// 任一服务进入失败终态(Exited/Restarting/Dead),立即中止
+    /// 任一服务进入失败终态(Restarting/Dead,或 Exited 且退出码非零/缺失),
+    /// 立即中止
     Unhealthy { service: String, state: String },
-    /// 尚无法判定(解析失败、服务仍在启动/健康检查进行中等),继续轮询;
-    /// `pending` 携带最近观察到的未就绪服务与状态,供预算耗尽时报错展示。
-    Indeterminate { pending: Option<(String, String)> },
+    /// 尚无法判定(解析失败、服务仍在启动/健康检查进行中、一次性服务已正常
+    /// 退出等),继续轮询;`pending` 携带最近观察到的未就绪服务与展示状态,
+    /// 供预算耗尽时报错展示;`exited_zero` 表示该服务"已退出(退出码 0)"
+    /// (典型为一次性初始化服务,预算耗尽的报错需据此提示关闭健康检查)。
+    Indeterminate {
+        pending: Option<(String, String)>,
+        exited_zero: bool,
+    },
 }
 
-/// 对 `docker compose ps --format json` 的输出行做单轮健康判定(纯函数)。
+/// 对 `docker compose ps --all --format json` 的输出行做单轮健康判定(纯函数)。
 ///
 /// - 逐行解析 JSON(容忍旧版 compose 一次性输出 JSON 数组;非 JSON 行忽略);
 ///   解析不出任何服务记录 → `Indeterminate`;
-/// - 任一服务 state 为 Exited/Restarting/Dead(不区分大小写)→ 立即
-///   `Unhealthy{ service, state }`;
+/// - restarting/dead → 立即 `Unhealthy{ service, state }`;
+/// - exited:按 `ExitCode` 区分(存在版本差异)——非零 → 立即 `Unhealthy`
+///   (state 展示 "exited(非零退出)");`0` → 一次性服务正常退出,不算失败,
+///   归入 `Indeterminate`(`pending` 展示 "已退出(退出码 0)" 且 `exited_zero`
+///   为 true,预算耗尽时由调用方附加一次性服务提示);`ExitCode` 字段缺失 →
+///   保守按 `Unhealthy`(宁误报不漏报);
 /// - 全部服务 state=="running" 且(无 Health 字段/为空 或 "healthy")→ `Pass`;
 /// - 其余(服务仍在启动、health 为 starting/unhealthy 等)→ `Indeterminate`,
 ///   `pending` 取第一个未就绪服务(有 Health 且非 healthy 时展示 Health,
 ///   否则展示容器 state)。
 pub fn health_verdict(lines: &[&str]) -> HealthVerdict {
-    // 收集解析出的 (服务名, 容器状态, 健康状态)
-    let mut entries: Vec<(String, String, Option<String>)> = Vec::new();
+    // 收集解析出的记录
+    let mut entries: Vec<PsEntry> = Vec::new();
     for line in lines {
         let line = line.trim();
         if line.is_empty() {
@@ -1858,25 +1882,46 @@ pub fn health_verdict(lines: &[&str]) -> HealthVerdict {
         }
     }
     if entries.is_empty() {
-        return HealthVerdict::Indeterminate { pending: None };
+        return HealthVerdict::Indeterminate {
+            pending: None,
+            exited_zero: false,
+        };
     }
-    // 失败终态:立即失败(取先出现者)
-    for (service, state, _) in &entries {
-        if matches!(
-            state.to_ascii_lowercase().as_str(),
-            "exited" | "restarting" | "dead"
-        ) {
-            return HealthVerdict::Unhealthy {
-                service: service.clone(),
-                state: state.clone(),
-            };
+    // 失败终态:立即失败(取先出现者);exited 需结合 ExitCode 区分一次性服务
+    for e in &entries {
+        match e.state.to_ascii_lowercase().as_str() {
+            "restarting" | "dead" => {
+                return HealthVerdict::Unhealthy {
+                    service: e.service.clone(),
+                    state: e.state.clone(),
+                };
+            }
+            "exited" => match e.exit_code {
+                // 一次性服务正常退出:不算失败,进入下方 pending 逻辑
+                Some(0) => {}
+                Some(_) => {
+                    return HealthVerdict::Unhealthy {
+                        service: e.service.clone(),
+                        state: "exited(非零退出)".to_string(),
+                    };
+                }
+                // ExitCode 字段缺失(版本差异)→ 保守按失败(宁误报不漏报)
+                None => {
+                    return HealthVerdict::Unhealthy {
+                        service: e.service.clone(),
+                        state: e.state.clone(),
+                    };
+                }
+            },
+            _ => {}
         }
     }
     // 逐服务判定 running + 健康
     let mut pending: Option<(String, String)> = None;
-    for (service, state, health) in &entries {
-        let state_ok = state.eq_ignore_ascii_case("running");
-        let health_ok = match health.as_deref() {
+    let mut exited_zero = false;
+    for e in &entries {
+        let state_ok = e.state.eq_ignore_ascii_case("running");
+        let health_ok = match e.health.as_deref() {
             None => true, // 无 healthcheck(或输出为空)
             Some(h) => h.eq_ignore_ascii_case("healthy"),
         };
@@ -1884,26 +1929,45 @@ pub fn health_verdict(lines: &[&str]) -> HealthVerdict {
             continue;
         }
         if pending.is_none() {
-            // 展示口径:健康检查未通过时优先展示 Health(如 starting/unhealthy),
-            // 否则展示容器状态(如 created/paused)
-            let shown = health.clone().unwrap_or_else(|| state.clone());
-            pending = Some((service.clone(), shown));
+            // 已退出(退出码 0)的服务永不满足"全部 running",展示专用状态,
+            // 预算耗尽时调用方据此附加一次性服务提示
+            let is_exited_zero =
+                e.state.eq_ignore_ascii_case("exited") && e.exit_code == Some(0);
+            let shown = if is_exited_zero {
+                "已退出(退出码 0)".to_string()
+            } else {
+                // 展示口径:健康检查未通过时优先展示 Health(如 starting/unhealthy),
+                // 否则展示容器状态(如 created/paused)
+                e.health.clone().unwrap_or_else(|| e.state.clone())
+            };
+            pending = Some((e.service.clone(), shown));
+            exited_zero = is_exited_zero;
         }
     }
     match pending {
         None => HealthVerdict::Pass,
         Some(p) => HealthVerdict::Indeterminate {
             pending: Some(p),
+            exited_zero,
         },
     }
 }
 
-/// 从单条 `compose ps --format json` 记录提取 `(服务名, 容器状态, 健康状态)`。
+/// 单条 `compose ps --format json` 记录的解析结果。
+struct PsEntry {
+    service: String,
+    state: String,
+    health: Option<String>,
+    exit_code: Option<i64>,
+}
+
+/// 从单条 `compose ps --format json` 记录提取服务信息。
 ///
 /// 服务名优先 `Service` 字段,缺失时回退容器 `Name`;State 缺失视为无效记录;
 /// Health 兼容三种形态:缺失/`null`/空串 → `None`(视为无 healthcheck)、
-/// 字符串原样、嵌套对象取其 `Status` 字段。
-fn parse_ps_entry(v: &serde_json::Value) -> Option<(String, String, Option<String>)> {
+/// 字符串原样、嵌套对象取其 `Status` 字段;ExitCode 非整数/缺失 → `None`
+/// (调用方对 exited 保守判失败)。
+fn parse_ps_entry(v: &serde_json::Value) -> Option<PsEntry> {
     let state = v.get("State")?.as_str()?.to_string();
     let service = v
         .get("Service")
@@ -1917,7 +1981,13 @@ fn parse_ps_entry(v: &serde_json::Value) -> Option<(String, String, Option<Strin
         Some(serde_json::Value::String(s)) => Some(s.clone()),
         Some(other) => other.get("Status").and_then(|s| s.as_str()).map(String::from),
     };
-    Some((service, state, health))
+    let exit_code = v.get("ExitCode").and_then(|c| c.as_i64());
+    Some(PsEntry {
+        service,
+        state,
+        health,
+        exit_code,
+    })
 }
 
 // ===== 管线辅助 =====
@@ -2559,7 +2629,7 @@ mod tests {
     fn test_compose_ps_json_cmd() {
         assert_eq!(
             compose_ps_json_cmd("/opt/app", "/opt/app/docker-compose.yml"),
-            "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' ps --format json"
+            "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' ps --all --format json"
         );
     }
 
@@ -2568,7 +2638,7 @@ mod tests {
         // 路径内嵌单引号被 '\'' 转义,无法逃出引号注入额外命令
         assert_eq!(
             compose_ps_json_cmd("/opt/app", "/op't.yml"),
-            "cd '/opt/app' && docker compose -f '/op'\\''t.yml' ps --format json"
+            "cd '/opt/app' && docker compose -f '/op'\\''t.yml' ps --all --format json"
         );
     }
 
@@ -2582,11 +2652,15 @@ mod tests {
 
     // ===== Task 3:health_verdict 判定 =====
 
-    /// 构造一行 `compose ps --format json` 输出(health 传 None 表示不带该字段)。
-    fn ps_line(service: &str, state: &str, health: Option<&str>) -> String {
+    /// 构造一行 `compose ps --format json` 输出
+    /// (health/exit_code 传 None 表示不带该字段)。
+    fn ps_line(service: &str, state: &str, health: Option<&str>, exit_code: Option<i64>) -> String {
         let mut json = format!(r#"{{"Service":"{}","State":"{}""#, service, state);
         if let Some(h) = health {
             json.push_str(&format!(r#","Health":"{}""#, h));
+        }
+        if let Some(c) = exit_code {
+            json.push_str(&format!(r#","ExitCode":{}"#, c));
         }
         json.push('}');
         json
@@ -2600,16 +2674,67 @@ mod tests {
     #[test]
     fn test_health_verdict_all_running_pass() {
         let raw = vec![
-            ps_line("web", "running", None),
-            ps_line("db", "running", Some("")),
-            ps_line("cache", "running", Some("healthy")),
+            ps_line("web", "running", None, None),
+            ps_line("db", "running", Some(""), None),
+            ps_line("cache", "running", Some("healthy"), Some(0)),
         ];
         assert_eq!(health_verdict(&as_lines(&raw)), HealthVerdict::Pass);
     }
 
     #[test]
     fn test_health_verdict_exited_fails_fast() {
-        let raw = vec![ps_line("web", "running", None), ps_line("db", "exited", None)];
+        // exited 且无 ExitCode 字段(版本差异)→ 保守按失败(宁误报不漏报)
+        let raw = vec![
+            ps_line("web", "running", None, None),
+            ps_line("db", "exited", None, None),
+        ];
+        assert_eq!(
+            health_verdict(&as_lines(&raw)),
+            HealthVerdict::Unhealthy {
+                service: "db".to_string(),
+                state: "exited".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_health_verdict_exited_nonzero_exit_code_unhealthy() {
+        // exited 且 ExitCode≠0 → 立即失败,状态注明"非零退出"
+        let raw = vec![
+            ps_line("web", "running", None, None),
+            ps_line("db", "exited", None, Some(1)),
+        ];
+        assert_eq!(
+            health_verdict(&as_lines(&raw)),
+            HealthVerdict::Unhealthy {
+                service: "db".to_string(),
+                state: "exited(非零退出)".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_health_verdict_exited_zero_exit_code_pending() {
+        // exited 且 ExitCode==0(一次性服务正常退出)→ 不算失败,继续轮询,
+        // pending 展示"已退出(退出码 0)"并置 exited_zero(预算耗尽时报错
+        // 据此提示关闭健康检查)
+        let raw = vec![
+            ps_line("web", "running", None, None),
+            ps_line("job", "exited", None, Some(0)),
+        ];
+        assert_eq!(
+            health_verdict(&as_lines(&raw)),
+            HealthVerdict::Indeterminate {
+                pending: Some(("job".to_string(), "已退出(退出码 0)".to_string())),
+                exited_zero: true
+            }
+        );
+    }
+
+    #[test]
+    fn test_health_verdict_exited_missing_exit_code_unhealthy() {
+        // 仅 exited 容器且无 ExitCode 字段 → 保守按失败
+        let raw = vec![ps_line("db", "exited", Some(""), None)];
         assert_eq!(
             health_verdict(&as_lines(&raw)),
             HealthVerdict::Unhealthy {
@@ -2622,7 +2747,7 @@ mod tests {
     #[test]
     fn test_health_verdict_restarting_and_dead_fail_fast() {
         for state in ["restarting", "dead"] {
-            let raw = vec![ps_line("db", state, None)];
+            let raw = vec![ps_line("db", state, None, None)];
             assert_eq!(
                 health_verdict(&as_lines(&raw)),
                 HealthVerdict::Unhealthy {
@@ -2638,40 +2763,42 @@ mod tests {
         // 空行 / 全空白 / 非 JSON 输出(旧版 compose、警告行等)→ 无法判定,继续轮询
         assert_eq!(
             health_verdict(&[""]),
-            HealthVerdict::Indeterminate { pending: None }
+            HealthVerdict::Indeterminate { pending: None, exited_zero: false }
         );
         assert_eq!(
             health_verdict(&["   "]),
-            HealthVerdict::Indeterminate { pending: None }
+            HealthVerdict::Indeterminate { pending: None, exited_zero: false }
         );
         assert_eq!(
             health_verdict(&[r#"time="2026-08-30" level=warning msg="x""#]),
-            HealthVerdict::Indeterminate { pending: None }
+            HealthVerdict::Indeterminate { pending: None, exited_zero: false }
         );
     }
 
     #[test]
     fn test_health_verdict_health_three_states() {
         // 无 Health 字段(无 healthcheck)→ Pass
-        let raw = vec![ps_line("web", "running", None)];
+        let raw = vec![ps_line("web", "running", None, None)];
         assert_eq!(health_verdict(&as_lines(&raw)), HealthVerdict::Pass);
         // Health="healthy" → Pass
-        let raw = vec![ps_line("web", "running", Some("healthy"))];
+        let raw = vec![ps_line("web", "running", Some("healthy"), None)];
         assert_eq!(health_verdict(&as_lines(&raw)), HealthVerdict::Pass);
         // Health="starting" → 尚未就绪,继续轮询(pending 展示 Health)
-        let raw = vec![ps_line("web", "running", Some("starting"))];
+        let raw = vec![ps_line("web", "running", Some("starting"), None)];
         assert_eq!(
             health_verdict(&as_lines(&raw)),
             HealthVerdict::Indeterminate {
-                pending: Some(("web".to_string(), "starting".to_string()))
+                pending: Some(("web".to_string(), "starting".to_string())),
+                exited_zero: false
             }
         );
         // Health="unhealthy" → 未通过,继续轮询(预算耗尽时报错展示该状态)
-        let raw = vec![ps_line("web", "running", Some("unhealthy"))];
+        let raw = vec![ps_line("web", "running", Some("unhealthy"), None)];
         assert_eq!(
             health_verdict(&as_lines(&raw)),
             HealthVerdict::Indeterminate {
-                pending: Some(("web".to_string(), "unhealthy".to_string()))
+                pending: Some(("web".to_string(), "unhealthy".to_string())),
+                exited_zero: false
             }
         );
     }
@@ -2679,11 +2806,12 @@ mod tests {
     #[test]
     fn test_health_verdict_not_running_pending() {
         // 非终态且非 running(created/paused)→ 继续轮询,带出服务与容器状态
-        let raw = vec![ps_line("web", "created", None)];
+        let raw = vec![ps_line("web", "created", None, None)];
         assert_eq!(
             health_verdict(&as_lines(&raw)),
             HealthVerdict::Indeterminate {
-                pending: Some(("web".to_string(), "created".to_string()))
+                pending: Some(("web".to_string(), "created".to_string())),
+                exited_zero: false
             }
         );
     }
