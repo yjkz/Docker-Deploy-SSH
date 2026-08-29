@@ -18,9 +18,10 @@
 //!
 //! 整栈部署管线(`deploy_stack`,六步,progress step 1..6):
 //! 前置(找 server/project、解析密码)→ 分类确认 → 打包(本地镜像并发 save_gzip)
-//! → 上传(compose 副本 + releases/<时间戳>/ 镜像包 + 文件映射,镜像包支持断点续传)
-//! → 部署前钩子 → 装载(逐包 docker load)→ 拉取(compose pull)→ 启动(compose up -d)
-//! → 健康检查 → 部署后钩子 → 清理旧 releases(仅留最新 5 个)。
+//! → 上传(compose 副本 + releases/<时间戳>/ 镜像包 + 文件映射;镜像包失败后
+//! 同路径重试一次,激活断点续传)→ 部署前钩子 → 装载(逐包 docker load)
+//! → 拉取(compose pull)→ 启动(compose up -d)→ 健康检查 → 部署后钩子
+//! → 清理旧 releases(仅留最新 5 个)。
 
 use std::any::Any;
 use std::panic::AssertUnwindSafe;
@@ -59,6 +60,8 @@ const SSH_EXEC_TIMEOUT_SECS: u64 = 60;
 const LOG_PROGRESS_STEP: u64 = 5 * 1024 * 1024;
 /// 整栈部署:并行打包的并发度上限(实际取 `min(本值, 可用并行度)`)。
 const PACK_CONCURRENCY_CAP: usize = 3;
+/// 镜像包上传失败后的重试等待(秒):给网络/服务端一点恢复时间,再同路径续传重试。
+const UPLOAD_RETRY_DELAY_SECS: u64 = 2;
 /// 整栈部署:单包 `docker load` 的执行超时(秒)。
 const STACK_LOAD_TIMEOUT_SECS: u64 = 600;
 /// 整栈部署:`docker compose pull` / `up -d` 的执行超时(秒)。
@@ -836,8 +839,26 @@ async fn export_image_silent(image_ref: &str, out_path: &Path) -> Result<u64, St
     run_save_gzip(image_ref, out_path, |_| {}).await
 }
 
+/// 拼装「镜像包上传重试仍失败」的中文错误(纯函数,便于单测):
+/// 保留两次失败信息,便于对照首次中断点与重试失败原因。
+pub fn upload_retry_failure_msg(retry_err: &str, first_err: &str) -> String {
+    format!("镜像上传重试仍失败:{}(首次失败:{})", retry_err, first_err)
+}
+
+/// 镜像包上传重试前的等待:提示 + 固定间隔(轮间检查取消)。
+/// 取消 → 返回 [`CANCELLED_MSG`] 中止,不再重试;否则由调用方对**同一远端路径**
+/// 执行重试 —— `sftp_upload(resume=true)` 的 stat 命中远端半成品 → 断点续传生效。
+async fn upload_retry_wait(app: &AppHandle) -> Result<(), String> {
+    emit_log(app, "上传中断,2 秒后从断点续传重试");
+    tokio::time::sleep(Duration::from_secs(UPLOAD_RETRY_DELAY_SECS)).await;
+    ensure_not_cancelled(app)
+}
+
 /// 步骤 3:上传镜像 tar 到远端固定 `/tmp` 目录,按每 10% 进度 emit `deploy-log`。
-/// 镜像包 uuid 命名、同名即同内容 → 启用断点续传(中断后重试不必重传已传部分)。
+///
+/// 断点续传在「失败后同路径重试一次」时生效:每次部署 attempt 的 tar 名均为新
+/// uuid,attempt 之间无同名文件;同 attempt 内重试时 `sftp_upload(resume=true)`
+/// 经 stat 命中远端半成品 → Resume 分支,不必重传已传部分。
 async fn upload_tar(
     app: &AppHandle,
     client: &mut SshClient,
@@ -847,20 +868,38 @@ async fn upload_tar(
     let last_pct = Arc::new(AtomicU64::new(0));
     let app_for_cb = app.clone();
     let last = Arc::clone(&last_pct);
+    let on_progress = move |sent, total| {
+        if total == 0 {
+            return;
+        }
+        let step10 = (sent * 100 / total) / 10 * 10;
+        let prev = last.load(Ordering::Relaxed);
+        if step10 > prev {
+            last.store(step10, Ordering::Relaxed);
+            emit_log(&app_for_cb, &format!("镜像上传进度 {}%", step10));
+        }
+    };
 
-    client
-        .sftp_upload(tar_path, "/tmp", tar_name, true, &move |sent, total| {
-            if total == 0 {
-                return;
-            }
-            let step10 = (sent * 100 / total) / 10 * 10;
-            let prev = last.load(Ordering::Relaxed);
-            if step10 > prev {
-                last.store(step10, Ordering::Relaxed);
-                emit_log(&app_for_cb, &format!("镜像上传进度 {}%", step10));
-            }
-        })
+    // 失败后同路径重试一次:重试时 stat 命中断点 → 续传生效;
+    // 重试返回 AlreadyDone(远端已传 ≥ 本地)同样视为该包成功。
+    let first_err = match client
+        .sftp_upload(tar_path, "/tmp", tar_name, true, &on_progress)
         .await
+    {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    upload_retry_wait(app).await?;
+    match client
+        .sftp_upload(tar_path, "/tmp", tar_name, true, &on_progress)
+        .await
+    {
+        Ok(()) => {
+            emit_log(app, "断点续传重试成功");
+            Ok(())
+        }
+        Err(e) => Err(upload_retry_failure_msg(&e, &first_err)),
+    }
 }
 
 /// 步骤 4:同步项目 `file_mappings` 到远端。
@@ -1643,7 +1682,12 @@ async fn upload_compose_files(
 }
 
 /// 步骤 3 子步:逐包上传本地镜像包到远端 releases 目录(进度:包序号 + 字节,
-/// 每 ≥5MB 变化汇报一次;镜像包 uuid 命名、同名即同内容 → 启用断点续传)。
+/// 每 ≥5MB 变化汇报一次)。
+///
+/// 断点续传在「失败后同路径重试一次」时生效:每次部署 attempt 的 releases 目录
+/// 均为新时间戳,attempt 之间无同名文件;同 attempt 内重试时 `sftp_upload(resume=true)`
+/// 经 stat 命中远端半成品 → Resume 分支(重试返回 AlreadyDone = 远端已传 ≥ 本地,
+/// 同样视为该包成功)。
 async fn upload_local_tars(
     app: &AppHandle,
     client: &mut SshClient,
@@ -1662,26 +1706,40 @@ async fn upload_local_tars(
         let idx = i + 1;
         let last = Arc::new(AtomicU64::new(0));
         let last_cb = Arc::clone(&last);
-        client
-            .sftp_upload(path, release_dir, name, true, &move |sent, total| {
-                if total == 0 {
-                    return;
-                }
-                if sent >= last_cb.load(Ordering::Relaxed) + LOG_PROGRESS_STEP {
-                    last_cb.store(sent, Ordering::Relaxed);
-                    emit_log(
-                        &app_for_cb,
-                        &format!(
-                            "上传镜像包 ({}/{}): {} MB / {} MB",
-                            idx,
-                            n,
-                            sent / 1024 / 1024,
-                            total / 1024 / 1024
-                        ),
-                    );
-                }
-            })
-            .await?;
+        let on_progress = move |sent, total| {
+            if total == 0 {
+                return;
+            }
+            if sent >= last_cb.load(Ordering::Relaxed) + LOG_PROGRESS_STEP {
+                last_cb.store(sent, Ordering::Relaxed);
+                emit_log(
+                    &app_for_cb,
+                    &format!(
+                        "上传镜像包 ({}/{}): {} MB / {} MB",
+                        idx,
+                        n,
+                        sent / 1024 / 1024,
+                        total / 1024 / 1024
+                    ),
+                );
+            }
+        };
+        // 失败后同路径重试一次(见 [`upload_retry_wait`];AlreadyDone 亦视为成功)
+        let first_err = match client
+            .sftp_upload(path, release_dir, name, true, &on_progress)
+            .await
+        {
+            Ok(()) => continue,
+            Err(e) => e,
+        };
+        upload_retry_wait(app).await?;
+        match client
+            .sftp_upload(path, release_dir, name, true, &on_progress)
+            .await
+        {
+            Ok(()) => emit_log(app, &format!("镜像包 {} 断点续传重试成功", name)),
+            Err(e) => return Err(upload_retry_failure_msg(&e, &first_err)),
+        }
     }
     emit_log(app, &format!("镜像包上传完成,共 {} 个", n));
     Ok(())
@@ -2601,6 +2659,17 @@ mod tests {
             prune_cmd(),
             "docker image prune -f; docker container prune -f"
         );
+    }
+
+    // ===== Task 4 修复轮:镜像包上传失败后同路径重试一次 =====
+
+    #[test]
+    fn test_upload_retry_failure_msg_keeps_both_errors() {
+        // 重试失败时报错应同时携带两次失败信息,便于对照断点与失败原因
+        let msg = upload_retry_failure_msg("SFTP 写入远端文件失败 (…)", "SSH 连接失败");
+        assert!(msg.contains("重试仍失败"), "实际: {}", msg);
+        assert!(msg.contains("SFTP 写入远端文件失败"), "应含重试错误: {}", msg);
+        assert!(msg.contains("首次失败:SSH 连接失败"), "应含首次错误: {}", msg);
     }
 
     // ===== Task 3:钩子命令拼装 =====
