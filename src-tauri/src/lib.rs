@@ -24,6 +24,7 @@ pub fn run() {
       commands::create_remote_dir,
       commands::deploy,
       commands::cancel_deploy,
+      commands::deploy_stack,
       commands::import_compose,
       commands::parse_compose,
       commands::preview_compose,
