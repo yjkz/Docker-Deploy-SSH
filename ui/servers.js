@@ -6,7 +6,8 @@
  *   Server  = { id, name, host, port, username, remote_dir,
  *               auth: { auth_type: "Key"|"Password", key_path, password_enc } }
  *   Project = { id, name, image_filter, compose_file,
- *               file_mappings: [{ local, remote, is_dir }] }
+ *               file_mappings: [{ local, remote, is_dir }], service_overrides,
+ *               health_wait_secs, pre_deploy_cmd, post_deploy_cmd, notify_webhook }
  * - save_config_cmd({ cfg })                全量保存配置
  * - encrypt_password({ plain }) -> string   base64 密文,存 auth.password_enc
  * - test_server / server_env_check({ serverId, passwordPlain? })
@@ -16,6 +17,8 @@
  *      解密已存密文;auth_type=Key 时后端忽略 passwordPlain)
  * - install_server_docker({ serverId })     过程输出经 'server-log' 事件逐行推送
  * - create_remote_dir({ serverId })
+ * - prune_server({ serverId, passwordPlain? }) -> null
+ *     清理悬空镜像与已退出容器;输出经 'server-log' 事件逐行推送(300s 超时)
  * - preview_compose({ sourcePath }) -> ComposeStack
  *     ComposeStack = { project_name, services: StackService[], errors: string[] }
  *     StackService = { service, image, has_build, mode: "Local"|"Pull",
@@ -40,6 +43,27 @@
   /** 运行日志最多保留的行数(超出丢弃最早的) */
   var LOG_MAX_LINES = 500;
 
+  /**
+   * 部署钩子预设模板(chips,不默认加载;点击插入 textarea 后可再编辑)。
+   * $(date ...) 由服务器端 shell 展开,前端原样插入。
+   */
+  var PRESET_CMDS = {
+    pre: [
+      {
+        label: 'MySQL 全库备份',
+        cmd: "mkdir -p backups && docker compose exec -T db sh -c 'mysqldump -uroot -p\"$MYSQL_ROOT_PASSWORD\" --all-databases' | gzip > backups/db-$(date +%F-%H%M).sql.gz"
+      },
+      {
+        label: 'PostgreSQL 全库备份',
+        cmd: "mkdir -p backups && docker compose exec -T db sh -c 'pg_dumpall -U\"$POSTGRES_USER\"' | gzip > backups/pg-$(date +%F-%H%M).sql.gz"
+      }
+    ],
+    post: [
+      { label: '悬空镜像清理', cmd: 'docker image prune -f' },
+      { label: '发布日志记录', cmd: 'echo "$(date +%F-%T) deployed" >> releases.log' }
+    ]
+  };
+
   var st = {
     cfg: null,            // get_config 的完整结果(AppConfig)
     loaded: false,        // 是否已成功加载过配置
@@ -48,6 +72,7 @@
     checking: {},         // serverId -> true(检测进行中,防重复触发)
     installing: {},       // serverId -> true(Docker 安装进行中)
     creating: {},         // serverId -> true(创建远程目录进行中)
+    pruning: {},          // serverId -> true(清理优化进行中)
     logs: []              // server-log 事件累积的输出行
   };
 
@@ -286,6 +311,18 @@
     envBtn.addEventListener('click', function () { runEnvCheck(server, 'env'); });
     actions.appendChild(envBtn);
 
+    // 清理优化:自绘确认条 → prune_server(输出经 server-log 回显)
+    var pruning = !!st.pruning[server.id];
+    var pruneBtn = el('button', 'btn btn-sm', pruning ? '清理中…' : '清理优化');
+    pruneBtn.type = 'button';
+    pruneBtn.disabled = pruning || checking || !!st.installing[server.id];
+    if (!pruneBtn.disabled) {
+      pruneBtn.addEventListener('click', function () { showPruneConfirm(card, server); });
+    } else if (pruning) {
+      pruneBtn.title = '正在清理,输出见底部「运行日志」';
+    }
+    actions.appendChild(pruneBtn);
+
     var editBtn = el('button', 'btn btn-sm', '编辑');
     editBtn.type = 'button';
     editBtn.addEventListener('click', function () {
@@ -402,6 +439,47 @@
     container.appendChild(cancel);
   }
 
+  /** 清理优化自绘确认条:插入卡片内嵌确认条(检测区上方),取消即移除 */
+  function showPruneConfirm(card, server) {
+    var old = card.querySelector('.server-prune-actions');
+    if (old) old.remove();
+    var bar = el('div', 'server-check-actions server-prune-actions');
+    bar.appendChild(el('span', 'confirm-text', '将清理悬空镜像与已退出容器,确认?'));
+    var ok = el('button', 'btn btn-danger btn-sm', '确认清理');
+    ok.type = 'button';
+    ok.addEventListener('click', function () { startPrune(server); });
+    bar.appendChild(ok);
+    var cancel = el('button', 'btn btn-sm', '取消');
+    cancel.type = 'button';
+    cancel.addEventListener('click', function () { bar.remove(); });
+    bar.appendChild(cancel);
+    var check = card.querySelector('.server-check');
+    if (check) card.insertBefore(bar, check);
+    else card.appendChild(bar);
+  }
+
+  /** 清理服务器(prune_server):输出经 server-log 事件写入底部运行日志 */
+  function startPrune(server) {
+    var id = server.id;
+    if (st.pruning[id] || st.checking[id] || st.installing[id]) return;
+    st.pruning[id] = true;
+    setLogOpen(true); // 自动展开 server-log 终端,便于观察清理输出
+    window.toast('开始清理服务器,输出见底部「运行日志」', 'info');
+    renderServers(); // 重渲染:按钮变「清理中…」禁用,确认条随卡片重建消失
+
+    window.AppBus.invoke('prune_server', { serverId: id })
+      .then(function () {
+        window.toast('清理完成', 'ok');
+      })
+      .catch(function (err) {
+        saveToastFail(err, '服务器清理失败');
+      })
+      .then(function () {
+        st.pruning[id] = false;
+        renderServers();
+      });
+  }
+
   // ===== 远端操作(test / env check / install / mkdir)=====
 
   /**
@@ -411,7 +489,7 @@
    */
   function runEnvCheck(server, mode) {
     var id = server.id;
-    if (st.checking[id] || st.installing[id]) return;
+    if (st.checking[id] || st.installing[id] || st.pruning[id]) return;
     st.checking[id] = true;
     renderServers();
 
@@ -440,7 +518,7 @@
   /** 一键安装 Docker(确认条点击「确认安装」后调用),输出写入底部运行日志 */
   function startInstallDocker(server) {
     var id = server.id;
-    if (st.installing[id] || st.checking[id]) return;
+    if (st.installing[id] || st.checking[id] || st.pruning[id]) return;
     st.installing[id] = true;
     setLogOpen(true); // 自动展开日志面板,便于观察安装输出
     window.toast('开始安装 Docker,过程输出见底部「运行日志」', 'info');
@@ -687,6 +765,80 @@
     err.id = errId;
     err.classList.add('hidden');
     body.appendChild(err);
+  }
+
+  // ===== 项目表单:部署钩子区块 + 预设 chips(Task 7 生产加固)=====
+
+  /**
+   * 钩子命令区块:标签 + 预设 chips 行 + 多行 textarea(等宽字体)。
+   * chips 不默认加载任何模板;点击把模板文本插入 textarea(已有内容时另起一行追加)。
+   */
+  function appendHookBlock(body, labelText, textareaId, presets, prevValue) {
+    var row = el('div', 'form-row');
+    row.appendChild(el('label', 'form-label', labelText));
+
+    var chipRow = el('div', 'chip-row');
+    presets.forEach(function (preset) {
+      var chip = el('button', 'preset-chip', preset.label);
+      chip.type = 'button';
+      chip.title = '点击插入预设模板,插入后可修改';
+      chip.addEventListener('click', function () { insertPresetCmd(textareaId, preset.cmd); });
+      chipRow.appendChild(chip);
+    });
+    row.appendChild(chipRow);
+
+    var ta = document.createElement('textarea');
+    ta.className = 'form-textarea';
+    ta.id = textareaId;
+    ta.rows = 3;
+    ta.spellcheck = false;
+    ta.autocomplete = 'off';
+    ta.placeholder = '留空表示不执行该钩子';
+    if (prevValue) ta.value = String(prevValue);
+    row.appendChild(ta);
+    body.appendChild(row);
+    return ta;
+  }
+
+  /** 预设 chip 点击:把模板命令插入对应 textarea(已有内容时先换行再追加,可再编辑) */
+  function insertPresetCmd(textareaId, cmd) {
+    var ta = document.getElementById(textareaId);
+    if (!ta) return;
+    var current = String(ta.value).replace(/\s+$/, '');
+    ta.value = current ? current + '\n' + cmd : cmd;
+    ta.focus();
+    ta.selectionStart = ta.selectionEnd = ta.value.length;
+  }
+
+  /**
+   * 收集并校验生产加固表单字段:健康等待秒数 / pre-post 钩子 / webhook。
+   * 校验失败已 formFail 提示并返回 null;钩子留空存 null,webhook 留空存 null。
+   */
+  function collectProjectExtras(errId) {
+    var healthRaw = fieldVal('prjf-health-wait');
+    var healthWait = 0;
+    if (healthRaw !== '') {
+      if (!/^\d+$/.test(healthRaw) || Number(healthRaw) > 86400) {
+        formFail(errId, '健康检查等待秒数需为 0 - 86400 之间的整数(0 为关闭)');
+        return null;
+      }
+      healthWait = Number(healthRaw);
+    }
+
+    var webhook = fieldVal('prjf-webhook');
+    if (webhook && !/^https?:\/\//i.test(webhook)) {
+      formFail(errId, '完成通知 webhook 需以 http:// 或 https:// 开头,或留空');
+      return null;
+    }
+
+    var preCmd = fieldVal('prjf-pre-cmd');
+    var postCmd = fieldVal('prjf-post-cmd');
+    return {
+      health_wait_secs: healthWait,
+      pre_deploy_cmd: preCmd ? preCmd : null,
+      post_deploy_cmd: postCmd ? postCmd : null,
+      notify_webhook: webhook ? webhook : null
+    };
   }
 
   // ===== 项目表单:导入 compose 文件区块(仅新增项目)=====
@@ -1121,6 +1273,27 @@
         appendMappingRow(tbody, null); // 至少给一行,方便直接填写
       }
 
+      // ===== 生产加固(Task 7):健康检查 / pre-post 钩子 / webhook =====
+      appendField(body, '健康检查', 'prjf-health-wait', 'number',
+        prev ? (prev.health_wait_secs || 0) : 0, '',
+        '部署后轮询容器状态的最长等待秒数,0 为关闭',
+        { min: '0', max: '86400', step: '1' });
+
+      appendHookBlock(body, 'pre-deploy 命令', 'prjf-pre-cmd', PRESET_CMDS.pre,
+        prev && prev.pre_deploy_cmd ? String(prev.pre_deploy_cmd) : '');
+      appendHookBlock(body, 'post-deploy 命令', 'prjf-post-cmd', PRESET_CMDS.post,
+        prev && prev.post_deploy_cmd ? String(prev.post_deploy_cmd) : '');
+      // 两个钩子块共用的 chips 说明
+      var hookHint = el('div', 'form-row');
+      hookHint.appendChild(el('div', 'form-hint',
+        '预设仅为模板,点击插入后可修改;留空表示不执行钩子。pre 失败将中止部署'));
+      body.appendChild(hookHint);
+
+      appendField(body, '完成通知 webhook', 'prjf-webhook', 'text',
+        prev && prev.notify_webhook ? String(prev.notify_webhook) : '',
+        'https://hook.example.com/xxx',
+        '部署结束后 POST JSON 结果;留空关闭');
+
       appendActions(body, 'prjf-error', closeModal, function () {
         saveProject(prev);
       });
@@ -1213,9 +1386,13 @@
     var mappings = collectMappings('prjf-error');
     if (mappings === null) return false;
 
+    // 生产加固字段:健康等待秒数 / pre-post 钩子 / webhook(编辑与新建都要带上)
+    var extras = collectProjectExtras('prjf-error');
+    if (extras === null) return false;
+
     // 导入流程:路径非空时校验解析(有未解决问题则阻止保存)→ import_compose 建项目
     if (importPath) {
-      saveProjectViaImport(name, filter, importPath, mappings);
+      saveProjectViaImport(name, filter, importPath, mappings, extras);
       return false;
     }
 
@@ -1236,6 +1413,10 @@
           cfg.projects[idx].image_filter = filter;
           cfg.projects[idx].compose_file = compose;
           cfg.projects[idx].file_mappings = mappings;
+          cfg.projects[idx].health_wait_secs = extras.health_wait_secs;
+          cfg.projects[idx].pre_deploy_cmd = extras.pre_deploy_cmd;
+          cfg.projects[idx].post_deploy_cmd = extras.post_deploy_cmd;
+          cfg.projects[idx].notify_webhook = extras.notify_webhook;
         } else {
           cfg.projects.push({
             id: pid,
@@ -1243,7 +1424,11 @@
             image_filter: filter,
             compose_file: compose,
             file_mappings: mappings,
-            service_overrides: []
+            service_overrides: [],
+            health_wait_secs: extras.health_wait_secs,
+            pre_deploy_cmd: extras.pre_deploy_cmd,
+            post_deploy_cmd: extras.post_deploy_cmd,
+            notify_webhook: extras.notify_webhook
           });
         }
         return window.AppBus.invoke('save_config_cmd', { cfg: cfg });
@@ -1267,7 +1452,7 @@
    *    (含 id / compose_file 副本路径 / service_overrides 默认分类);
    * 3. 并入项目列表,补齐表单中的名称/镜像过滤/文件映射后 save_config_cmd 全量写回。
    */
-  function saveProjectViaImport(name, filter, importPath, mappings) {
+  function saveProjectViaImport(name, filter, importPath, mappings, extras) {
     var ensured = (importPreview.stack && importPreview.path === importPath)
       ? Promise.resolve(importPreview.stack)
       : window.AppBus.invoke('preview_compose', { sourcePath: importPath });
@@ -1292,7 +1477,11 @@
               file_mappings: mappings,
               service_overrides: Array.isArray(imported.service_overrides)
                 ? imported.service_overrides
-                : []
+                : [],
+              health_wait_secs: extras.health_wait_secs,
+              pre_deploy_cmd: extras.pre_deploy_cmd,
+              post_deploy_cmd: extras.post_deploy_cmd,
+              notify_webhook: extras.notify_webhook
             };
             return window.AppBus.invoke('get_config').then(function (cfg) {
               cfg = normalizeCfg(cfg);

@@ -62,6 +62,18 @@ pub struct ProjectConfig {
     /// 整栈部署:各服务的传输方式默认分类;旧版配置无此字段,反序列化为空 Vec(旧行为不变)
     #[serde(default)]
     pub service_overrides: Vec<ServiceOverride>,
+    /// 部署后健康检查等待秒数(0=关闭);>0 时 up 后轮询服务状态直至全部就绪
+    #[serde(default)]
+    pub health_wait_secs: u32,
+    /// 部署前钩子命令(远端执行,可选;失败中止部署)
+    #[serde(default)]
+    pub pre_deploy_cmd: Option<String>,
+    /// 部署后钩子命令(远端执行,可选)
+    #[serde(default)]
+    pub post_deploy_cmd: Option<String>,
+    /// 部署完成通知的 webhook URL(可选)
+    #[serde(default)]
+    pub notify_webhook: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -164,7 +176,8 @@ fn load_json_list<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>>
     }
 }
 
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+/// `.tmp` 临时文件写完并 sync 后 rename 原子覆盖目标(history.rs 复用同一模式)。
+pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let tmp = path.with_extension("tmp");
     {
         let mut file = std::fs::File::create(&tmp)?;
@@ -201,6 +214,10 @@ mod tests {
             compose_file: "C:/app/config/stacks/x/docker-compose.yml".into(),
             file_mappings: vec![FileMapping { local: "a".into(), remote: "b".into(), is_dir: false }],
             service_overrides: vec![ServiceOverride { service: "web".into(), mode: TransferMode::Local }],
+            health_wait_secs: 120,
+            pre_deploy_cmd: Some("mysqldump -uroot -p'x' db > /opt/backup.sql".into()),
+            post_deploy_cmd: Some("docker image prune -f".into()),
+            notify_webhook: Some("https://example.com/hook".into()),
         });
         // config_dir 依赖环境变量以便测试注入
         std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
@@ -214,6 +231,20 @@ mod tests {
             loaded.projects[0].service_overrides,
             vec![ServiceOverride { service: "web".into(), mode: TransferMode::Local }]
         );
+        // 新增字段完整 roundtrip
+        assert_eq!(loaded.projects[0].health_wait_secs, 120);
+        assert_eq!(
+            loaded.projects[0].pre_deploy_cmd.as_deref(),
+            Some("mysqldump -uroot -p'x' db > /opt/backup.sql")
+        );
+        assert_eq!(
+            loaded.projects[0].post_deploy_cmd.as_deref(),
+            Some("docker image prune -f")
+        );
+        assert_eq!(
+            loaded.projects[0].notify_webhook.as_deref(),
+            Some("https://example.com/hook")
+        );
         assert!(dir.join("config/servers.json").exists());
         assert!(dir.join("config/projects.json").exists());
     }
@@ -224,5 +255,16 @@ mod tests {
         let json = r#"{"id":"p1","name":"n","image_filter":"","compose_file":"","file_mappings":[]}"#;
         let p: ProjectConfig = serde_json::from_str(json).unwrap();
         assert!(p.service_overrides.is_empty());
+    }
+
+    #[test]
+    fn test_project_config_new_fields_default() {
+        // 旧版配置无新增字段 → serde default:0 / None,旧行为不变
+        let json = r#"{"id":"p1","name":"n","image_filter":"","compose_file":"","file_mappings":[]}"#;
+        let p: ProjectConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(p.health_wait_secs, 0);
+        assert_eq!(p.pre_deploy_cmd, None);
+        assert_eq!(p.post_deploy_cmd, None);
+        assert_eq!(p.notify_webhook, None);
     }
 }

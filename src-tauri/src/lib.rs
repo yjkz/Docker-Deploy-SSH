@@ -2,6 +2,7 @@ pub mod commands;
 pub mod config;
 pub mod crypto;
 pub mod docker;
+pub mod history;
 pub mod ssh;
 pub mod stack;
 
@@ -22,12 +23,15 @@ pub fn run() {
       commands::server_env_check,
       commands::install_server_docker,
       commands::create_remote_dir,
+      commands::prune_server,
       commands::deploy,
       commands::cancel_deploy,
       commands::deploy_stack,
       commands::import_compose,
       commands::parse_compose,
       commands::preview_compose,
+      commands::preview_stack_changes,
+      commands::get_history,
     ])
     .setup(|app| {
       // 日志(不限 debug 构建,release 同样记录,便于现场排查):

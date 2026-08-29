@@ -827,6 +827,52 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   gap: 10px;
   margin-top: 16px;
 }
+
+/* 多行命令输入(pre/post 部署钩子):与输入框同族,等宽字体 */
+.form-textarea {
+  width: 100%;
+  min-height: 64px;
+  padding: 8px 10px;
+  border: 1px solid var(--ark-line);
+  border-bottom: 2px solid var(--ark-ink);
+  border-radius: 2px;
+  background: var(--ark-paper);
+  color: var(--ark-ink);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.6;
+  outline: none;
+  resize: vertical;
+  transition: border-color .18s ease;
+}
+.form-textarea:focus { border-bottom-color: var(--ark-signal); }
+.form-textarea::placeholder { color: var(--ark-ink-35); }
+
+/* 预设命令 chips:1px 墨线空心小按钮,点击插入模板(悬停墨底反白) */
+.chip-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.preset-chip {
+  padding: 3px 10px;
+  border: 1px solid var(--ark-line);
+  background: transparent;
+  color: var(--ark-ink);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: .04em;
+  cursor: pointer;
+  transition: background .18s ease, color .18s ease, border-color .18s ease;
+}
+.preset-chip:hover {
+  background: var(--ark-ink);
+  color: var(--ark-paper);
+  border-color: var(--ark-ink);
+}
+.preset-chip:disabled { opacity: .45; cursor: not-allowed; }
 .radio-row { display: flex; align-items: center; gap: 20px; padding: 4px 0; }
 .radio-row label {
   display: inline-flex;
@@ -977,6 +1023,26 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   font-family: var(--font-mono);
   font-size: 10px;
   letter-spacing: .08em;
+}
+
+/* 整栈部署预览结果区(独立 dry-run,服务分类表下方;错误沿用 check-error 墨线框) */
+.deploy-preview-box { margin-top: 14px; }
+
+/* 部署历史折叠面板(默认收起;toggle 沿用 log-toggle,徽章沿用三态语言) */
+.history-panel { margin-top: 26px; }
+.deploy-history-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 8px 0 10px;
+}
+.deploy-history-count {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  letter-spacing: .06em;
+  color: var(--ark-paper-dim-ink);
 }
 
 /* 选择区:四控件横排 action strip,下衬 1px 墨线 */

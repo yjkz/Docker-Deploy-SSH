@@ -21,6 +21,13 @@
  *             services: [{ service, image, mode: "Local"|"Pull" }],
  *             password_plain }                 // 必须 snake_case
  * - cancel_deploy() -> 置位后端全局取消标志
+ * - preview_stack_changes({ serverId, projectId, passwordPlain? }) -> StackPreview
+ *     StackPreview = { entries: [{ service, image, mode: "Local"|"Pull",
+ *                      action: "Recreate"|"Create"|"Unchanged"|"Pull"|"Absent" }],
+ *                      errors: string[] }(独立 dry-run,只读不落盘)
+ * - get_history() -> DeployRecord[](倒序 = 最新在前)
+ *     DeployRecord = { ts, mode: "single"|"stack", server_name, project_name,
+ *                      images: string[], success, message, duration_secs }
  *
  * 事件(AppBus.on,模块级守卫保证只注册一次):
  * - 'deploy-progress' { step, total, message }
@@ -42,6 +49,10 @@
  *   对应下拉项,用后即删(置 null);找不到则 toast 提示并忽略。
  * - 日志区自动滚底,但用户向上滚动查看历史时不强制拉底
  *   (仅在 scrollTop 接近底部时才 autoscroll)。
+ * - 「部署预览」为独立 dry-run(preview_stack_changes):不自动触发、
+ *   不影响开始部署;切换项目/服务器后预览结果隐藏,需重新预览。
+ * - 「部署历史」折叠面板(get_history):进入页面自动刷新一次,
+ *   部署结束(deploy-done)后亦刷新;上限渲染 50 条 + 总数计数。
  *
  * 安全说明:所有来自后端/配置的数据一律 createElement + textContent 渲染,
  * 不使用 innerHTML 拼接;提示一律用 toast / 自绘错误框,不调用系统对话框。
@@ -55,6 +66,10 @@
   var DISK_MIN_GB = 2;
   /** 部署日志距离底部多少像素以内视为「在底部」(才自动滚底) */
   var LOG_BOTTOM_GAP = 40;
+  /** 部署历史渲染上限(超过只渲染最新 N 条,计数展示总数) */
+  var HISTORY_MAX_ROWS = 50;
+  /** 部署历史镜像列展示上限字符数(超长截断,完整内容放 title) */
+  var HISTORY_IMAGES_MAX = 64;
 
   /**
    * 两组进度节点(与后端 deploy-progress 步骤一一对应):
@@ -81,7 +96,11 @@
     mode: 'single',    // 'single' 单镜像 | 'stack' 整栈部署(compose)
     stack: null,       // parse_compose 结果(ComposeStack),整栈模式服务分类表数据源
     stackProjectId: '',// st.stack 对应的项目 id(切换项目后需重新解析)
-    parsing: false     // parse_compose 请求进行中(防重复解析)
+    parsing: false,    // parse_compose 请求进行中(防重复解析)
+    previewing: false, // preview_stack_changes 请求进行中(防重复预览)
+    history: [],       // get_history 结果(DeployRecord[],倒序 = 最新在前)
+    historyLoaded: false, // 是否已成功拉取过部署历史
+    historyLoading: false // 部署历史加载中(防重复请求)
   };
 
   /** 部署事件监听守卫:只注册一次,防止重复绑定 */
@@ -336,14 +355,16 @@
         if (node) node.disabled = st.deploying || st.checking;
       });
 
-    // 模式切换 tab 与整栈面板按钮同步禁用(与现有并发防护一致;解析中锁面板)
+    // 模式切换 tab 与整栈面板按钮同步禁用(与现有并发防护一致;解析/预览中锁对应按钮)
     var locked = st.deploying || st.checking;
     ['deploy-mode-single', 'deploy-mode-stack',
-      'deploy-stack-parse-btn', 'deploy-stack-save-btn']
+      'deploy-stack-parse-btn', 'deploy-stack-save-btn', 'deploy-stack-preview-btn']
       .forEach(function (id) {
         var node = document.getElementById(id);
         if (!node) return;
-        node.disabled = locked || (id === 'deploy-stack-parse-btn' && st.parsing);
+        node.disabled = locked ||
+          (id === 'deploy-stack-parse-btn' && st.parsing) ||
+          (id === 'deploy-stack-preview-btn' && st.previewing);
       });
     var panel = document.getElementById('deploy-stack-panel');
     if (panel) {
@@ -784,6 +805,131 @@
       });
   }
 
+  // ===== 部署预览(preview_stack_changes:独立 dry-run,不影响开始部署)=====
+
+  /** 隐藏预览结果区(切换项目/服务器后旧快照不再展示) */
+  function hidePreviewBox() {
+    var box = document.getElementById('deploy-preview-box');
+    if (box) box.classList.add('hidden');
+  }
+
+  /**
+   * 预览变更徽章(ark 三态语言,与既有徽章同视觉):
+   * Recreate→琥珀底「重建」/ Create→青淡底「新建」/ Unchanged→空心「不变」
+   * / Pull→青淡底「拉取」/ Absent→墨底「缺失」(未知值按空心原样显示)。
+   */
+  function previewActionBadge(action) {
+    var map = {
+      Recreate: ['warn', '重建'],
+      Create: ['ok', '新建'],
+      Unchanged: ['info', '不变'],
+      Pull: ['ok', '拉取'],
+      Absent: ['fail', '缺失']
+    };
+    var hit = map[action];
+    if (!hit) return window.fillBadge(el('span'), 'info', String(action));
+    return window.fillBadge(el('span'), hit[0], hit[1]);
+  }
+
+  /** 渲染预览表:服务 / 镜像 / 变更徽章;errors 非阻断,墨线框逐条列出 */
+  function renderStackPreview(preview) {
+    var box = document.getElementById('deploy-preview-box');
+    var tbody = document.getElementById('deploy-preview-tbody');
+    var errBox = document.getElementById('deploy-preview-errors');
+    if (!box || !tbody || !errBox) return;
+
+    tbody.textContent = '';
+    errBox.textContent = '';
+
+    var errors = Array.isArray(preview.errors) ? preview.errors : [];
+    if (errors.length > 0) {
+      errBox.appendChild(el('div', 'servers-error-text', '预览存在以下问题(不阻断部署):'));
+      errors.forEach(function (line) {
+        errBox.appendChild(el('div', 'servers-error-text', line));
+      });
+      errBox.classList.remove('hidden');
+    } else {
+      errBox.classList.add('hidden');
+    }
+
+    var entries = Array.isArray(preview.entries) ? preview.entries : [];
+    if (entries.length === 0 && errors.length === 0) {
+      var emptyTr = document.createElement('tr');
+      var emptyTd = el('td', 'empty-cell', '没有可预览的服务变更');
+      emptyTd.colSpan = 3;
+      emptyTr.appendChild(emptyTd);
+      tbody.appendChild(emptyTr);
+    }
+    entries.forEach(function (entry) {
+      var e = entry || {};
+      var tr = document.createElement('tr');
+
+      var tdSvc = document.createElement('td');
+      tdSvc.className = 'mono';
+      tdSvc.textContent = String(e.service || '');
+      tr.appendChild(tdSvc);
+
+      var tdImg = document.createElement('td');
+      tdImg.className = 'mono';
+      tdImg.textContent = String(e.image || '');
+      tr.appendChild(tdImg);
+
+      var tdAct = document.createElement('td');
+      tdAct.appendChild(previewActionBadge(e.action));
+      tr.appendChild(tdAct);
+
+      tbody.appendChild(tr);
+    });
+
+    box.classList.remove('hidden');
+  }
+
+  /** 「部署预览」:对比本地 compose 与远端实际状态;预览期间按钮禁用 */
+  function runStackPreview() {
+    if (st.deploying || st.checking || st.parsing || st.previewing) return;
+    var srvSel = document.getElementById('deploy-server');
+    var prjSel = document.getElementById('deploy-project');
+    var serverId = srvSel ? String(srvSel.value) : '';
+    var projectId = prjSel ? String(prjSel.value) : '';
+
+    var missing = [];
+    if (!projectId) missing.push('项目');
+    if (!serverId) missing.push('服务器');
+    if (missing.length > 0) {
+      window.toast('请先选择:' + missing.join('、'), 'warn');
+      return;
+    }
+    if (!findById(st.cfg ? st.cfg.projects : [], projectId)) {
+      window.toast('所选项目已变化,请重新选择', 'warn');
+      return;
+    }
+
+    st.previewing = true;
+    refreshControls();
+    var btn = document.getElementById('deploy-stack-preview-btn');
+    if (btn) btn.textContent = '预览中…';
+    hidePreviewBox();
+
+    // 密码用后端已存密文,不传 passwordPlain
+    window.AppBus.invoke('preview_stack_changes',
+        { serverId: serverId, projectId: projectId })
+      .then(function (preview) {
+        renderStackPreview(preview || { entries: [], errors: [] });
+      })
+      .catch(function (err) {
+        // 连接失败等 invoke 级错误:就地展示在预览错误框(与解析失败同风格)
+        renderStackPreview({
+          entries: [],
+          errors: ['预览失败:' + (errText(err) || '未知错误')]
+        });
+      })
+      .then(function () {
+        st.previewing = false;
+        if (btn) btn.textContent = '部署预览';
+        refreshControls();
+      });
+  }
+
   // ===== 部署流程 =====
 
   /** 每次点击「开始部署」:清空横幅 / 错误框 / 预检条 / 日志,进度重置 */
@@ -1023,6 +1169,156 @@
     } else {
       showBanner('fail', '部署失败:' + (message || '未知错误'));
     }
+
+    // 部署结束(成功/失败/取消均落历史)后刷新部署历史
+    refreshHistory();
+  }
+
+  // ===== 部署历史(get_history:折叠面板,进入页面自动刷新一次)=====
+
+  function setHistoryOpen(open) {
+    var body = document.getElementById('deploy-history-body');
+    var btn = document.getElementById('deploy-history-toggle');
+    if (!body || !btn) return;
+    body.classList.toggle('hidden', !open);
+    btn.textContent = open ? '− 部署历史' : '+ 部署历史';
+    if (open && !st.historyLoaded && !st.historyLoading) refreshHistory();
+  }
+
+  /** 拉取部署历史(倒序,最新在前);失败就地显示在表体空行 */
+  function refreshHistory() {
+    if (st.historyLoading) return;
+    st.historyLoading = true;
+    var btn = document.getElementById('deploy-history-refresh-btn');
+    if (btn) btn.disabled = true;
+
+    window.AppBus.invoke('get_history')
+      .then(function (records) {
+        st.history = Array.isArray(records) ? records : [];
+        st.historyLoaded = true;
+        renderHistory();
+      })
+      .catch(function (err) {
+        st.history = [];
+        st.historyLoaded = true;
+        renderHistory('读取部署历史失败:' + (errText(err) || '未知错误'));
+      })
+      .then(function () {
+        st.historyLoading = false;
+        if (btn) btn.disabled = false;
+      });
+  }
+
+  /** 模式徽章:单镜像 / 整栈(分类信息,用空心信息徽章) */
+  function historyModeBadge(mode) {
+    return window.fillBadge(el('span'), 'info',
+      String(mode) === 'stack' ? '整栈' : '单镜像');
+  }
+
+  /** 结果徽章:成功→badge-ok / 取消→badge-warn / 失败→badge-fail(title 带结果消息) */
+  function historyResultBadge(rec) {
+    var message = String(rec.message || '');
+    var badge;
+    if (rec.success === true) {
+      badge = window.fillBadge(el('span'), 'ok', '成功');
+    } else if (message === '部署已取消') {
+      badge = window.fillBadge(el('span'), 'warn', '取消');
+    } else {
+      badge = window.fillBadge(el('span'), 'fail', '失败');
+    }
+    badge.title = message || (rec.success === true ? '部署完成' : '未知错误');
+    return badge;
+  }
+
+  /** 镜像列文本:join ", ";超长截断,完整内容放 title */
+  function historyImagesText(images) {
+    var full = (Array.isArray(images) ? images : []).map(String).join(', ');
+    if (!full) return { text: '(空)', title: '' };
+    if (full.length > HISTORY_IMAGES_MAX) {
+      return { text: full.slice(0, HISTORY_IMAGES_MAX - 1) + '…', title: full };
+    }
+    return { text: full, title: full };
+  }
+
+  /** 耗时格式化:>60 秒显示「m 分 s 秒」,否则「N 秒」(异常值显示 -) */
+  function formatDuration(secs) {
+    var n = Number(secs);
+    if (!isFinite(n) || n < 0) return '-';
+    if (n > 60) {
+      return Math.floor(n / 60) + ' 分 ' + (n % 60) + ' 秒';
+    }
+    return n + ' 秒';
+  }
+
+  /**
+   * 渲染部署历史表:上限 50 条 + 计数;
+   * 传入 errMsg 时(读取失败)以空行形式就地展示错误。
+   */
+  function renderHistory(errMsg) {
+    var tbody = document.getElementById('deploy-history-tbody');
+    var count = document.getElementById('deploy-history-count');
+    if (!tbody || !count) return;
+    tbody.textContent = '';
+
+    if (errMsg) {
+      count.textContent = '';
+      var errTr = document.createElement('tr');
+      var errTd = el('td', 'empty-cell', errMsg);
+      errTd.colSpan = 6;
+      errTr.appendChild(errTd);
+      tbody.appendChild(errTr);
+      return;
+    }
+
+    var records = st.history;
+    count.textContent = records.length + ' 条记录' +
+      (records.length > HISTORY_MAX_ROWS
+        ? '(显示最新 ' + HISTORY_MAX_ROWS + ' 条)' : '');
+
+    if (records.length === 0) {
+      var emptyTr = document.createElement('tr');
+      var emptyTd = el('td', 'empty-cell', '暂无部署记录');
+      emptyTd.colSpan = 6;
+      emptyTr.appendChild(emptyTd);
+      tbody.appendChild(emptyTr);
+      return;
+    }
+
+    records.slice(0, HISTORY_MAX_ROWS).forEach(function (rec) {
+      var r = rec || {};
+      var tr = document.createElement('tr');
+
+      var tdTs = document.createElement('td');
+      tdTs.className = 'mono nowrap';
+      tdTs.textContent = String(r.ts || '');
+      tr.appendChild(tdTs);
+
+      var tdMode = document.createElement('td');
+      tdMode.appendChild(historyModeBadge(r.mode));
+      tr.appendChild(tdMode);
+
+      var tdTarget = document.createElement('td');
+      tdTarget.textContent = String(r.project_name || '') + ' @ ' + String(r.server_name || '');
+      tr.appendChild(tdTarget);
+
+      var img = historyImagesText(r.images);
+      var tdImages = document.createElement('td');
+      tdImages.className = 'mono';
+      tdImages.textContent = img.text;
+      if (img.title && img.title !== img.text) tdImages.title = img.title;
+      tr.appendChild(tdImages);
+
+      var tdResult = document.createElement('td');
+      tdResult.appendChild(historyResultBadge(r));
+      tr.appendChild(tdResult);
+
+      var tdCost = document.createElement('td');
+      tdCost.className = 'mono nowrap';
+      tdCost.textContent = formatDuration(r.duration_secs);
+      tr.appendChild(tdCost);
+
+      tbody.appendChild(tr);
+    });
   }
 
   // ===== 事件监听(模块级守卫:只注册一次)=====
@@ -1082,11 +1378,34 @@
     if (saveBtn) {
       saveBtn.addEventListener('click', onSaveStackDefaults);
     }
+    // 部署预览:独立 dry-run 按钮
+    var previewBtn = document.getElementById('deploy-stack-preview-btn');
+    if (previewBtn) {
+      previewBtn.addEventListener('click', runStackPreview);
+    }
     var prjSel = document.getElementById('deploy-project');
     if (prjSel) {
       prjSel.addEventListener('change', function () {
+        hidePreviewBox(); // 项目变化后旧预览快照失效
         if (st.mode === 'stack') parseStack(); // 整栈模式:选中即自动解析
       });
+    }
+    var srvSel = document.getElementById('deploy-server');
+    if (srvSel) {
+      srvSel.addEventListener('change', hidePreviewBox); // 服务器变化后旧预览失效
+    }
+
+    // 部署历史:折叠开关 + 手动刷新
+    var histToggle = document.getElementById('deploy-history-toggle');
+    if (histToggle) {
+      histToggle.addEventListener('click', function () {
+        var body = document.getElementById('deploy-history-body');
+        setHistoryOpen(!!(body && body.classList.contains('hidden')));
+      });
+    }
+    var histRefresh = document.getElementById('deploy-history-refresh-btn');
+    if (histRefresh) {
+      histRefresh.addEventListener('click', refreshHistory);
     }
 
     // 节点集与静态 HTML 一致化(单镜像 5 节点;切整栈时按 6 节点重建)
@@ -1096,10 +1415,12 @@
     refreshControls();
     bindDeployEvents(); // 常驻监听,内部有守卫防重复注册
 
-    // 每次进入部署页都重新拉取镜像与配置(可能已变化),并处理预填镜像
+    // 每次进入部署页都重新拉取镜像与配置(可能已变化),并处理预填镜像;
+    // 同时自动刷新一次部署历史
     window.addEventListener('pagechange', function (e) {
       if (!e || !e.detail || e.detail.page !== 'deploy') return;
       loadPageData();
+      refreshHistory();
     });
   }
 

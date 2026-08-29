@@ -6,26 +6,38 @@
 //! - `deploy-progress`:`DeployProgress { step, total, message }`,step 1..5
 //!   (1=打标签 2=导出压缩 3=上传镜像 4=同步文件 5=服务器部署)
 //! - `deploy-log`:一行日志字符串,带 `[HH:MM:SS]` 前缀
-//! - `deploy-done`:`DeployDone { success, message }`
-//! - `server-log`:`install_server_docker` 安装脚本的逐行输出
+//! - `deploy-done`:`DeployDone { success, message }`;emit 后按结果落一条
+//!   部署历史(`history::append_record`,成功/失败/取消统一记录),并按项目
+//!   配置的 `notify_webhook` 异步发送 webhook 通知(尽力而为,失败仅告警)
+//! - `server-log`:`install_server_docker` 安装脚本与 `prune_server` 清理命令的逐行输出
 //!
 //! 部署管线(`deploy` 命令同步返回 `Ok(())`,后台任务执行,严格顺序,
 //! 任一步失败即中止并 emit `deploy-done` failure):
 //! 前置(找 server/project、解析密码)→ 打标签 → 导出压缩 → 上传镜像
-//! → 同步文件 → 服务器部署(docker load → compose up -d → 清理远端 tar)。
+//! → 同步文件 → 部署前钩子 → 服务器部署(docker load → compose up -d →
+//! 健康检查 → 部署后钩子 → 清理远端 tar)。
 //!
 //! 整栈部署管线(`deploy_stack`,六步,progress step 1..6):
-//! 前置(找 server/project、解析密码)→ 分类确认 → 打包(逐镜像 save_gzip)
-//! → 上传(compose 副本 + releases/<时间戳>/ 镜像包 + 文件映射)
-//! → 装载(逐包 docker load)→ 拉取(compose pull)→ 启动(compose up -d)
+//! 前置(找 server/project、解析密码)→ 分类确认 → 打包(本地镜像并发 save_gzip)
+//! → 上传(compose 副本与 override 文件 + releases/<时间戳>/ 镜像包 + 文件映射;
+//! 镜像包失败后同路径重试一次,激活断点续传)→ 部署前钩子 → 装载(逐包 docker load)
+//! → 拉取(compose pull;私有仓库认证失败时追加 docker login 提示)
+//! → 启动(compose up -d)→ 健康检查(compose ps/logs 与 pull/up 同序
+//! -f override,override-only 服务不逃逸判定)→ 部署后钩子
 //! → 清理旧 releases(仅留最新 5 个)。
+//!
+//! 整栈部署预览(`preview_stack_changes`,Task 6 独立 dry-run 功能,不接入
+//! 部署流程):建连后对比本地 compose 解析结果与远端实际状态(远端镜像 ID +
+//! compose 项目现存容器),逐服务分类为 重建/新建/不变/拉取/缺失;纯只读,
+//! 不落盘、不改远端状态。
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -37,14 +49,17 @@ use crate::config::{
     TransferMode,
 };
 use crate::crypto::dpapi_unprotect;
+use crate::history::{append_record, load_history, DeployRecord, MODE_SINGLE, MODE_STACK};
 use crate::docker::{
     check_host, image_exists, image_size, make_deploy_tag, save_gzip, start_daemon, tag_image,
     HostCheckReport, ImageInfo,
 };
 use crate::ssh::{
-    check_server_env, mkdir_p_cmd, ServerCheckReport, SshClient, INSTALL_DOCKER_CMD,
+    check_server_env, exec_collect, mkdir_p_cmd, ServerCheckReport, SshClient, INSTALL_DOCKER_CMD,
 };
-use crate::stack::{apply_overrides, parse_compose_file, ComposeStack};
+use crate::stack::{
+    apply_overrides, find_override_files, parse_compose_file, split_image_ref, ComposeStack,
+};
 
 /// 取消提示文案(取消导致的失败统一用它,便于前端识别)。
 const CANCELLED_MSG: &str = "部署已取消";
@@ -54,10 +69,29 @@ const SSH_CONNECT_TIMEOUT_SECS: u64 = 15;
 const SSH_EXEC_TIMEOUT_SECS: u64 = 60;
 /// 导出进度日志的汇报粒度:每 ≥5MB 变化汇报一次。
 const LOG_PROGRESS_STEP: u64 = 5 * 1024 * 1024;
+/// 整栈部署:并行打包的并发度上限(实际取 `min(本值, 可用并行度)`)。
+const PACK_CONCURRENCY_CAP: usize = 3;
+/// 镜像包上传失败后的重试等待(秒):给网络/服务端一点恢复时间,再同路径续传重试。
+const UPLOAD_RETRY_DELAY_SECS: u64 = 2;
 /// 整栈部署:单包 `docker load` 的执行超时(秒)。
 const STACK_LOAD_TIMEOUT_SECS: u64 = 600;
 /// 整栈部署:`docker compose pull` / `up -d` 的执行超时(秒)。
 const STACK_COMPOSE_TIMEOUT_SECS: u64 = 900;
+/// 服务器清理(`prune_server`)的执行超时(秒)。
+const PRUNE_TIMEOUT_SECS: u64 = 300;
+/// 部署前/后钩子命令的执行超时(秒)。
+const HOOK_TIMEOUT_SECS: u64 = 600;
+/// 健康检查:轮询间隔(秒)。
+const HEALTH_POLL_INTERVAL_SECS: u64 = 5;
+/// 健康检查:单轮 `compose ps` 状态查询的执行超时(秒)。
+const HEALTH_PS_TIMEOUT_SECS: u64 = 60;
+/// 整栈拉取失败时并入错误信息的远端输出末尾行数
+/// (供 [`augment_pull_error`] 依据输出识别私有仓库认证问题)。
+const PULL_OUTPUT_TAIL_LINES: usize = 10;
+/// 部署完成 webhook 通知的 HTTP 超时(秒)。
+const WEBHOOK_TIMEOUT_SECS: u64 = 10;
+/// 整栈部署预览:远端查询镜像列表的命令(JSON 输出,每行一条)。
+const REMOTE_IMAGES_CMD: &str = "docker images --format '{{json .}}'";
 
 /// 部署运行状态:`cancel_deploy` 置位 `cancelled`,
 /// 部署管线在各步骤之间以及 exec 输出行回调中检查后中止。
@@ -141,10 +175,12 @@ pub fn encrypt_password(plain: String) -> Result<String, String> {
 
 // ===== compose 整栈命令 =====
 
-/// 导入 compose 文件:校验文件存在且可解析后,把 compose(连同同目录 `.env`,
-/// 若存在)复制到 `config/stacks/<uuid>/docker-compose.yml` 持久化,以解析出的
-/// 默认传输分类创建新项目(名称为用户自命名,compose_file 指向副本),写回配置
-/// 并返回完整 ProjectConfig。
+/// 导入 compose 文件:校验文件存在且可解析后,把 compose(连同同目录 `.env`
+/// 与 override 文件,若存在)复制到 `config/stacks/<uuid>/docker-compose.yml`
+/// 持久化,以解析出的默认传输分类创建新项目(名称为用户自命名,compose_file
+/// 指向副本),写回配置并返回完整 ProjectConfig。
+/// (解析时同目录 override 文件已按 [`crate::stack::find_override_files`] 顺序
+/// 做服务级浅合并,分类与镜像基于合并结果。)
 #[tauri::command]
 pub fn import_compose(source_path: String, name: String) -> Result<ProjectConfig, String> {
     let source = PathBuf::from(&source_path);
@@ -183,6 +219,24 @@ pub fn import_compose(source_path: String, name: String) -> Result<ProjectConfig
             })?;
         }
     }
+    // compose 同目录的 override 文件一并复制(同名 basename):
+    // 与解析合并保持一致,远端 pull/up 的 -f 文件链才能指向同名文件
+    if let Some(parent) = source.parent() {
+        for ov_path in find_override_files(parent) {
+            let Some(name) = ov_path.file_name() else {
+                continue;
+            };
+            let dest_ov = dest_dir.join(name);
+            std::fs::copy(&ov_path, &dest_ov).map_err(|e| {
+                format!(
+                    "复制 override 文件失败 ({} -> {}): {}",
+                    ov_path.display(),
+                    dest_ov.display(),
+                    e
+                )
+            })?;
+        }
+    }
 
     let project = ProjectConfig {
         id,
@@ -198,6 +252,10 @@ pub fn import_compose(source_path: String, name: String) -> Result<ProjectConfig
                 mode: s.mode.clone(),
             })
             .collect(),
+        health_wait_secs: 0,
+        pre_deploy_cmd: None,
+        post_deploy_cmd: None,
+        notify_webhook: None,
     };
     let mut cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
     cfg.projects.push(project.clone());
@@ -296,20 +354,7 @@ async fn connect_and_check(
     server_id: &str,
     password_plain: Option<String>,
 ) -> Result<ServerCheckReport, String> {
-    let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
-    let server = find_server(&cfg, server_id)?.clone();
-    let password = resolve_password(
-        &server.auth.auth_type,
-        password_plain.as_deref(),
-        server.auth.password_enc.as_deref(),
-    )?;
-    let mut client = with_timeout(
-        SSH_CONNECT_TIMEOUT_SECS,
-        "连接超时",
-        "请检查服务器地址与网络",
-        SshClient::connect(&server, password.as_deref()),
-    )
-    .await?;
+    let (server, mut client) = connect_server(server_id, password_plain.as_deref()).await?;
     with_timeout(
         SSH_EXEC_TIMEOUT_SECS,
         "环境检查超时",
@@ -317,6 +362,30 @@ async fn connect_and_check(
         check_server_env(&mut client, &server.remote_dir),
     )
     .await
+}
+
+/// 按 server_id 解析服务器配置与密码并建立 SSH 连接(带连接超时兜底)。
+/// `connect_and_check` 与 [`preview_stack_changes`] 共用的建连路径,
+/// 返回 `(服务器配置, 已连接的客户端)`。
+async fn connect_server(
+    server_id: &str,
+    password_plain: Option<&str>,
+) -> Result<(ServerConfig, SshClient), String> {
+    let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    let server = find_server(&cfg, server_id)?.clone();
+    let password = resolve_password(
+        &server.auth.auth_type,
+        password_plain,
+        server.auth.password_enc.as_deref(),
+    )?;
+    let client = with_timeout(
+        SSH_CONNECT_TIMEOUT_SECS,
+        "连接超时",
+        "请检查服务器地址与网络",
+        SshClient::connect(&server, password.as_deref()),
+    )
+    .await?;
+    Ok((server, client))
 }
 
 /// 给可能长时间无响应的 SSH future 整体套一层超时(兜底 russh 自身不带连接超时)。
@@ -410,6 +479,103 @@ pub async fn create_remote_dir(
     Ok(())
 }
 
+// ===== 服务器清理 + 远端磁盘预检(Task 2)=====
+
+/// 清理服务器:删除悬空镜像与已停止容器(见 [`prune_cmd`]),输出逐行 emit
+/// `server-log`(与 [`install_server_docker`] 同通道,前端服务器卡片可回显),
+/// 超时 [`PRUNE_TIMEOUT_SECS`] 秒。
+#[tauri::command]
+pub async fn prune_server(
+    server_id: String,
+    password_plain: Option<String>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    let server = find_server(&cfg, &server_id)?.clone();
+    let password = resolve_password(
+        &server.auth.auth_type,
+        password_plain.as_deref(),
+        server.auth.password_enc.as_deref(),
+    )?;
+    let mut client = with_timeout(
+        SSH_CONNECT_TIMEOUT_SECS,
+        "连接超时",
+        "请检查服务器地址与网络",
+        SshClient::connect(&server, password.as_deref()),
+    )
+    .await?;
+
+    let mut on_output = |line: &str| {
+        let _ = app.emit("server-log", line.trim_end().to_string());
+    };
+    let cmd = prune_cmd();
+    let fut = client.exec(&cmd, &mut on_output);
+    let code = with_timeout(
+        PRUNE_TIMEOUT_SECS,
+        "服务器清理超时",
+        "请检查服务器网络后重试",
+        async { fut.await.map_err(|e| format!("执行服务器清理命令失败: {}", e)) },
+    )
+    .await?;
+    if code != 0 {
+        return Err(format!(
+            "服务器清理命令退出码 {},请根据输出排查(常见原因:无 docker 权限)",
+            code
+        ));
+    }
+    Ok(())
+}
+
+/// 拼装服务器清理命令:删除悬空镜像与已停止容器(`-f` 免交互;用 `;` 串联,
+/// 第二项不受第一项退出码影响,两项均尽力执行)。
+pub fn prune_cmd() -> String {
+    "docker image prune -f; docker container prune -f".to_string()
+}
+
+/// 拼装查询 Docker 数据根目录的命令(`docker info` 的 Go 模板,单行输出)。
+pub fn docker_root_cmd() -> String {
+    "docker info -f '{{.DockerRootDir}}'".to_string()
+}
+
+/// 拼装查询 `path` 所在文件系统剩余空间(GB)的命令。
+/// 与 [`check_server_env`] 的 df 口径一致:`-P` POSIX 单行格式 + `-BG` 以 GB 为块
+/// 单位,`tail -1` 取数据行,`awk` 取第 4 列(Available);路径单引号包裹防注入。
+pub fn df_free_gb_cmd(path: &str) -> String {
+    format!(
+        "df -PBG {} | tail -1 | awk '{{print $4}}'",
+        shell_single_quote(path)
+    )
+}
+
+/// 解析 `df -PBG` 第 4 列的 Available 值(如 `30G` / `30` / `0.5`)为 GB 数;
+/// 空输出或非数字(BusyBox 等口径不一致的环境)返回 `None`。
+/// 解析口径与 [`check_server_env`] 一致(trim 后去掉尾部 `G` 再按 f64 解析)。
+pub fn parse_df_gb(raw: &str) -> Option<f64> {
+    let trimmed = raw.trim().trim_end_matches('G').trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse::<f64>().ok()
+}
+
+/// 远端磁盘预检判定(纯函数):剩余空间(GB)小于 `need_bytes`(已含余量)换算的
+/// GB 数 → 返回中文错误(含所需/实际 GB);`free_gb` 为 `None` 表示无法获取剩余
+/// 空间,跳过预检返回 `Ok(())`(告警由调用方负责)。
+pub fn precheck_remote_disk(free_gb: Option<f64>, need_bytes: u64) -> Result<(), String> {
+    let free = match free_gb {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+    let need_gb = need_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
+    if free < need_gb {
+        return Err(format!(
+            "服务器磁盘剩余空间不足:本次部署约需 {:.1} GB,Docker 根目录所在盘仅剩 {:.1} GB,请先清理服务器磁盘后重试",
+            need_gb, free
+        ));
+    }
+    Ok(())
+}
+
 // ===== 部署命令 =====
 
 /// 发起部署:立即返回 `Ok(())`,管线在后台任务执行并通过事件推送进度。
@@ -427,18 +593,28 @@ pub fn deploy_stack(req: StackDeployRequest, app: AppHandle) -> Result<(), Strin
     Ok(())
 }
 
-/// 后台部署任务的统一启动器:panic 兜底([`CatchPanic`])+ 收尾事件,
-/// 保证任何路径(成功/失败/panic)下 `deploy-done` 恰好 emit 一次。
+/// 后台部署任务的统一启动器:panic 兜底([`CatchPanic`])+ 收尾事件 + 部署历史
+/// + webhook 通知,保证任何路径(成功/失败/panic)下 `deploy-done` 恰好 emit 一次;
+/// 正常结束路径(成功/失败/取消)在 emit `deploy-done` 之后落地部署历史记录
+/// (由管线组装的 [`DeployRecord`],append 失败仅告警,不影响收尾),并按项目
+/// 配置的 `notify_webhook` 异步发送 webhook 通知(尽力而为,失败仅告警)。
 fn spawn_deploy_task<F>(app: AppHandle, fut: F)
 where
-    F: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    F: std::future::Future<Output = (Result<(), String>, DeployRecord, Option<String>)>
+        + Send
+        + 'static,
 {
     tauri::async_runtime::spawn(async move {
-        let result = match CatchPanic::new(fut).await {
-            Ok(result) => result,
+        let (result, record, webhook_url) = match CatchPanic::new(fut).await {
+            Ok(triple) => (triple.0, Some(triple.1), triple.2),
             Err(panic_info) => {
                 log::error!("部署管线发生 panic: {}", panic_info);
-                Err("部署过程发生内部错误,详情见日志".to_string())
+                // 管线内组装的部署记录随 panic 丢失,此路径不写历史、不发通知
+                (
+                    Err("部署过程发生内部错误,详情见日志".to_string()),
+                    None,
+                    None,
+                )
             }
         };
         match result {
@@ -455,6 +631,16 @@ where
                 emit_log(&app, &format!("部署失败: {}", e));
                 let _ = app.emit("deploy-done", DeployDone { success: false, message: e });
             }
+        }
+        // deploy-done 之后落地部署历史(成功/失败/取消统一记录)
+        if let Some(record) = record {
+            // webhook 通知:项目配置了 notify_webhook 才发;阻塞 HTTP 放 blocking
+            // 线程池 fire-and-forget,失败仅告警,不影响部署收尾
+            if let Some(url) = webhook_url.filter(|u| !u.trim().is_empty()) {
+                let payload = webhook_payload(&record);
+                tauri::async_runtime::spawn_blocking(move || send_webhook(&url, &payload));
+            }
+            append_record(record);
         }
     });
 }
@@ -494,6 +680,88 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
     }
 }
 
+// ===== 部署 webhook 通知(Task 6)=====
+
+/// 部署完成 webhook 通知的 JSON 载荷(纯函数,便于单测)。
+/// 字段:`event`/`success`/`message`/`server`/`project`/`duration_secs`/`ts`。
+fn webhook_payload(record: &DeployRecord) -> String {
+    serde_json::json!({
+        "event": "deploy",
+        "success": record.success,
+        "message": record.message,
+        "server": record.server_name,
+        "project": record.project_name,
+        "duration_secs": record.duration_secs,
+        "ts": record.ts,
+    })
+    .to_string()
+}
+
+/// 发送 webhook 通知(阻塞 HTTP,调用方须放 blocking 线程池)。
+/// 尽力而为:成功 `log::info`,失败(网络/超时/非 2xx)仅 `log::warn`,
+/// 不向调用方传播错误、不影响部署结果。
+/// 日志脱敏:webhook URL 常内嵌 token(query/userinfo,如飞书/钉钉机器人
+/// 地址),完整落 `logs/app.log` 会泄漏凭据 —— 成功/失败日志均只记主机名
+/// (见 [`url_host_for_log`]);ureq 的错误文本同样内嵌完整 URL,不直接落其
+/// Display,只取状态码/错误类别与描述(见 [`webhook_error_detail`])。
+fn send_webhook(url: &str, payload: &str) {
+    let host = url_host_for_log(url);
+    let result = ureq::post(url)
+        .timeout(Duration::from_secs(WEBHOOK_TIMEOUT_SECS))
+        .set("Content-Type", "application/json")
+        .send_string(payload);
+    match result {
+        Ok(_) => log::info!("部署 webhook 通知已发送:{}", host),
+        Err(e) => log::warn!(
+            "部署 webhook 通知发送失败 ({}): {}",
+            host,
+            webhook_error_detail(&e)
+        ),
+    }
+}
+
+/// URL 日志脱敏(纯函数):只取 `scheme://` 之后的 `host[:port]` 部分
+/// (`user:pass@host` 的 userinfo 凭据段一并剥除),不落 path/query;
+/// 解析不出 host(非 URL / 空 authority)返回 `"<unparseable-url>"`。
+fn url_host_for_log(url: &str) -> String {
+    let Some((_, authority_full)) = url.split_once("://") else {
+        return "<unparseable-url>".to_string();
+    };
+    let authority = authority_full.split(['/', '?', '#']).next().unwrap_or("");
+    // user:pass@host 形态取 @ 之后的 host;无 @ 即整段
+    let host = match authority.rsplit_once('@') {
+        Some((_, h)) => h,
+        None => authority,
+    };
+    if host.is_empty() {
+        "<unparseable-url>".to_string()
+    } else {
+        host.to_string()
+    }
+}
+
+/// ureq 错误的脱敏文本(纯函数):ureq 的错误 Display 会内嵌完整 URL
+/// (`Status` 带响应 URL、`Transport` 带请求 URL),不能直接落日志;
+/// 这里只取状态码 / 错误类别与描述,不含 URL。
+fn webhook_error_detail(e: &ureq::Error) -> String {
+    match e {
+        ureq::Error::Status(code, _) => format!("HTTP 状态码 {}", code),
+        ureq::Error::Transport(t) => match t.message() {
+            Some(m) => format!("{}: {}", t.kind(), m),
+            None => format!("{}", t.kind()),
+        },
+    }
+}
+
+/// 读取项目配置的 webhook 通知地址(`notify_webhook`;读取配置失败或项目
+/// 不存在 → `None`,此时不发通知)。
+fn project_webhook_url(project_id: &str) -> Option<String> {
+    let cfg = load_config().ok()?;
+    find_project(&cfg, project_id)
+        .ok()
+        .and_then(|p| p.notify_webhook.clone())
+}
+
 /// 取消当前部署(置位 AtomicBool;管线在各步骤间检查后中止)。
 #[tauri::command]
 pub fn cancel_deploy(state: tauri::State<'_, DeployState>) -> Result<(), String> {
@@ -501,10 +769,48 @@ pub fn cancel_deploy(state: tauri::State<'_, DeployState>) -> Result<(), String>
     Ok(())
 }
 
+/// 读取部署历史(倒序 = 最新在前;文件缺失/损坏时为空,由 history 层容错)。
+#[tauri::command]
+pub fn get_history() -> Result<Vec<DeployRecord>, String> {
+    Ok(load_history().into_iter().rev().collect())
+}
+
 // ===== 部署管线(严格顺序,任一步失败即中止)=====
 
-/// 部署管线主体。失败返回中文错误,由 [`deploy`] 统一 emit `deploy-done` failure。
-async fn run_deploy(app: &AppHandle, req: DeployRequest) -> Result<(), String> {
+/// 部署管线入口:组装部署历史记录骨架(含开始计时),执行管线主体,
+/// 出口填充 success/message/duration 后连同结果与 webhook 通知地址一起返回
+/// (由 spawn 层落历史、发通知)。
+async fn run_deploy(
+    app: &AppHandle,
+    req: DeployRequest,
+) -> (Result<(), String>, DeployRecord, Option<String>) {
+    let started = std::time::Instant::now();
+    // webhook 通知地址:项目配置了 notify_webhook 才发(前置失败的路径取不到,为 None)
+    let webhook_url = project_webhook_url(&req.project_id);
+    // 骨架:server/project 名称由前置解析回填(前置失败时以 ID 兜底)
+    let mut record = DeployRecord::new_skeleton(
+        MODE_SINGLE,
+        &req.server_id,
+        &req.project_id,
+        vec![req.image.clone()],
+    );
+    let result = run_deploy_steps(app, req, &mut record).await;
+    record.success = result.is_ok();
+    record.message = match &result {
+        Ok(()) => "部署完成".to_string(),
+        Err(e) => e.clone(),
+    };
+    record.duration_secs = started.elapsed().as_secs();
+    (result, record, webhook_url)
+}
+
+/// 部署管线主体(严格顺序,任一步失败即中止)。`record` 为组装中的部署历史
+/// 记录,随步骤推进回填服务器/项目名称与实际部署的镜像引用。
+async fn run_deploy_steps(
+    app: &AppHandle,
+    req: DeployRequest,
+    record: &mut DeployRecord,
+) -> Result<(), String> {
     // ---- 步骤 0:前置 ----
     // 每次 deploy 开始时重置取消标志;结束时保持不变(取消后为 true,下次部署重置)
     reset_cancelled(app);
@@ -512,6 +818,8 @@ async fn run_deploy(app: &AppHandle, req: DeployRequest) -> Result<(), String> {
     let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
     let server = find_server(&cfg, &req.server_id)?.clone();
     let project = find_project(&cfg, &req.project_id)?.clone();
+    record.server_name = server.name.clone();
+    record.project_name = project.name.clone();
     let password = resolve_password(
         &server.auth.auth_type,
         req.password_plain.as_deref(),
@@ -538,6 +846,8 @@ async fn run_deploy(app: &AppHandle, req: DeployRequest) -> Result<(), String> {
         emit_log(app, "使用原始镜像标签,跳过打标签");
         req.image.clone()
     };
+    // 历史记录登记实际部署的镜像引用(勾选日期标签时为生成的部署标签)
+    record.images = vec![image_ref.clone()];
 
     // ---- 步骤 2:导出压缩 ----
     emit_progress(app, 2, 5, "导出压缩镜像");
@@ -548,7 +858,9 @@ async fn run_deploy(app: &AppHandle, req: DeployRequest) -> Result<(), String> {
     let _tar_guard = TempFileGuard(out_path.clone());
 
     // 空间预检:导出目标盘(临时目录所在盘)剩余空间 ≥ 镜像大小 × 1.5
-    match image_size(&image_ref) {
+    // (镜像大小暂存,供步骤 3 的远端磁盘预检复用,避免二次查询)
+    let image_bytes = image_size(&image_ref);
+    match image_bytes {
         Some(size) => check_export_disk_space(size)?,
         None => emit_log(app, "警告:无法获取镜像大小,跳过磁盘剩余空间检查"),
     }
@@ -560,6 +872,11 @@ async fn run_deploy(app: &AppHandle, req: DeployRequest) -> Result<(), String> {
     emit_progress(app, 3, 5, "上传镜像到服务器");
     ensure_not_cancelled(app)?;
     let mut client = SshClient::connect(&server, password.as_deref()).await?;
+    // 远端磁盘预检:上传前确认 Docker 根目录所在盘剩余空间 ≥ 镜像大小 × 1.5
+    // (镜像大小未知 → 告警跳过;不足 → 中文报错中止)
+    let need_bytes = image_bytes.map(|size| (size as f64 * 1.5) as u64);
+    remote_disk_precheck(app, &mut client, need_bytes).await?;
+    // 镜像包同名即同内容(uuid 命名),启用断点续传
     upload_tar(app, &mut client, &out_path, &tar_name).await?;
     emit_log(app, "镜像上传完成");
 
@@ -568,6 +885,8 @@ async fn run_deploy(app: &AppHandle, req: DeployRequest) -> Result<(), String> {
     ensure_not_cancelled(app)?;
     sync_files(app, &mut client, &server, &project).await?;
     emit_log(app, "项目文件同步完成");
+    // 部署前钩子(归入步骤 4:装载前执行,旧容器仍在运行;失败即中止部署)
+    run_hook(app, &mut client, &project, HookKind::Pre, &server.remote_dir).await?;
 
     // ---- 步骤 5:服务器部署 ----
     emit_progress(app, 5, 5, "服务器部署");
@@ -625,27 +944,16 @@ fn check_export_disk_space(image_bytes: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// 步骤 2:`docker save` → gzip 流式压缩导出到 `out_path`。
-///
-/// 阻塞型 `save_gzip` 放入 blocking 线程池;progress_cb 用 `AtomicU64`
-/// 累计压缩后字节数,每 ≥5MB 变化 emit 一次 `deploy-log`(“已导出 X MB”)。
-/// 返回压缩后的总字节数。
-async fn export_image(app: &AppHandle, image_ref: &str, out_path: &Path) -> Result<u64, String> {
-    let last_reported = Arc::new(AtomicU64::new(0));
-    let app_for_cb = app.clone();
+/// 把阻塞型 `save_gzip`(`docker save` → gzip 流式压缩)放入 blocking 线程池
+/// 执行,返回压缩后的总字节数;进度回调由调用方提供(并行打包传空回调)。
+/// 内层 blocking 任务 panic 也被转换为 `Err`,不会向上传播 panic。
+async fn run_save_gzip<F>(image_ref: &str, out_path: &Path, progress_cb: F) -> Result<u64, String>
+where
+    F: Fn(u64) + Send + 'static,
+{
     let image = image_ref.to_string();
     let path = out_path.to_path_buf();
-    let last = Arc::clone(&last_reported);
-
-    let handle = tauri::async_runtime::spawn_blocking(move || {
-        save_gzip(&image, &path, move |n| {
-            let prev = last.load(Ordering::Relaxed);
-            if n >= prev.saturating_add(LOG_PROGRESS_STEP) {
-                last.store(n, Ordering::Relaxed);
-                emit_log(&app_for_cb, &format!("已导出 {} MB", n / 1024 / 1024));
-            }
-        })
-    });
+    let handle = tauri::async_runtime::spawn_blocking(move || save_gzip(&image, &path, progress_cb));
     match handle.await {
         Ok(Ok(total)) => Ok(total),
         Ok(Err(e)) => Err(e),
@@ -653,7 +961,51 @@ async fn export_image(app: &AppHandle, image_ref: &str, out_path: &Path) -> Resu
     }
 }
 
+/// 步骤 2(单镜像管线):`docker save` → gzip 流式压缩导出到 `out_path`。
+///
+/// progress_cb 用 `AtomicU64` 累计压缩后字节数,每 ≥5MB 变化 emit 一次
+/// `deploy-log`(“已导出 X MB”)。
+async fn export_image(app: &AppHandle, image_ref: &str, out_path: &Path) -> Result<u64, String> {
+    let last_reported = Arc::new(AtomicU64::new(0));
+    let app_for_cb = app.clone();
+    let last = Arc::clone(&last_reported);
+
+    run_save_gzip(image_ref, out_path, move |n| {
+        let prev = last.load(Ordering::Relaxed);
+        if n >= prev.saturating_add(LOG_PROGRESS_STEP) {
+            last.store(n, Ordering::Relaxed);
+            emit_log(&app_for_cb, &format!("已导出 {} MB", n / 1024 / 1024));
+        }
+    })
+    .await
+}
+
+/// 静默导出(无逐块进度日志):并行打包时多个镜像交叉输出逐块日志没有意义,
+/// 进度改为按「完成镜像数」汇报(见 [`pack_local_images`])。
+async fn export_image_silent(image_ref: &str, out_path: &Path) -> Result<u64, String> {
+    run_save_gzip(image_ref, out_path, |_| {}).await
+}
+
+/// 拼装「镜像包上传重试仍失败」的中文错误(纯函数,便于单测):
+/// 保留两次失败信息,便于对照首次中断点与重试失败原因。
+pub fn upload_retry_failure_msg(retry_err: &str, first_err: &str) -> String {
+    format!("镜像上传重试仍失败:{}(首次失败:{})", retry_err, first_err)
+}
+
+/// 镜像包上传重试前的等待:提示 + 固定间隔(轮间检查取消)。
+/// 取消 → 返回 [`CANCELLED_MSG`] 中止,不再重试;否则由调用方对**同一远端路径**
+/// 执行重试 —— `sftp_upload(resume=true)` 的 stat 命中远端半成品 → 断点续传生效。
+async fn upload_retry_wait(app: &AppHandle) -> Result<(), String> {
+    emit_log(app, "上传中断,2 秒后从断点续传重试");
+    tokio::time::sleep(Duration::from_secs(UPLOAD_RETRY_DELAY_SECS)).await;
+    ensure_not_cancelled(app)
+}
+
 /// 步骤 3:上传镜像 tar 到远端固定 `/tmp` 目录,按每 10% 进度 emit `deploy-log`。
+///
+/// 断点续传在「失败后同路径重试一次」时生效:每次部署 attempt 的 tar 名均为新
+/// uuid,attempt 之间无同名文件;同 attempt 内重试时 `sftp_upload(resume=true)`
+/// 经 stat 命中远端半成品 → Resume 分支,不必重传已传部分。
 async fn upload_tar(
     app: &AppHandle,
     client: &mut SshClient,
@@ -663,20 +1015,38 @@ async fn upload_tar(
     let last_pct = Arc::new(AtomicU64::new(0));
     let app_for_cb = app.clone();
     let last = Arc::clone(&last_pct);
+    let on_progress = move |sent, total| {
+        if total == 0 {
+            return;
+        }
+        let step10 = (sent * 100 / total) / 10 * 10;
+        let prev = last.load(Ordering::Relaxed);
+        if step10 > prev {
+            last.store(step10, Ordering::Relaxed);
+            emit_log(&app_for_cb, &format!("镜像上传进度 {}%", step10));
+        }
+    };
 
-    client
-        .sftp_upload(tar_path, "/tmp", tar_name, &move |sent, total| {
-            if total == 0 {
-                return;
-            }
-            let step10 = (sent * 100 / total) / 10 * 10;
-            let prev = last.load(Ordering::Relaxed);
-            if step10 > prev {
-                last.store(step10, Ordering::Relaxed);
-                emit_log(&app_for_cb, &format!("镜像上传进度 {}%", step10));
-            }
-        })
+    // 失败后同路径重试一次:重试时 stat 命中断点 → 续传生效;
+    // 重试返回 AlreadyDone(远端已传 ≥ 本地)同样视为该包成功。
+    let first_err = match client
+        .sftp_upload(tar_path, "/tmp", tar_name, true, &on_progress)
         .await
+    {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    upload_retry_wait(app).await?;
+    match client
+        .sftp_upload(tar_path, "/tmp", tar_name, true, &on_progress)
+        .await
+    {
+        Ok(()) => {
+            emit_log(app, "断点续传重试成功");
+            Ok(())
+        }
+        Err(e) => Err(upload_retry_failure_msg(&e, &first_err)),
+    }
 }
 
 /// 步骤 4:同步项目 `file_mappings` 到远端。
@@ -709,17 +1079,22 @@ async fn sync_files(
         } else {
             let (dir, name) = split_remote_file(&full_remote);
             emit_log(app, &format!("同步文件: {} -> {}/{}", mapping.local, dir, name));
-            client.sftp_upload(&local, &dir, &name, &|_, _| {}).await?;
+            // 文件映射内容可变、远端同名未必同内容,不做断点续传(全新写)
+            client
+                .sftp_upload(&local, &dir, &name, false, &|_, _| {})
+                .await?;
         }
     }
     Ok(())
 }
 
-/// 步骤 5:服务器部署 —— `docker load` → [`docker tag` 同步原标签] → `compose up -d` → 删除远端 tar。
+/// 步骤 5:服务器部署 —— `docker load` → 同步原标签 → `compose up -d` → 健康检查 → 部署后钩子 → 删除远端 tar。
 ///
 /// 每条命令超时 600 秒(清理 60 秒),输出实时转发到 `deploy-log`,收到输出行时检查取消标志。
 /// `retag` 为 `Some((日期tag, 原引用))` 时,装载后把原引用(如 myapp:latest)也指向
 /// 新镜像,否则 compose 引用原 tag 时感知不到变化、不会重建容器。
+/// up 之后先做健康检查(未启用则跳过),再执行部署后钩子(失败仅告警),
+/// 最后清理远端 tar。
 async fn server_deploy(
     app: &AppHandle,
     client: &mut SshClient,
@@ -757,12 +1132,213 @@ async fn server_deploy(
     );
     exec_forwarded(app, client, &up_cmd, 600).await?;
 
-    // 5.4 清理远端 tar(尽力而为,失败不影响部署结果)
+    // 5.4 健康检查(up 后按预算轮询服务状态;health_wait_secs=0 时跳过)
+    // 单镜像管线无 override 文件链(远端 up 亦不带 -f override),传空列表
+    health_check(app, client, project, &server.remote_dir, &project.compose_file, &[]).await?;
+
+    // 5.5 部署后钩子(健康检查通过后执行;失败仅告警,不影响部署结果)
+    run_hook(app, client, project, HookKind::Post, &server.remote_dir).await?;
+
+    // 5.6 清理远端 tar(尽力而为,失败不影响部署结果)
     let rm_cmd = format!("rm -f {}", shell_single_quote(&remote_tar));
     if let Err(e) = exec_forwarded(app, client, &rm_cmd, 60).await {
         emit_log(app, &format!("警告:清理远端临时文件失败: {}", e));
     }
     Ok(())
+}
+
+// ===== 部署钩子 + 健康检查(Task 3)=====
+
+/// 部署钩子类型:`Pre` = 部署前(装载前,旧容器仍在运行,失败中止部署),
+/// `Post` = 部署后(健康检查通过后,失败仅告警)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookKind {
+    Pre,
+    Post,
+}
+
+impl HookKind {
+    /// 日志中的中文名称。
+    fn label(self) -> &'static str {
+        match self {
+            HookKind::Pre => "部署前钩子",
+            HookKind::Post => "部署后钩子",
+        }
+    }
+
+    /// 项目配置里对应的钩子命令(未配置为 `None`)。
+    fn cmd_of<'a>(self, project: &'a ProjectConfig) -> Option<&'a str> {
+        match self {
+            HookKind::Pre => project.pre_deploy_cmd.as_deref(),
+            HookKind::Post => project.post_deploy_cmd.as_deref(),
+        }
+    }
+}
+
+/// 执行项目的部署前/后钩子命令(远端执行,可选)。
+///
+/// - 未配置或空白 → 直接返回 `Ok(())`;
+/// - 命令以 [`hook_cmd`](`cd '<remote_dir>' && ( <cmd> )`)执行,超时
+///   [`HOOK_TIMEOUT_SECS`] 秒,输出实时转发到 `deploy-log`;
+/// - `Pre` 失败 → `Err` 中止部署(此时旧容器仍在运行,尚未 load/up);
+/// - `Post` 失败 → 仅告警并返回 `Ok(())`(不影响部署结果);取消除外。
+async fn run_hook(
+    app: &AppHandle,
+    client: &mut SshClient,
+    project: &ProjectConfig,
+    which: HookKind,
+    remote_dir: &str,
+) -> Result<(), String> {
+    let cmd = match which.cmd_of(project).map(str::trim) {
+        Some(c) if !c.is_empty() => c,
+        _ => return Ok(()),
+    };
+    let full_cmd = hook_cmd(remote_dir, cmd);
+    emit_log(app, &format!("执行{}: {}", which.label(), cmd));
+    match exec_forwarded(app, client, &full_cmd, HOOK_TIMEOUT_SECS).await {
+        Ok(()) => {
+            emit_log(app, &format!("{}执行完成", which.label()));
+            Ok(())
+        }
+        Err(e) => match which {
+            HookKind::Pre => Err(format!("{}执行失败,部署中止: {}", which.label(), e)),
+            HookKind::Post => {
+                if e == CANCELLED_MSG {
+                    Err(e)
+                } else {
+                    emit_log(
+                        app,
+                        &format!("警告:{}执行失败(不影响部署结果): {}", which.label(), e),
+                    );
+                    Ok(())
+                }
+            }
+        },
+    }
+}
+
+/// up 之后的健康检查:`health_wait_secs > 0` 时,每 [`HEALTH_POLL_INTERVAL_SECS`]
+/// 秒轮询一次 [`compose_ps_json_cmd`](`docker compose ps --all --format json`),
+/// 预算为 `health_wait_secs` 秒;判定见 [`health_verdict`]。
+///
+/// `overrides` 为与 pull/up 同源检测的 override 文件名列表([`compose_override_names`]
+/// → [`upload_compose_files`] 上传的同一批文件):逐个追加 `-f`,保证 override-only
+/// 的服务同样出现在 ps 输出中、不逃逸健康判定。
+///
+/// - 全部服务 running 且(无 healthcheck 或 healthy)→ 通过;
+/// - 任一服务 Restarting/Dead(或 Exited 且退出码非零/字段缺失)→ 立即失败;
+///   Exited 且退出码 0(一次性服务正常退出)→ 不算失败,继续轮询,预算耗尽
+///   报错并注明"若为一次性初始化服务请关闭健康检查";
+/// - 解析不出状态(旧版 compose 输出、查询暂时失败等)→ 继续轮询至预算耗尽;
+/// - 失败时先经 [`dump_compose_logs`] 拉取各服务最近日志进部署日志,再以中文
+///   错误中止(`健康检查未通过:<服务> <状态>`)。
+/// - `health_wait_secs == 0` → 未启用,直接跳过。
+async fn health_check(
+    app: &AppHandle,
+    client: &mut SshClient,
+    project: &ProjectConfig,
+    remote_dir: &str,
+    compose_file: &str,
+    overrides: &[String],
+) -> Result<(), String> {
+    if project.health_wait_secs == 0 {
+        emit_log(app, "健康检查未启用,跳过");
+        return Ok(());
+    }
+    let budget = Duration::from_secs(project.health_wait_secs as u64);
+    let started = std::time::Instant::now();
+    let ps_cmd = compose_ps_json_cmd(remote_dir, compose_file, overrides);
+    emit_log(
+        app,
+        &format!(
+            "健康检查:开始轮询服务状态(每 {} 秒一轮,预算 {} 秒)",
+            HEALTH_POLL_INTERVAL_SECS, project.health_wait_secs
+        ),
+    );
+    // 最近一轮"尚未就绪"的服务与状态(预算耗尽时报错展示);
+    // last_exited_zero:该服务是否"已退出(退出码 0)"(一次性服务提示)
+    let mut last_pending: Option<(String, String)> = None;
+    let mut last_exited_zero = false;
+    loop {
+        ensure_not_cancelled(app)?;
+        // 单轮查询:60 秒超时;查询超时或 SSH 传输失败都按"无法判定"
+        // 继续轮询(不直接失败,与解析不出的处理一致)
+        let out = match with_timeout(
+            HEALTH_PS_TIMEOUT_SECS,
+            "健康检查状态查询超时",
+            "请检查服务器网络后重试",
+            exec_collect(client, &ps_cmd),
+        )
+        .await
+        {
+            Ok((_, out)) => out,
+            Err(e) => {
+                emit_log(app, &format!("警告:{}(继续等待)", e));
+                String::new()
+            }
+        };
+        let lines: Vec<&str> = out.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        match health_verdict(&lines) {
+            HealthVerdict::Pass => {
+                emit_log(
+                    app,
+                    &format!("健康检查通过(耗时 {} 秒)", started.elapsed().as_secs()),
+                );
+                return Ok(());
+            }
+            HealthVerdict::Unhealthy { service, state } => {
+                dump_compose_logs(app, client, remote_dir, compose_file, overrides).await;
+                return Err(format!("健康检查未通过:{} {}", service, state));
+            }
+            HealthVerdict::Indeterminate { pending, exited_zero } => {
+                if let Some(p) = pending {
+                    if last_pending.as_ref() != Some(&p) {
+                        emit_log(app, &format!("健康检查:{} 尚未就绪({})", p.0, p.1));
+                    }
+                    last_pending = Some(p);
+                    last_exited_zero = exited_zero;
+                }
+            }
+        }
+        if started.elapsed() >= budget {
+            dump_compose_logs(app, client, remote_dir, compose_file, overrides).await;
+            return Err(match (&last_pending, last_exited_zero) {
+                // 一次性服务已正常退出:报错注明,提示关闭健康检查
+                (Some((service, state)), true) => format!(
+                    "健康检查未通过:{} {},若为一次性初始化服务请关闭健康检查(等待 {} 秒超时)",
+                    service, state, project.health_wait_secs
+                ),
+                (Some((service, state)), false) => format!(
+                    "健康检查未通过:{} {}(等待 {} 秒超时)",
+                    service, state, project.health_wait_secs
+                ),
+                (None, _) => format!(
+                    "健康检查未通过:无法获取服务状态(等待 {} 秒超时)",
+                    project.health_wait_secs
+                ),
+            });
+        }
+        // 轮间取消检查后按固定间隔进入下一轮
+        ensure_not_cancelled(app)?;
+        tokio::time::sleep(Duration::from_secs(HEALTH_POLL_INTERVAL_SECS)).await;
+    }
+}
+
+/// 健康检查失败时,拉取各服务最近 50 行日志并逐行转发到 `deploy-log`
+/// (尽力而为:获取失败仅告警,不掩盖原始的健康检查错误)。
+/// `overrides` 与健康检查的 ps 查询同源,保证 override-only 服务日志可查。
+async fn dump_compose_logs(
+    app: &AppHandle,
+    client: &mut SshClient,
+    remote_dir: &str,
+    compose_file: &str,
+    overrides: &[String],
+) {
+    emit_log(app, "正在获取服务最近日志(最后 50 行):");
+    let cmd = compose_logs_cmd(remote_dir, compose_file, overrides);
+    if let Err(e) = exec_forwarded(app, client, &cmd, SSH_EXEC_TIMEOUT_SECS).await {
+        emit_log(app, &format!("警告:获取服务日志失败: {}", e));
+    }
 }
 
 /// 执行远端命令并把输出逐行转发到 `deploy-log`,带超时与取消检查。
@@ -775,11 +1351,33 @@ async fn exec_forwarded(
     cmd: &str,
     timeout_secs: u64,
 ) -> Result<(), String> {
+    exec_forwarded_inner(app, client, cmd, timeout_secs, 0).await
+}
+
+/// [`exec_forwarded`] 的实现:`tail_lines > 0` 时,非零退出的错误信息额外并入
+/// 远端输出末尾 `tail_lines` 行(供调用方依据输出内容做判定/提示,如
+/// [`augment_pull_error`]);其余行为(日志逐行转发、超时、取消)不变。
+async fn exec_forwarded_inner(
+    app: &AppHandle,
+    client: &mut SshClient,
+    cmd: &str,
+    timeout_secs: u64,
+    tail_lines: usize,
+) -> Result<(), String> {
     let saw_cancel = Arc::new(AtomicBool::new(false));
     let app_for_cb = app.clone();
     let cancel_flag = Arc::clone(&saw_cancel);
+    let tail = Arc::new(Mutex::new(Vec::new()));
+    let tail_for_cb = Arc::clone(&tail);
     let mut on_output = move |line: &str| {
         emit_log(&app_for_cb, line);
+        if tail_lines > 0 {
+            let mut buf = tail_for_cb.lock().unwrap_or_else(|e| e.into_inner());
+            buf.push(line.trim_end().to_string());
+            if buf.len() > tail_lines {
+                buf.remove(0);
+            }
+        }
         if is_cancelled(&app_for_cb) {
             cancel_flag.store(true, Ordering::SeqCst);
         }
@@ -796,7 +1394,15 @@ async fn exec_forwarded(
         return Err(CANCELLED_MSG.to_string());
     }
     if code != 0 {
-        return Err(format!("远端命令执行失败(退出码 {}): {}", code, cmd));
+        let mut msg = format!("远端命令执行失败(退出码 {}): {}", code, cmd);
+        if tail_lines > 0 {
+            let buf = tail.lock().unwrap_or_else(|e| e.into_inner());
+            if !buf.is_empty() {
+                msg.push_str("\n远端输出(末尾):\n");
+                msg.push_str(&buf.join("\n"));
+            }
+        }
+        return Err(msg);
     }
     // 末尾取消复查:命令可能全程无输出、回调一次都未触发,
     // 结束后再查一次取消标志,保证取消后不会把该步误报为成功。
@@ -806,13 +1412,107 @@ async fn exec_forwarded(
     Ok(())
 }
 
+/// 远端磁盘预检(两条部署管线共用):查询 Docker 数据根目录所在盘剩余空间,
+/// 与 `need_bytes`(已含 ×1.5 余量)比对,不足则以中文错误中止管线。
+///
+/// 容错(仅 emit 告警后跳过,不硬性拦截):`need_bytes` 为 `None`(本地镜像大小
+/// 未知)、Docker 根目录查询失败/为空、df 输出解析失败(BusyBox 等口径不一致)。
+/// SSH 传输层错误(通道打不开等)照常以 `Err` 传播 —— 连接已坏,上传必然失败。
+async fn remote_disk_precheck(
+    app: &AppHandle,
+    client: &mut SshClient,
+    need_bytes: Option<u64>,
+) -> Result<(), String> {
+    let need = match need_bytes {
+        Some(v) => v,
+        None => {
+            emit_log(app, "警告:无法获取本地镜像大小,跳过服务器磁盘剩余空间检查");
+            return Ok(());
+        }
+    };
+
+    // 1. Docker 数据根目录(单行 trim)
+    let (code, out) = exec_collect(client, &docker_root_cmd()).await?;
+    let root = out.trim().to_string();
+    if code != 0 || root.is_empty() {
+        emit_log(
+            app,
+            &format!(
+                "警告:无法获取 Docker 根目录(退出码 {}),跳过服务器磁盘剩余空间检查",
+                code
+            ),
+        );
+        return Ok(());
+    }
+
+    // 2. 根目录所在盘剩余空间(GB)
+    let (code, out) = exec_collect(client, &df_free_gb_cmd(&root)).await?;
+    let free_gb = if code == 0 { parse_df_gb(&out) } else { None };
+    let free = match free_gb {
+        Some(v) => v,
+        None => {
+            emit_log(
+                app,
+                &format!(
+                    "警告:服务器磁盘剩余空间查询失败(退出码 {},df 输出: {:?}),跳过磁盘剩余空间检查",
+                    code,
+                    out.trim()
+                ),
+            );
+            return Ok(());
+        }
+    };
+
+    // 3. 判定(不足 → 中文报错中止)
+    precheck_remote_disk(Some(free), need)?;
+    emit_log(
+        app,
+        &format!(
+            "服务器磁盘剩余空间检查通过:Docker 根目录 {} 所在盘剩余 {:.1} GB,本次部署约需 {:.1} GB",
+            root,
+            free,
+            need as f64 / 1024.0 / 1024.0 / 1024.0
+        ),
+    );
+    Ok(())
+}
+
 // ===== 整栈部署管线(六步,任一步失败即中止)=====
 
-/// 整栈部署管线主体。失败返回中文错误,由 [`deploy_stack`] 统一 emit
-/// `deploy-done` failure。六步:
-/// 1 分类确认 → 2 打包 → 3 上传 → 4 装载 → 5 拉取 → 6 启动;
-/// 收尾清理旧 releases(仅留最新 5 个),本地 tar 由 [`LocalTars`] 的守卫删除。
-async fn run_deploy_stack(app: &AppHandle, req: StackDeployRequest) -> Result<(), String> {
+/// 整栈部署管线入口:组装部署历史记录骨架(含开始计时),执行管线主体,
+/// 出口填充 success/message/duration 后连同结果与 webhook 通知地址一起返回
+/// (由 spawn 层落历史、发通知)。
+async fn run_deploy_stack(
+    app: &AppHandle,
+    req: StackDeployRequest,
+) -> (Result<(), String>, DeployRecord, Option<String>) {
+    let started = std::time::Instant::now();
+    // webhook 通知地址:项目配置了 notify_webhook 才发(前置失败的路径取不到,为 None)
+    let webhook_url = project_webhook_url(&req.project_id);
+    // 骨架:镜像列表取本地传输的服务镜像;server/project 名称由前置解析回填
+    let mut record = DeployRecord::new_skeleton(
+        MODE_STACK,
+        &req.server_id,
+        &req.project_id,
+        stack_record_images(&req.services),
+    );
+    let result = run_deploy_stack_steps(app, req, &mut record).await;
+    record.success = result.is_ok();
+    record.message = match &result {
+        Ok(()) => "部署完成".to_string(),
+        Err(e) => e.clone(),
+    };
+    record.duration_secs = started.elapsed().as_secs();
+    (result, record, webhook_url)
+}
+
+/// 整栈部署管线主体(六步,任一步失败即中止)。`record` 为组装中的部署历史
+/// 记录,前置解析后回填服务器/项目名称。
+async fn run_deploy_stack_steps(
+    app: &AppHandle,
+    req: StackDeployRequest,
+    record: &mut DeployRecord,
+) -> Result<(), String> {
     // ---- 前置:找 server/project、解析密码 ----
     // 每次部署开始时重置取消标志(与单镜像 run_deploy 一致)
     reset_cancelled(app);
@@ -820,6 +1520,8 @@ async fn run_deploy_stack(app: &AppHandle, req: StackDeployRequest) -> Result<()
     let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
     let server = find_server(&cfg, &req.server_id)?.clone();
     let project = find_project(&cfg, &req.project_id)?.clone();
+    record.server_name = server.name.clone();
+    record.project_name = project.name.clone();
     let password = resolve_password(
         &server.auth.auth_type,
         req.password_plain.as_deref(),
@@ -866,6 +1568,15 @@ async fn run_deploy_stack(app: &AppHandle, req: StackDeployRequest) -> Result<()
     )
     .await?;
 
+    // 远端磁盘预检:上传前确认 Docker 根目录所在盘剩余空间 ≥ Local 镜像字节总和 × 1.5
+    // (与本地导出预检同一 sum 口径;大小未知 → 告警跳过;不足 → 中文报错中止)
+    let local_sizes: Vec<Option<u64>> = local_choices
+        .iter()
+        .map(|s| image_size(&s.image))
+        .collect();
+    let need_bytes = sum_sizes(&local_sizes).map(|total| (total as f64 * 1.5) as u64);
+    remote_disk_precheck(app, &mut client, need_bytes).await?;
+
     // 远端建本次发布目录 <remote_dir>/releases/<时间戳>/(mkdir -p 连带创建 remote_dir)
     let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
     let release_dir = releases_dir(&server.remote_dir, &ts);
@@ -894,6 +1605,8 @@ async fn run_deploy_stack(app: &AppHandle, req: StackDeployRequest) -> Result<()
     upload_local_tars(app, &mut client, &tars, &release_dir).await?;
     sync_files(app, &mut client, &server, &project).await?;
     emit_log(app, "上传完成");
+    // 部署前钩子(归入步骤 3:装载/拉取前执行,旧容器仍在运行;失败即中止部署)
+    run_hook(app, &mut client, &project, HookKind::Pre, &server.remote_dir).await?;
 
     // ---- 步骤 4:装载 ----
     emit_progress(app, 4, 6, "装载");
@@ -921,47 +1634,61 @@ async fn run_deploy_stack(app: &AppHandle, req: StackDeployRequest) -> Result<()
     // ---- 步骤 5:拉取 ----
     emit_progress(app, 5, 6, "拉取");
     ensure_not_cancelled(app)?;
+    // override 文件名:按 compose 副本目录检测(与 upload_compose_files 上传的
+    // 一致),pull / up 均按同序 -f 传入,保证远端合并结果与本地解析一致
+    let override_names = compose_override_names(&project.compose_file);
     let pull_names: Vec<String> = pull_choices.iter().map(|s| s.service.clone()).collect();
     if pull_names.is_empty() {
         emit_log(app, "无需要服务器拉取的服务,跳过拉取");
     } else {
         let remote_compose = remote_compose_path(&server.remote_dir);
-        let pull_cmd = compose_pull_cmd(&server.remote_dir, &remote_compose, &pull_names);
-        emit_log(
+        let pull_cmd =
+            compose_pull_cmd(&server.remote_dir, &remote_compose, &override_names, &pull_names);
+        emit_log(app, &format!("拉取远端镜像: {}", pull_cmd));
+        // 远端输出末尾并入错误信息:私有仓库认证失败(401/Unauthorized/denied)
+        // 时由 augment_pull_error 追加 docker login 提示
+        exec_forwarded_inner(
             app,
-            &format!(
-                "拉取远端镜像: docker compose -f {} pull {}",
-                remote_compose,
-                pull_names.join(" ")
-            ),
-        );
-        exec_forwarded(app, &mut client, &pull_cmd, STACK_COMPOSE_TIMEOUT_SECS)
-            .await
-            .map_err(|e| {
-                if e == CANCELLED_MSG {
+            &mut client,
+            &pull_cmd,
+            STACK_COMPOSE_TIMEOUT_SECS,
+            PULL_OUTPUT_TAIL_LINES,
+        )
+        .await
+        .map_err(|e| {
+            if e == CANCELLED_MSG {
+                e
+            } else {
+                augment_pull_error(&format!(
+                    "{}(请检查服务器能否出网访问镜像仓库,或在服务分类中把这些服务改为本地传输)",
                     e
-                } else {
-                    format!(
-                        "{}(请检查服务器能否出网访问镜像仓库,或在服务分类中把这些服务改为本地传输)",
-                        e
-                    )
-                }
-            })?;
+                ))
+            }
+        })?;
     }
 
     // ---- 步骤 6:启动 ----
     emit_progress(app, 6, 6, "启动");
     ensure_not_cancelled(app)?;
     let remote_compose = remote_compose_path(&server.remote_dir);
-    let up_cmd = compose_up_cmd(&server.remote_dir, &remote_compose);
-    emit_log(
-        app,
-        &format!(
-            "启动服务: cd {} && docker compose -f {} up -d",
-            server.remote_dir, remote_compose
-        ),
-    );
+    let up_cmd = compose_up_cmd(&server.remote_dir, &remote_compose, &override_names);
+    emit_log(app, &format!("启动服务: {}", up_cmd));
     exec_forwarded(app, &mut client, &up_cmd, STACK_COMPOSE_TIMEOUT_SECS).await?;
+
+    // 健康检查(up 后按预算轮询服务状态;health_wait_secs=0 时跳过)
+    // overrides 与 pull/up 同源,override-only 服务同样进入健康判定
+    health_check(
+        app,
+        &mut client,
+        &project,
+        &server.remote_dir,
+        &remote_compose,
+        &override_names,
+    )
+    .await?;
+
+    // 部署后钩子(健康检查通过后执行;失败仅告警,不影响部署结果)
+    run_hook(app, &mut client, &project, HookKind::Post, &server.remote_dir).await?;
 
     // ---- 收尾:清理旧 releases(仅留最新 5 个,尽力而为,失败仅告警)----
     ensure_not_cancelled(app)?;
@@ -977,16 +1704,28 @@ async fn run_deploy_stack(app: &AppHandle, req: StackDeployRequest) -> Result<()
 
 /// 步骤 2 打包出的本地镜像包集合。
 struct LocalTars {
-    /// `(本地路径, 远端文件名)`,按打包顺序排列
+    /// `(本地路径, 远端文件名)`,按服务顺序排列(与串行打包时的顺序一致)
     files: Vec<(PathBuf, String)>,
     /// Drop 守卫:管线函数返回(成功或失败)时删除全部本地 tar
     _guards: Vec<TempFileGuard>,
 }
 
-/// 步骤 2:把 Local 类镜像逐个导出为 gzip 压缩包(`temp_dir/<uuid>.tar.gz`)。
+/// 步骤 2:把 Local 类镜像并发导出为 gzip 压缩包(`temp_dir/<uuid>.tar.gz`)。
 ///
-/// 先做磁盘预检:全部 Local 镜像大小求和 ×1.5(复用 [`check_export_disk_space`];
-/// 有镜像大小未知则跳过预检并告警)。列表为空(全 Pull)时返回空集合。
+/// 磁盘预检保持打包前一次性(全部 Local 镜像大小求和 ×1.5,复用
+/// [`check_export_disk_space`];有镜像大小未知则跳过预检并告警)。
+/// 列表为空(全 Pull)时返回空集合。
+///
+/// 并发打包:并发度 = [`PACK_CONCURRENCY_CAP`] 与可用并行度的较小值,
+/// 用 `tokio::task::JoinSet` 保活至多 N 个任务、完成一个补位一个
+/// (阻塞型 `save_gzip` 经 [`export_image_silent`] 在 blocking 线程池执行);
+/// 结果按服务顺序回填,`files` 顺序与串行版一致。
+///
+/// 进度与取消:每完成一个镜像 emit 一次 `deploy-log`(“打包完成 (i/n)”)并
+/// 检查一次取消;取消或出错后不再启动新任务,但**已启动的阻塞 `docker save`
+/// 无法中断**,只能等其在途任务自然结束后以“部署已取消”/首个错误中止。
+/// 输出路径的 [`TempFileGuard`] 预先建立,任何返回路径(成功/失败/取消)下
+/// 半成品 tar 都随管线返回统一删除。
 async fn pack_local_images(
     app: &AppHandle,
     local: &[&StackServiceChoice],
@@ -1006,33 +1745,110 @@ async fn pack_local_images(
     }
 
     let n = local.len();
-    let mut files = Vec::with_capacity(n);
-    let mut guards = Vec::with_capacity(n);
-    for (i, svc) in local.iter().enumerate() {
-        ensure_not_cancelled(app)?;
+    // guard 先建:导出失败的半成品文件同样会在管线返回时删除
+    let mut outputs: Vec<(PathBuf, String)> = Vec::with_capacity(n);
+    for _ in 0..n {
         let tar_name = format!("{}.tar.gz", uuid::Uuid::new_v4());
         let out_path = std::env::temp_dir().join(&tar_name);
-        // guard 先建:导出失败的半成品文件同样会在管线返回时删除
-        let guard = TempFileGuard(out_path.clone());
-        emit_log(app, &format!("打包镜像 ({}/{}): {}", i + 1, n, svc.image));
-        let total_bytes = export_image(app, &svc.image, &out_path).await?;
-        emit_log(
-            app,
-            &format!("打包完成: {} (共 {} MB)", svc.image, total_bytes / 1024 / 1024),
-        );
-        guards.push(guard);
-        files.push((out_path, tar_name));
+        outputs.push((out_path, tar_name));
+    }
+    let guards: Vec<TempFileGuard> = outputs.iter().map(|(p, _)| TempFileGuard(p.clone())).collect();
+    let images: Vec<String> = local.iter().map(|s| s.image.clone()).collect();
+
+    let available = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1);
+    let concurrency = PACK_CONCURRENCY_CAP.min(available).max(1);
+    emit_log(
+        app,
+        &format!("并行打包 {} 个本地镜像包(并发 {})", n, concurrency),
+    );
+
+    let mut set: tokio::task::JoinSet<(usize, Result<u64, String>)> = tokio::task::JoinSet::new();
+    // 启动第一批(至多 concurrency 个);此后每完成一个补位一个
+    let mut next = 0usize;
+    while next < n && set.len() < concurrency {
+        set.spawn(spawn_pack_job(next, images[next].clone(), outputs[next].0.clone()));
+        next += 1;
+    }
+
+    let mut first_error: Option<String> = None;
+    let mut cancelled = false;
+    let mut done = 0usize;
+    while let Some(joined) = set.join_next().await {
+        let (idx, res) = match joined {
+            Ok(pair) => pair,
+            // 外层包装任务自身 panic(理论上不可能,防御性兜底)
+            Err(e) => (usize::MAX, Err(format!("打包任务异常终止: {}", e))),
+        };
+        match res {
+            Ok(bytes) => {
+                done += 1;
+                if let Some(name) = images.get(idx) {
+                    emit_log(
+                        app,
+                        &format!(
+                            "打包完成 ({}/{}): {} (共 {} MB)",
+                            done,
+                            n,
+                            name,
+                            bytes / 1024 / 1024
+                        ),
+                    );
+                }
+            }
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+        // 每完成一个检查一次取消;取消/出错后不再启动新任务
+        if is_cancelled(app) {
+            cancelled = true;
+        }
+        if cancelled || first_error.is_some() {
+            continue;
+        }
+        if next < n {
+            set.spawn(spawn_pack_job(next, images[next].clone(), outputs[next].0.clone()));
+            next += 1;
+        }
+    }
+
+    if cancelled {
+        return Err(CANCELLED_MSG.to_string());
+    }
+    if let Some(e) = first_error {
+        return Err(e);
     }
     Ok(LocalTars {
-        files,
+        files: outputs,
         _guards: guards,
     })
 }
 
-/// 步骤 3 子步:上传 compose 副本(及同目录 `.env`,若存在)到远端根目录。
+/// 启动一个静默打包任务:并发导出 `image` 到 `out_path`,返回 `(任务序号, 结果)`。
+/// (外层 async 任务包装保证内层 blocking 任务 panic 也带序号转为 `Err`,
+/// 便于定位失败的是哪个镜像。)
+fn spawn_pack_job(
+    idx: usize,
+    image: String,
+    out_path: PathBuf,
+) -> impl std::future::Future<Output = (usize, Result<u64, String>)> + Send + 'static {
+    async move {
+        let res = export_image_silent(&image, &out_path).await;
+        (idx, res)
+    }
+}
+
+/// 步骤 3 子步:上传 compose 副本(及同目录 `.env`、override 文件,若存在)
+/// 到远端根目录。
 ///
 /// 远端 `docker compose -f` 指向这份副本,服务器上没有它无法启动,
-/// 故先于镜像包上传,失败尽早暴露。`.env` 供服务器端 compose 变量插值。
+/// 故先于镜像包上传,失败尽早暴露。`.env` 供服务器端 compose 变量插值;
+/// override 文件按副本目录 [`find_override_files`] 检测、同名 basename 上传,
+/// 供 pull / up 按同序追加 `-f`(与本地解析合并一致)。
 async fn upload_compose_files(
     app: &AppHandle,
     client: &mut SshClient,
@@ -1049,22 +1865,44 @@ async fn upload_compose_files(
             remote_join(&server.remote_dir, compose_name)
         ),
     );
+    // compose 副本 / .env / override 内容可变且远端同名,不做续传(全新写覆盖)
     client
-        .sftp_upload(&compose_local, &server.remote_dir, compose_name, &|_, _| {})
+        .sftp_upload(&compose_local, &server.remote_dir, compose_name, false, &|_, _| {})
         .await?;
     if let Some(env_path) = compose_local.parent().map(|p| p.join(".env")) {
         if env_path.is_file() {
             emit_log(app, "上传 compose 同目录 .env 文件");
             client
-                .sftp_upload(&env_path, &server.remote_dir, ".env", &|_, _| {})
+                .sftp_upload(&env_path, &server.remote_dir, ".env", false, &|_, _| {})
                 .await?;
         }
+    }
+    for ov_path in find_override_files(compose_local.parent().unwrap_or_else(|| Path::new(""))) {
+        let Some(name) = ov_path.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            continue;
+        };
+        emit_log(
+            app,
+            &format!(
+                "上传 override 文件: {} -> {}",
+                ov_path.display(),
+                remote_join(&server.remote_dir, &name)
+            ),
+        );
+        client
+            .sftp_upload(&ov_path, &server.remote_dir, &name, false, &|_, _| {})
+            .await?;
     }
     Ok(())
 }
 
 /// 步骤 3 子步:逐包上传本地镜像包到远端 releases 目录(进度:包序号 + 字节,
 /// 每 ≥5MB 变化汇报一次)。
+///
+/// 断点续传在「失败后同路径重试一次」时生效:每次部署 attempt 的 releases 目录
+/// 均为新时间戳,attempt 之间无同名文件;同 attempt 内重试时 `sftp_upload(resume=true)`
+/// 经 stat 命中远端半成品 → Resume 分支(重试返回 AlreadyDone = 远端已传 ≥ 本地,
+/// 同样视为该包成功)。
 async fn upload_local_tars(
     app: &AppHandle,
     client: &mut SshClient,
@@ -1083,26 +1921,40 @@ async fn upload_local_tars(
         let idx = i + 1;
         let last = Arc::new(AtomicU64::new(0));
         let last_cb = Arc::clone(&last);
-        client
-            .sftp_upload(path, release_dir, name, &move |sent, total| {
-                if total == 0 {
-                    return;
-                }
-                if sent >= last_cb.load(Ordering::Relaxed) + LOG_PROGRESS_STEP {
-                    last_cb.store(sent, Ordering::Relaxed);
-                    emit_log(
-                        &app_for_cb,
-                        &format!(
-                            "上传镜像包 ({}/{}): {} MB / {} MB",
-                            idx,
-                            n,
-                            sent / 1024 / 1024,
-                            total / 1024 / 1024
-                        ),
-                    );
-                }
-            })
-            .await?;
+        let on_progress = move |sent, total| {
+            if total == 0 {
+                return;
+            }
+            if sent >= last_cb.load(Ordering::Relaxed) + LOG_PROGRESS_STEP {
+                last_cb.store(sent, Ordering::Relaxed);
+                emit_log(
+                    &app_for_cb,
+                    &format!(
+                        "上传镜像包 ({}/{}): {} MB / {} MB",
+                        idx,
+                        n,
+                        sent / 1024 / 1024,
+                        total / 1024 / 1024
+                    ),
+                );
+            }
+        };
+        // 失败后同路径重试一次(见 [`upload_retry_wait`];AlreadyDone 亦视为成功)
+        let first_err = match client
+            .sftp_upload(path, release_dir, name, true, &on_progress)
+            .await
+        {
+            Ok(()) => continue,
+            Err(e) => e,
+        };
+        upload_retry_wait(app).await?;
+        match client
+            .sftp_upload(path, release_dir, name, true, &on_progress)
+            .await
+        {
+            Ok(()) => emit_log(app, &format!("镜像包 {} 断点续传重试成功", name)),
+            Err(e) => return Err(upload_retry_failure_msg(&e, &first_err)),
+        }
     }
     emit_log(app, &format!("镜像包上传完成,共 {} 个", n));
     Ok(())
@@ -1142,6 +1994,16 @@ pub fn group_by_mode(
     (local, pull)
 }
 
+/// 整栈部署历史记录的镜像列表:本地传输且镜像引用非空的服务镜像
+/// (按服务顺序;Pull 类由服务器自拉,引用常为空,不计入)。
+pub fn stack_record_images(services: &[StackServiceChoice]) -> Vec<String> {
+    services
+        .iter()
+        .filter(|s| matches!(s.mode, TransferMode::Local) && !s.image.trim().is_empty())
+        .map(|s| s.image.clone())
+        .collect()
+}
+
 /// 求和一组镜像大小;任一项未知(`None`)或求和溢出则整体返回 `None`
 /// (调用方跳过磁盘预检并告警)。
 pub fn sum_sizes(sizes: &[Option<u64>]) -> Option<u64> {
@@ -1162,6 +2024,17 @@ pub fn remote_compose_path(remote_dir: &str) -> String {
     remote_join(remote_dir, "docker-compose.yml")
 }
 
+/// 检测项目 compose 文件同目录的 override 文件,返回文件名(basename)列表
+/// (按 compose 默认合并顺序;供远端 pull / up 的 `-f` 文件链使用,
+/// 与 [`upload_compose_files`] 上传的 override 文件一致)。
+fn compose_override_names(compose_file: &str) -> Vec<String> {
+    let dir = Path::new(compose_file).parent().unwrap_or_else(|| Path::new(""));
+    find_override_files(dir)
+        .iter()
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        .collect()
+}
+
 /// 拼装 releases 清理命令:按修改时间保留最新 5 个版本目录,其余删除
 /// (`tail -n +6` 从第 6 行起取;`xargs -r` 无输入时不执行 rm)。
 pub fn cleanup_releases_cmd(remote_dir: &str) -> String {
@@ -1171,24 +2044,58 @@ pub fn cleanup_releases_cmd(remote_dir: &str) -> String {
     )
 }
 
-/// 拼装 compose pull 命令;远端路径与服务名逐个单引号包裹防注入。
-pub fn compose_pull_cmd(remote_dir: &str, compose_file: &str, services: &[String]) -> String {
+/// 拼装 compose pull 命令;compose 文件与每个 override 文件(按检测顺序,
+/// 后者覆盖前者)逐个 `-f` 传入,远端路径与服务名逐个单引号包裹防注入。
+pub fn compose_pull_cmd(
+    remote_dir: &str,
+    compose_file: &str,
+    overrides: &[String],
+    services: &[String],
+) -> String {
     let quoted: Vec<String> = services.iter().map(|s| shell_single_quote(s)).collect();
     format!(
-        "cd {} && docker compose -f {} pull {}",
+        "cd {} && docker compose {} pull {}",
         shell_single_quote(remote_dir),
-        shell_single_quote(compose_file),
+        compose_file_flags(compose_file, overrides),
         quoted.join(" ")
     )
 }
 
-/// 拼装 compose up 命令(后台启动全部服务)。
-pub fn compose_up_cmd(remote_dir: &str, compose_file: &str) -> String {
+/// 拼装 compose up 命令(后台启动全部服务;override 文件按序 `-f` 追加)。
+pub fn compose_up_cmd(remote_dir: &str, compose_file: &str, overrides: &[String]) -> String {
     format!(
-        "cd {} && docker compose -f {} up -d",
+        "cd {} && docker compose {} up -d",
         shell_single_quote(remote_dir),
-        shell_single_quote(compose_file)
+        compose_file_flags(compose_file, overrides)
     )
+}
+
+/// 拼装 `-f <base> -f <override>...` 片段(compose 按顺序合并,后者覆盖前者);
+/// 文件路径逐个单引号包裹防注入。
+fn compose_file_flags(compose_file: &str, overrides: &[String]) -> String {
+    let mut flags = vec![format!("-f {}", shell_single_quote(compose_file))];
+    flags.extend(
+        overrides
+            .iter()
+            .map(|o| format!("-f {}", shell_single_quote(o))),
+    );
+    flags.join(" ")
+}
+
+/// pull 失败错误增强(纯函数):错误信息(含并入的远端输出末尾,见
+/// [`PULL_OUTPUT_TAIL_LINES`])含 `401` / `Unauthorized` / `denied`
+/// (不区分大小写)时,判定为私有仓库认证问题,在错误后追加服务器
+/// docker login 提示;其余错误原样返回。
+pub fn augment_pull_error(err: &str) -> String {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("401") || lower.contains("unauthorized") || lower.contains("denied") {
+        format!(
+            "{};检测到私有仓库认证问题,请先在服务器上 docker login 对应 registry",
+            err
+        )
+    } else {
+        err.to_string()
+    }
 }
 
 /// 组装 `docker tag` 指针移动命令:让 target 引用与 source 引用指向同一镜像。
@@ -1199,6 +2106,485 @@ pub fn docker_tag_cmd(source: &str, target: &str) -> String {
         shell_single_quote(source),
         shell_single_quote(target)
     )
+}
+
+// ===== 整栈部署预览(dry-run,Task 6,独立功能不接入部署流程)=====
+
+/// 部署预览的单服务条目;`action` 为分类结果字符串:
+/// `"Recreate"`(重建)/`"Create"`(新建)/`"Unchanged"`(不变)/
+/// `"Pull"`(服务器拉取)/`"Absent"`(缺失)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StackPreviewEntry {
+    pub service: String,
+    /// compose 里的镜像引用(未设置 image 的服务不产生条目)
+    pub image: String,
+    /// 传输方式(与部署分类一致,已应用 service_overrides)
+    pub mode: TransferMode,
+    pub action: String,
+}
+
+/// 整栈部署预览结果(纯只读,不落盘、不改远端状态);`errors` 为非阻断问题
+/// (compose 副本缺失/解析失败、服务未设 image 等)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StackPreview {
+    pub entries: Vec<StackPreviewEntry>,
+    pub errors: Vec<String>,
+}
+
+/// 整栈部署 dry-run 预览:建连后对比「本地 compose 解析结果」与「远端实际状态」,
+/// 逐服务分类为 重建/新建/不变/拉取/缺失(见 [`classify_change`])。
+///
+/// - 本地 `docker images`(含 ID)一次取回,既供 compose 三级匹配,也供镜像
+///   ID 与远端对比;compose 副本按 [`parse_compose_file`] 解析并应用
+///   service_overrides;
+/// - 远端 `docker images` 收集 (repo:tag → 镜像 ID);远端 `docker ps -a`
+///   (按 compose project 标签 = remote_dir 基名过滤)收集各服务现存容器镜像;
+/// - compose 副本缺失/解析失败、服务未设 image 等 → 记入 `errors`(空 entries
+///   照常返回);连接/远端查询失败 → `Err`。
+#[tauri::command]
+pub async fn preview_stack_changes(
+    server_id: String,
+    project_id: String,
+    password_plain: Option<String>,
+) -> Result<StackPreview, String> {
+    let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    let project = find_project(&cfg, &project_id)?.clone();
+
+    // compose 副本检查前置:副本缺失直接以 errors 返回,避免无谓建连
+    let mut errors: Vec<String> = Vec::new();
+    if project.compose_file.trim().is_empty() {
+        errors.push(format!(
+            "项目「{}」未配置 compose 文件,无法预览",
+            project.name
+        ));
+        return Ok(StackPreview {
+            entries: Vec::new(),
+            errors,
+        });
+    }
+    let compose_path = PathBuf::from(&project.compose_file);
+    if !compose_path.is_file() {
+        errors.push(format!("compose 文件不存在:{}", project.compose_file));
+        return Ok(StackPreview {
+            entries: Vec::new(),
+            errors,
+        });
+    }
+
+    let (server, mut client) = connect_server(&server_id, password_plain.as_deref()).await?;
+
+    // 本地镜像列表(docker images,含 ID):一次取回,既供 compose 三级匹配,
+    // 也供镜像 ID 与远端对比
+    let local_images = tauri::async_runtime::spawn_blocking(crate::docker::list_images)
+        .await
+        .map_err(|e| format!("获取镜像列表任务失败: {}", e))??;
+    let pairs: Vec<(String, String)> = local_images
+        .iter()
+        .map(|i| (i.repository.clone(), i.tag.clone()))
+        .collect();
+    let mut stack = match parse_compose_file(&compose_path, &pairs) {
+        Ok(s) => s,
+        Err(e) => return Ok(StackPreview { entries: Vec::new(), errors: vec![e] }),
+    };
+    apply_overrides(&mut stack.services, &project.service_overrides);
+    errors.extend(stack.errors);
+
+    // 远端镜像列表(repo:tag → 镜像 ID)
+    let (code, out) = with_timeout(
+        SSH_EXEC_TIMEOUT_SECS,
+        "查询远端镜像超时",
+        "请检查服务器网络后重试",
+        exec_collect(&mut client, REMOTE_IMAGES_CMD),
+    )
+    .await?;
+    if code != 0 {
+        return Err(format!(
+            "查询远端镜像列表失败(退出码 {}),请确认服务器 Docker 可用",
+            code
+        ));
+    }
+    let remote_images = parse_image_lines(&out);
+
+    // 远端 compose 项目现存容器(按 project 标签过滤,项目名 = remote_dir 基名)
+    let (code, out) = with_timeout(
+        SSH_EXEC_TIMEOUT_SECS,
+        "查询远端容器超时",
+        "请检查服务器网络后重试",
+        exec_collect(&mut client, &compose_containers_cmd(&server.remote_dir)),
+    )
+    .await?;
+    if code != 0 {
+        return Err(format!(
+            "查询远端容器列表失败(退出码 {}),请确认服务器 Docker 可用",
+            code
+        ));
+    }
+    let containers = parse_container_lines(&out);
+
+    // 逐服务分类
+    let mut entries = Vec::with_capacity(stack.services.len());
+    for svc in &stack.services {
+        let Some(image) = svc.image.as_deref() else {
+            errors.push(format!(
+                "服务「{}」未设置 image 字段,无法预览变更",
+                svc.service
+            ));
+            continue;
+        };
+        let (repo, tag) = split_image_ref(image);
+        let local_info = local_images
+            .iter()
+            .find(|i| i.repository == repo && i.tag == tag);
+        let remote_id = remote_images
+            .iter()
+            .find(|i| i.repository == repo && i.tag == tag)
+            .map(|i| i.id.as_str());
+        let action = classify_change(
+            &svc.mode,
+            local_info.is_some(),
+            remote_id,
+            local_info.map(|i| i.id.as_str()),
+            containers.get(&svc.service).map(String::as_str),
+        );
+        entries.push(StackPreviewEntry {
+            service: svc.service.clone(),
+            image: image.to_string(),
+            mode: svc.mode.clone(),
+            action: action.to_string(),
+        });
+    }
+    Ok(StackPreview { entries, errors })
+}
+
+/// 部署变更分类(纯函数,预览核心逻辑)。
+///
+/// 口径:`remote_image_id` / `local_image_id` 均取自 `docker images
+/// --format '{{json .}}'` 的 ID 字段(本地/远端同一命令,口径一致),
+/// 比较前剥除 `sha256:` 前缀并忽略大小写(见 [`same_image_id`])。
+///
+/// - Pull → `"Pull"`(服务器自拉,不对比本地);
+/// - Local 且本地不存在该 repo:tag → `"Absent"`;
+/// - 远端无该 repo:tag 的镜像 → 远端已有容器(旧版在跑)`"Recreate"`,
+///   否则 `"Create"`;
+/// - 远端镜像 ID 与本地一致 → `"Unchanged"`;
+/// - ID 不同 → `"Recreate"`(镜像已更新,up 时会重建容器)。
+pub fn classify_change(
+    mode: &TransferMode,
+    local_exists: bool,
+    remote_image_id: Option<&str>,
+    local_image_id: Option<&str>,
+    remote_container_image: Option<&str>,
+) -> &'static str {
+    if matches!(mode, TransferMode::Pull) {
+        return "Pull";
+    }
+    if !local_exists {
+        return "Absent";
+    }
+    match (remote_image_id, local_image_id) {
+        (Some(r), Some(l)) if same_image_id(r, l) => "Unchanged",
+        (Some(_), Some(_)) => "Recreate",
+        // 远端无该镜像:已有容器(旧版在跑)→ 重建,否则全新创建
+        _ => {
+            if remote_container_image.is_some() {
+                "Recreate"
+            } else {
+                "Create"
+            }
+        }
+    }
+}
+
+/// 镜像 ID 等价判定(纯函数):剥除 `sha256:` 前缀、忽略大小写后比较,
+/// 容忍不同 docker 版本的输出差异;任一为空视为不等。
+fn same_image_id(a: &str, b: &str) -> bool {
+    fn norm(id: &str) -> &str {
+        let id = id.trim();
+        id.strip_prefix("sha256:").unwrap_or(id)
+    }
+    let (a, b) = (norm(a), norm(b));
+    !a.is_empty() && !b.is_empty() && a.eq_ignore_ascii_case(b)
+}
+
+/// 取远端目录的基名(去尾部 `/` 后取最后一个 `/` 之后的部分;
+/// 根目录/空串 → 空串)。远端 compose 部署的项目名 = 该基名。
+fn remote_dir_basename(remote_dir: &str) -> &str {
+    let trimmed = remote_dir.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(i) => &trimmed[i + 1..],
+        None => trimmed,
+    }
+}
+
+/// 拼装查询远端 compose 项目现存容器的命令:`docker ps -a` 按
+/// `com.docker.compose.project` 标签过滤(项目名 = remote_dir 基名,含已退出
+/// 容器),JSON 输出每容器一行;`--filter` 参数整体单引号包裹防注入。
+fn compose_containers_cmd(remote_dir: &str) -> String {
+    format!(
+        "docker ps -a --filter {} --format '{{{{json .}}}}'",
+        shell_single_quote(&format!(
+            "label=com.docker.compose.project={}",
+            remote_dir_basename(remote_dir)
+        ))
+    )
+}
+
+/// 逐行解析 `docker images --format {{json .}}` 输出为镜像信息
+/// (解析失败的行告警跳过,不让整条查询失败)。
+fn parse_image_lines(out: &str) -> Vec<ImageInfo> {
+    let mut images = Vec::new();
+    for line in out.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match crate::docker::parse_image_line(line) {
+            Ok(info) => images.push(info),
+            Err(e) => log::warn!("跳过无法解析的远端镜像行: {}", e),
+        }
+    }
+    images
+}
+
+/// 解析 `docker ps --format {{json .}}` 输出为 (compose 服务名 → 容器镜像引用)
+/// 映射(同一服务多容器时后者覆盖;无 compose 服务标签的容器跳过)。
+fn parse_container_lines(out: &str) -> HashMap<String, String> {
+    let mut containers = HashMap::new();
+    for line in out.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match parse_container_line(line) {
+            Some((service, image)) => {
+                containers.insert(service, image);
+            }
+            None => log::warn!("跳过无法解析的远端容器行(缺 compose 服务标签或字段异常)"),
+        }
+    }
+    containers
+}
+
+/// 从 `docker ps --format {{json .}}` 的一行 JSON 提取
+/// `(compose 服务名, 容器镜像引用)`(纯函数,便于单测)。
+///
+/// 服务名取 Labels(`docker ps` 输出为逗号分隔的 `key=value` 字符串)里的
+/// `com.docker.compose.service`;手动 `docker run` 的容器没有该标签 → `None`。
+fn parse_container_line(line: &str) -> Option<(String, String)> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let labels = v.get("Labels")?.as_str()?;
+    let service = labels
+        .split(',')
+        .find_map(|kv| kv.trim().strip_prefix("com.docker.compose.service="))?
+        .trim()
+        .to_string();
+    if service.is_empty() {
+        return None;
+    }
+    let image = v.get("Image")?.as_str()?.to_string();
+    Some((service, image))
+}
+
+// ===== 钩子/健康检查纯逻辑(便于单测,Task 3)=====
+
+/// 拼装钩子命令:`cd '<remote_dir>' && ( <cmd> )`。
+///
+/// `cmd` 是用户在项目配置里自己填写的**可信复合命令**(可含 `&&`/`;`/重定向/
+/// 管道等),原样拼入、不加引号 —— 相当于用户在本机执行自定义脚本,`cmd`
+/// 内容不是防注入边界;`remote_dir` 是程序拼装的路径,单引号转义防注入。
+pub fn hook_cmd(remote_dir: &str, cmd: &str) -> String {
+    format!("cd {} && ( {} )", shell_single_quote(remote_dir), cmd)
+}
+
+/// 拼装查询 compose 服务状态的命令(`--all` 含已退出/未启动容器,每容器一行
+/// JSON,含 Service/State/Health/ExitCode)。
+///
+/// 必须带 `--all`:默认的 `docker compose ps` 只列 running 容器,"启动即退出
+/// 且其余服务健康"的多服务栈会因故障服务缺席而被误判通过。
+/// `overrides` 按检测顺序逐个追加 `-f`(与 pull/up 同序合并),否则只存在于
+/// override 中的服务不会出现在 ps 输出、完全逃逸健康判定。
+pub fn compose_ps_json_cmd(remote_dir: &str, compose_file: &str, overrides: &[String]) -> String {
+    format!(
+        "cd {} && docker compose {} ps --all --format json",
+        shell_single_quote(remote_dir),
+        compose_file_flags(compose_file, overrides)
+    )
+}
+
+/// 拼装查看 compose 各服务最近日志的命令(最后 50 行;overrides 同 ps 口径)。
+pub fn compose_logs_cmd(remote_dir: &str, compose_file: &str, overrides: &[String]) -> String {
+    format!(
+        "cd {} && docker compose {} logs --tail 50",
+        shell_single_quote(remote_dir),
+        compose_file_flags(compose_file, overrides)
+    )
+}
+
+/// 单轮健康检查判定结果(见 [`health_verdict`])。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HealthVerdict {
+    /// 全部服务 running 且健康检查通过(或无 healthcheck)
+    Pass,
+    /// 任一服务进入失败终态(Restarting/Dead,或 Exited 且退出码非零/缺失),
+    /// 立即中止
+    Unhealthy { service: String, state: String },
+    /// 尚无法判定(解析失败、服务仍在启动/健康检查进行中、一次性服务已正常
+    /// 退出等),继续轮询;`pending` 携带最近观察到的未就绪服务与展示状态,
+    /// 供预算耗尽时报错展示;`exited_zero` 表示该服务"已退出(退出码 0)"
+    /// (典型为一次性初始化服务,预算耗尽的报错需据此提示关闭健康检查)。
+    Indeterminate {
+        pending: Option<(String, String)>,
+        exited_zero: bool,
+    },
+}
+
+/// 对 `docker compose ps --all --format json` 的输出行做单轮健康判定(纯函数)。
+///
+/// - 逐行解析 JSON(容忍旧版 compose 一次性输出 JSON 数组;非 JSON 行忽略);
+///   解析不出任何服务记录 → `Indeterminate`;
+/// - restarting/dead → 立即 `Unhealthy{ service, state }`;
+/// - exited:按 `ExitCode` 区分(存在版本差异)——非零 → 立即 `Unhealthy`
+///   (state 展示 "exited(非零退出)");`0` → 一次性服务正常退出,不算失败,
+///   归入 `Indeterminate`(`pending` 展示 "已退出(退出码 0)" 且 `exited_zero`
+///   为 true,预算耗尽时由调用方附加一次性服务提示);`ExitCode` 字段缺失 →
+///   保守按 `Unhealthy`(宁误报不漏报);
+/// - 全部服务 state=="running" 且(无 Health 字段/为空 或 "healthy")→ `Pass`;
+/// - 其余(服务仍在启动、health 为 starting/unhealthy 等)→ `Indeterminate`,
+///   `pending` 取第一个未就绪服务(有 Health 且非 healthy 时展示 Health,
+///   否则展示容器 state)。
+pub fn health_verdict(lines: &[&str]) -> HealthVerdict {
+    // 收集解析出的记录
+    let mut entries: Vec<PsEntry> = Vec::new();
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(line) {
+            // 旧版 compose 一次性输出 JSON 数组
+            Ok(serde_json::Value::Array(items)) => {
+                for item in &items {
+                    if let Some(e) = parse_ps_entry(item) {
+                        entries.push(e);
+                    }
+                }
+            }
+            Ok(v) => {
+                if let Some(e) = parse_ps_entry(&v) {
+                    entries.push(e);
+                }
+            }
+            // 非 JSON 行(警告、日志前缀等)忽略
+            Err(_) => {}
+        }
+    }
+    if entries.is_empty() {
+        return HealthVerdict::Indeterminate {
+            pending: None,
+            exited_zero: false,
+        };
+    }
+    // 失败终态:立即失败(取先出现者);exited 需结合 ExitCode 区分一次性服务
+    for e in &entries {
+        match e.state.to_ascii_lowercase().as_str() {
+            "restarting" | "dead" => {
+                return HealthVerdict::Unhealthy {
+                    service: e.service.clone(),
+                    state: e.state.clone(),
+                };
+            }
+            "exited" => match e.exit_code {
+                // 一次性服务正常退出:不算失败,进入下方 pending 逻辑
+                Some(0) => {}
+                Some(_) => {
+                    return HealthVerdict::Unhealthy {
+                        service: e.service.clone(),
+                        state: "exited(非零退出)".to_string(),
+                    };
+                }
+                // ExitCode 字段缺失(版本差异)→ 保守按失败(宁误报不漏报)
+                None => {
+                    return HealthVerdict::Unhealthy {
+                        service: e.service.clone(),
+                        state: e.state.clone(),
+                    };
+                }
+            },
+            _ => {}
+        }
+    }
+    // 逐服务判定 running + 健康
+    let mut pending: Option<(String, String)> = None;
+    let mut exited_zero = false;
+    for e in &entries {
+        let state_ok = e.state.eq_ignore_ascii_case("running");
+        let health_ok = match e.health.as_deref() {
+            None => true, // 无 healthcheck(或输出为空)
+            Some(h) => h.eq_ignore_ascii_case("healthy"),
+        };
+        if state_ok && health_ok {
+            continue;
+        }
+        if pending.is_none() {
+            // 已退出(退出码 0)的服务永不满足"全部 running",展示专用状态,
+            // 预算耗尽时调用方据此附加一次性服务提示
+            let is_exited_zero =
+                e.state.eq_ignore_ascii_case("exited") && e.exit_code == Some(0);
+            let shown = if is_exited_zero {
+                "已退出(退出码 0)".to_string()
+            } else {
+                // 展示口径:健康检查未通过时优先展示 Health(如 starting/unhealthy),
+                // 否则展示容器状态(如 created/paused)
+                e.health.clone().unwrap_or_else(|| e.state.clone())
+            };
+            pending = Some((e.service.clone(), shown));
+            exited_zero = is_exited_zero;
+        }
+    }
+    match pending {
+        None => HealthVerdict::Pass,
+        Some(p) => HealthVerdict::Indeterminate {
+            pending: Some(p),
+            exited_zero,
+        },
+    }
+}
+
+/// 单条 `compose ps --format json` 记录的解析结果。
+struct PsEntry {
+    service: String,
+    state: String,
+    health: Option<String>,
+    exit_code: Option<i64>,
+}
+
+/// 从单条 `compose ps --format json` 记录提取服务信息。
+///
+/// 服务名优先 `Service` 字段,缺失时回退容器 `Name`;State 缺失视为无效记录;
+/// Health 兼容三种形态:缺失/`null`/空串 → `None`(视为无 healthcheck)、
+/// 字符串原样、嵌套对象取其 `Status` 字段;ExitCode 非整数/缺失 → `None`
+/// (调用方对 exited 保守判失败)。
+fn parse_ps_entry(v: &serde_json::Value) -> Option<PsEntry> {
+    let state = v.get("State")?.as_str()?.to_string();
+    let service = v
+        .get("Service")
+        .and_then(|s| s.as_str())
+        .or_else(|| v.get("Name").and_then(|s| s.as_str()))
+        .unwrap_or("<unknown>")
+        .to_string();
+    let health = match v.get("Health") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) if s.is_empty() => None,
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(other) => other.get("Status").and_then(|s| s.as_str()).map(String::from),
+    };
+    let exit_code = v.get("ExitCode").and_then(|c| c.as_i64());
+    Some(PsEntry {
+        service,
+        state,
+        health,
+        exit_code,
+    })
 }
 
 // ===== 管线辅助 =====
@@ -1534,6 +2920,56 @@ mod tests {
         assert!(!dir.join("config").join("stacks").exists(), "解析失败不应创建栈目录");
     }
 
+    #[test]
+    fn test_import_compose_copies_override_files() {
+        let _guard = crate::config::TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ddtest-import-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
+
+        // 源 compose + 同目录 override(合并后 web 的 image 以 override 为准)
+        let src_dir = dir.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let source = src_dir.join("docker-compose.yml");
+        std::fs::write(
+            &source,
+            "name: demo\nservices:\n  web:\n    build: ./web\n    image: myapp:1\n  db:\n    image: postgres:16\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src_dir.join("compose.override.yaml"),
+            "services:\n  web:\n    image: myapp:2\n",
+        )
+        .unwrap();
+        // 非 override 命名的文件不应被复制
+        std::fs::write(src_dir.join("other.yaml"), "services: {}\n").unwrap();
+
+        let project =
+            import_compose(source.to_string_lossy().to_string(), "override 栈".into()).unwrap();
+        let copy_dir = PathBuf::from(&project.compose_file)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+
+        // override 副本同名落在 stacks/<uuid>/ 下
+        assert!(
+            copy_dir.join("compose.override.yaml").is_file(),
+            "override 副本应存在: {}",
+            copy_dir.display()
+        );
+        assert!(
+            !copy_dir.join("other.yaml").exists(),
+            "非 override 文件不应被复制"
+        );
+        // 解析时已合并 override:web 的 image 以 override 为准(build 保留 → Local)
+        let web = project.service_overrides.iter().find(|o| o.service == "web").unwrap();
+        assert_eq!(web.mode, TransferMode::Local);
+        let db = project.service_overrides.iter().find(|o| o.service == "db").unwrap();
+        assert_eq!(db.mode, TransferMode::Pull);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // ===== 整栈部署:请求反序列化(前端契约,snake_case)=====
 
     /// 构造服务分类项的便捷函数。
@@ -1621,6 +3057,23 @@ mod tests {
     }
 
     #[test]
+    fn test_stack_record_images() {
+        // 仅登记本地传输且镜像非空的服务,按服务顺序
+        let services = vec![
+            choice("web", "myapp:1", TransferMode::Local),
+            choice("db", "", TransferMode::Pull),
+            choice("cache", "redis:7", TransferMode::Local),
+            choice("worker", "   ", TransferMode::Local),
+        ];
+        assert_eq!(
+            stack_record_images(&services),
+            vec!["myapp:1".to_string(), "redis:7".to_string()]
+        );
+        // 全 Pull → 空列表
+        assert!(stack_record_images(&[choice("db", "", TransferMode::Pull)]).is_empty());
+    }
+
+    #[test]
     fn test_sum_sizes() {
         assert_eq!(sum_sizes(&[]), Some(0));
         assert_eq!(sum_sizes(&[Some(1), Some(2)]), Some(3));
@@ -1661,9 +3114,20 @@ mod tests {
             compose_pull_cmd(
                 "/opt/app",
                 "/opt/app/docker-compose.yml",
+                &[],
                 &["web".to_string(), "db".to_string()]
             ),
             "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' pull 'web' 'db'"
+        );
+        // 有 override:按检测顺序追加 -f(compose 后者覆盖前者)
+        assert_eq!(
+            compose_pull_cmd(
+                "/opt/app",
+                "/opt/app/docker-compose.yml",
+                &["compose.override.yaml".to_string(), "docker-compose.override.yml".to_string()],
+                &["web".to_string()]
+            ),
+            "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' -f 'compose.override.yaml' -f 'docker-compose.override.yml' pull 'web'"
         );
     }
 
@@ -1674,9 +3138,20 @@ mod tests {
             compose_pull_cmd(
                 "/opt/app",
                 "/opt/app/docker-compose.yml",
+                &[],
                 &["a'; rm -rf /".to_string()]
             ),
             "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' pull 'a'\\''; rm -rf /'"
+        );
+        // override 文件名同样转义
+        assert_eq!(
+            compose_pull_cmd(
+                "/opt/app",
+                "/opt/app/docker-compose.yml",
+                &["o'.yaml".to_string()],
+                &["web".to_string()]
+            ),
+            "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' -f 'o'\\''.yaml' pull 'web'"
         );
     }
 
@@ -1685,9 +3160,44 @@ mod tests {
     #[test]
     fn test_compose_up_cmd() {
         assert_eq!(
-            compose_up_cmd("/opt/app", "/opt/app/docker-compose.yml"),
+            compose_up_cmd("/opt/app", "/opt/app/docker-compose.yml", &[]),
             "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' up -d"
         );
+        assert_eq!(
+            compose_up_cmd(
+                "/opt/app",
+                "/opt/app/docker-compose.yml",
+                &["compose.override.yaml".to_string()]
+            ),
+            "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' -f 'compose.override.yaml' up -d"
+        );
+    }
+
+    // ===== Task 5:augment_pull_error 私有仓库认证提示 =====
+
+    #[test]
+    fn test_augment_pull_error_auth_variants() {
+        for fragment in [
+            "unauthorized: authentication required",
+            "HTTP 401 Unauthorized",
+            "denied: requested access to the resource is denied",
+            "_ERROR: PERMISSION DENIED_",
+        ] {
+            let err = format!("远端命令执行失败(退出码 1): pull ({})", fragment);
+            let msg = augment_pull_error(&err);
+            assert!(
+                msg.contains("检测到私有仓库认证问题,请先在服务器上 docker login 对应 registry"),
+                "应追加登录提示: {}", msg
+            );
+            assert!(msg.starts_with(&err), "原错误应保留在前: {}", msg);
+        }
+    }
+
+    #[test]
+    fn test_augment_pull_error_other_failure_unchanged() {
+        let err = "远端命令执行失败(退出码 1): pull (no such host)";
+        assert_eq!(augment_pull_error(err), err);
+        assert_eq!(augment_pull_error(""), "");
     }
 
     // ===== 收尾:cleanup_releases_cmd =====
@@ -1724,5 +3234,535 @@ mod tests {
             docker_tag_cmd("my'app:20260829", "my'app:latest"),
             "docker tag 'my'\\''app:20260829' 'my'\\''app:latest'"
         );
+    }
+
+    // ===== Task 2:远端磁盘预检命令拼装 =====
+
+    #[test]
+    fn test_docker_root_cmd() {
+        assert_eq!(docker_root_cmd(), "docker info -f '{{.DockerRootDir}}'");
+    }
+
+    #[test]
+    fn test_df_free_gb_cmd() {
+        assert_eq!(
+            df_free_gb_cmd("/var/lib/docker"),
+            "df -PBG '/var/lib/docker' | tail -1 | awk '{print $4}'"
+        );
+    }
+
+    #[test]
+    fn test_df_free_gb_cmd_escapes_quote() {
+        // 路径内嵌单引号被 '\'' 转义,无法逃出引号注入额外命令
+        assert_eq!(
+            df_free_gb_cmd("/var/li'b"),
+            "df -PBG '/var/li'\\''b' | tail -1 | awk '{print $4}'"
+        );
+    }
+
+    #[test]
+    fn test_parse_df_gb() {
+        assert_eq!(parse_df_gb("30G\n"), Some(30.0));
+        assert_eq!(parse_df_gb("  12 "), Some(12.0));
+        assert_eq!(parse_df_gb("0.5"), Some(0.5));
+        // 空输出 / 非数字(BusyBox 等口径不一致)→ None,调用方跳过预检
+        assert_eq!(parse_df_gb(""), None);
+        assert_eq!(parse_df_gb("   \n"), None);
+        assert_eq!(parse_df_gb("N/A"), None);
+    }
+
+    // ===== Task 2:precheck_remote_disk 判定(Ok / None 跳过 / 不足)=====
+
+    #[test]
+    fn test_precheck_remote_disk_ok() {
+        assert!(precheck_remote_disk(Some(20.0), 15 * 1024 * 1024 * 1024).is_ok());
+        // 恰好等于需求(边界)也通过
+        assert!(precheck_remote_disk(Some(15.0), 15 * 1024 * 1024 * 1024).is_ok());
+        // 需求为 0(如全 Pull)恒通过
+        assert!(precheck_remote_disk(Some(0.0), 0).is_ok());
+    }
+
+    #[test]
+    fn test_precheck_remote_disk_none_skips() {
+        // 无法获取剩余空间 → 跳过预检(告警由调用方负责)
+        assert!(precheck_remote_disk(None, u64::MAX).is_ok());
+    }
+
+    #[test]
+    fn test_precheck_remote_disk_insufficient() {
+        let err = precheck_remote_disk(Some(10.0), 15 * 1024 * 1024 * 1024).unwrap_err();
+        assert!(err.contains("磁盘剩余空间不足"), "实际: {}", err);
+        assert!(err.contains("15.0"), "错误应含所需 GB: {}", err);
+        assert!(err.contains("10.0"), "错误应含实际 GB: {}", err);
+        assert!(err.contains("清理服务器磁盘"), "实际: {}", err);
+    }
+
+    // ===== Task 2:prune_cmd =====
+
+    #[test]
+    fn test_prune_cmd() {
+        assert_eq!(
+            prune_cmd(),
+            "docker image prune -f; docker container prune -f"
+        );
+    }
+
+    // ===== Task 4 修复轮:镜像包上传失败后同路径重试一次 =====
+
+    #[test]
+    fn test_upload_retry_failure_msg_keeps_both_errors() {
+        // 重试失败时报错应同时携带两次失败信息,便于对照断点与失败原因
+        let msg = upload_retry_failure_msg("SFTP 写入远端文件失败 (…)", "SSH 连接失败");
+        assert!(msg.contains("重试仍失败"), "实际: {}", msg);
+        assert!(msg.contains("SFTP 写入远端文件失败"), "应含重试错误: {}", msg);
+        assert!(msg.contains("首次失败:SSH 连接失败"), "应含首次错误: {}", msg);
+    }
+
+    // ===== Task 3:钩子命令拼装 =====
+
+    #[test]
+    fn test_hook_cmd() {
+        assert_eq!(
+            hook_cmd("/opt/app", "docker image prune -f"),
+            "cd '/opt/app' && ( docker image prune -f )"
+        );
+    }
+
+    #[test]
+    fn test_hook_cmd_escapes_remote_dir_quote() {
+        // remote_dir 单引号转义;钩子命令是用户配置的可信复合命令,原样拼入
+        // (支持 && / ; / 重定向,不整体加引号 —— 非防注入边界,见 hook_cmd 文档)
+        assert_eq!(
+            hook_cmd("/op't", "a && b; c > /tmp/log"),
+            "cd '/op'\\''t' && ( a && b; c > /tmp/log )"
+        );
+    }
+
+    // ===== Task 3:compose ps / logs 命令拼装 =====
+
+    #[test]
+    fn test_compose_ps_json_cmd() {
+        assert_eq!(
+            compose_ps_json_cmd("/opt/app", "/opt/app/docker-compose.yml", &[]),
+            "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' ps --all --format json"
+        );
+        // override 与 pull/up 同序追加 -f:override-only 服务也进入健康判定
+        assert_eq!(
+            compose_ps_json_cmd(
+                "/opt/app",
+                "/opt/app/docker-compose.yml",
+                &["compose.override.yaml".to_string()]
+            ),
+            "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' -f 'compose.override.yaml' ps --all --format json"
+        );
+    }
+
+    #[test]
+    fn test_compose_ps_json_cmd_escapes_quote() {
+        // 路径内嵌单引号被 '\'' 转义,无法逃出引号注入额外命令
+        assert_eq!(
+            compose_ps_json_cmd("/opt/app", "/op't.yml", &[]),
+            "cd '/opt/app' && docker compose -f '/op'\\''t.yml' ps --all --format json"
+        );
+    }
+
+    #[test]
+    fn test_compose_logs_cmd() {
+        assert_eq!(
+            compose_logs_cmd("/opt/app", "./docker-compose.yml", &[]),
+            "cd '/opt/app' && docker compose -f './docker-compose.yml' logs --tail 50"
+        );
+        assert_eq!(
+            compose_logs_cmd(
+                "/opt/app",
+                "./docker-compose.yml",
+                &["compose.override.yml".to_string()]
+            ),
+            "cd '/opt/app' && docker compose -f './docker-compose.yml' -f 'compose.override.yml' logs --tail 50"
+        );
+    }
+
+    // ===== Task 3:health_verdict 判定 =====
+
+    /// 构造一行 `compose ps --format json` 输出
+    /// (health/exit_code 传 None 表示不带该字段)。
+    fn ps_line(service: &str, state: &str, health: Option<&str>, exit_code: Option<i64>) -> String {
+        let mut json = format!(r#"{{"Service":"{}","State":"{}""#, service, state);
+        if let Some(h) = health {
+            json.push_str(&format!(r#","Health":"{}""#, h));
+        }
+        if let Some(c) = exit_code {
+            json.push_str(&format!(r#","ExitCode":{}"#, c));
+        }
+        json.push('}');
+        json
+    }
+
+    /// String 行列表转 `&str` 切片(临时 String 需先绑定再借用)。
+    fn as_lines(raw: &[String]) -> Vec<&str> {
+        raw.iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn test_health_verdict_all_running_pass() {
+        let raw = vec![
+            ps_line("web", "running", None, None),
+            ps_line("db", "running", Some(""), None),
+            ps_line("cache", "running", Some("healthy"), Some(0)),
+        ];
+        assert_eq!(health_verdict(&as_lines(&raw)), HealthVerdict::Pass);
+    }
+
+    #[test]
+    fn test_health_verdict_exited_fails_fast() {
+        // exited 且无 ExitCode 字段(版本差异)→ 保守按失败(宁误报不漏报)
+        let raw = vec![
+            ps_line("web", "running", None, None),
+            ps_line("db", "exited", None, None),
+        ];
+        assert_eq!(
+            health_verdict(&as_lines(&raw)),
+            HealthVerdict::Unhealthy {
+                service: "db".to_string(),
+                state: "exited".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_health_verdict_exited_nonzero_exit_code_unhealthy() {
+        // exited 且 ExitCode≠0 → 立即失败,状态注明"非零退出"
+        let raw = vec![
+            ps_line("web", "running", None, None),
+            ps_line("db", "exited", None, Some(1)),
+        ];
+        assert_eq!(
+            health_verdict(&as_lines(&raw)),
+            HealthVerdict::Unhealthy {
+                service: "db".to_string(),
+                state: "exited(非零退出)".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_health_verdict_exited_zero_exit_code_pending() {
+        // exited 且 ExitCode==0(一次性服务正常退出)→ 不算失败,继续轮询,
+        // pending 展示"已退出(退出码 0)"并置 exited_zero(预算耗尽时报错
+        // 据此提示关闭健康检查)
+        let raw = vec![
+            ps_line("web", "running", None, None),
+            ps_line("job", "exited", None, Some(0)),
+        ];
+        assert_eq!(
+            health_verdict(&as_lines(&raw)),
+            HealthVerdict::Indeterminate {
+                pending: Some(("job".to_string(), "已退出(退出码 0)".to_string())),
+                exited_zero: true
+            }
+        );
+    }
+
+    #[test]
+    fn test_health_verdict_exited_missing_exit_code_unhealthy() {
+        // 仅 exited 容器且无 ExitCode 字段 → 保守按失败
+        let raw = vec![ps_line("db", "exited", Some(""), None)];
+        assert_eq!(
+            health_verdict(&as_lines(&raw)),
+            HealthVerdict::Unhealthy {
+                service: "db".to_string(),
+                state: "exited".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_health_verdict_restarting_and_dead_fail_fast() {
+        for state in ["restarting", "dead"] {
+            let raw = vec![ps_line("db", state, None, None)];
+            assert_eq!(
+                health_verdict(&as_lines(&raw)),
+                HealthVerdict::Unhealthy {
+                    service: "db".to_string(),
+                    state: state.to_string()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn test_health_verdict_blank_or_garbage_indeterminate() {
+        // 空行 / 全空白 / 非 JSON 输出(旧版 compose、警告行等)→ 无法判定,继续轮询
+        assert_eq!(
+            health_verdict(&[""]),
+            HealthVerdict::Indeterminate { pending: None, exited_zero: false }
+        );
+        assert_eq!(
+            health_verdict(&["   "]),
+            HealthVerdict::Indeterminate { pending: None, exited_zero: false }
+        );
+        assert_eq!(
+            health_verdict(&[r#"time="2026-08-30" level=warning msg="x""#]),
+            HealthVerdict::Indeterminate { pending: None, exited_zero: false }
+        );
+    }
+
+    #[test]
+    fn test_health_verdict_health_three_states() {
+        // 无 Health 字段(无 healthcheck)→ Pass
+        let raw = vec![ps_line("web", "running", None, None)];
+        assert_eq!(health_verdict(&as_lines(&raw)), HealthVerdict::Pass);
+        // Health="healthy" → Pass
+        let raw = vec![ps_line("web", "running", Some("healthy"), None)];
+        assert_eq!(health_verdict(&as_lines(&raw)), HealthVerdict::Pass);
+        // Health="starting" → 尚未就绪,继续轮询(pending 展示 Health)
+        let raw = vec![ps_line("web", "running", Some("starting"), None)];
+        assert_eq!(
+            health_verdict(&as_lines(&raw)),
+            HealthVerdict::Indeterminate {
+                pending: Some(("web".to_string(), "starting".to_string())),
+                exited_zero: false
+            }
+        );
+        // Health="unhealthy" → 未通过,继续轮询(预算耗尽时报错展示该状态)
+        let raw = vec![ps_line("web", "running", Some("unhealthy"), None)];
+        assert_eq!(
+            health_verdict(&as_lines(&raw)),
+            HealthVerdict::Indeterminate {
+                pending: Some(("web".to_string(), "unhealthy".to_string())),
+                exited_zero: false
+            }
+        );
+    }
+
+    #[test]
+    fn test_health_verdict_not_running_pending() {
+        // 非终态且非 running(created/paused)→ 继续轮询,带出服务与容器状态
+        let raw = vec![ps_line("web", "created", None, None)];
+        assert_eq!(
+            health_verdict(&as_lines(&raw)),
+            HealthVerdict::Indeterminate {
+                pending: Some(("web".to_string(), "created".to_string())),
+                exited_zero: false
+            }
+        );
+    }
+
+    #[test]
+    fn test_health_verdict_json_array_format() {
+        // 旧版 compose 一次性输出 JSON 数组 → 同样可解析
+        let lines = vec![
+            r#"[{"Service":"web","State":"running"},{"Service":"db","State":"running","Health":"healthy"}]"#,
+        ];
+        assert_eq!(health_verdict(&lines), HealthVerdict::Pass);
+    }
+
+    #[test]
+    fn test_health_verdict_falls_back_to_name_field() {
+        // 缺 Service 字段时回退容器 Name
+        let lines = vec![r#"{"Name":"app-db-1","State":"exited"}"#];
+        assert_eq!(
+            health_verdict(&lines),
+            HealthVerdict::Unhealthy {
+                service: "app-db-1".to_string(),
+                state: "exited".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_health_verdict_health_object_status() {
+        // Health 为嵌套对象时取其 Status 字段
+        let lines = vec![r#"{"Service":"web","State":"running","Health":{"Status":"healthy"}}"#];
+        assert_eq!(health_verdict(&lines), HealthVerdict::Pass);
+    }
+
+    // ===== Task 6:classify_change 部署变更分类(六例)=====
+
+    #[test]
+    fn test_classify_change_pull_mode_always_pull() {
+        // 例 1:Pull 类一律 "Pull",不看本地/远端状态
+        assert_eq!(
+            classify_change(
+                &TransferMode::Pull,
+                true,
+                Some("sha256:a"),
+                Some("sha256:a"),
+                Some("old:1")
+            ),
+            "Pull"
+        );
+        assert_eq!(
+            classify_change(&TransferMode::Pull, false, None, None, None),
+            "Pull"
+        );
+    }
+
+    #[test]
+    fn test_classify_change_local_image_missing_absent() {
+        // 例 2:Local 且本地不存在该 repo:tag → "Absent"
+        assert_eq!(
+            classify_change(&TransferMode::Local, false, Some("sha256:a"), None, None),
+            "Absent"
+        );
+        assert_eq!(
+            classify_change(&TransferMode::Local, false, None, None, Some("old:1")),
+            "Absent"
+        );
+    }
+
+    #[test]
+    fn test_classify_change_remote_missing_create() {
+        // 例 3:远端无该镜像、也无现存容器 → 全新创建
+        assert_eq!(
+            classify_change(&TransferMode::Local, true, None, Some("sha256:abc"), None),
+            "Create"
+        );
+    }
+
+    #[test]
+    fn test_classify_change_remote_missing_with_container_recreate() {
+        // 例 4:远端无该镜像但有现存容器(旧版在跑)→ 重建
+        assert_eq!(
+            classify_change(
+                &TransferMode::Local,
+                true,
+                None,
+                Some("sha256:abc"),
+                Some("myapp:old")
+            ),
+            "Recreate"
+        );
+    }
+
+    #[test]
+    fn test_classify_change_same_id_unchanged() {
+        // 例 5:远端镜像 ID 与本地一致(容忍 sha256: 前缀与大小写差异)→ 不变
+        assert_eq!(
+            classify_change(
+                &TransferMode::Local,
+                true,
+                Some("sha256:ABC123"),
+                Some("abc123"),
+                Some("myapp:1")
+            ),
+            "Unchanged"
+        );
+    }
+
+    #[test]
+    fn test_classify_change_different_id_recreate() {
+        // 例 6:ID 不同 → 镜像已更新,重建
+        assert_eq!(
+            classify_change(
+                &TransferMode::Local,
+                true,
+                Some("sha256:aaa"),
+                Some("sha256:bbb"),
+                Some("myapp:1")
+            ),
+            "Recreate"
+        );
+    }
+
+    // ===== Task 6:webhook 载荷序列化 =====
+
+    #[test]
+    fn test_webhook_payload_fields() {
+        let record = DeployRecord {
+            ts: "2026-08-29 10:00:00".into(),
+            mode: MODE_STACK.into(),
+            server_name: "生产服务器".into(),
+            project_name: "博客".into(),
+            images: vec!["web:1".into()],
+            success: true,
+            message: "部署完成".into(),
+            duration_secs: 42,
+        };
+        let v: serde_json::Value = serde_json::from_str(&webhook_payload(&record)).unwrap();
+        assert_eq!(v["event"], "deploy");
+        assert_eq!(v["success"], true);
+        assert_eq!(v["message"], "部署完成");
+        assert_eq!(v["server"], "生产服务器");
+        assert_eq!(v["project"], "博客");
+        assert_eq!(v["duration_secs"], 42);
+        assert_eq!(v["ts"], "2026-08-29 10:00:00");
+
+        // 失败记录同样携带完整字段(success=false)
+        let mut failed = record.clone();
+        failed.success = false;
+        failed.message = "部署失败:连接超时".into();
+        let v: serde_json::Value = serde_json::from_str(&webhook_payload(&failed)).unwrap();
+        assert_eq!(v["success"], false);
+        assert_eq!(v["message"], "部署失败:连接超时");
+        assert_eq!(v["event"], "deploy");
+    }
+
+    // ===== Task 6:远端容器查询命令与解析 =====
+
+    #[test]
+    fn test_remote_dir_basename() {
+        assert_eq!(remote_dir_basename("/opt/app"), "app");
+        assert_eq!(remote_dir_basename("/opt/app/"), "app");
+        assert_eq!(remote_dir_basename("app"), "app");
+        assert_eq!(remote_dir_basename("/"), "");
+        assert_eq!(remote_dir_basename(""), "");
+    }
+
+    #[test]
+    fn test_compose_containers_cmd() {
+        assert_eq!(
+            compose_containers_cmd("/opt/app"),
+            "docker ps -a --filter 'label=com.docker.compose.project=app' --format '{{json .}}'"
+        );
+        // 项目名(基名)内嵌单引号被 '\'' 转义,无法逃出引号注入额外命令
+        assert_eq!(
+            compose_containers_cmd("/op't"),
+            "docker ps -a --filter 'label=com.docker.compose.project=op'\\''t' --format '{{json .}}'"
+        );
+    }
+
+    #[test]
+    fn test_parse_container_line() {
+        let line = r#"{"Command":"nginx","CreatedAt":"2026-08-30 10:00:00 +0800 CST","ID":"abc123","Image":"myapp:1","Labels":"com.docker.compose.project=demo,com.docker.compose.service=web","Names":"demo-web-1","State":"running"}"#;
+        assert_eq!(
+            parse_container_line(line),
+            Some(("web".to_string(), "myapp:1".to_string()))
+        );
+        // 无 compose 服务标签(手动 docker run 的容器)→ None
+        assert_eq!(parse_container_line(r#"{"Image":"x","Labels":"foo=bar"}"#), None);
+        // 非 JSON 行 → None
+        assert_eq!(parse_container_line("oops"), None);
+    }
+
+    // ===== 修复轮:webhook URL 日志脱敏 =====
+
+    #[test]
+    fn test_url_host_for_log_sanitizes_token() {
+        // query 内嵌 token(飞书/钉钉机器人地址形态):只留 host
+        assert_eq!(
+            url_host_for_log("https://open.feishu.cn/open-apis/bot/v2/hook?token=secret123"),
+            "open.feishu.cn"
+        );
+        // userinfo 内嵌凭据:取 @ 之后的 host[:port]
+        assert_eq!(
+            url_host_for_log("https://user:pass@hook.example.com:8443/x"),
+            "hook.example.com:8443"
+        );
+        // 无 path/query
+        assert_eq!(url_host_for_log("http://example.com"), "example.com");
+        // 解析不出 host(非 URL / 空 authority)→ 占位符
+        assert_eq!(url_host_for_log("not-a-url"), "<unparseable-url>");
+        assert_eq!(url_host_for_log("https://"), "<unparseable-url>");
+        assert_eq!(url_host_for_log(""), "<unparseable-url>");
+    }
+
+    #[test]
+    fn test_webhook_error_detail_no_url() {
+        // Status 错误:只落状态码,不内嵌 URL(ureq 的 Display 会带响应 URL)
+        let resp = ureq::Response::new(404, "Not Found", "body").unwrap();
+        let detail = webhook_error_detail(&ureq::Error::Status(404, resp));
+        assert_eq!(detail, "HTTP 状态码 404");
+        assert!(!detail.contains("http"), "不应包含 URL: {}", detail);
     }
 }
