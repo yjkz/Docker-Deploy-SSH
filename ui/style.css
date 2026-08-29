@@ -31,7 +31,7 @@
   --ark-on-signal: #080a0b;            /* 青色实心底上的文字(青恒亮,两主题固定墨色) */
   --ark-on-warn: #080a0b;              /* 琥珀底上的文字(琥珀恒亮,两主题固定墨色) */
   --ark-on-signal-dim: var(--ark-ink); /* 青淡底上的文字(暗色翻为青字) */
-  --ark-on-ink-55: rgba(244, 246, 246, .55); /* 墨底(含反转行)上的弱化文字,随墨纸翻转 */
+  --ark-on-ink-55: rgba(244, 246, 246, .55); /* 墨底(含反转行)上的弱化文字,随墨纸翻转(暗色 .6 以过 AA) */
   --ark-dock-text-strong: #ffffff;     /* dock 激活/悬停文字(dock 常暗,两主题固定纯白) */
   --ark-overlay: rgba(8, 10, 11, .55); /* 模态遮罩 */
   --ark-shadow: rgba(8, 10, 11, .35);  /* 模态投影 */
@@ -69,7 +69,7 @@
   --ark-paper-ink-65: rgba(244, 246, 246, .65);
   --ark-ink-35: rgba(244, 246, 246, .35);
   --ark-on-signal-dim: var(--ark-signal); /* 青淡底上改用青字 */
-  --ark-on-ink-55: rgba(8, 10, 11, .55);
+  --ark-on-ink-55: rgba(8, 10, 11, .6); /* alpha .6:反白行(纸白底)上对比度过 WCAG AA */
   --ark-overlay: rgba(0, 0, 0, .62);
   --ark-shadow: rgba(0, 0, 0, .5);
 }
@@ -189,8 +189,8 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 32px;
-  height: 32px;
+  width: 40px;   /* 命中区 40×40(简报 a11y 要求);按钮透明,可见大小仅 16px 图标 */
+  height: 40px;
   padding: 0;
   border: none;
   background: transparent;
@@ -1164,7 +1164,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
 ::view-transition-new(root) { animation: none; mix-blend-mode: normal; }
 ::view-transition-old(root) { animation: scheme-fade .5s ease both; }
 ::view-transition-new(root) {
-  animation: scheme-reveal .5s cubic-bezier(.22, .61, .36, 1);
+  animation: scheme-reveal .5s cubic-bezier(.22, .61, .36, 1) both;
   clip-path: circle(0px at var(--scheme-x, 100%) var(--scheme-y, 0));
 }
 @keyframes scheme-fade { to { opacity: .35; } }
