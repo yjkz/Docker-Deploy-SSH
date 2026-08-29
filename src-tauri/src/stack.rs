@@ -9,6 +9,8 @@
 //!
 //! 解析约定:
 //! - 顶层 `x-` 开头的扩展键自动忽略(只读取 `name` 与 `services`);
+//! - YAML 合并键(`<<: *anchor`)显式应用(serde_yaml 不自动合并),
+//!   compose 常用锚点注入公共 image/build;
 //! - `build` 字段存在即可(字符串或映射都算 has_build);
 //! - image 与 build 都缺失的服务仍保留在 services 中,同时记入 `errors`
 //!   (部署前由前端红框阻断);
@@ -77,8 +79,13 @@ pub fn parse_compose_file(
             e
         )
     })?;
-    let value: serde_yaml::Value = serde_yaml::from_str(&text)
+    let mut value: serde_yaml::Value = serde_yaml::from_str(&text)
         .map_err(|e| format!("解析 compose 文件失败,不是有效的 YAML: {}", e))?;
+    // serde_yaml 不自动应用合并键(<<):compose 惯用锚点 + `<<: *common` 注入
+    // image/build 等公共字段,必须显式合并,否则相关服务会被误判为未设置 image/build
+    value.apply_merge().map_err(|e| {
+        format!("解析 compose 文件失败,处理 YAML 合并键(<<)失败: {}", e)
+    })?;
     if !value.is_mapping() {
         return Err("compose 文件顶层结构不正确,应为键值映射".to_string());
     }
@@ -464,6 +471,40 @@ mod tests {
         // build(映射)同样算 has_build → Local
         let api = find_svc(&stack, "api");
         assert!(api.has_build);
+        assert_eq!(api.mode, TransferMode::Local);
+    }
+
+    // ===== 锚点 + 合并键(<<):x-common 注入公共 image/build =====
+
+    #[test]
+    fn test_parse_yaml_merge_keys() {
+        let dir = temp_fixture_dir();
+        let path = dir.join("stack.yml");
+        // serde_yaml 不自动应用合并键;x-common 锚点注入 image 和 build,
+        // api 服务在合并后再覆盖 image(显式键优先于合并键)
+        std::fs::write(
+            &path,
+            "x-common: &common\n  build: ./svc\n  image: shared:v1\n\nservices:\n  web:\n    <<: *common\n  api:\n    <<: *common\n    image: api:override\n",
+        )
+        .unwrap();
+        let local = vec![
+            ("shared".to_string(), "v1".to_string()),
+            ("api".to_string(), "override".to_string()),
+        ];
+        let stack = parse_compose_file(&path, &local).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(stack.errors.is_empty(), "errors: {:?}", stack.errors);
+        // web:靠 << 注入 image/build,不得误判"未设置 image 且没有 build 配置"
+        let web = find_svc(&stack, "web");
+        assert!(web.has_build, "<< 注入的 build 应生效");
+        assert_eq!(web.image.as_deref(), Some("shared:v1"), "<< 注入的 image 应生效");
+        assert_eq!(web.match_state, MatchState::Exact);
+        assert!(web.warning.is_none());
+        // api:显式 image 覆盖合并键的 image;build 仍由 << 注入(不被误分类为 Pull)
+        let api = find_svc(&stack, "api");
+        assert!(api.has_build);
+        assert_eq!(api.image.as_deref(), Some("api:override"));
         assert_eq!(api.mode, TransferMode::Local);
     }
 
