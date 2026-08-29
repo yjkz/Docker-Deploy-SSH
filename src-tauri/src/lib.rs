@@ -23,6 +23,7 @@ pub fn run() {
       commands::server_env_check,
       commands::install_server_docker,
       commands::create_remote_dir,
+      commands::prune_server,
       commands::deploy,
       commands::cancel_deploy,
       commands::deploy_stack,

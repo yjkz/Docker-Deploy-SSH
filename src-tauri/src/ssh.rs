@@ -252,7 +252,7 @@ impl SshClient {
 
 /// 执行命令并收集全部输出,返回 `(退出码, 合并后的 stdout+stderr)`。
 /// 传输层失败(无法开通道等)直接以 `Err` 传播。
-async fn exec_collect(client: &mut SshClient, cmd: &str) -> Result<(i32, String), String> {
+pub(crate) async fn exec_collect(client: &mut SshClient, cmd: &str) -> Result<(i32, String), String> {
     let mut out = String::new();
     let code = client.exec(cmd, &mut |line| out.push_str(line)).await?;
     Ok((code, out))

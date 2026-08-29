@@ -8,7 +8,7 @@
 //! - `deploy-log`:一行日志字符串,带 `[HH:MM:SS]` 前缀
 //! - `deploy-done`:`DeployDone { success, message }`;emit 后按结果落一条
 //!   部署历史(`history::append_record`,成功/失败/取消统一记录)
-//! - `server-log`:`install_server_docker` 安装脚本的逐行输出
+//! - `server-log`:`install_server_docker` 安装脚本与 `prune_server` 清理命令的逐行输出
 //!
 //! 部署管线(`deploy` 命令同步返回 `Ok(())`,后台任务执行,严格顺序,
 //! 任一步失败即中止并 emit `deploy-done` failure):
@@ -44,7 +44,7 @@ use crate::docker::{
     HostCheckReport, ImageInfo,
 };
 use crate::ssh::{
-    check_server_env, mkdir_p_cmd, ServerCheckReport, SshClient, INSTALL_DOCKER_CMD,
+    check_server_env, exec_collect, mkdir_p_cmd, ServerCheckReport, SshClient, INSTALL_DOCKER_CMD,
 };
 use crate::stack::{apply_overrides, parse_compose_file, ComposeStack};
 
@@ -60,6 +60,8 @@ const LOG_PROGRESS_STEP: u64 = 5 * 1024 * 1024;
 const STACK_LOAD_TIMEOUT_SECS: u64 = 600;
 /// 整栈部署:`docker compose pull` / `up -d` 的执行超时(秒)。
 const STACK_COMPOSE_TIMEOUT_SECS: u64 = 900;
+/// 服务器清理(`prune_server`)的执行超时(秒)。
+const PRUNE_TIMEOUT_SECS: u64 = 300;
 
 /// 部署运行状态:`cancel_deploy` 置位 `cancelled`,
 /// 部署管线在各步骤之间以及 exec 输出行回调中检查后中止。
@@ -416,6 +418,103 @@ pub async fn create_remote_dir(
     Ok(())
 }
 
+// ===== 服务器清理 + 远端磁盘预检(Task 2)=====
+
+/// 清理服务器:删除悬空镜像与已停止容器(见 [`prune_cmd`]),输出逐行 emit
+/// `server-log`(与 [`install_server_docker`] 同通道,前端服务器卡片可回显),
+/// 超时 [`PRUNE_TIMEOUT_SECS`] 秒。
+#[tauri::command]
+pub async fn prune_server(
+    server_id: String,
+    password_plain: Option<String>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    let server = find_server(&cfg, &server_id)?.clone();
+    let password = resolve_password(
+        &server.auth.auth_type,
+        password_plain.as_deref(),
+        server.auth.password_enc.as_deref(),
+    )?;
+    let mut client = with_timeout(
+        SSH_CONNECT_TIMEOUT_SECS,
+        "连接超时",
+        "请检查服务器地址与网络",
+        SshClient::connect(&server, password.as_deref()),
+    )
+    .await?;
+
+    let mut on_output = |line: &str| {
+        let _ = app.emit("server-log", line.trim_end().to_string());
+    };
+    let cmd = prune_cmd();
+    let fut = client.exec(&cmd, &mut on_output);
+    let code = with_timeout(
+        PRUNE_TIMEOUT_SECS,
+        "服务器清理超时",
+        "请检查服务器网络后重试",
+        async { fut.await.map_err(|e| format!("执行服务器清理命令失败: {}", e)) },
+    )
+    .await?;
+    if code != 0 {
+        return Err(format!(
+            "服务器清理命令退出码 {},请根据输出排查(常见原因:无 docker 权限)",
+            code
+        ));
+    }
+    Ok(())
+}
+
+/// 拼装服务器清理命令:删除悬空镜像与已停止容器(`-f` 免交互;用 `;` 串联,
+/// 第二项不受第一项退出码影响,两项均尽力执行)。
+pub fn prune_cmd() -> String {
+    "docker image prune -f; docker container prune -f".to_string()
+}
+
+/// 拼装查询 Docker 数据根目录的命令(`docker info` 的 Go 模板,单行输出)。
+pub fn docker_root_cmd() -> String {
+    "docker info -f '{{.DockerRootDir}}'".to_string()
+}
+
+/// 拼装查询 `path` 所在文件系统剩余空间(GB)的命令。
+/// 与 [`check_server_env`] 的 df 口径一致:`-P` POSIX 单行格式 + `-BG` 以 GB 为块
+/// 单位,`tail -1` 取数据行,`awk` 取第 4 列(Available);路径单引号包裹防注入。
+pub fn df_free_gb_cmd(path: &str) -> String {
+    format!(
+        "df -PBG {} | tail -1 | awk '{{print $4}}'",
+        shell_single_quote(path)
+    )
+}
+
+/// 解析 `df -PBG` 第 4 列的 Available 值(如 `30G` / `30` / `0.5`)为 GB 数;
+/// 空输出或非数字(BusyBox 等口径不一致的环境)返回 `None`。
+/// 解析口径与 [`check_server_env`] 一致(trim 后去掉尾部 `G` 再按 f64 解析)。
+pub fn parse_df_gb(raw: &str) -> Option<f64> {
+    let trimmed = raw.trim().trim_end_matches('G').trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse::<f64>().ok()
+}
+
+/// 远端磁盘预检判定(纯函数):剩余空间(GB)小于 `need_bytes`(已含余量)换算的
+/// GB 数 → 返回中文错误(含所需/实际 GB);`free_gb` 为 `None` 表示无法获取剩余
+/// 空间,跳过预检返回 `Ok(())`(告警由调用方负责)。
+pub fn precheck_remote_disk(free_gb: Option<f64>, need_bytes: u64) -> Result<(), String> {
+    let free = match free_gb {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+    let need_gb = need_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
+    if free < need_gb {
+        return Err(format!(
+            "服务器磁盘剩余空间不足:本次部署约需 {:.1} GB,Docker 根目录所在盘仅剩 {:.1} GB,请先清理服务器磁盘后重试",
+            need_gb, free
+        ));
+    }
+    Ok(())
+}
+
 // ===== 部署命令 =====
 
 /// 发起部署:立即返回 `Ok(())`,管线在后台任务执行并通过事件推送进度。
@@ -600,7 +699,9 @@ async fn run_deploy_steps(
     let _tar_guard = TempFileGuard(out_path.clone());
 
     // 空间预检:导出目标盘(临时目录所在盘)剩余空间 ≥ 镜像大小 × 1.5
-    match image_size(&image_ref) {
+    // (镜像大小暂存,供步骤 3 的远端磁盘预检复用,避免二次查询)
+    let image_bytes = image_size(&image_ref);
+    match image_bytes {
         Some(size) => check_export_disk_space(size)?,
         None => emit_log(app, "警告:无法获取镜像大小,跳过磁盘剩余空间检查"),
     }
@@ -612,6 +713,10 @@ async fn run_deploy_steps(
     emit_progress(app, 3, 5, "上传镜像到服务器");
     ensure_not_cancelled(app)?;
     let mut client = SshClient::connect(&server, password.as_deref()).await?;
+    // 远端磁盘预检:上传前确认 Docker 根目录所在盘剩余空间 ≥ 镜像大小 × 1.5
+    // (镜像大小未知 → 告警跳过;不足 → 中文报错中止)
+    let need_bytes = image_bytes.map(|size| (size as f64 * 1.5) as u64);
+    remote_disk_precheck(app, &mut client, need_bytes).await?;
     upload_tar(app, &mut client, &out_path, &tar_name).await?;
     emit_log(app, "镜像上传完成");
 
@@ -858,6 +963,71 @@ async fn exec_forwarded(
     Ok(())
 }
 
+/// 远端磁盘预检(两条部署管线共用):查询 Docker 数据根目录所在盘剩余空间,
+/// 与 `need_bytes`(已含 ×1.5 余量)比对,不足则以中文错误中止管线。
+///
+/// 容错(仅 emit 告警后跳过,不硬性拦截):`need_bytes` 为 `None`(本地镜像大小
+/// 未知)、Docker 根目录查询失败/为空、df 输出解析失败(BusyBox 等口径不一致)。
+/// SSH 传输层错误(通道打不开等)照常以 `Err` 传播 —— 连接已坏,上传必然失败。
+async fn remote_disk_precheck(
+    app: &AppHandle,
+    client: &mut SshClient,
+    need_bytes: Option<u64>,
+) -> Result<(), String> {
+    let need = match need_bytes {
+        Some(v) => v,
+        None => {
+            emit_log(app, "警告:无法获取本地镜像大小,跳过服务器磁盘剩余空间检查");
+            return Ok(());
+        }
+    };
+
+    // 1. Docker 数据根目录(单行 trim)
+    let (code, out) = exec_collect(client, &docker_root_cmd()).await?;
+    let root = out.trim().to_string();
+    if code != 0 || root.is_empty() {
+        emit_log(
+            app,
+            &format!(
+                "警告:无法获取 Docker 根目录(退出码 {}),跳过服务器磁盘剩余空间检查",
+                code
+            ),
+        );
+        return Ok(());
+    }
+
+    // 2. 根目录所在盘剩余空间(GB)
+    let (code, out) = exec_collect(client, &df_free_gb_cmd(&root)).await?;
+    let free_gb = if code == 0 { parse_df_gb(&out) } else { None };
+    let free = match free_gb {
+        Some(v) => v,
+        None => {
+            emit_log(
+                app,
+                &format!(
+                    "警告:服务器磁盘剩余空间查询失败(退出码 {},df 输出: {:?}),跳过磁盘剩余空间检查",
+                    code,
+                    out.trim()
+                ),
+            );
+            return Ok(());
+        }
+    };
+
+    // 3. 判定(不足 → 中文报错中止)
+    precheck_remote_disk(Some(free), need)?;
+    emit_log(
+        app,
+        &format!(
+            "服务器磁盘剩余空间检查通过:Docker 根目录 {} 所在盘剩余 {:.1} GB,本次部署约需 {:.1} GB",
+            root,
+            free,
+            need as f64 / 1024.0 / 1024.0 / 1024.0
+        ),
+    );
+    Ok(())
+}
+
 // ===== 整栈部署管线(六步,任一步失败即中止)=====
 
 /// 整栈部署管线入口:组装部署历史记录骨架(含开始计时),执行管线主体,
@@ -945,6 +1115,15 @@ async fn run_deploy_stack_steps(
         SshClient::connect(&server, password.as_deref()),
     )
     .await?;
+
+    // 远端磁盘预检:上传前确认 Docker 根目录所在盘剩余空间 ≥ Local 镜像字节总和 × 1.5
+    // (与本地导出预检同一 sum 口径;大小未知 → 告警跳过;不足 → 中文报错中止)
+    let local_sizes: Vec<Option<u64>> = local_choices
+        .iter()
+        .map(|s| image_size(&s.image))
+        .collect();
+    let need_bytes = sum_sizes(&local_sizes).map(|total| (total as f64 * 1.5) as u64);
+    remote_disk_precheck(app, &mut client, need_bytes).await?;
 
     // 远端建本次发布目录 <remote_dir>/releases/<时间戳>/(mkdir -p 连带创建 remote_dir)
     let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
@@ -1830,6 +2009,77 @@ mod tests {
         assert_eq!(
             docker_tag_cmd("my'app:20260829", "my'app:latest"),
             "docker tag 'my'\\''app:20260829' 'my'\\''app:latest'"
+        );
+    }
+
+    // ===== Task 2:远端磁盘预检命令拼装 =====
+
+    #[test]
+    fn test_docker_root_cmd() {
+        assert_eq!(docker_root_cmd(), "docker info -f '{{.DockerRootDir}}'");
+    }
+
+    #[test]
+    fn test_df_free_gb_cmd() {
+        assert_eq!(
+            df_free_gb_cmd("/var/lib/docker"),
+            "df -PBG '/var/lib/docker' | tail -1 | awk '{print $4}'"
+        );
+    }
+
+    #[test]
+    fn test_df_free_gb_cmd_escapes_quote() {
+        // 路径内嵌单引号被 '\'' 转义,无法逃出引号注入额外命令
+        assert_eq!(
+            df_free_gb_cmd("/var/li'b"),
+            "df -PBG '/var/li'\\''b' | tail -1 | awk '{print $4}'"
+        );
+    }
+
+    #[test]
+    fn test_parse_df_gb() {
+        assert_eq!(parse_df_gb("30G\n"), Some(30.0));
+        assert_eq!(parse_df_gb("  12 "), Some(12.0));
+        assert_eq!(parse_df_gb("0.5"), Some(0.5));
+        // 空输出 / 非数字(BusyBox 等口径不一致)→ None,调用方跳过预检
+        assert_eq!(parse_df_gb(""), None);
+        assert_eq!(parse_df_gb("   \n"), None);
+        assert_eq!(parse_df_gb("N/A"), None);
+    }
+
+    // ===== Task 2:precheck_remote_disk 判定(Ok / None 跳过 / 不足)=====
+
+    #[test]
+    fn test_precheck_remote_disk_ok() {
+        assert!(precheck_remote_disk(Some(20.0), 15 * 1024 * 1024 * 1024).is_ok());
+        // 恰好等于需求(边界)也通过
+        assert!(precheck_remote_disk(Some(15.0), 15 * 1024 * 1024 * 1024).is_ok());
+        // 需求为 0(如全 Pull)恒通过
+        assert!(precheck_remote_disk(Some(0.0), 0).is_ok());
+    }
+
+    #[test]
+    fn test_precheck_remote_disk_none_skips() {
+        // 无法获取剩余空间 → 跳过预检(告警由调用方负责)
+        assert!(precheck_remote_disk(None, u64::MAX).is_ok());
+    }
+
+    #[test]
+    fn test_precheck_remote_disk_insufficient() {
+        let err = precheck_remote_disk(Some(10.0), 15 * 1024 * 1024 * 1024).unwrap_err();
+        assert!(err.contains("磁盘剩余空间不足"), "实际: {}", err);
+        assert!(err.contains("15.0"), "错误应含所需 GB: {}", err);
+        assert!(err.contains("10.0"), "错误应含实际 GB: {}", err);
+        assert!(err.contains("清理服务器磁盘"), "实际: {}", err);
+    }
+
+    // ===== Task 2:prune_cmd =====
+
+    #[test]
+    fn test_prune_cmd() {
+        assert_eq!(
+            prune_cmd(),
+            "docker image prune -f; docker container prune -f"
         );
     }
 }
