@@ -170,9 +170,14 @@
         <div class="section-head">
           <h2 class="section-title">部署配置<span class="section-en">CONFIG</span></h2>
         </div>
-        <div class="deploy-form">
+        <div class="deploy-form" id="deploy-form">
+          <!-- 模式切换:单镜像 / 整栈部署(compose);激活 tab 墨底纸白字 + 青色下条 -->
+          <div class="deploy-mode-tabs" id="deploy-mode-tabs">
+            <button id="deploy-mode-single" class="mode-tab active" type="button">单镜像</button>
+            <button id="deploy-mode-stack" class="mode-tab" type="button">整栈部署(compose)</button>
+          </div>
           <div class="deploy-form-grid">
-            <div class="form-row">
+            <div class="form-row mode-single-only">
               <label class="form-label" for="deploy-image">本地镜像</label>
               <select id="deploy-image" class="form-input"></select>
               <div id="deploy-images-hint" class="form-hint hidden"></div>
@@ -185,9 +190,9 @@
             <div class="form-row">
               <label class="form-label" for="deploy-project">部署项目</label>
               <select id="deploy-project" class="form-input"></select>
-              <div class="form-hint">在「服务器管理」页维护</div>
+              <div id="deploy-project-hint" class="form-hint">在「服务器管理」页维护</div>
             </div>
-            <div class="form-row">
+            <div class="form-row mode-single-only">
               <span class="form-label">标签选项</span>
               <label class="deploy-checkbox">
                 <input type="checkbox" id="deploy-date-tag" checked>
@@ -196,6 +201,32 @@
               <div class="form-hint">为镜像追加「仓库名:日期时间」标签,出问题可快速回滚</div>
             </div>
           </div>
+
+          <!-- 整栈模式:服务分类表(parse_compose 结果;hidden 由 deploy.js 切换) -->
+          <div id="deploy-stack-panel" class="deploy-stack-panel hidden">
+            <div class="deploy-stack-bar">
+              <button id="deploy-stack-parse-btn" class="btn btn-sm" type="button">解析服务</button>
+              <div id="deploy-stack-status" class="deploy-stack-status"></div>
+              <button id="deploy-stack-save-btn" class="btn btn-sm" type="button">保存为默认分类</button>
+            </div>
+            <div id="deploy-stack-errors" class="check-error hidden"></div>
+            <div id="deploy-stack-table-wrap" class="table-wrap hidden">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>服务 SERVICE</th>
+                    <th>镜像 IMAGE</th>
+                    <th>匹配 MATCH</th>
+                    <th class="col-action">传输方式 TRANSFER</th>
+                  </tr>
+                </thead>
+                <tbody id="deploy-stack-tbody">
+                  <tr><td class="empty-cell" colspan="4">选择项目后自动解析</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
           <div class="deploy-actions">
             <button id="deploy-start-btn" class="btn btn-primary btn-lg" type="button">开始部署</button>
             <button id="deploy-cancel-btn" class="btn btn-danger" type="button" disabled>取消部署</button>
@@ -208,7 +239,7 @@
         <div class="section-head">
           <h2 class="section-title">部署进度<span class="section-en">PROGRESS</span></h2>
         </div>
-        <!-- 五步索引化校准仪:状态类(done/current)由 deploy.js 切换 -->
+        <!-- 索引化校准仪:单镜像 5 节点(静态默认)/ 整栈 6 节点由 deploy.js 重建;状态类(done/current)由 deploy.js 切换 -->
         <div id="deploy-steps" class="deploy-steps">
           <div class="deploy-step" id="deploy-step-1">
             <div class="deploy-step-box">

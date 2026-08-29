@@ -16,6 +16,15 @@
  *      解密已存密文;auth_type=Key 时后端忽略 passwordPlain)
  * - install_server_docker({ serverId })     过程输出经 'server-log' 事件逐行推送
  * - create_remote_dir({ serverId })
+ * - preview_compose({ sourcePath }) -> ComposeStack
+ *     ComposeStack = { project_name, services: StackService[], errors: string[] }
+ *     StackService = { service, image, has_build, mode: "Local"|"Pull",
+ *                      match_state: "Exact"|"RepoOnly"|"Missing",
+ *                      local_tag, warning }(静态只读解析,供导入前预览)
+ * - import_compose({ sourcePath, name }) -> ProjectConfig
+ *     校验并复制 compose(连同同目录 .env)到应用配置目录,以解析默认分类
+ *     建新项目并写回配置;返回的 ProjectConfig 含 id/compose_file 副本路径/
+ *     service_overrides,由前端并入项目列表后 save_config_cmd 补齐其余字段
  *
  * 页面进入时机:app.js 的 showPage() 成功切换页面后会在 window 上派发
  * 'pagechange'(detail.page = 页面名),本文件在首次进入服务器页时加载配置。
@@ -45,6 +54,13 @@
   /** server-log 事件监听守卫:只注册一次,防止重复绑定 */
   var logListenerBound = false;
 
+  /**
+   * 新增项目表单的导入预览状态(模块级:保存时 saveProject 需读取)。
+   * path = 已成功预览的 compose 路径;stack = 对应 ComposeStack。
+   * 两者一致时保存可直接复用预览结果,路径变化后重新解析。
+   */
+  var importPreview = { path: '', stack: null };
+
   // ===== 小工具 =====
 
   function el(tag, className, text) {
@@ -72,6 +88,43 @@
   function fieldVal(id) {
     var node = document.getElementById(id);
     return node ? String(node.value).trim() : '';
+  }
+
+  /** 取路径的文件名并去掉扩展名(D:/a/b/my-stack.yml → my-stack);用于导入时预填项目名 */
+  function fileNameNoExt(p) {
+    if (!p) return '';
+    var s = String(p).replace(/[\\/]+$/, '');
+    var idx = Math.max(s.lastIndexOf('\\'), s.lastIndexOf('/'));
+    var base = idx >= 0 ? s.slice(idx + 1) : s;
+    var dot = base.lastIndexOf('.');
+    if (dot > 0) base = base.slice(0, dot);
+    return base;
+  }
+
+  /**
+   * compose 服务匹配徽章(三级匹配,与部署页整栈分类表同视觉):
+   * Exact → 青淡底 check「已匹配」;RepoOnly → 琥珀底 run「标签不一致」;
+   * Missing → 墨底白字 cross「本地不存在」。warning 有值时悬浮展示。
+   */
+  function matchBadge(svc) {
+    var kind = svc.match_state === 'Exact' ? 'ok'
+      : (svc.match_state === 'RepoOnly' ? 'warn' : 'fail');
+    var text = svc.match_state === 'Exact' ? '已匹配'
+      : (svc.match_state === 'RepoOnly' ? '标签不一致' : '本地不存在');
+    var badge = window.fillBadge(el('span'), kind, text);
+    if (svc.warning) {
+      badge.title = String(svc.warning);
+    } else if (svc.match_state === 'RepoOnly') {
+      badge.title = '本地标签与 compose 不一致';
+    }
+    return badge;
+  }
+
+  /** 传输分类徽章(默认分类;has_build 的 Local 服务附 build 标记) */
+  function modeBadge(mode, hasBuild) {
+    var text = mode === 'Local' ? '本地传输' : '服务器拉取';
+    if (mode === 'Local' && hasBuild) text += ' · build';
+    return window.fillBadge(el('span'), 'info', text);
   }
 
   function normalizeCfg(cfg) {
@@ -636,6 +689,192 @@
     body.appendChild(err);
   }
 
+  // ===== 项目表单:导入 compose 文件区块(仅新增项目)=====
+
+  /**
+   * 「导入 compose 文件」区块:路径输入 + 解析预览(preview_compose)
+   * + 预览表(服务/镜像/匹配徽章/默认分类徽章,errors 红框)。
+   * 路径变化时项目名自动预填为文件名去扩展名(可手动改)。
+   */
+  function appendImportBlock(body) {
+    // 路径输入
+    var pathRow = el('div', 'form-row');
+    pathRow.appendChild(el('label', 'form-label', '导入 compose 文件(可选)'));
+    var pathInput = document.createElement('input');
+    pathInput.className = 'form-input';
+    pathInput.id = 'prjf-import-path';
+    pathInput.type = 'text';
+    pathInput.autocomplete = 'off';
+    pathInput.placeholder = '如:D:\\apps\\myapp\\docker-compose.yml';
+    pathRow.appendChild(pathInput);
+    pathRow.appendChild(el('div', 'form-hint',
+      '填写 compose 文件绝对路径,保存时复制到应用配置目录并按解析结果自动生成服务传输分类;留空则手工填写下方 compose 相对路径'));
+    body.appendChild(pathRow);
+
+    // 解析预览按钮 + 状态
+    var previewRow = el('div', 'form-row');
+    var bar = el('div', 'preview-bar');
+    var previewBtn = el('button', 'btn btn-sm', '解析预览');
+    previewBtn.id = 'prjf-preview-btn';
+    previewBtn.type = 'button';
+    var status = el('span', 'preview-status');
+    status.id = 'prjf-preview-status';
+    bar.appendChild(previewBtn);
+    bar.appendChild(status);
+
+    // 预览表 + 错误框(默认隐藏)
+    var box = el('div', 'hidden');
+    box.id = 'prjf-preview-box';
+    var wrap = el('div', 'table-wrap');
+    var table = document.createElement('table');
+    table.className = 'data-table';
+    var thead = document.createElement('thead');
+    var headTr = document.createElement('tr');
+    ['服务 SERVICE', '镜像 IMAGE', '匹配 MATCH', '默认分类 MODE'].forEach(function (text) {
+      headTr.appendChild(el('th', '', text));
+    });
+    thead.appendChild(headTr);
+    table.appendChild(thead);
+    var tbody = document.createElement('tbody');
+    tbody.id = 'prjf-preview-tbody';
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+    box.appendChild(wrap);
+    var perr = el('div', 'check-error');
+    perr.id = 'prjf-preview-errors';
+    perr.classList.add('hidden');
+    box.appendChild(perr);
+    bar.appendChild(box);
+    previewRow.appendChild(bar);
+    body.appendChild(previewRow);
+
+    previewBtn.addEventListener('click', function () { runImportPreview(); });
+    pathInput.addEventListener('input', function () { onImportPathInput(); });
+  }
+
+  /** 路径输入变化:预填项目名(文件名去扩展名,已手改则不覆盖)+ 切换手工路径置灰 + 清理过期预览 */
+  function onImportPathInput() {
+    var p = fieldVal('prjf-import-path');
+    var base = fileNameNoExt(p);
+    var nameInput = document.getElementById('prjf-name');
+    if (nameInput && base) {
+      var current = String(nameInput.value).trim();
+      // 名称尚为空或仍是上一次自动预填值时才覆盖,保留用户手改内容
+      if (!current || current === importPreview.autoName) {
+        nameInput.value = base;
+      }
+    }
+    importPreview.autoName = base;
+
+    var manual = document.getElementById('prjf-compose');
+    if (manual) manual.disabled = !!p;
+
+    if (!p) {
+      // 清空路径:预览与错误一并复位
+      importPreview.path = '';
+      importPreview.stack = null;
+      var box = document.getElementById('prjf-preview-box');
+      if (box) box.classList.add('hidden');
+      var perr = document.getElementById('prjf-preview-errors');
+      if (perr) { perr.textContent = ''; perr.classList.add('hidden'); }
+      var status = document.getElementById('prjf-preview-status');
+      if (status) status.textContent = '';
+    }
+  }
+
+  /** 解析预览:preview_compose(静态只读,不落盘);失败进表单错误框 */
+  function runImportPreview() {
+    var p = fieldVal('prjf-import-path');
+    if (!p) {
+      formFail('prjf-error', '请先填写 compose 文件路径');
+      return;
+    }
+    formClearError('prjf-error');
+    var btn = document.getElementById('prjf-preview-btn');
+    var status = document.getElementById('prjf-preview-status');
+    if (btn) btn.disabled = true;
+    if (status) status.textContent = '解析中…';
+
+    window.AppBus.invoke('preview_compose', { sourcePath: p })
+      .then(function (stack) {
+        importPreview.path = p;
+        importPreview.stack = stack || { project_name: '', services: [], errors: [] };
+        renderImportPreview(importPreview.stack);
+        if (status) {
+          status.textContent = (importPreview.stack.errors || []).length > 0
+            ? '解析完成,存在需要处理的问题'
+            : '解析完成';
+        }
+      })
+      .catch(function (err) {
+        importPreview.path = '';
+        importPreview.stack = null;
+        var box = document.getElementById('prjf-preview-box');
+        if (box) box.classList.add('hidden');
+        formFail('prjf-error', '解析失败:' + (errText(err) || '未知错误'));
+        if (status) status.textContent = '';
+      })
+      .then(function () {
+        if (btn) btn.disabled = false;
+      });
+  }
+
+  /** 渲染预览表:服务/镜像/匹配徽章/默认分类徽章;errors 红框(阻断保存) */
+  function renderImportPreview(stack) {
+    var box = document.getElementById('prjf-preview-box');
+    var tbody = document.getElementById('prjf-preview-tbody');
+    var perr = document.getElementById('prjf-preview-errors');
+    if (!box || !tbody || !perr) return;
+
+    tbody.textContent = '';
+    perr.textContent = '';
+
+    var errors = Array.isArray(stack.errors) ? stack.errors : [];
+    if (errors.length > 0) {
+      perr.appendChild(el('div', 'servers-error-text', '以下问题将阻断整栈部署:'));
+      errors.forEach(function (line) {
+        perr.appendChild(el('div', 'servers-error-text', line));
+      });
+      perr.classList.remove('hidden');
+    } else {
+      perr.classList.add('hidden');
+    }
+
+    var services = Array.isArray(stack.services) ? stack.services : [];
+    if (services.length === 0) {
+      emptyRow(tbody, 4, 'compose 未定义任何服务');
+    }
+    services.forEach(function (svc) {
+      var tr = document.createElement('tr');
+
+      var tdSvc = document.createElement('td');
+      tdSvc.className = 'mono';
+      tdSvc.textContent = String(svc.service);
+      tr.appendChild(tdSvc);
+
+      var tdImg = document.createElement('td');
+      tdImg.className = 'mono';
+      if (svc.image) {
+        tdImg.textContent = String(svc.image);
+      } else {
+        tdImg.appendChild(el('span', 'none-text', '(未设 image 字段)'));
+      }
+      tr.appendChild(tdImg);
+
+      var tdMatch = document.createElement('td');
+      tdMatch.appendChild(matchBadge(svc));
+      tr.appendChild(tdMatch);
+
+      var tdMode = document.createElement('td');
+      tdMode.appendChild(modeBadge(svc.mode, !!svc.has_build));
+      tr.appendChild(tdMode);
+
+      tbody.appendChild(tr);
+    });
+
+    box.classList.remove('hidden');
+  }
+
   // ===== 服务器编辑表单 =====
 
   function openServerModal(server) {
@@ -821,16 +1060,26 @@
 
   function openProjectModal(project) {
     var prev = project || null;
+    importPreview = { path: '', stack: null, autoName: '' }; // 每次打开表单重置导入预览状态
 
     openModal(prev ? '编辑项目' : '新增项目', function (body) {
       appendErrorBox(body, 'prjf-error');
 
       appendField(body, '名称', 'prjf-name', 'text',
         prev ? prev.name : '', '如:我的应用');
+
+      if (!prev) {
+        appendImportBlock(body);
+      }
+
       appendField(body, '镜像过滤关键字', 'prjf-filter', 'text',
         prev ? prev.image_filter : '', '如:myapp', '部署时按该关键字匹配本地镜像仓库名,留空匹配全部镜像');
-      appendField(body, 'compose 文件相对路径', 'prjf-compose', 'text',
+      var composeInput = appendField(body, 'compose 文件相对路径', 'prjf-compose', 'text',
         prev ? prev.compose_file : '', '如:docker-compose.yml', '相对远程部署目录的路径');
+      if (!prev) {
+        // 走导入流程时 compose 相对路径不再参与保存,置灰防误解
+        composeInput.disabled = !!fieldVal('prjf-import-path');
+      }
 
       // 文件映射编辑表格
       var mapRow = el('div', 'form-row');
@@ -924,17 +1173,8 @@
     tbody.appendChild(tr);
   }
 
-  /** 项目表单保存:校验 → get_config → 全量写回 */
-  function saveProject(prev) {
-    formClearError('prjf-error');
-
-    var name = fieldVal('prjf-name');
-    var filter = fieldVal('prjf-filter');
-    var compose = fieldVal('prjf-compose');
-
-    if (!name) return formFail('prjf-error', '请填写名称');
-    if (!compose) return formFail('prjf-error', '请填写 compose 文件相对路径');
-
+  /** 收集文件映射编辑行;行校验失败时已 formFail 提示并返回 null */
+  function collectMappings(errId) {
     var mappings = [];
     var tbody = document.getElementById('prjf-mappings-body');
     var rows = tbody ? tbody.querySelectorAll('tr') : [];
@@ -946,8 +1186,9 @@
       var remote = remoteNode ? remoteNode.value.trim() : '';
       if (!local && !remote) continue; // 两格都空:忽略该行
       if (!local || !remote) {
-        return formFail('prjf-error',
+        formFail(errId,
           '文件映射第 ' + (i + 1) + ' 行需同时填写本地路径与服务器相对路径');
+        return null;
       }
       mappings.push({
         local: local,
@@ -955,6 +1196,30 @@
         is_dir: !!(dirNode && dirNode.checked)
       });
     }
+    return mappings;
+  }
+
+  /** 项目表单保存:校验 →(导入流程:preview 校验 + import_compose)→ get_config → 全量写回 */
+  function saveProject(prev) {
+    formClearError('prjf-error');
+
+    var name = fieldVal('prjf-name');
+    var filter = fieldVal('prjf-filter');
+    var compose = fieldVal('prjf-compose');
+    var importPath = fieldVal('prjf-import-path'); // 编辑表单无此输入框,得空串
+
+    if (!name) return formFail('prjf-error', '请填写名称');
+
+    var mappings = collectMappings('prjf-error');
+    if (mappings === null) return false;
+
+    // 导入流程:路径非空时校验解析(有未解决问题则阻止保存)→ import_compose 建项目
+    if (importPath) {
+      saveProjectViaImport(name, filter, importPath, mappings);
+      return false;
+    }
+
+    if (!compose) return formFail('prjf-error', '请填写 compose 文件相对路径');
 
     window.AppBus.invoke('get_config')
       .then(function (cfg) {
@@ -982,6 +1247,67 @@
       .catch(function (err) {
         formFail('prjf-error', errText(err) || '保存失败');
         saveToastFail(err, '保存失败');
+      });
+  }
+
+  /**
+   * 导入流程保存:
+   * 1. preview_compose 复核(已有同路径成功预览则直接复用);解析存在
+   *    errors(如服务既无 image 也无 build)时阻止保存并显示错误;
+   * 2. import_compose 复制 compose 到配置目录,返回新 ProjectConfig
+   *    (含 id / compose_file 副本路径 / service_overrides 默认分类);
+   * 3. 并入项目列表,补齐表单中的名称/镜像过滤/文件映射后 save_config_cmd 全量写回。
+   */
+  function saveProjectViaImport(name, filter, importPath, mappings) {
+    var ensured = (importPreview.stack && importPreview.path === importPath)
+      ? Promise.resolve(importPreview.stack)
+      : window.AppBus.invoke('preview_compose', { sourcePath: importPath });
+
+    ensured
+      .then(function (stack) {
+        var errors = stack && Array.isArray(stack.errors) ? stack.errors : [];
+        if (errors.length > 0) {
+          formFail('prjf-error', 'compose 存在未解决问题,已阻止保存:' + errors.join(';'));
+          return null;
+        }
+        return window.AppBus.invoke('import_compose', { sourcePath: importPath, name: name })
+          .then(function (imported) {
+            if (!imported || !imported.id) {
+              throw new Error('导入结果异常(缺少项目 id)');
+            }
+            var merged = {
+              id: String(imported.id),
+              name: name,
+              image_filter: filter,
+              compose_file: String(imported.compose_file || ''),
+              file_mappings: mappings,
+              service_overrides: Array.isArray(imported.service_overrides)
+                ? imported.service_overrides
+                : []
+            };
+            return window.AppBus.invoke('get_config').then(function (cfg) {
+              cfg = normalizeCfg(cfg);
+              var idx = -1;
+              for (var i = 0; i < cfg.projects.length; i++) {
+                if (cfg.projects[i].id === merged.id) { idx = i; break; }
+              }
+              // import_compose 已把项目写入配置:此处覆盖为补齐表单字段后的版本
+              if (idx >= 0) cfg.projects[idx] = merged;
+              else cfg.projects.push(merged);
+              return window.AppBus.invoke('save_config_cmd', { cfg: cfg })
+                .then(function () { return true; });
+            });
+          });
+      })
+      .then(function (done) {
+        if (done !== true) return; // 被校验阻止,错误已显示
+        closeModal();
+        window.toast('已导入 compose 并保存项目', 'ok');
+        return loadConfig();
+      })
+      .catch(function (err) {
+        formFail('prjf-error', errText(err) || '导入失败');
+        saveToastFail(err, '导入失败');
       });
   }
 

@@ -803,7 +803,111 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
 }
 .mapping-add { margin-top: 8px; }
 
+/* compose 导入:解析预览条(项目表单模态框内) */
+.preview-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.preview-status {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: .06em;
+  color: var(--ark-paper-dim-ink);
+}
+/* 预览表内的错误清单(红改墨:沿用 check-error) */
+.preview-bar .check-error { width: 100%; margin-bottom: 0; }
+
 /* ===== 04 部署向导 DEPLOY ===== */
+
+/* 模式切换 tab:激活项墨底纸白字 + 底缘 3px 青色下条(压在 1px 分隔线上) */
+.deploy-mode-tabs {
+  display: flex;
+  align-items: stretch;
+  margin-bottom: 18px;
+  border-bottom: 1px solid var(--ark-line);
+}
+.mode-tab {
+  position: relative;
+  padding: 10px 22px 12px;
+  border: none;
+  background: transparent;
+  color: var(--ark-paper-ink-65);
+  font-family: inherit;
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: color .18s ease, background .18s ease;
+}
+.mode-tab + .mode-tab { border-left: 1px solid var(--ark-line-soft); }
+.mode-tab:hover { color: var(--ark-ink); background: var(--ark-paper-dim); }
+.mode-tab.active { background: var(--ark-ink); color: var(--ark-paper); }
+.mode-tab.active::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 3px;
+  background: var(--ark-signal);
+}
+.mode-tab:disabled,
+.mode-tab:disabled:hover {
+  opacity: .45;
+  cursor: not-allowed;
+  background: transparent;
+  color: var(--ark-paper-ink-65);
+}
+.mode-tab.active:disabled { background: var(--ark-ink); color: var(--ark-paper); }
+
+/* 整栈模式:隐藏单镜像专属格子,选择区收窄为两列 */
+.deploy-form.mode-stack .mode-single-only { display: none; }
+.deploy-form.mode-stack .deploy-form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+/* 整栈服务分类面板 */
+.deploy-stack-panel { margin-top: 16px; }
+.deploy-stack-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding-bottom: 10px;
+}
+.deploy-stack-status {
+  flex: 1;
+  min-width: 200px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: .06em;
+  color: var(--ark-paper-dim-ink);
+}
+.deploy-stack-panel .check-error { margin-bottom: 12px; }
+/* 服务行的非阻断警告:紧跟其后的小字行(不随整行 hover 反色) */
+.data-table tbody tr.stack-warn-row,
+.data-table tbody tr.stack-warn-row:hover {
+  background: transparent;
+  color: var(--ark-paper-ink-65);
+  border-top: none;
+}
+.data-table tbody tr.stack-warn-row td {
+  height: auto;
+  padding: 0 14px 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.6;
+  word-break: break-all;
+}
+/* 传输方式切换按钮上的 build 标记(随按钮文字色,1px 空心) */
+.transfer-build {
+  margin-left: 6px;
+  padding: 1px 5px;
+  border: 1px solid currentColor;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: .08em;
+}
 
 /* 选择区:四控件横排 action strip,下衬 1px 墨线 */
 .deploy-form { margin-bottom: 4px; }
@@ -1022,6 +1126,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   .page-tools { width: 100%; margin-left: 0; padding-bottom: 0; }
   .page-tools .text-input { flex: 1; width: auto; min-width: 0; }
   .deploy-form-grid { grid-template-columns: 1fr; }
+  .deploy-form.mode-stack .deploy-form-grid { grid-template-columns: 1fr; }
   .server-kv { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .check-line { flex-wrap: wrap; }
   .check-detail { text-align: left; max-width: 100%; }

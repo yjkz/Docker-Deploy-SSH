@@ -11,16 +11,32 @@
  * - deploy({ req }) -> 同步返回 null,结果只经事件:
  *     req = { image, repository, server_id, project_id,
  *             use_date_tag, password_plain }   // 必须 snake_case
+ * - parse_compose({ projectId }) -> ComposeStack
+ *     ComposeStack = { project_name, services: StackService[], errors: string[] }
+ *     StackService = { service, image, has_build, mode: "Local"|"Pull",
+ *                      match_state: "Exact"|"RepoOnly"|"Missing",
+ *                      local_tag, warning }(按项目解析,含 overrides 与本地镜像实时匹配)
+ * - deploy_stack({ req }) -> 同步返回 null,结果只经事件:
+ *     req = { project_id, server_id,
+ *             services: [{ service, image, mode: "Local"|"Pull" }],
+ *             password_plain }                 // 必须 snake_case
  * - cancel_deploy() -> 置位后端全局取消标志
  *
  * 事件(AppBus.on,模块级守卫保证只注册一次):
- * - 'deploy-progress' { step, total, message }(step 1..5)
+ * - 'deploy-progress' { step, total, message }
+ *     单镜像模式 step 1..5(打标签/导出压缩/上传镜像/同步文件/服务器部署);
+ *     整栈模式  step 1..6(分类确认/打包/上传/装载/拉取/启动)
  * - 'deploy-log'      string(带 [HH:MM:SS] 前缀的一行日志)
  * - 'deploy-done'     { success, message }(取消固定 message === "部署已取消")
  *
  * 交互约定:
+ * - 页首「单镜像 / 整栈部署(compose)」双 tab 切换模式;单镜像模式行为不变;
+ *   整栈模式:项目下拉选中即自动 parse_compose 渲染服务分类表(可手动重新解析),
+ *   Local/Pull 文字按钮逐服务切换,「保存为默认分类」写回 project.service_overrides;
+ *   compose errors 非空时红框并阻断开始部署。
  * - 部署中(deploy 起点至 deploy-done)「开始部署」禁用、「取消部署」可用,
- *   且不得再次发起 deploy(后端全局取消标志会在新部署开始时被重置)。
+ *   且不得再次发起 deploy(后端全局取消标志会在新部署开始时被重置);
+ *   部署 / 预检期间同时禁用模式切换与服务器、项目、镜像下拉。
  * - 进入页面时重新拉取 list_images + get_config(镜像与配置可能变化);
  *   若 window.__pendingDeployImage 存在(镜像页「部署」按钮带入),自动选中
  *   对应下拉项,用后即删(置 null);找不到则 toast 提示并忽略。
@@ -37,18 +53,35 @@
   var LOG_MAX_LINES = 2000;
   /** 远端磁盘剩余空间低于该值(GB)视为未通过,阻止部署 */
   var DISK_MIN_GB = 2;
-  /** 五个进度节点名称(与后端 deploy-progress 步骤一一对应) */
-  var STEP_NAMES = ['打标签', '导出压缩', '上传镜像', '同步文件', '服务器部署'];
   /** 部署日志距离底部多少像素以内视为「在底部」(才自动滚底) */
   var LOG_BOTTOM_GAP = 40;
+
+  /**
+   * 两组进度节点(与后端 deploy-progress 步骤一一对应):
+   * 单镜像 5 节点 / 整栈 6 节点;按当前模式选节点集渲染。
+   */
+  var STEP_SETS = {
+    single: {
+      names: ['打标签', '导出压缩', '上传镜像', '同步文件', '服务器部署'],
+      ens: ['TAG', 'PACK', 'UPLOAD', 'SYNC', 'APPLY']
+    },
+    stack: {
+      names: ['分类确认', '打包', '上传', '装载', '拉取', '启动'],
+      ens: ['CONFIRM', 'PACK', 'UPLOAD', 'LOAD', 'PULL', 'UP']
+    }
+  };
 
   var st = {
     images: [],        // 过滤 <none> 后的可用镜像(ImageInfo[])
     cfg: null,         // get_config 的完整结果(AppConfig)
     loading: false,    // 页面数据加载中(list_images + get_config)
     checking: false,   // 部署前预检中(server_env_check)
-    deploying: false,  // 部署中(invoke deploy 成功 → deploy-done)
-    logs: []           // deploy-log 事件累积的日志行
+    deploying: false,  // 部署中(invoke deploy/deploy_stack 成功 → deploy-done)
+    logs: [],          // deploy-log 事件累积的日志行
+    mode: 'single',    // 'single' 单镜像 | 'stack' 整栈部署(compose)
+    stack: null,       // parse_compose 结果(ComposeStack),整栈模式服务分类表数据源
+    stackProjectId: '',// st.stack 对应的项目 id(切换项目后需重新解析)
+    parsing: false     // parse_compose 请求进行中(防重复解析)
   };
 
   /** 部署事件监听守卫:只注册一次,防止重复绑定 */
@@ -246,6 +279,12 @@
         showErrorBox(errs, false);
       }
       applyPendingImage();
+      // 整栈模式:已选项目与已解析结果不一致(或尚无解析结果)时自动解析
+      if (st.mode === 'stack') {
+        var prjSel = document.getElementById('deploy-project');
+        var projectId = prjSel ? String(prjSel.value) : '';
+        if (projectId && st.stackProjectId !== projectId) parseStack();
+      }
     });
   }
 
@@ -296,6 +335,29 @@
         var node = document.getElementById(id);
         if (node) node.disabled = st.deploying || st.checking;
       });
+
+    // 模式切换 tab 与整栈面板按钮同步禁用(与现有并发防护一致;解析中锁面板)
+    var locked = st.deploying || st.checking;
+    ['deploy-mode-single', 'deploy-mode-stack',
+      'deploy-stack-parse-btn', 'deploy-stack-save-btn']
+      .forEach(function (id) {
+        var node = document.getElementById(id);
+        if (!node) return;
+        node.disabled = locked || (id === 'deploy-stack-parse-btn' && st.parsing);
+      });
+    var panel = document.getElementById('deploy-stack-panel');
+    if (panel) {
+      var panelBtns = panel.querySelectorAll('button');
+      if (locked || st.parsing) {
+        Array.prototype.forEach.call(panelBtns, function (btn) {
+          btn.disabled = true;
+        });
+      } else if (st.stack) {
+        // 解锁:按数据源重渲染,恢复每个切换按钮的固有禁用态
+        // (无 image 字段的服务保持禁用;st.stack 为空时不重渲染,保留解析失败红框)
+        renderStackPanel();
+      }
+    }
   }
 
   // ===== 预检结果条(5 项徽章 + 错误明细)=====
@@ -364,15 +426,50 @@
     box.classList.remove('hidden');
   }
 
-  // ===== 进度条 =====
+  // ===== 进度条(双节点集:单镜像 5 节点 / 整栈 6 节点)=====
+
+  /** 当前模式的节点数(deploy-done 时用 step > total 点亮全部完成态) */
+  function stepCount() {
+    var set = STEP_SETS[st.mode] || STEP_SETS.single;
+    return set.names.length;
+  }
 
   /**
-   * 渲染五步进度(编号 01..05 与对勾图标由 index.html 静态承载,此处只切状态类)。
-   * @param {number} step 当前步骤 1..5;0 表示重置(全部灰色待命)
+   * 按当前模式重建进度节点(结构与 index.html 静态五节点一致:
+   * .deploy-step > .deploy-step-box(.deploy-step-num + .deploy-step-tick>svg)
+   * + .deploy-step-name + .deploy-step-en + .deploy-step-msg)。
+   */
+  function buildSteps(mode) {
+    var wrap = document.getElementById('deploy-steps');
+    if (!wrap) return;
+    var set = STEP_SETS[mode] || STEP_SETS.single;
+    wrap.textContent = '';
+    set.names.forEach(function (name, i) {
+      var node = el('div', 'deploy-step');
+      node.id = 'deploy-step-' + (i + 1);
+
+      var box = el('div', 'deploy-step-box');
+      box.appendChild(el('span', 'deploy-step-num', ('0' + (i + 1)).slice(-2)));
+      var tick = el('span', 'deploy-step-tick');
+      tick.appendChild(window.appIcon('ok'));
+      box.appendChild(tick);
+      node.appendChild(box);
+
+      node.appendChild(el('div', 'deploy-step-name', name));
+      node.appendChild(el('div', 'deploy-step-en', set.ens[i] || ''));
+      node.appendChild(el('div', 'deploy-step-msg'));
+      wrap.appendChild(node);
+    });
+  }
+
+  /**
+   * 渲染进度(按当前模式节点集;编号与对勾图标由 buildSteps 承载,此处只切状态类)。
+   * @param {number} step 当前步骤 1..N;0 表示重置(全部灰色待命)
    * @param {string} message 当前节点文案(deploy-progress 的 message)
    */
   function renderProgress(step, message) {
-    for (var i = 1; i <= STEP_NAMES.length; i++) {
+    var total = stepCount();
+    for (var i = 1; i <= total; i++) {
       var node = document.getElementById('deploy-step-' + i);
       if (!node) continue;
       node.classList.toggle('done', step > i);
@@ -419,6 +516,273 @@
     renderLogCount();
   }
 
+  // ===== 模式切换(单镜像 / 整栈部署)=====
+
+  /**
+   * 切换部署模式:tab 激活态、单镜像专属格子显隐、整栈面板显隐、
+   * 项目提示文案、进度节点集重建。部署 / 预检中禁止切换。
+   */
+  function setMode(mode) {
+    if (st.deploying || st.checking) {
+      window.toast('部署进行中,无法切换模式', 'warn');
+      return;
+    }
+    if (st.mode === mode) return;
+    st.mode = mode;
+
+    var form = document.getElementById('deploy-form');
+    if (form) form.classList.toggle('mode-stack', mode === 'stack');
+
+    var tabSingle = document.getElementById('deploy-mode-single');
+    var tabStack = document.getElementById('deploy-mode-stack');
+    if (tabSingle) tabSingle.classList.toggle('active', mode === 'single');
+    if (tabStack) tabStack.classList.toggle('active', mode === 'stack');
+
+    var panel = document.getElementById('deploy-stack-panel');
+    if (panel) panel.classList.toggle('hidden', mode !== 'stack');
+
+    var hint = document.getElementById('deploy-project-hint');
+    if (hint) {
+      hint.textContent = mode === 'stack'
+        ? '选择项目后自动解析 compose 服务分类'
+        : '在「服务器管理」页维护';
+    }
+
+    buildSteps(mode);
+    renderProgress(0, '');
+
+    // 切到整栈:已选项目且尚未解析(或解析的是别的项目)时自动解析
+    if (mode === 'stack') {
+      var prjSel = document.getElementById('deploy-project');
+      var projectId = prjSel ? String(prjSel.value) : '';
+      if (projectId && st.stackProjectId !== projectId) parseStack();
+    }
+  }
+
+  // ===== 整栈模式:服务分类(parse_compose → 分类表 → 默认分类写回)=====
+
+  /** 匹配徽章:Exact→ok「已匹配」/ RepoOnly→warn「标签不一致」/ Missing→fail「本地不存在」 */
+  function matchBadge(svc) {
+    var kind = svc.match_state === 'Exact' ? 'ok'
+      : (svc.match_state === 'RepoOnly' ? 'warn' : 'fail');
+    var text = svc.match_state === 'Exact' ? '已匹配'
+      : (svc.match_state === 'RepoOnly' ? '标签不一致' : '本地不存在');
+    var badge = window.fillBadge(el('span'), kind, text);
+    if (svc.warning) {
+      badge.title = String(svc.warning);
+    } else if (svc.match_state === 'RepoOnly') {
+      badge.title = '本地标签与 compose 不一致';
+    }
+    return badge;
+  }
+
+  /** 传输方式切换按钮:文字按钮显示当前 mode;Local + has_build 附加 build 标记 */
+  function transferButton(svc) {
+    var btn = el('button', 'btn btn-sm',
+      svc.mode === 'Local' ? '本地传输' : '服务器拉取');
+    btn.type = 'button';
+    if (svc.mode === 'Local' && svc.has_build) {
+      btn.appendChild(el('span', 'transfer-build', 'build'));
+    }
+    if (!svc.image) {
+      // 无 image 字段:无法由服务器拉取,锁定为本地传输
+      btn.disabled = true;
+      btn.title = 'compose 未设 image 字段,无法由服务器拉取,请保留本地传输或在 compose 补 image:';
+    } else {
+      btn.addEventListener('click', function () { toggleServiceMode(svc.service); });
+      // 部署 / 预检 / 解析进行中一并禁用(refreshControls 解锁时按数据源恢复)
+      btn.disabled = st.deploying || st.checking || st.parsing;
+    }
+    return btn;
+  }
+
+  /** 单个服务行:服务名(mono)/ 镜像(mono)/ 匹配徽章 / 传输方式切换 */
+  function stackRow(svc) {
+    var tr = document.createElement('tr');
+
+    var tdSvc = document.createElement('td');
+    tdSvc.className = 'mono';
+    tdSvc.textContent = String(svc.service);
+    tr.appendChild(tdSvc);
+
+    var tdImg = document.createElement('td');
+    tdImg.className = 'mono';
+    if (svc.image) {
+      tdImg.textContent = String(svc.image);
+    } else {
+      tdImg.appendChild(el('span', 'none-text', '(未设 image 字段)'));
+    }
+    tr.appendChild(tdImg);
+
+    var tdMatch = document.createElement('td');
+    tdMatch.appendChild(matchBadge(svc));
+    tr.appendChild(tdMatch);
+
+    var tdAct = document.createElement('td');
+    tdAct.className = 'col-action';
+    tdAct.appendChild(transferButton(svc));
+    tr.appendChild(tdAct);
+
+    return tr;
+  }
+
+  /** 服务行下方的非阻断警告小字行(warning 有值时渲染) */
+  function stackWarnRow(warning) {
+    var tr = document.createElement('tr');
+    tr.className = 'stack-warn-row';
+    var td = document.createElement('td');
+    td.colSpan = 4;
+    td.textContent = String(warning);
+    tr.appendChild(td);
+    return tr;
+  }
+
+  /** 渲染整栈面板:状态行 + errors 红框 + 服务分类表(st.stack 为数据源) */
+  function renderStackPanel() {
+    var tbody = document.getElementById('deploy-stack-tbody');
+    var wrap = document.getElementById('deploy-stack-table-wrap');
+    var errBox = document.getElementById('deploy-stack-errors');
+    var status = document.getElementById('deploy-stack-status');
+    if (!tbody || !wrap || !errBox || !status) return;
+
+    tbody.textContent = '';
+    errBox.textContent = '';
+
+    var stack = st.stack;
+    if (!stack) {
+      wrap.classList.add('hidden');
+      errBox.classList.add('hidden');
+      status.textContent = '';
+      return;
+    }
+
+    var project = findById(st.cfg ? st.cfg.projects : [], st.stackProjectId);
+    var services = Array.isArray(stack.services) ? stack.services : [];
+    var localCount = services.filter(function (s) { return s.mode === 'Local'; }).length;
+    status.textContent = '项目「' + (project ? project.name : stack.project_name) + '」共 '
+      + services.length + ' 个服务:本地传输 ' + localCount
+      + ' / 服务器拉取 ' + (services.length - localCount);
+
+    var errors = Array.isArray(stack.errors) ? stack.errors : [];
+    if (errors.length > 0) {
+      errBox.appendChild(el('div', 'servers-error-text',
+        'compose 解析存在以下问题,修正后重新解析(未解决前无法开始部署):'));
+      errors.forEach(function (line) {
+        errBox.appendChild(el('div', 'servers-error-text', line));
+      });
+      errBox.classList.remove('hidden');
+    } else {
+      errBox.classList.add('hidden');
+    }
+
+    if (services.length === 0) {
+      var tr = document.createElement('tr');
+      var td = el('td', 'empty-cell', 'compose 未定义任何服务');
+      td.colSpan = 4;
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+    }
+    services.forEach(function (svc) {
+      tbody.appendChild(stackRow(svc));
+      if (svc.warning) tbody.appendChild(stackWarnRow(svc.warning));
+    });
+
+    wrap.classList.remove('hidden');
+  }
+
+  /** 切换单个服务的传输方式(Local ↔ Pull)并重渲染分类表 */
+  function toggleServiceMode(serviceName) {
+    if (st.deploying || st.checking || !st.stack) return;
+    var services = Array.isArray(st.stack.services) ? st.stack.services : [];
+    for (var i = 0; i < services.length; i++) {
+      if (services[i].service === serviceName) {
+        services[i].mode = services[i].mode === 'Local' ? 'Pull' : 'Local';
+        break;
+      }
+    }
+    renderStackPanel();
+  }
+
+  /** 解析所选项目的 compose(parse_compose);项目下拉选中时自动触发 */
+  function parseStack() {
+    if (st.deploying || st.checking || st.parsing) return;
+    var prjSel = document.getElementById('deploy-project');
+    var projectId = prjSel ? String(prjSel.value) : '';
+    if (!projectId) {
+      window.toast('请先选择部署项目', 'warn');
+      return;
+    }
+    var project = findById(st.cfg ? st.cfg.projects : [], projectId);
+    if (!project) {
+      window.toast('所选项目已变化,请重新选择', 'warn');
+      return;
+    }
+
+    st.parsing = true;
+    refreshControls();
+    var status = document.getElementById('deploy-stack-status');
+    if (status) status.textContent = '正在解析 compose…';
+
+    window.AppBus.invoke('parse_compose', { projectId: projectId })
+      .then(function (stack) {
+        st.stack = stack || { project_name: '', services: [], errors: [] };
+        st.stackProjectId = projectId;
+        renderStackPanel();
+      })
+      .catch(function (err) {
+        st.stack = null;
+        st.stackProjectId = '';
+        renderStackPanel();
+        var errBox = document.getElementById('deploy-stack-errors');
+        if (errBox) {
+          errBox.textContent = '';
+          errBox.appendChild(el('div', 'servers-error-text',
+            '解析失败:' + (errText(err) || '未知错误')));
+          errBox.classList.remove('hidden');
+        }
+      })
+      .then(function () {
+        st.parsing = false;
+        refreshControls();
+      });
+  }
+
+  /** 「保存为默认分类」:当前 services 的 mode 组装为 service_overrides 写回项目 */
+  function onSaveStackDefaults() {
+    if (st.deploying || st.checking || st.parsing) return;
+    if (!st.stack || !st.stackProjectId) {
+      window.toast('请先解析服务分类', 'warn');
+      return;
+    }
+    var services = Array.isArray(st.stack.services) ? st.stack.services : [];
+    if (services.length === 0) {
+      window.toast('当前解析结果没有任何服务,无需保存', 'warn');
+      return;
+    }
+    var overrides = services.map(function (s) {
+      return { service: String(s.service), mode: s.mode === 'Local' ? 'Local' : 'Pull' };
+    });
+    var projectId = st.stackProjectId;
+
+    window.AppBus.invoke('get_config')
+      .then(function (cfg) {
+        cfg = normalizeCfg(cfg);
+        var project = findById(cfg.projects, projectId);
+        if (!project) throw new Error('项目已不存在,请刷新页面后重试');
+        project.service_overrides = overrides;
+        return window.AppBus.invoke('save_config_cmd', { cfg: cfg });
+      })
+      .then(function () {
+        // 同步本地缓存,避免下次解析覆盖前显示过期分类
+        var localProject = findById(st.cfg ? st.cfg.projects : [], projectId);
+        if (localProject) localProject.service_overrides = overrides;
+        window.toast('已保存为该项目默认分类', 'ok');
+      })
+      .catch(function (err) {
+        window.toast('保存默认分类失败:' + (errText(err) || '未知错误'), 'fail');
+      });
+  }
+
   // ===== 部署流程 =====
 
   /** 每次点击「开始部署」:清空横幅 / 错误框 / 预检条 / 日志,进度重置 */
@@ -433,6 +797,10 @@
 
   function onStartDeploy() {
     if (st.deploying || st.checking) return; // 并发防护:部署 / 预检中不得再次发起
+    if (st.mode === 'stack') {
+      onStartStackDeploy();
+      return;
+    }
 
     var imgRef = '';
     var serverId = '';
@@ -515,6 +883,116 @@
       });
   }
 
+  // ===== 整栈部署流程(预检复用,管线走 deploy_stack)=====
+
+  /** 整栈开始部署:项目/服务器校验 → 分类表校验(errors 阻断)→ 预检 → deploy_stack */
+  function onStartStackDeploy() {
+    var srvSel = document.getElementById('deploy-server');
+    var prjSel = document.getElementById('deploy-project');
+    var serverId = srvSel ? String(srvSel.value) : '';
+    var projectId = prjSel ? String(prjSel.value) : '';
+
+    var missing = [];
+    if (!projectId) missing.push('项目');
+    if (!serverId) missing.push('服务器');
+    if (missing.length > 0) {
+      window.toast('请先选择:' + missing.join('、'), 'warn');
+      return;
+    }
+
+    var server = findById(st.cfg ? st.cfg.servers : [], serverId);
+    var project = findById(st.cfg ? st.cfg.projects : [], projectId);
+    if (!server || !project) {
+      window.toast('所选数据已变化,请重新进入页面后选择', 'warn');
+      return;
+    }
+
+    // 服务分类表必须已按当前项目解析
+    if (!st.stack || st.stackProjectId !== projectId) {
+      window.toast('请先解析项目服务分类', 'warn');
+      parseStack();
+      return;
+    }
+    var stack = st.stack;
+    var services = Array.isArray(stack.services) ? stack.services : [];
+
+    // compose errors 非空:红框已在面板显示,阻断开始部署
+    if (Array.isArray(stack.errors) && stack.errors.length > 0) {
+      window.toast('compose 存在未解决问题,无法开始部署(详见服务分类表上方)', 'fail');
+      return;
+    }
+    if (services.length === 0) {
+      window.toast('compose 未定义任何服务,无法部署', 'warn');
+      return;
+    }
+    // 与后端 validate_stack_choices 对齐的前置校验:Local 类服务镜像引用必须非空
+    for (var i = 0; i < services.length; i++) {
+      var svc = services[i];
+      if (svc.mode === 'Local' && !svc.image) {
+        window.toast('服务「' + svc.service + '」未设 image 字段,无法本地传输,请先修正 compose',
+          'fail');
+        return;
+      }
+    }
+
+    resetRunView();
+
+    // 预检:server_env_check(密码用后端已存密文,不传 passwordPlain)
+    st.checking = true;
+    refreshControls();
+
+    window.AppBus.invoke('server_env_check', { serverId: serverId })
+      .then(function (report) {
+        renderCheck(report);
+        var fails = collectFailures(report);
+        if (fails.length > 0) {
+          showErrorBox([
+            '服务器环境未通过检测(未通过:' + fails.join('、') + '),请先到服务器管理页处理'
+          ], true);
+          return;
+        }
+        window.toast('环境检测通过,开始整栈部署', 'ok');
+        startStackDeploy(server, project);
+      })
+      .catch(function (err) {
+        showErrorBox(['服务器预检失败:' + (errText(err) || '未知错误')], true);
+      })
+      .then(function () {
+        st.checking = false;
+        refreshControls();
+      });
+  }
+
+  /** 发起整栈部署(req 字段 snake_case);成功后等待 deploy-done 事件收尾 */
+  function startStackDeploy(server, project) {
+    var services = Array.isArray(st.stack.services) ? st.stack.services : [];
+    var req = {
+      project_id: String(project.id),
+      server_id: String(server.id),
+      // 前端分类表逐服务确认后的传输分类(image 缺失时传空串,仅允许 Pull 类)
+      services: services.map(function (s) {
+        return {
+          service: String(s.service),
+          image: s.image ? String(s.image) : '',
+          mode: s.mode === 'Local' ? 'Local' : 'Pull'
+        };
+      }),
+      password_plain: null
+    };
+
+    st.deploying = true;
+    refreshControls();
+    renderProgress(0, '');
+
+    window.AppBus.invoke('deploy_stack', { req: req })
+      .catch(function (err) {
+        // invoke 本身失败:部署未真正启动,立即还原控件
+        st.deploying = false;
+        refreshControls();
+        showErrorBox(['发起整栈部署失败:' + (errText(err) || '未知错误')], false);
+      });
+  }
+
   function onCancelDeploy() {
     if (!st.deploying) return;
     window.AppBus.invoke('cancel_deploy')
@@ -536,7 +1014,7 @@
     refreshControls();
 
     if (success) {
-      renderProgress(6, ''); // step > 5:全部 5 个节点置为完成态
+      renderProgress(stepCount() + 1, ''); // step > total:当前模式全部节点置为完成态
       showBanner('ok', '部署完成');
       window.toast('部署完成', 'ok');
     } else if (message === '部署已取消') {
@@ -584,6 +1062,34 @@
       cancel.addEventListener('click', onCancelDeploy);
     }
 
+    // 模式切换 tab
+    var tabSingle = document.getElementById('deploy-mode-single');
+    if (tabSingle) {
+      tabSingle.addEventListener('click', function () { setMode('single'); });
+    }
+    var tabStack = document.getElementById('deploy-mode-stack');
+    if (tabStack) {
+      tabStack.addEventListener('click', function () { setMode('stack'); });
+    }
+
+    // 整栈面板:解析(选中项目自动触发 + 按钮手动重解析)与保存默认分类
+    var parseBtn = document.getElementById('deploy-stack-parse-btn');
+    if (parseBtn) {
+      parseBtn.addEventListener('click', parseStack);
+    }
+    var saveBtn = document.getElementById('deploy-stack-save-btn');
+    if (saveBtn) {
+      saveBtn.addEventListener('click', onSaveStackDefaults);
+    }
+    var prjSel = document.getElementById('deploy-project');
+    if (prjSel) {
+      prjSel.addEventListener('change', function () {
+        if (st.mode === 'stack') parseStack(); // 整栈模式:选中即自动解析
+      });
+    }
+
+    // 节点集与静态 HTML 一致化(单镜像 5 节点;切整栈时按 6 节点重建)
+    buildSteps(st.mode);
     renderLog();
     renderProgress(0, '');
     refreshControls();
