@@ -6,7 +6,8 @@
 //! - `deploy-progress`:`DeployProgress { step, total, message }`,step 1..5
 //!   (1=打标签 2=导出压缩 3=上传镜像 4=同步文件 5=服务器部署)
 //! - `deploy-log`:一行日志字符串,带 `[HH:MM:SS]` 前缀
-//! - `deploy-done`:`DeployDone { success, message }`
+//! - `deploy-done`:`DeployDone { success, message }`;emit 后按结果落一条
+//!   部署历史(`history::append_record`,成功/失败/取消统一记录)
 //! - `server-log`:`install_server_docker` 安装脚本的逐行输出
 //!
 //! 部署管线(`deploy` 命令同步返回 `Ok(())`,后台任务执行,严格顺序,
@@ -37,6 +38,7 @@ use crate::config::{
     TransferMode,
 };
 use crate::crypto::dpapi_unprotect;
+use crate::history::{append_record, load_history, DeployRecord, MODE_SINGLE, MODE_STACK};
 use crate::docker::{
     check_host, image_exists, image_size, make_deploy_tag, save_gzip, start_daemon, tag_image,
     HostCheckReport, ImageInfo,
@@ -198,6 +200,10 @@ pub fn import_compose(source_path: String, name: String) -> Result<ProjectConfig
                 mode: s.mode.clone(),
             })
             .collect(),
+        health_wait_secs: 0,
+        pre_deploy_cmd: None,
+        post_deploy_cmd: None,
+        notify_webhook: None,
     };
     let mut cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
     cfg.projects.push(project.clone());
@@ -427,18 +433,24 @@ pub fn deploy_stack(req: StackDeployRequest, app: AppHandle) -> Result<(), Strin
     Ok(())
 }
 
-/// 后台部署任务的统一启动器:panic 兜底([`CatchPanic`])+ 收尾事件,
-/// 保证任何路径(成功/失败/panic)下 `deploy-done` 恰好 emit 一次。
+/// 后台部署任务的统一启动器:panic 兜底([`CatchPanic`])+ 收尾事件 + 部署历史,
+/// 保证任何路径(成功/失败/panic)下 `deploy-done` 恰好 emit 一次;
+/// 正常结束路径(成功/失败/取消)在 emit `deploy-done` 之后落一条部署历史记录
+/// (由管线组装的 [`DeployRecord`],append 失败仅告警,不影响收尾)。
 fn spawn_deploy_task<F>(app: AppHandle, fut: F)
 where
-    F: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    F: std::future::Future<Output = (Result<(), String>, DeployRecord)> + Send + 'static,
 {
     tauri::async_runtime::spawn(async move {
-        let result = match CatchPanic::new(fut).await {
-            Ok(result) => result,
+        let (result, record) = match CatchPanic::new(fut).await {
+            Ok(pair) => (pair.0, Some(pair.1)),
             Err(panic_info) => {
                 log::error!("部署管线发生 panic: {}", panic_info);
-                Err("部署过程发生内部错误,详情见日志".to_string())
+                // 管线内组装的部署记录随 panic 丢失,此路径不写历史
+                (
+                    Err("部署过程发生内部错误,详情见日志".to_string()),
+                    None,
+                )
             }
         };
         match result {
@@ -455,6 +467,10 @@ where
                 emit_log(&app, &format!("部署失败: {}", e));
                 let _ = app.emit("deploy-done", DeployDone { success: false, message: e });
             }
+        }
+        // deploy-done 之后落地部署历史(成功/失败/取消统一记录)
+        if let Some(record) = record {
+            append_record(record);
         }
     });
 }
@@ -501,10 +517,42 @@ pub fn cancel_deploy(state: tauri::State<'_, DeployState>) -> Result<(), String>
     Ok(())
 }
 
+/// 读取部署历史(倒序 = 最新在前;文件缺失/损坏时为空,由 history 层容错)。
+#[tauri::command]
+pub fn get_history() -> Result<Vec<DeployRecord>, String> {
+    Ok(load_history().into_iter().rev().collect())
+}
+
 // ===== 部署管线(严格顺序,任一步失败即中止)=====
 
-/// 部署管线主体。失败返回中文错误,由 [`deploy`] 统一 emit `deploy-done` failure。
-async fn run_deploy(app: &AppHandle, req: DeployRequest) -> Result<(), String> {
+/// 部署管线入口:组装部署历史记录骨架(含开始计时),执行管线主体,
+/// 出口填充 success/message/duration 后连同结果一起返回(由 spawn 层落历史)。
+async fn run_deploy(app: &AppHandle, req: DeployRequest) -> (Result<(), String>, DeployRecord) {
+    let started = std::time::Instant::now();
+    // 骨架:server/project 名称由前置解析回填(前置失败时以 ID 兜底)
+    let mut record = DeployRecord::new_skeleton(
+        MODE_SINGLE,
+        &req.server_id,
+        &req.project_id,
+        vec![req.image.clone()],
+    );
+    let result = run_deploy_steps(app, req, &mut record).await;
+    record.success = result.is_ok();
+    record.message = match &result {
+        Ok(()) => "部署完成".to_string(),
+        Err(e) => e.clone(),
+    };
+    record.duration_secs = started.elapsed().as_secs();
+    (result, record)
+}
+
+/// 部署管线主体(严格顺序,任一步失败即中止)。`record` 为组装中的部署历史
+/// 记录,随步骤推进回填服务器/项目名称与实际部署的镜像引用。
+async fn run_deploy_steps(
+    app: &AppHandle,
+    req: DeployRequest,
+    record: &mut DeployRecord,
+) -> Result<(), String> {
     // ---- 步骤 0:前置 ----
     // 每次 deploy 开始时重置取消标志;结束时保持不变(取消后为 true,下次部署重置)
     reset_cancelled(app);
@@ -512,6 +560,8 @@ async fn run_deploy(app: &AppHandle, req: DeployRequest) -> Result<(), String> {
     let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
     let server = find_server(&cfg, &req.server_id)?.clone();
     let project = find_project(&cfg, &req.project_id)?.clone();
+    record.server_name = server.name.clone();
+    record.project_name = project.name.clone();
     let password = resolve_password(
         &server.auth.auth_type,
         req.password_plain.as_deref(),
@@ -538,6 +588,8 @@ async fn run_deploy(app: &AppHandle, req: DeployRequest) -> Result<(), String> {
         emit_log(app, "使用原始镜像标签,跳过打标签");
         req.image.clone()
     };
+    // 历史记录登记实际部署的镜像引用(勾选日期标签时为生成的部署标签)
+    record.images = vec![image_ref.clone()];
 
     // ---- 步骤 2:导出压缩 ----
     emit_progress(app, 2, 5, "导出压缩镜像");
@@ -808,11 +860,37 @@ async fn exec_forwarded(
 
 // ===== 整栈部署管线(六步,任一步失败即中止)=====
 
-/// 整栈部署管线主体。失败返回中文错误,由 [`deploy_stack`] 统一 emit
-/// `deploy-done` failure。六步:
-/// 1 分类确认 → 2 打包 → 3 上传 → 4 装载 → 5 拉取 → 6 启动;
-/// 收尾清理旧 releases(仅留最新 5 个),本地 tar 由 [`LocalTars`] 的守卫删除。
-async fn run_deploy_stack(app: &AppHandle, req: StackDeployRequest) -> Result<(), String> {
+/// 整栈部署管线入口:组装部署历史记录骨架(含开始计时),执行管线主体,
+/// 出口填充 success/message/duration 后连同结果一起返回(由 spawn 层落历史)。
+async fn run_deploy_stack(
+    app: &AppHandle,
+    req: StackDeployRequest,
+) -> (Result<(), String>, DeployRecord) {
+    let started = std::time::Instant::now();
+    // 骨架:镜像列表取本地传输的服务镜像;server/project 名称由前置解析回填
+    let mut record = DeployRecord::new_skeleton(
+        MODE_STACK,
+        &req.server_id,
+        &req.project_id,
+        stack_record_images(&req.services),
+    );
+    let result = run_deploy_stack_steps(app, req, &mut record).await;
+    record.success = result.is_ok();
+    record.message = match &result {
+        Ok(()) => "部署完成".to_string(),
+        Err(e) => e.clone(),
+    };
+    record.duration_secs = started.elapsed().as_secs();
+    (result, record)
+}
+
+/// 整栈部署管线主体(六步,任一步失败即中止)。`record` 为组装中的部署历史
+/// 记录,前置解析后回填服务器/项目名称。
+async fn run_deploy_stack_steps(
+    app: &AppHandle,
+    req: StackDeployRequest,
+    record: &mut DeployRecord,
+) -> Result<(), String> {
     // ---- 前置:找 server/project、解析密码 ----
     // 每次部署开始时重置取消标志(与单镜像 run_deploy 一致)
     reset_cancelled(app);
@@ -820,6 +898,8 @@ async fn run_deploy_stack(app: &AppHandle, req: StackDeployRequest) -> Result<()
     let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
     let server = find_server(&cfg, &req.server_id)?.clone();
     let project = find_project(&cfg, &req.project_id)?.clone();
+    record.server_name = server.name.clone();
+    record.project_name = project.name.clone();
     let password = resolve_password(
         &server.auth.auth_type,
         req.password_plain.as_deref(),
@@ -1140,6 +1220,16 @@ pub fn group_by_mode(
         }
     }
     (local, pull)
+}
+
+/// 整栈部署历史记录的镜像列表:本地传输且镜像引用非空的服务镜像
+/// (按服务顺序;Pull 类由服务器自拉,引用常为空,不计入)。
+pub fn stack_record_images(services: &[StackServiceChoice]) -> Vec<String> {
+    services
+        .iter()
+        .filter(|s| matches!(s.mode, TransferMode::Local) && !s.image.trim().is_empty())
+        .map(|s| s.image.clone())
+        .collect()
 }
 
 /// 求和一组镜像大小;任一项未知(`None`)或求和溢出则整体返回 `None`
@@ -1618,6 +1708,23 @@ mod tests {
         let (local, pull) = group_by_mode(&services);
         assert!(local.is_empty());
         assert_eq!(pull.len(), 1);
+    }
+
+    #[test]
+    fn test_stack_record_images() {
+        // 仅登记本地传输且镜像非空的服务,按服务顺序
+        let services = vec![
+            choice("web", "myapp:1", TransferMode::Local),
+            choice("db", "", TransferMode::Pull),
+            choice("cache", "redis:7", TransferMode::Local),
+            choice("worker", "   ", TransferMode::Local),
+        ];
+        assert_eq!(
+            stack_record_images(&services),
+            vec!["myapp:1".to_string(), "redis:7".to_string()]
+        );
+        // 全 Pull → 空列表
+        assert!(stack_record_images(&[choice("db", "", TransferMode::Pull)]).is_empty());
     }
 
     #[test]

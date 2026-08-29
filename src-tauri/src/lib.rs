@@ -2,6 +2,7 @@ pub mod commands;
 pub mod config;
 pub mod crypto;
 pub mod docker;
+pub mod history;
 pub mod ssh;
 pub mod stack;
 
@@ -28,6 +29,7 @@ pub fn run() {
       commands::import_compose,
       commands::parse_compose,
       commands::preview_compose,
+      commands::get_history,
     ])
     .setup(|app| {
       // 日志(不限 debug 构建,release 同样记录,便于现场排查):
