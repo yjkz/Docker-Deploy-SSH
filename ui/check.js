@@ -41,8 +41,7 @@
     if (!row) return;
     var badge = row.querySelector('.badge');
     if (!badge) return;
-    badge.className = 'badge badge-' + kind;
-    badge.textContent = text;
+    window.fillBadge(badge, kind, text);
   }
 
   function setDetail(key, text) {
@@ -76,28 +75,43 @@
     return box;
   }
 
-  // ===== 检测项骨架(每行 = 徽章 + 名称 + 详情 + 操作区)=====
+  // ===== 检测项骨架(每行 = 中文名+英文微标签 | 值+徽章,行尾操作区)=====
+
+  /**
+   * 构造一行检测项:左=中文项名+英文微标签;右=值(mono)+状态徽章;
+   * 未通过时的操作按钮组由 renderXxxAction 注入 .check-action。
+   * 注意:.badge / .check-detail / .check-action 三个选择器被
+   * setBadge / setDetail / clearAction 依赖,结构不可改名。
+   */
+  function checkRow(key, name, en) {
+    var row = el('div', 'check-item');
+    if (key) row.id = 'check-' + key;
+    var line = el('div', 'check-line');
+    var main = el('div', 'check-main');
+    main.appendChild(el('div', 'check-name', name));
+    main.appendChild(el('div', 'check-micro', en));
+    line.appendChild(main);
+    var side = el('div', 'check-side');
+    side.appendChild(el('span', 'check-detail hidden'));
+    side.appendChild(window.fillBadge(el('span'), 'info', '待检测'));
+    line.appendChild(side);
+    row.appendChild(line);
+    row.appendChild(el('div', 'check-action hidden'));
+    return row;
+  }
 
   function buildRows() {
     var list = document.getElementById('check-list');
     if (!list) return;
     list.textContent = '';
     [
-      { key: 'docker_installed', name: 'Docker 已安装' },
-      { key: 'daemon_running', name: 'Docker 守护进程运行中' },
-      { key: 'compose_ok', name: 'docker compose 可用' },
-      { key: 'disk', name: '磁盘空间充足(临时目录)' },
-      { key: 'arch', name: '本机架构' }
+      { key: 'docker_installed', name: 'Docker 已安装', en: 'DOCKER INSTALLED' },
+      { key: 'daemon_running', name: 'Docker 守护进程运行中', en: 'DOCKER DAEMON' },
+      { key: 'compose_ok', name: 'docker compose 可用', en: 'COMPOSE PLUGIN' },
+      { key: 'disk', name: '磁盘空间充足(临时目录)', en: 'DISK FREE' },
+      { key: 'arch', name: '本机架构', en: 'ARCHITECTURE' }
     ].forEach(function (item) {
-      var row = el('div', 'check-item');
-      row.id = 'check-' + item.key;
-      row.appendChild(el('span', 'badge badge-info', '待检测'));
-      var body = el('div', 'check-body');
-      body.appendChild(el('div', 'check-name', item.name));
-      body.appendChild(el('div', 'check-detail hidden'));
-      body.appendChild(el('div', 'check-action hidden'));
-      row.appendChild(body);
-      list.appendChild(row);
+      list.appendChild(checkRow(item.key, item.name, item.en));
     });
   }
 
@@ -163,7 +177,7 @@
     if (!banner) return;
     if (allPass) {
       banner.className = 'banner banner-ok';
-      banner.textContent = '环境就绪,可以开始部署';
+      banner.textContent = '环境就绪 READY';
     } else {
       banner.className = 'banner banner-fail';
       banner.textContent = '环境检测未通过,请处理下方未通过项后重新检测';
@@ -271,12 +285,11 @@
     var list = document.getElementById('check-list');
     if (list) {
       list.textContent = '';
-      var row = el('div', 'check-item');
-      row.appendChild(el('span', 'badge badge-fail', '错误'));
-      var body = el('div', 'check-body');
-      body.appendChild(el('div', 'check-name', '环境检测失败'));
-      body.appendChild(el('div', 'check-detail', errText(err) || '未知错误'));
-      row.appendChild(body);
+      var row = checkRow(null, '环境检测失败', 'PREFLIGHT');
+      window.fillBadge(row.querySelector('.badge'), 'fail', '错误');
+      var detail = row.querySelector('.check-detail');
+      detail.textContent = errText(err) || '未知错误';
+      detail.classList.remove('hidden');
       list.appendChild(row);
     }
     var banner = document.getElementById('check-banner');

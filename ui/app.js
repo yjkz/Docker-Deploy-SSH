@@ -79,7 +79,14 @@
     for (i = 0; i < sections.length; i++) {
       sections[i].classList.toggle('active', sections[i] === section);
     }
-    var items = document.querySelectorAll('.nav-item');
+
+    // 切页动画:给新 section 挂 page-reveal 触发一次 clip-path masked reveal
+    // (CSS animation 播完自动结束;先移除并强制 reflow 以便重复切换时可重触发)
+    section.classList.remove('page-reveal');
+    void section.offsetWidth;
+    section.classList.add('page-reveal');
+
+    var items = document.querySelectorAll('.dock-item');
     for (i = 0; i < items.length; i++) {
       items[i].classList.toggle('active', items[i].getAttribute('data-nav') === name);
     }
@@ -94,7 +101,7 @@
   window.refreshNav = function () {
     var ok = window.AppState.hostOk;
     LOCKED_PAGES.forEach(function (name) {
-      var item = document.querySelector('.nav-item[data-nav="' + name + '"]');
+      var item = document.querySelector('.dock-item[data-nav="' + name + '"]');
       if (!item) return;
       if (ok) {
         item.classList.remove('disabled');
@@ -109,7 +116,7 @@
 
     // 兜底:若当前停留在被锁定的页面,退回环境检测页
     if (!ok) {
-      var active = document.querySelector('.nav-item.active');
+      var active = document.querySelector('.dock-item.active');
       if (active && LOCKED_PAGES.indexOf(active.getAttribute('data-nav')) !== -1) {
         window.showPage('check');
       }
@@ -131,6 +138,45 @@
       el.classList.remove('toast-show');
       window.setTimeout(function () { el.remove(); }, 300);
     }, 2500);
+  };
+
+  // ===== 呈现辅助:内联 SVG 图标 + 状态徽章(供各页面脚本构造 DOM)=====
+  var SVG_NS = 'http://www.w3.org/2000/svg';
+
+  /**
+   * 构造引用 index.html 内 <symbol> 的内联 SVG 图标(check / cross / run)
+   * @param {string} name 'ok' | 'x' | 'run'
+   * @returns {SVGElement}
+   */
+  window.appIcon = function (name) {
+    var svg = document.createElementNS(SVG_NS, 'svg');
+    svg.setAttribute('class', 'badge-ico');
+    svg.setAttribute('aria-hidden', 'true');
+    var use = document.createElementNS(SVG_NS, 'use');
+    use.setAttribute('href', '#icon-' + name);
+    svg.appendChild(use);
+    return svg;
+  };
+
+  /**
+   * 填充状态徽章:同步类名 + 前置图标 + 文本(kind 对应图标:ok=check fail=cross warn=run info=无)
+   * @param {HTMLElement} node 徽章元素(通常为新建 span)
+   * @param {string} kind 'ok' | 'fail' | 'warn' | 'info'
+   * @param {string} text 徽章文字
+   * @returns {HTMLElement} 传入的节点(便于链式 append)
+   */
+  window.fillBadge = function (node, kind, text) {
+    if (!node) return node;
+    node.className = 'badge' + (kind ? ' badge-' + kind : '');
+    node.textContent = '';
+    var icon = kind === 'ok' ? 'ok'
+      : (kind === 'fail' ? 'x'
+        : (kind === 'warn' ? 'run' : null));
+    if (icon) node.appendChild(window.appIcon(icon));
+    if (text !== undefined && text !== null) {
+      node.appendChild(document.createTextNode(String(text)));
+    }
+    return node;
   };
 
   // ===== 复制文本到剪贴板(成功 toast「已复制」)=====
@@ -160,7 +206,7 @@
 
   // ===== 初始化:绑定导航点击 + 刷新禁用态 =====
   document.addEventListener('DOMContentLoaded', function () {
-    var items = document.querySelectorAll('.nav-item');
+    var items = document.querySelectorAll('.dock-item');
     Array.prototype.forEach.call(items, function (item) {
       item.addEventListener('click', function () {
         window.showPage(item.getAttribute('data-nav'));

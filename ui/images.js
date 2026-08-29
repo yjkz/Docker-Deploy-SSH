@@ -86,14 +86,17 @@
       : '共 ' + total + ' 个镜像';
   }
 
-  /** 仓库名 / TAG 单元格:缺失时灰色 <none>,否则等宽字体 */
-  function nameCell(value) {
+  /**
+   * 仓库名 / TAG 单元格:缺失时斜体 <none>,否则等宽字体;
+   * mod 为附加类(仓库名列传 'cell-repo' 走 15px 墨粗样式)
+   */
+  function nameCell(value, mod) {
     var td = document.createElement('td');
     if (isNone(value)) {
       td.className = 'none-text';
       td.textContent = '<none>';
     } else {
-      td.className = 'mono';
+      td.className = mod ? 'mono ' + mod : 'mono';
       td.textContent = String(value);
     }
     return td;
@@ -142,7 +145,7 @@
     rows.forEach(function (img) {
       var tr = document.createElement('tr');
 
-      tr.appendChild(nameCell(img.repository));
+      tr.appendChild(nameCell(img.repository, 'cell-repo'));
       tr.appendChild(nameCell(img.tag));
 
       var sizeTd = document.createElement('td');

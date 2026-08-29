@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-ark-theme="ark" data-ark-depth="complex">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -7,71 +7,90 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
+  <!-- 全站唯一图标源:三个内联 SVG symbol(check / cross / run),经 <use> 复用 -->
+  <svg class="svg-defs" aria-hidden="true" focusable="false">
+    <defs>
+      <symbol id="icon-ok" viewBox="0 0 16 16">
+        <polyline points="3.5 8.5 6.5 11.5 12.5 4.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="square" stroke-linejoin="miter"/>
+      </symbol>
+      <symbol id="icon-x" viewBox="0 0 16 16">
+        <line x1="4" y1="4" x2="12" y2="12" stroke="currentColor" stroke-width="1.8" stroke-linecap="square"/>
+        <line x1="12" y1="4" x2="4" y2="12" stroke="currentColor" stroke-width="1.8" stroke-linecap="square"/>
+      </symbol>
+      <symbol id="icon-run" viewBox="0 0 16 16">
+        <polygon points="5 3.5 12.5 8 5 12.5" fill="currentColor"/>
+      </symbol>
+    </defs>
+  </svg>
+
   <div class="layout">
-    <!-- 左侧固定导航 -->
-    <aside class="sidebar">
-      <div class="sidebar-brand">
-        <span class="brand-icon">&#128038;</span>
-        <span class="brand-text">DockerDeploy</span>
-      </div>
-      <nav class="nav">
-        <button class="nav-item active" type="button" data-nav="check">
-          <span class="nav-icon">&#129658;</span><span class="nav-text">环境检测</span>
+    <!-- 左侧 64px 纯黑 edge dock(<900px 时转为顶部横向黑条) -->
+    <aside class="dock">
+      <div class="dock-brand">DOCKERDEPLOY</div>
+      <nav class="dock-nav">
+        <button class="dock-item active" type="button" data-nav="check">
+          <span class="dock-num">01</span><span class="dock-label">环境检测</span>
         </button>
-        <button class="nav-item disabled" type="button" data-nav="images" title="环境检测未通过" aria-disabled="true">
-          <span class="nav-icon">&#128230;</span><span class="nav-text">镜像列表</span>
+        <button class="dock-item disabled" type="button" data-nav="images" title="环境检测未通过" aria-disabled="true">
+          <span class="dock-num">02</span><span class="dock-label">镜像列表</span>
         </button>
-        <!-- 服务器管理:配置编辑不依赖本机 Docker,始终可进入(hostOk=false 时页面顶部有黄色横幅) -->
-        <button class="nav-item" type="button" data-nav="servers">
-          <span class="nav-icon">&#128421;</span><span class="nav-text">服务器管理</span>
+        <!-- 服务器管理:配置编辑不依赖本机 Docker,始终可进入(hostOk=false 时页面顶部有警示条) -->
+        <button class="dock-item" type="button" data-nav="servers">
+          <span class="dock-num">03</span><span class="dock-label">服务器管理</span>
         </button>
-        <button class="nav-item disabled" type="button" data-nav="deploy" title="环境检测未通过" aria-disabled="true">
-          <span class="nav-icon">&#128640;</span><span class="nav-text">部署向导</span>
+        <button class="dock-item disabled" type="button" data-nav="deploy" title="环境检测未通过" aria-disabled="true">
+          <span class="dock-num">04</span><span class="dock-label">部署向导</span>
         </button>
       </nav>
-      <div class="sidebar-footer">v0.1.0</div>
+      <div class="dock-foot">v0.1.0</div>
     </aside>
 
-    <!-- 右侧内容区 -->
-    <main class="content">
-      <!-- 环境检测页(默认显示) -->
+    <!-- 右侧纸白舞台 -->
+    <main class="stage">
+      <!-- 01 环境检测 PREFLIGHT -->
       <section data-page="check" class="page active">
-        <div id="check-banner" class="banner banner-wait">正在检测本机环境…</div>
-        <header class="page-header">
-          <h1 class="page-title">环境检测</h1>
-          <p class="page-desc">检测本机 Docker 环境是否满足部署条件</p>
+        <header class="page-head">
+          <div class="page-index">01</div>
+          <div class="page-titles">
+            <h1 class="page-title">环境检测</h1>
+            <span class="page-sub">PREFLIGHT</span>
+          </div>
+          <div class="page-tools">
+            <button id="recheck-btn" class="btn" type="button">重新检测</button>
+          </div>
         </header>
+        <div id="check-banner" class="banner banner-wait">正在检测本机环境…</div>
         <div id="check-error" class="check-error hidden"></div>
         <div id="check-list" class="check-list">
           <div class="check-item"><span class="badge badge-info">待检测</span></div>
         </div>
-        <div class="check-footer">
-          <button id="recheck-btn" class="btn" type="button">重新检测</button>
-        </div>
       </section>
 
-      <!-- 镜像列表页 -->
+      <!-- 02 镜像列表 IMAGES -->
       <section data-page="images" class="page">
-        <header class="page-header">
-          <h1 class="page-title">镜像列表</h1>
-          <p class="page-desc">列出本机 Docker 镜像,选择镜像后进入部署向导</p>
+        <header class="page-head">
+          <div class="page-index">02</div>
+          <div class="page-titles">
+            <h1 class="page-title">镜像列表</h1>
+            <span class="page-sub">IMAGES</span>
+          </div>
+          <div class="page-tools">
+            <input id="images-search" class="text-input" type="search"
+                   placeholder="搜索仓库名或标签…" autocomplete="off">
+            <button id="images-refresh-btn" class="btn" type="button">刷新</button>
+          </div>
         </header>
-        <div class="images-toolbar">
-          <input id="images-search" class="text-input" type="search"
-                 placeholder="搜索仓库名或标签…" autocomplete="off">
-          <button id="images-refresh-btn" class="btn" type="button">刷新</button>
-        </div>
         <div id="images-count" class="images-count">尚未加载</div>
         <div id="images-error" class="images-error hidden"></div>
         <div id="images-table-wrap" class="table-wrap">
           <table class="data-table">
             <thead>
               <tr>
-                <th>仓库</th>
+                <th>仓库 REPO</th>
                 <th>TAG</th>
-                <th>大小</th>
-                <th>创建时间</th>
-                <th class="col-action">操作</th>
+                <th>大小 SIZE</th>
+                <th>创建时间 CREATED</th>
+                <th class="col-action">操作 ACTION</th>
               </tr>
             </thead>
             <tbody id="images-tbody">
@@ -81,37 +100,42 @@
         </div>
       </section>
 
-      <!-- 服务器管理页 -->
+      <!-- 03 服务器管理 SERVERS -->
       <section data-page="servers" class="page">
         <div id="servers-banner" class="banner banner-warn hidden"></div>
-        <header class="page-header">
-          <h1 class="page-title">服务器管理</h1>
-          <p class="page-desc">维护 SSH 服务器连接与部署项目配置</p>
+        <header class="page-head">
+          <div class="page-index">03</div>
+          <div class="page-titles">
+            <h1 class="page-title">服务器管理</h1>
+            <span class="page-sub">SERVERS</span>
+          </div>
+          <div class="page-tools">
+            <button id="servers-add-btn" class="btn btn-primary" type="button">新增服务器</button>
+            <button id="projects-add-btn" class="btn" type="button">新增项目</button>
+          </div>
         </header>
 
         <div id="servers-error" class="check-error hidden"></div>
 
         <div class="section-head">
-          <h2 class="section-title">服务器</h2>
-          <button id="servers-add-btn" class="btn btn-primary" type="button">新增服务器</button>
+          <h2 class="section-title">服务器<span class="section-en">SERVERS</span></h2>
         </div>
         <div id="servers-list" class="server-list">
           <div class="list-hint">正在加载配置…</div>
         </div>
 
         <div class="section-head">
-          <h2 class="section-title">部署项目</h2>
-          <button id="projects-add-btn" class="btn btn-primary" type="button">新增项目</button>
+          <h2 class="section-title">部署项目<span class="section-en">PROJECTS</span></h2>
         </div>
         <div id="projects-table-wrap" class="table-wrap">
           <table class="data-table">
             <thead>
               <tr>
-                <th>名称</th>
-                <th>镜像过滤</th>
-                <th>compose 文件</th>
-                <th>映射数</th>
-                <th class="col-action">操作</th>
+                <th>名称 NAME</th>
+                <th>镜像过滤 FILTER</th>
+                <th>compose 文件 COMPOSE</th>
+                <th>映射数 MAPS</th>
+                <th class="col-action">操作 ACTION</th>
               </tr>
             </thead>
             <tbody id="projects-tbody">
@@ -122,26 +146,29 @@
 
         <!-- 运行日志(折叠面板,默认收起):install / create 等远端命令输出 -->
         <div class="log-panel">
-          <button id="servers-log-toggle" class="log-toggle" type="button">运行日志(点击展开,安装/检测输出在此显示)</button>
+          <button id="servers-log-toggle" class="log-toggle" type="button">+ 运行日志(安装/检测输出在此显示)</button>
           <pre id="servers-log-body" class="log-body hidden"></pre>
         </div>
       </section>
 
-      <!-- 部署向导页 -->
+      <!-- 04 部署向导 DEPLOY -->
       <section data-page="deploy" class="page">
         <!-- 结束横幅(成功/失败/已取消),下次点击「开始部署」时清空 -->
         <div id="deploy-banner" class="banner banner-ok hidden"></div>
 
-        <header class="page-header">
-          <h1 class="page-title">部署向导</h1>
-          <p class="page-desc">选择本地镜像、目标服务器与部署项目,一键部署到远程服务器</p>
+        <header class="page-head">
+          <div class="page-index">04</div>
+          <div class="page-titles">
+            <h1 class="page-title">部署向导</h1>
+            <span class="page-sub">DEPLOY</span>
+          </div>
         </header>
 
         <!-- 预检未通过 / 预检失败 / 数据加载失败错误框(内容由 deploy.js 构建) -->
         <div id="deploy-error" class="check-error hidden"></div>
 
         <div class="section-head">
-          <h2 class="section-title">部署配置</h2>
+          <h2 class="section-title">部署配置<span class="section-en">CONFIG</span></h2>
         </div>
         <div class="deploy-form">
           <div class="deploy-form-grid">
@@ -170,7 +197,7 @@
             </div>
           </div>
           <div class="deploy-actions">
-            <button id="deploy-start-btn" class="btn btn-primary" type="button">开始部署</button>
+            <button id="deploy-start-btn" class="btn btn-primary btn-lg" type="button">开始部署</button>
             <button id="deploy-cancel-btn" class="btn btn-danger" type="button" disabled>取消部署</button>
           </div>
         </div>
@@ -179,38 +206,62 @@
         <div id="deploy-check" class="server-check hidden"></div>
 
         <div class="section-head">
-          <h2 class="section-title">部署进度</h2>
+          <h2 class="section-title">部署进度<span class="section-en">PROGRESS</span></h2>
         </div>
+        <!-- 五步索引化校准仪:状态类(done/current)由 deploy.js 切换 -->
         <div id="deploy-steps" class="deploy-steps">
           <div class="deploy-step" id="deploy-step-1">
-            <div class="deploy-step-dot">1</div>
+            <div class="deploy-step-box">
+              <span class="deploy-step-num">01</span>
+              <span class="deploy-step-tick"><svg class="badge-ico" aria-hidden="true"><use href="#icon-ok"></use></svg></span>
+            </div>
             <div class="deploy-step-name">打标签</div>
+            <div class="deploy-step-en">TAG</div>
             <div class="deploy-step-msg"></div>
           </div>
           <div class="deploy-step" id="deploy-step-2">
-            <div class="deploy-step-dot">2</div>
+            <div class="deploy-step-box">
+              <span class="deploy-step-num">02</span>
+              <span class="deploy-step-tick"><svg class="badge-ico" aria-hidden="true"><use href="#icon-ok"></use></svg></span>
+            </div>
             <div class="deploy-step-name">导出压缩</div>
+            <div class="deploy-step-en">PACK</div>
             <div class="deploy-step-msg"></div>
           </div>
           <div class="deploy-step" id="deploy-step-3">
-            <div class="deploy-step-dot">3</div>
+            <div class="deploy-step-box">
+              <span class="deploy-step-num">03</span>
+              <span class="deploy-step-tick"><svg class="badge-ico" aria-hidden="true"><use href="#icon-ok"></use></svg></span>
+            </div>
             <div class="deploy-step-name">上传镜像</div>
+            <div class="deploy-step-en">UPLOAD</div>
             <div class="deploy-step-msg"></div>
           </div>
           <div class="deploy-step" id="deploy-step-4">
-            <div class="deploy-step-dot">4</div>
+            <div class="deploy-step-box">
+              <span class="deploy-step-num">04</span>
+              <span class="deploy-step-tick"><svg class="badge-ico" aria-hidden="true"><use href="#icon-ok"></use></svg></span>
+            </div>
             <div class="deploy-step-name">同步文件</div>
+            <div class="deploy-step-en">SYNC</div>
             <div class="deploy-step-msg"></div>
           </div>
           <div class="deploy-step" id="deploy-step-5">
-            <div class="deploy-step-dot">5</div>
+            <div class="deploy-step-box">
+              <span class="deploy-step-num">05</span>
+              <span class="deploy-step-tick"><svg class="badge-ico" aria-hidden="true"><use href="#icon-ok"></use></svg></span>
+            </div>
             <div class="deploy-step-name">服务器部署</div>
+            <div class="deploy-step-en">APPLY</div>
             <div class="deploy-step-msg"></div>
           </div>
         </div>
 
-        <!-- 部署日志(深底等宽,自动滚底;上限 2000 行,超出丢弃最旧) -->
-        <pre id="deploy-log" class="deploy-log"></pre>
+        <!-- 部署日志(墨黑面板,自动滚底;上限 2000 行,超出丢弃最旧;右下角行计数) -->
+        <div class="log-shell">
+          <pre id="deploy-log" class="deploy-log"></pre>
+          <div id="deploy-log-count" class="log-count"></div>
+        </div>
       </section>
     </main>
   </div>
@@ -223,7 +274,7 @@
     <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="servers-modal-title">
       <div class="modal-head">
         <div id="servers-modal-title" class="modal-title"></div>
-        <button id="servers-modal-close" class="modal-close" type="button" title="关闭">×</button>
+        <button id="servers-modal-close" class="modal-close" type="button" title="关闭">关闭</button>
       </div>
       <div id="servers-modal-body" class="modal-body"></div>
     </div>

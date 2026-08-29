@@ -97,7 +97,7 @@
     return null;
   }
 
-  /** 表单内联错误提示(自绘,不用 alert) */
+  /** 表单内联错误提示(自绘,不调用系统对话框) */
   function formFail(errId, msg) {
     var box = document.getElementById(errId);
     if (box) {
@@ -193,23 +193,31 @@
       list.appendChild(el('div', 'list-hint', '暂无服务器,点击右上角「新增服务器」添加'));
       return;
     }
-    st.cfg.servers.forEach(function (server) {
-      list.appendChild(serverCard(server));
+    st.cfg.servers.forEach(function (server, i) {
+      list.appendChild(serverCard(server, i));
     });
   }
 
-  function serverCard(server) {
+  /** 键值对节点(键 = 大写微标签,值 = mono) */
+  function kvPair(key, val) {
+    var node = el('div', 'kv');
+    node.appendChild(el('span', 'kv-key', key));
+    node.appendChild(el('span', 'kv-val', val));
+    return node;
+  }
+
+  /** 服务器卡片 = dossier 技术面板:SRV 编号 + 名称 + 操作组 / 键值区 / 检测区 */
+  function serverCard(server, index) {
     var auth = server.auth || {};
     var isPassword = auth.auth_type === 'Password';
     var checking = !!st.checking[server.id];
 
     var card = el('div', 'server-card');
 
-    // 头部:名称 + host:port + 认证徽章 + 操作按钮
+    // 头部:SRV-XX 编号 + 名称 + 操作按钮组(文字按钮)
     var head = el('div', 'server-head');
+    head.appendChild(el('span', 'server-index', 'SRV-' + ('0' + (index + 1)).slice(-2)));
     head.appendChild(el('span', 'server-name', server.name));
-    head.appendChild(el('span', 'server-addr', server.host + ':' + server.port));
-    head.appendChild(el('span', 'badge badge-info', isPassword ? '密码' : '私钥'));
 
     var actions = el('div', 'server-actions');
 
@@ -243,11 +251,13 @@
     head.appendChild(actions);
     card.appendChild(head);
 
-    // 元信息:用户名 + 远程目录
-    var meta = el('div', 'server-meta');
-    meta.appendChild(el('span', '', '用户:' + server.username));
-    meta.appendChild(el('span', '', '远程目录:' + server.remote_dir));
-    card.appendChild(meta);
+    // 键值区:host:port / 用户 / 认证 / 远程目录
+    var kv = el('div', 'server-kv');
+    kv.appendChild(kvPair('主机 HOST', server.host + ':' + server.port));
+    kv.appendChild(kvPair('用户 USER', server.username));
+    kv.appendChild(kvPair('认证 AUTH', isPassword ? '密码' : '私钥'));
+    kv.appendChild(kvPair('远程目录 REMOTE_DIR', server.remote_dir));
+    card.appendChild(kv);
 
     // 内嵌环境检测结果区
     card.appendChild(checkSection(server));
@@ -279,7 +289,7 @@
     var disk = Number(report.disk_free_gb);
     var diskText = isFinite(disk) ? '磁盘 ' + disk.toFixed(1) + ' GB' : '磁盘未知';
     var diskKind = (isFinite(disk) && disk >= DISK_MIN_GB) ? 'ok' : 'warn';
-    badges.appendChild(el('span', 'badge badge-' + diskKind, diskText));
+    badges.appendChild(window.fillBadge(el('span'), diskKind, diskText));
     box.appendChild(badges);
 
     var errors = Array.isArray(report.errors) ? report.errors : [];
@@ -320,11 +330,11 @@
   }
 
   function badgeBool(label, ok) {
-    return el('span', 'badge ' + (ok ? 'badge-ok' : 'badge-fail'),
+    return window.fillBadge(el('span'), ok ? 'ok' : 'fail',
       label + ':' + (ok ? '通过' : '未通过'));
   }
 
-  /** 自绘确认条(不用 confirm()):文案 + 确认/取消 内联按钮 */
+  /** 自绘确认条(不调用系统对话框):文案 + 确认/取消 内联按钮 */
   function showInstallConfirm(container, server) {
     container.textContent = '';
     container.appendChild(el('span', 'confirm-text',
@@ -982,7 +992,7 @@
     var btn = document.getElementById('servers-log-toggle');
     if (!body || !btn) return;
     body.classList.toggle('hidden', !open);
-    btn.textContent = open ? '运行日志(点击收起)' : '运行日志(点击展开,安装/检测输出在此显示)';
+    btn.textContent = open ? '− 运行日志' : '+ 运行日志(安装/检测输出在此显示)';
     if (open) rebuildLog();
   }
 

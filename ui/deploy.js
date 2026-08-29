@@ -28,7 +28,7 @@
  *   (仅在 scrollTop 接近底部时才 autoscroll)。
  *
  * 安全说明:所有来自后端/配置的数据一律 createElement + textContent 渲染,
- * 不使用 innerHTML 拼接;提示一律用 toast / 自绘错误框,不用 alert。
+ * 不使用 innerHTML 拼接;提示一律用 toast / 自绘错误框,不调用系统对话框。
  * ============================================================ */
 (function () {
   'use strict';
@@ -330,25 +330,25 @@
     box.appendChild(el('div', 'server-check-title', '服务器环境预检结果'));
 
     var badges = el('div', 'server-check-badges');
-    badges.appendChild(el('span',
-      'badge ' + (r.docker ? 'badge-ok' : 'badge-fail'),
+    badges.appendChild(window.fillBadge(el('span'),
+      r.docker ? 'ok' : 'fail',
       'Docker:' + (r.docker ? '通过' : '未通过')));
-    badges.appendChild(el('span',
-      'badge ' + (r.compose ? 'badge-ok' : 'badge-fail'),
+    badges.appendChild(window.fillBadge(el('span'),
+      r.compose ? 'ok' : 'fail',
       'Compose:' + (r.compose ? '通过' : '未通过')));
-    badges.appendChild(el('span',
-      'badge ' + (r.gzip ? 'badge-ok' : 'badge-fail'),
+    badges.appendChild(window.fillBadge(el('span'),
+      r.gzip ? 'ok' : 'fail',
       'gzip:' + (r.gzip ? '通过' : '未通过')));
-    badges.appendChild(el('span',
-      'badge ' + (r.remote_dir_exists ? 'badge-ok' : 'badge-fail'),
+    badges.appendChild(window.fillBadge(el('span'),
+      r.remote_dir_exists ? 'ok' : 'fail',
       '远程目录:' + (r.remote_dir_exists ? '存在' : '不存在')));
 
     var disk = Number(r.disk_free_gb);
     var diskText = isFinite(disk)
       ? '磁盘 ' + disk.toFixed(1) + ' GB'
       : '磁盘未知';
-    badges.appendChild(el('span',
-      'badge ' + (isFinite(disk) && disk >= DISK_MIN_GB ? 'badge-ok' : 'badge-warn'),
+    badges.appendChild(window.fillBadge(el('span'),
+      isFinite(disk) && disk >= DISK_MIN_GB ? 'ok' : 'warn',
       diskText));
     box.appendChild(badges);
 
@@ -367,7 +367,7 @@
   // ===== 进度条 =====
 
   /**
-   * 渲染五步进度。
+   * 渲染五步进度(编号 01..05 与对勾图标由 index.html 静态承载,此处只切状态类)。
    * @param {number} step 当前步骤 1..5;0 表示重置(全部灰色待命)
    * @param {string} message 当前节点文案(deploy-progress 的 message)
    */
@@ -375,24 +375,27 @@
     for (var i = 1; i <= STEP_NAMES.length; i++) {
       var node = document.getElementById('deploy-step-' + i);
       if (!node) continue;
-      var done = step > i;
-      var current = step === i;
-      node.classList.toggle('done', done);
-      node.classList.toggle('current', current);
-      var dot = node.querySelector('.deploy-step-dot');
-      if (dot) dot.textContent = done ? '✓' : String(i);
+      node.classList.toggle('done', step > i);
+      node.classList.toggle('current', step === i);
       var msg = node.querySelector('.deploy-step-msg');
-      if (msg) msg.textContent = current ? String(message || '') : '';
+      if (msg) msg.textContent = step === i ? String(message || '') : '';
     }
   }
 
-  // ===== 部署日志(自动滚底,上限 2000 行)=====
+  // ===== 部署日志(自动滚底,上限 2000 行,右下角行计数)=====
+
+  /** 更新日志面板右下角的行计数(元素缺失时静默跳过) */
+  function renderLogCount() {
+    var counter = document.getElementById('deploy-log-count');
+    if (counter) counter.textContent = st.logs.length + ' 行';
+  }
 
   function renderLog() {
     var body = document.getElementById('deploy-log');
     if (!body) return;
     body.textContent = st.logs.length > 0 ? st.logs.join('\n') : '(暂无日志)';
     body.scrollTop = body.scrollHeight;
+    renderLogCount();
   }
 
   function appendLogLine(line) {
@@ -413,6 +416,7 @@
       body.textContent = st.logs.join('\n');
       if (nearBottom) body.scrollTop = body.scrollHeight;
     }
+    renderLogCount();
   }
 
   // ===== 部署流程 =====
