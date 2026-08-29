@@ -8,11 +8,14 @@
  * - window.AppBus.invoke / on     Tauri 命令与事件的薄封装
  * - window.toast(msg, type)       右下角 Toast(2.5 秒自动消失)
  * - window.copyText(text)         复制文本到剪贴板(成功 toast「已复制」)
+ * - window.toggleScheme(evt)      亮暗主题切换(View Transitions 圆形扩散揭示,
+ *                                 持久化 localStorage['dd_scheme'])
  * ============================================================ */
 (function () {
   'use strict';
 
   var HOST_OK_KEY = 'dd_hostOk';
+  var SCHEME_KEY = 'dd_scheme';
   /** 环境检测未通过时禁用的页面(服务器管理页除外:配置编辑不依赖 Docker) */
   var LOCKED_PAGES = ['images', 'deploy'];
 
@@ -204,7 +207,34 @@
     }
   };
 
-  // ===== 初始化:绑定导航点击 + 刷新禁用态 =====
+  // ===== 亮暗主题切换:新状态自按钮位置圆形扩散揭示(View Transitions)=====
+  // 支持 reduce 或 API 不可用时:直接切换,无动画(首帧前主题由 index.html head 脚本恢复)。
+  // 注意:startViewTransition 定义在 Document 接口(document.startViewTransition,
+  // Chromium 111+);Element 级变体 Chromium 147+ 才有,故必须用 document 调用。
+  window.toggleScheme = function (evt) {
+    var root = document.documentElement;
+    var next = root.dataset.arkScheme === 'dark' ? 'light' : 'dark';
+    var reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    var apply = function () {
+      root.dataset.arkScheme = next;
+      try { localStorage.setItem(SCHEME_KEY, next); } catch (e) { /* 忽略 */ }
+    };
+    if (reduce || typeof document.startViewTransition !== 'function') { apply(); return; }
+    // evt.currentTarget 仅在派发期间有效,先同步取按钮矩形,以按钮中心为圆心
+    var rect = evt && evt.currentTarget && typeof evt.currentTarget.getBoundingClientRect === 'function'
+      ? evt.currentTarget.getBoundingClientRect()
+      : { left: window.innerWidth - 48, top: 24, width: 32, height: 32 };
+    var x = rect.left + rect.width / 2;
+    var y = rect.top + rect.height / 2;
+    var end = Math.hypot(Math.max(x, window.innerWidth - x), Math.max(y, window.innerHeight - y));
+    // 揭示圆心/半径写在根节点,供 ::view-transition-new(root) 的 clip-path 消费
+    root.style.setProperty('--scheme-x', x + 'px');
+    root.style.setProperty('--scheme-y', y + 'px');
+    root.style.setProperty('--scheme-r', end + 'px');
+    document.startViewTransition(apply);
+  };
+
+  // ===== 初始化:绑定导航点击 + 主题切换按钮 + 刷新禁用态 =====
   document.addEventListener('DOMContentLoaded', function () {
     var items = document.querySelectorAll('.dock-item');
     Array.prototype.forEach.call(items, function (item) {
@@ -212,6 +242,10 @@
         window.showPage(item.getAttribute('data-nav'));
       });
     });
+    var schemeBtn = document.getElementById('scheme-toggle');
+    if (schemeBtn) {
+      schemeBtn.addEventListener('click', window.toggleScheme);
+    }
     window.refreshNav();
   });
 })();
