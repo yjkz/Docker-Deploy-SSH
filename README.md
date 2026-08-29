@@ -8,6 +8,16 @@ Windows 桌面客户端(Tauri 2):把本地构建的 Docker 镜像一键部署到
 
 历史设计过程文档在 `docs/`(spec / 实现计划 / UI 简报)。
 
+![运行截图](image/1.png)
+
+![运行截图](image/2.png)
+
+![运行截图](image/3.png)
+
+![运行截图](image/4.png)
+
+![运行截图](image/6.png)
+
 ## 快速开始
 
 ```bash
