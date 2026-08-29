@@ -549,7 +549,8 @@
     }
 
     buildSteps(mode);
-    renderProgress(0, '');
+    // 切模式即重置本次运行视图:清横幅/预检条/错误框/日志,进度按新节点集归零
+    resetRunView();
 
     // 切到整栈:已选项目且尚未解析(或解析的是别的项目)时自动解析
     if (mode === 'stack') {

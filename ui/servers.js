@@ -1224,19 +1224,28 @@
     window.AppBus.invoke('get_config')
       .then(function (cfg) {
         cfg = normalizeCfg(cfg);
-        var project = {
-          id: (prev && prev.id) ? prev.id : uuid(),
-          name: name,
-          image_filter: filter,
-          compose_file: compose,
-          file_mappings: mappings
-        };
+        var pid = (prev && prev.id) ? prev.id : uuid();
         var idx = -1;
         for (var j = 0; j < cfg.projects.length; j++) {
-          if (cfg.projects[j].id === project.id) { idx = j; break; }
+          if (cfg.projects[j].id === pid) { idx = j; break; }
         }
-        if (idx >= 0) cfg.projects[idx] = project;
-        else cfg.projects.push(project);
+        if (idx >= 0) {
+          // 编辑:在配置中的原条目上就地改表单承载的字段,保留 service_overrides
+          // 等表单未承载的字段(整对象替换会经 serde(default) 把它们清空)
+          cfg.projects[idx].name = name;
+          cfg.projects[idx].image_filter = filter;
+          cfg.projects[idx].compose_file = compose;
+          cfg.projects[idx].file_mappings = mappings;
+        } else {
+          cfg.projects.push({
+            id: pid,
+            name: name,
+            image_filter: filter,
+            compose_file: compose,
+            file_mappings: mappings,
+            service_overrides: []
+          });
+        }
         return window.AppBus.invoke('save_config_cmd', { cfg: cfg });
       })
       .then(function () {
