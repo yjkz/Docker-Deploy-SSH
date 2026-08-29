@@ -413,7 +413,8 @@ pub fn registry_of(image: &str) -> Option<String> {
 /// 把镜像引用拆成 `(仓库, 标签)`;无标签时按 Docker 约定补 `latest`。
 /// 标签分隔取最后一个 `/` 之后的第一个 `:`
 /// (因此仓库内含端口的 `reg:5000/app:v1` 也能正确拆分)。
-fn split_image_ref(image: &str) -> (String, String) {
+/// (供部署预览按 repo:tag 在本地/远端镜像列表中定位镜像 ID。)
+pub fn split_image_ref(image: &str) -> (String, String) {
     let s = image.trim();
     let after_last_slash = match s.rfind('/') {
         Some(i) => &s[i + 1..],

@@ -30,6 +30,7 @@ pub fn run() {
       commands::import_compose,
       commands::parse_compose,
       commands::preview_compose,
+      commands::preview_stack_changes,
       commands::get_history,
     ])
     .setup(|app| {
