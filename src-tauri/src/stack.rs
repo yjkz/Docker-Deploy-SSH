@@ -19,8 +19,9 @@
 //! - image 与 build 都缺失的服务仍保留在 services 中,同时记入 `errors`
 //!   (部署前由前端红框阻断);
 //! - 镜像引用无标签时按 Docker 约定补 `latest` 参与匹配;
-//! - Pull 类服务的 image 首段为私有仓库主机名([`registry_of`])时,追加
-//!   “请确认服务器已 docker login” 警告。
+//! - Pull 类服务的 image 首段为私有仓库主机名([`registry_of`],Docker Hub
+//!   官方别名 docker.io / index.docker.io / registry-1.docker.io 除外)时,
+//!   追加 “请确认服务器已 docker login” 警告。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -400,9 +401,15 @@ fn classify(
 /// 或等于 `localhost` 时视为 registry 主机名(如 `ghcr.io/x/y` → `ghcr.io`、
 /// `reg:5000/a` → `reg:5000`);无 `/`(`myapp:v1` 的 `:` 是标签分隔符)或首段
 /// 为普通仓库名段 → `None`(按 docker.io 处理)。
+/// Docker Hub 官方别名 `docker.io` / `index.docker.io` / `registry-1.docker.io`
+/// 同样返回 `None` —— Pull 类官方 Hub 镜像匿名可拉,不算私有仓库、免登录提示。
 pub fn registry_of(image: &str) -> Option<String> {
     let s = image.trim();
     let (first, _) = s.split_once('/')?;
+    // Docker Hub 官方仓库的完整引用形态(三种别名):不算私有仓库
+    if matches!(first, "docker.io" | "index.docker.io" | "registry-1.docker.io") {
+        return None;
+    }
     if first.contains('.') || first.contains(':') || first == "localhost" {
         Some(first.to_string())
     } else {
@@ -1112,6 +1119,10 @@ mod tests {
         assert_eq!(registry_of("myapp:v1"), None);
         assert_eq!(registry_of("library/nginx:1.25"), None);
         assert_eq!(registry_of("user/app"), None);
+        // Docker Hub 官方别名的完整引用形态 → None(官方 Hub 镜像免登录提示)
+        assert_eq!(registry_of("docker.io/library/nginx:1.25"), None);
+        assert_eq!(registry_of("index.docker.io/user/app:1"), None);
+        assert_eq!(registry_of("registry-1.docker.io/user/app:1"), None);
         // 首段含 . / : / localhost → registry 主机名
         assert_eq!(registry_of("ghcr.io/x/y:v1"), Some("ghcr.io".to_string()));
         assert_eq!(registry_of("reg:5000/a"), Some("reg:5000".to_string()));
@@ -1120,6 +1131,41 @@ mod tests {
             Some("reg.example.com:5000".to_string())
         );
         assert_eq!(registry_of("localhost/app"), Some("localhost".to_string()));
+    }
+
+    // ===== Pull 类官方 Hub 镜像(docker.io 别名)不弹私有仓库登录提示 =====
+
+    #[test]
+    fn test_docker_hub_official_pull_no_private_warning() {
+        let dir = temp_fixture_dir();
+        let path = dir.join("stack.yml");
+        std::fs::write(
+            &path,
+            "services:\n  db:\n    image: docker.io/library/postgres:16\n  cache:\n    image: index.docker.io/redis:7\n",
+        )
+        .unwrap();
+        let stack = parse_compose_file(&path, &[]).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        for name in ["db", "cache"] {
+            let svc = stack
+                .services
+                .iter()
+                .find(|s| s.service == name)
+                .unwrap_or_else(|| panic!("服务 {} 不在解析结果中", name));
+            assert_eq!(svc.mode, TransferMode::Pull);
+            assert_eq!(
+                svc.registry, None,
+                "官方 Hub 镜像不应判定为私有仓库: {}",
+                name
+            );
+            assert_eq!(
+                svc.warning.as_deref(),
+                Some("本地不存在,将由服务器拉取"),
+                "不应追加私有仓库登录提示: {}",
+                name
+            );
+        }
     }
 
     // ===== 私有仓库 Pull 类服务的 warning 与 registry 字段 =====

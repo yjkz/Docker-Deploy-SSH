@@ -700,14 +700,56 @@ fn webhook_payload(record: &DeployRecord) -> String {
 /// 发送 webhook 通知(阻塞 HTTP,调用方须放 blocking 线程池)。
 /// 尽力而为:成功 `log::info`,失败(网络/超时/非 2xx)仅 `log::warn`,
 /// 不向调用方传播错误、不影响部署结果。
+/// 日志脱敏:webhook URL 常内嵌 token(query/userinfo,如飞书/钉钉机器人
+/// 地址),完整落 `logs/app.log` 会泄漏凭据 —— 成功/失败日志均只记主机名
+/// (见 [`url_host_for_log`]);ureq 的错误文本同样内嵌完整 URL,不直接落其
+/// Display,只取状态码/错误类别与描述(见 [`webhook_error_detail`])。
 fn send_webhook(url: &str, payload: &str) {
+    let host = url_host_for_log(url);
     let result = ureq::post(url)
         .timeout(Duration::from_secs(WEBHOOK_TIMEOUT_SECS))
         .set("Content-Type", "application/json")
         .send_string(payload);
     match result {
-        Ok(_) => log::info!("部署 webhook 通知已发送: {}", url),
-        Err(e) => log::warn!("部署 webhook 通知发送失败 ({}): {}", url, e),
+        Ok(_) => log::info!("部署 webhook 通知已发送:{}", host),
+        Err(e) => log::warn!(
+            "部署 webhook 通知发送失败 ({}): {}",
+            host,
+            webhook_error_detail(&e)
+        ),
+    }
+}
+
+/// URL 日志脱敏(纯函数):只取 `scheme://` 之后的 `host[:port]` 部分
+/// (`user:pass@host` 的 userinfo 凭据段一并剥除),不落 path/query;
+/// 解析不出 host(非 URL / 空 authority)返回 `"<unparseable-url>"`。
+fn url_host_for_log(url: &str) -> String {
+    let Some((_, authority_full)) = url.split_once("://") else {
+        return "<unparseable-url>".to_string();
+    };
+    let authority = authority_full.split(['/', '?', '#']).next().unwrap_or("");
+    // user:pass@host 形态取 @ 之后的 host;无 @ 即整段
+    let host = match authority.rsplit_once('@') {
+        Some((_, h)) => h,
+        None => authority,
+    };
+    if host.is_empty() {
+        "<unparseable-url>".to_string()
+    } else {
+        host.to_string()
+    }
+}
+
+/// ureq 错误的脱敏文本(纯函数):ureq 的错误 Display 会内嵌完整 URL
+/// (`Status` 带响应 URL、`Transport` 带请求 URL),不能直接落日志;
+/// 这里只取状态码 / 错误类别与描述,不含 URL。
+fn webhook_error_detail(e: &ureq::Error) -> String {
+    match e {
+        ureq::Error::Status(code, _) => format!("HTTP 状态码 {}", code),
+        ureq::Error::Transport(t) => match t.message() {
+            Some(m) => format!("{}: {}", t.kind(), m),
+            None => format!("{}", t.kind()),
+        },
     }
 }
 
@@ -3691,5 +3733,36 @@ mod tests {
         assert_eq!(parse_container_line(r#"{"Image":"x","Labels":"foo=bar"}"#), None);
         // 非 JSON 行 → None
         assert_eq!(parse_container_line("oops"), None);
+    }
+
+    // ===== 修复轮:webhook URL 日志脱敏 =====
+
+    #[test]
+    fn test_url_host_for_log_sanitizes_token() {
+        // query 内嵌 token(飞书/钉钉机器人地址形态):只留 host
+        assert_eq!(
+            url_host_for_log("https://open.feishu.cn/open-apis/bot/v2/hook?token=secret123"),
+            "open.feishu.cn"
+        );
+        // userinfo 内嵌凭据:取 @ 之后的 host[:port]
+        assert_eq!(
+            url_host_for_log("https://user:pass@hook.example.com:8443/x"),
+            "hook.example.com:8443"
+        );
+        // 无 path/query
+        assert_eq!(url_host_for_log("http://example.com"), "example.com");
+        // 解析不出 host(非 URL / 空 authority)→ 占位符
+        assert_eq!(url_host_for_log("not-a-url"), "<unparseable-url>");
+        assert_eq!(url_host_for_log("https://"), "<unparseable-url>");
+        assert_eq!(url_host_for_log(""), "<unparseable-url>");
+    }
+
+    #[test]
+    fn test_webhook_error_detail_no_url() {
+        // Status 错误:只落状态码,不内嵌 URL(ureq 的 Display 会带响应 URL)
+        let resp = ureq::Response::new(404, "Not Found", "body").unwrap();
+        let detail = webhook_error_detail(&ureq::Error::Status(404, resp));
+        assert_eq!(detail, "HTTP 状态码 404");
+        assert!(!detail.contains("http"), "不应包含 URL: {}", detail);
     }
 }
