@@ -5,6 +5,10 @@
 //!   (image / build)→ 用 compose 同目录 `.env` 只对 image 字段做变量插值
 //!   → 按默认规则分类(has_build→Local;仅 image→Pull)→ 与本地镜像
 //!   (`docker images` 的 repo/tag 对)做 Exact / RepoOnly / Missing 三级匹配;
+//! - [`find_override_files`] + 服务级浅合并:检测 compose 同目录的 override
+//!   文件并按序合并进 base(同名服务的 image/build 等键存在即以 override 为准,
+//!   新服务追加;`services` 之外的顶层键不参与合并),合并结果同时决定本地
+//!   解析分类与远端 `compose pull/up` 的 `-f` 文件链;
 //! - [`apply_overrides`]:用项目保存的 service_overrides 覆盖默认分类。
 //!
 //! 解析约定:
@@ -14,10 +18,12 @@
 //! - `build` 字段存在即可(字符串或映射都算 has_build);
 //! - image 与 build 都缺失的服务仍保留在 services 中,同时记入 `errors`
 //!   (部署前由前端红框阻断);
-//! - 镜像引用无标签时按 Docker 约定补 `latest` 参与匹配。
+//! - 镜像引用无标签时按 Docker 约定补 `latest` 参与匹配;
+//! - Pull 类服务的 image 首段为私有仓库主机名([`registry_of`])时,追加
+//!   “请确认服务器已 docker login” 警告。
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -47,8 +53,12 @@ pub struct StackService {
     pub match_state: MatchState,
     /// 本地实际存在的标签(Exact 时与 compose 相同;RepoOnly 时为本地任一标签)
     pub local_tag: Option<String>,
-    /// 非阻断警告(插值未定义变量 / 标签不一致 / 本地不存在 / 未设 image)
+    /// 非阻断警告(插值未定义变量 / 标签不一致 / 本地不存在 / 未设 image /
+    /// 私有仓库需登录)
     pub warning: Option<String>,
+    /// 私有仓库主机名(image 首段,见 [`registry_of`]);docker.io 官方仓库为 None
+    #[serde(default)]
+    pub registry: Option<String>,
 }
 
 /// compose 解析结果。
@@ -59,15 +69,23 @@ pub struct ComposeStack {
     pub services: Vec<StackService>,
     /// 阻断性错误(如服务既无 image 也无 build);非空时前端红框禁止部署
     pub errors: Vec<String>,
+    /// 参与合并的 override 文件名列表(按 [`find_override_files`] 检测顺序;
+    /// 无 override 时为空;远端 pull/up 按同序追加 `-f`)
+    #[serde(default)]
+    pub overrides: Vec<String>,
 }
 
 /// 解析 compose 文件并做本地镜像三级匹配。
 ///
-/// * `compose_path`:compose YAML 路径(插值用的 `.env` 取其同目录);
+/// * `compose_path`:compose YAML 路径(插值用的 `.env` 与 override 文件取其同目录);
 /// * `local_images`:`docker images` 的 (repository, tag) 对。
 ///
 /// 非 YAML / 缺少 services 等结构性失败返回 `Err`(中文);
 /// 单个服务的非阻断问题记入 [`ComposeStack::errors`] / `warning`。
+///
+/// base 解析成功后,按 [`find_override_files`] 顺序读入同目录 override 文件
+/// 做服务级浅合并(同名服务 image/build 等键存在即以 override 为准,新服务
+/// 追加),参与合并的文件名记入 [`ComposeStack::overrides`]。
 pub fn parse_compose_file(
     compose_path: &Path,
     local_images: &[(String, String)],
@@ -88,6 +106,42 @@ pub fn parse_compose_file(
     })?;
     if !value.is_mapping() {
         return Err("compose 文件顶层结构不正确,应为键值映射".to_string());
+    }
+
+    // ---- override 检测 + 服务级浅合并(多个 override 按检测顺序,后覆盖前)----
+    let mut overrides: Vec<String> = Vec::new();
+    if let Some(dir) = compose_path.parent() {
+        for override_path in find_override_files(dir) {
+            let file_name = override_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let ov_text = std::fs::read_to_string(&override_path).map_err(|e| {
+                format!(
+                    "读取 override 文件失败 ({}): {}",
+                    override_path.display(),
+                    e
+                )
+            })?;
+            let mut ov_value: serde_yaml::Value = serde_yaml::from_str(&ov_text).map_err(|e| {
+                format!(
+                    "解析 override 文件失败 ({}),不是有效的 YAML: {}",
+                    override_path.display(),
+                    e
+                )
+            })?;
+            ov_value.apply_merge().map_err(|e| {
+                format!(
+                    "解析 override 文件失败 ({}),处理 YAML 合并键(<<)失败: {}",
+                    override_path.display(),
+                    e
+                )
+            })?;
+            if let Some(ov_services) = ov_value.get("services") {
+                merge_override_services(&mut value, ov_services);
+            }
+            overrides.push(file_name);
+        }
     }
 
     // 项目名:顶层 name(字符串且非空)优先,否则取文件名去扩展名
@@ -161,10 +215,17 @@ pub fn parse_compose_file(
             })
             .flatten();
 
+        // 私有仓库判定:image 首段为 registry 主机名时记录(前端展示/提示用)
+        let registry = image.as_deref().and_then(registry_of);
+
         let (mode, match_state, local_tag, match_warning) =
             classify(image.as_deref(), has_build, local_images);
         if let Some(w) = match_warning {
             warnings.push(w);
+        }
+        // Pull 类且来自私有仓库:提醒服务器需先 docker login
+        if matches!(mode, TransferMode::Pull) && registry.is_some() {
+            warnings.push("私有仓库,请确认服务器已 docker login".to_string());
         }
         if image.is_none() {
             if has_build {
@@ -192,6 +253,7 @@ pub fn parse_compose_file(
             match_state,
             local_tag,
             warning,
+            registry,
         });
     }
 
@@ -199,6 +261,7 @@ pub fn parse_compose_file(
         project_name,
         services,
         errors,
+        overrides,
     })
 }
 
@@ -208,6 +271,84 @@ pub fn apply_overrides(services: &mut [StackService], overrides: &[ServiceOverri
     for svc in services.iter_mut() {
         if let Some(o) = overrides.iter().find(|o| o.service == svc.service) {
             svc.mode = o.mode.clone();
+        }
+    }
+}
+
+/// 按 compose 默认加载顺序检测 `compose_dir` 下的 override 文件:
+/// `compose.override.yaml` → `compose.override.yml` →
+/// `docker-compose.override.yaml` → `docker-compose.override.yml`,
+/// 存在的全部按此序返回(合并时后者覆盖前者;无则返回空)。
+pub fn find_override_files(compose_dir: &Path) -> Vec<PathBuf> {
+    [
+        "compose.override.yaml",
+        "compose.override.yml",
+        "docker-compose.override.yaml",
+        "docker-compose.override.yml",
+    ]
+    .iter()
+    .map(|name| compose_dir.join(name))
+    .filter(|path| path.is_file())
+    .collect()
+}
+
+/// 把 override 文件的 `services` 映射按服务级浅合并进 base 顶层文档:
+///
+/// - 同名服务:条目级浅合并 —— 从 base 条目映射出发,override 条目的键覆盖
+///   (image/build 等存在即覆盖;条目内部结构不做深合并);
+/// - override 的新服务:追加到 base `services` 末尾;
+/// - `services` 之外的顶层键不参与合并(base 的 `name` 等保持不变);
+/// - base 缺 `services` 键(或为 null)且 override 提供了非空 services →
+///   整体插入/替换,使合并后的文档可正常解析;
+/// - 结构不符(override 的 services 非映射、base 的 services 非映射)时跳过
+///   合并保持 base 原样(后续解析按 base 原样处理)。
+fn merge_override_services(base: &mut serde_yaml::Value, override_services: &serde_yaml::Value) {
+    let Some(ov_map) = override_services.as_mapping() else {
+        return; // override 的 services 不是映射,跳过合并
+    };
+    if ov_map.is_empty() {
+        return;
+    }
+    let Some(base_map) = base.as_mapping_mut() else {
+        return; // base 顶层不是映射(解析前置检查已排除),防御性跳过
+    };
+    match base_map.get_mut("services") {
+        None => {
+            // base 无 services 键:override 的 services 整体插入
+            base_map.insert(
+                serde_yaml::Value::String("services".to_string()),
+                override_services.clone(),
+            );
+        }
+        Some(base_services) => {
+            if base_services.is_null() {
+                *base_services = override_services.clone();
+                return;
+            }
+            let Some(base_services_map) = base_services.as_mapping_mut() else {
+                return; // base 的 services 不是映射,无法合并(后续解析照常报错)
+            };
+            for (key, ov_entry) in ov_map {
+                match base_services_map.get_mut(key) {
+                    Some(base_entry) => {
+                        // 同名服务:条目级浅合并(override 键覆盖 base 条目)
+                        if let (Some(entry_map), Some(ov_entry_map)) =
+                            (base_entry.as_mapping_mut(), ov_entry.as_mapping())
+                        {
+                            for (k, v) in ov_entry_map {
+                                entry_map.insert(k.clone(), v.clone());
+                            }
+                        } else if !ov_entry.is_null() {
+                            // base 条目非映射(异常写法)而 override 条目可读 → 整体替换
+                            *base_entry = ov_entry.clone();
+                        }
+                    }
+                    None => {
+                        // override 的新服务:追加到 services 末尾
+                        base_services_map.insert(key.clone(), ov_entry.clone());
+                    }
+                }
+            }
         }
     }
 }
@@ -251,6 +392,22 @@ fn classify(
         Some("本地不存在,将由服务器拉取".to_string())
     };
     (mode, MatchState::Missing, None, warning)
+}
+
+/// 判定镜像引用的私有仓库主机名(纯函数)。
+///
+/// 规则与 Docker 一致:存在 `/` 时取第一个 `/` 之前的首段,该段含 `.` 或 `:`
+/// 或等于 `localhost` 时视为 registry 主机名(如 `ghcr.io/x/y` → `ghcr.io`、
+/// `reg:5000/a` → `reg:5000`);无 `/`(`myapp:v1` 的 `:` 是标签分隔符)或首段
+/// 为普通仓库名段 → `None`(按 docker.io 处理)。
+pub fn registry_of(image: &str) -> Option<String> {
+    let s = image.trim();
+    let (first, _) = s.split_once('/')?;
+    if first.contains('.') || first.contains(':') || first == "localhost" {
+        Some(first.to_string())
+    } else {
+        None
+    }
 }
 
 /// 把镜像引用拆成 `(仓库, 标签)`;无标签时按 Docker 约定补 `latest`。
@@ -567,7 +724,16 @@ mod tests {
         let svc1 = find_svc(&stack, "svc1");
         assert_eq!(svc1.image.as_deref(), Some("registry.example/app:1.0"));
         assert_eq!(svc1.match_state, MatchState::Exact);
-        assert!(svc1.warning.is_none());
+        // Pull 类 + 首段含 `.`(私有仓库主机名)→ 追加登录提示
+        assert_eq!(
+            svc1.registry.as_deref(),
+            Some("registry.example"),
+            "首段含 . 应判定为 registry"
+        );
+        assert_eq!(
+            svc1.warning.as_deref(),
+            Some("私有仓库,请确认服务器已 docker login")
+        );
         let svc2 = find_svc(&stack, "svc2");
         assert_eq!(svc2.image.as_deref(), Some("app2:"));
         assert_eq!(svc2.mode, TransferMode::Local);
@@ -762,6 +928,248 @@ mod tests {
         //(${export X} 无法引用,无副作用)
         assert!(!map.contains_key("NOEQ_LINE"));
         assert_eq!(map.len(), 4, "实际: {:?}", map);
+    }
+
+    // ===== find_override_files:按序检测、缺失跳过 =====
+
+    #[test]
+    fn test_find_override_files_order_and_missing() {
+        // 四个变体全部存在 → 按固定顺序返回(合并时后者覆盖前者)
+        let dir = temp_fixture_dir();
+        for name in [
+            "docker-compose.override.yml",
+            "compose.override.yaml",
+            "compose.override.yml",
+            "docker-compose.override.yaml",
+        ] {
+            std::fs::write(dir.join(name), "services: {}").unwrap();
+        }
+        let found = find_override_files(&dir);
+        let names: Vec<String> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "compose.override.yaml".to_string(),
+                "compose.override.yml".to_string(),
+                "docker-compose.override.yaml".to_string(),
+                "docker-compose.override.yml".to_string(),
+            ]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+
+        // 只有部分存在 → 仅返回存在的,顺序保持
+        let dir = temp_fixture_dir();
+        std::fs::write(dir.join("docker-compose.override.yaml"), "services: {}").unwrap();
+        std::fs::write(dir.join("compose.override.yml"), "services: {}").unwrap();
+        let found = find_override_files(&dir);
+        let names: Vec<String> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "compose.override.yml".to_string(),
+                "docker-compose.override.yaml".to_string(),
+            ]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+
+        // 目录不存在 / 无 override → 空
+        assert!(find_override_files(Path::new("Z:/definitely/not/exist")).is_empty());
+        let dir = temp_fixture_dir();
+        std::fs::write(dir.join("other.yaml"), "services: {}").unwrap();
+        assert!(find_override_files(&dir).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ===== override 合并:image/build 覆盖、新服务追加、非服务键不深合并 =====
+
+    #[test]
+    fn test_parse_merges_override_image_and_build() {
+        let dir = temp_fixture_dir();
+        let path = dir.join("docker-compose.yml");
+        std::fs::write(
+            &path,
+            "services:\n  web:\n    build: ./web\n    image: myapp:1\n  db:\n    image: postgres:16\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("compose.override.yaml"),
+            "services:\n  web:\n    image: myapp:2\n  cache:\n    image: redis:7\n",
+        )
+        .unwrap();
+        let stack = parse_compose_file(&path, &[]).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        // 参与合并的 override 文件名被记录
+        assert_eq!(stack.overrides, vec!["compose.override.yaml".to_string()]);
+        // 同名服务:image 以 override 为准;base 的 build 保留(has_build → Local)
+        let web = find_svc(&stack, "web");
+        assert_eq!(web.image.as_deref(), Some("myapp:2"));
+        assert!(web.has_build, "base 的 build 应保留");
+        assert_eq!(web.mode, TransferMode::Local);
+        // override 里的新服务照常追加
+        let cache = find_svc(&stack, "cache");
+        assert_eq!(cache.image.as_deref(), Some("redis:7"));
+        assert_eq!(cache.mode, TransferMode::Pull);
+        // 未在 override 出现的服务保持 base 原样
+        assert_eq!(find_svc(&stack, "db").image.as_deref(), Some("postgres:16"));
+    }
+
+    #[test]
+    fn test_parse_override_build_only_makes_service_local() {
+        // override 只补 build:base 仅 image(Pull)→ 合并后 has_build(Local),
+        // base 的 image 保留
+        let dir = temp_fixture_dir();
+        let path = dir.join("docker-compose.yml");
+        std::fs::write(&path, "services:\n  app:\n    image: myapp:1\n").unwrap();
+        std::fs::write(
+            dir.join("docker-compose.override.yml"),
+            "services:\n  app:\n    build: ./app\n",
+        )
+        .unwrap();
+        let stack = parse_compose_file(&path, &[]).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let app = find_svc(&stack, "app");
+        assert!(app.has_build);
+        assert_eq!(app.image.as_deref(), Some("myapp:1"), "base 的 image 应保留");
+        assert_eq!(app.mode, TransferMode::Local);
+        assert_eq!(
+            stack.overrides,
+            vec!["docker-compose.override.yml".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_parse_override_non_service_keys_not_merged() {
+        // 顶层 name 等非 services 键不参与合并:base 的 name 保持不变
+        let dir = temp_fixture_dir();
+        let path = dir.join("docker-compose.yml");
+        std::fs::write(&path, "name: base-proj\nservices:\n  web:\n    image: a:1\n").unwrap();
+        std::fs::write(
+            dir.join("compose.override.yaml"),
+            "name: override-proj\nvolumes:\n  data: {}\nservices:\n  web:\n    image: a:2\n",
+        )
+        .unwrap();
+        let stack = parse_compose_file(&path, &[]).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(stack.project_name, "base-proj", "服务级之外的键不做合并");
+        assert_eq!(find_svc(&stack, "web").image.as_deref(), Some("a:2"));
+    }
+
+    #[test]
+    fn test_parse_multiple_overrides_later_wins() {
+        // 多个 override 按检测顺序合并:后合并者覆盖先合并者
+        let dir = temp_fixture_dir();
+        let path = dir.join("docker-compose.yml");
+        std::fs::write(&path, "services:\n  web:\n    image: a:1\n").unwrap();
+        std::fs::write(dir.join("compose.override.yaml"), "services:\n  web:\n    image: a:2\n").unwrap();
+        std::fs::write(dir.join("compose.override.yml"), "services:\n  web:\n    image: a:3\n").unwrap();
+        let stack = parse_compose_file(&path, &[]).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            stack.overrides,
+            vec![
+                "compose.override.yaml".to_string(),
+                "compose.override.yml".to_string(),
+            ]
+        );
+        assert_eq!(find_svc(&stack, "web").image.as_deref(), Some("a:3"));
+    }
+
+    #[test]
+    fn test_parse_without_override_records_empty_and_invalid_override_errors() {
+        // 无 override → overrides 为空,解析不受影响
+        let dir = temp_fixture_dir();
+        let path = dir.join("docker-compose.yml");
+        std::fs::write(&path, "services:\n  web:\n    image: a:1\n").unwrap();
+        let stack = parse_compose_file(&path, &[]).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(stack.overrides.is_empty());
+
+        // override 不是有效 YAML → 结构性报错(远端 compose -f 同样无法加载)
+        let dir = temp_fixture_dir();
+        let path = dir.join("docker-compose.yml");
+        std::fs::write(&path, "services:\n  web:\n    image: a:1\n").unwrap();
+        std::fs::write(dir.join("compose.override.yaml"), "services: [unclosed\n").unwrap();
+        let err = parse_compose_file(&path, &[]).unwrap_err();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(err.contains("override"), "错误应指向 override 文件: {}", err);
+        assert!(err.contains("YAML"), "实际: {}", err);
+    }
+
+    // ===== registry_of 私有仓库判定 =====
+
+    #[test]
+    fn test_registry_of() {
+        // docker.io(无斜杠时 `:` 是标签分隔;普通仓库名段)→ None
+        assert_eq!(registry_of("myapp"), None);
+        assert_eq!(registry_of("myapp:v1"), None);
+        assert_eq!(registry_of("library/nginx:1.25"), None);
+        assert_eq!(registry_of("user/app"), None);
+        // 首段含 . / : / localhost → registry 主机名
+        assert_eq!(registry_of("ghcr.io/x/y:v1"), Some("ghcr.io".to_string()));
+        assert_eq!(registry_of("reg:5000/a"), Some("reg:5000".to_string()));
+        assert_eq!(
+            registry_of("reg.example.com:5000/app:v1"),
+            Some("reg.example.com:5000".to_string())
+        );
+        assert_eq!(registry_of("localhost/app"), Some("localhost".to_string()));
+    }
+
+    // ===== 私有仓库 Pull 类服务的 warning 与 registry 字段 =====
+
+    #[test]
+    fn test_private_registry_pull_warning() {
+        let dir = temp_fixture_dir();
+        let path = dir.join("stack.yml");
+        std::fs::write(
+            &path,
+            "services:\n  priv:\n    image: ghcr.io/x/y:1\n  pub:\n    image: nginx:1.25\n  local:\n    build: .\n    image: ghcr.io/x/z:1\n",
+        )
+        .unwrap();
+        let stack = parse_compose_file(&path, &[]).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Pull 类 + 私有仓库 → 追加登录提示(与既有警告分号拼接)
+        let priv_svc = find_svc(&stack, "priv");
+        assert_eq!(priv_svc.registry.as_deref(), Some("ghcr.io"));
+        let warning = priv_svc.warning.as_deref().unwrap_or_default();
+        assert!(
+            warning.contains("私有仓库,请确认服务器已 docker login"),
+            "应含登录提示: {}", warning
+        );
+        assert!(warning.contains("本地不存在,将由服务器拉取"), "既有警告应保留: {}", warning);
+        assert!(warning.contains("; "), "警告应以分号拼接: {}", warning);
+        // docker.io 公共镜像:registry 为 None,不追加登录提示
+        let pub_svc = find_svc(&stack, "pub");
+        assert_eq!(pub_svc.registry, None);
+        assert_eq!(pub_svc.warning.as_deref(), Some("本地不存在,将由服务器拉取"));
+        // 本地传输(Local)不告警,但 registry 字段仍记录
+        let local_svc = find_svc(&stack, "local");
+        assert_eq!(local_svc.registry.as_deref(), Some("ghcr.io"));
+        assert!(local_svc.warning.is_none());
+    }
+
+    // ===== 新增字段 serde 默认兼容(旧 JSON 缺字段)=====
+
+    #[test]
+    fn test_new_fields_serde_default() {
+        // 旧 JSON 无 registry / overrides 字段 → 反序列化为 None / 空 Vec(兼容)
+        let svc_json = r#"{"service":"web","image":"a:1","has_build":false,"mode":"Pull","match_state":"Missing","local_tag":null,"warning":null}"#;
+        let svc: StackService = serde_json::from_str(svc_json).unwrap();
+        assert_eq!(svc.registry, None);
+        let stack_json = r#"{"project_name":"p","services":[],"errors":[]}"#;
+        let stack: ComposeStack = serde_json::from_str(stack_json).unwrap();
+        assert!(stack.overrides.is_empty());
+        // 新字段正常反序列化
+        let stack_json2 = r#"{"project_name":"p","services":[],"errors":[],"overrides":["compose.override.yaml"]}"#;
+        let stack2: ComposeStack = serde_json::from_str(stack_json2).unwrap();
+        assert_eq!(stack2.overrides, vec!["compose.override.yaml".to_string()]);
     }
 
     // ===== TransferMode serde 序列化为 "Local"/"Pull" =====

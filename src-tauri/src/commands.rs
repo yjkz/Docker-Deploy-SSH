@@ -18,9 +18,10 @@
 //!
 //! 整栈部署管线(`deploy_stack`,六步,progress step 1..6):
 //! 前置(找 server/project、解析密码)→ 分类确认 → 打包(本地镜像并发 save_gzip)
-//! → 上传(compose 副本 + releases/<时间戳>/ 镜像包 + 文件映射;镜像包失败后
-//! 同路径重试一次,激活断点续传)→ 部署前钩子 → 装载(逐包 docker load)
-//! → 拉取(compose pull)→ 启动(compose up -d)→ 健康检查 → 部署后钩子
+//! → 上传(compose 副本与 override 文件 + releases/<时间戳>/ 镜像包 + 文件映射;
+//! 镜像包失败后同路径重试一次,激活断点续传)→ 部署前钩子 → 装载(逐包 docker load)
+//! → 拉取(compose pull;私有仓库认证失败时追加 docker login 提示)
+//! → 启动(compose up -d)→ 健康检查 → 部署后钩子
 //! → 清理旧 releases(仅留最新 5 个)。
 
 use std::any::Any;
@@ -28,7 +29,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -48,7 +49,7 @@ use crate::docker::{
 use crate::ssh::{
     check_server_env, exec_collect, mkdir_p_cmd, ServerCheckReport, SshClient, INSTALL_DOCKER_CMD,
 };
-use crate::stack::{apply_overrides, parse_compose_file, ComposeStack};
+use crate::stack::{apply_overrides, find_override_files, parse_compose_file, ComposeStack};
 
 /// 取消提示文案(取消导致的失败统一用它,便于前端识别)。
 const CANCELLED_MSG: &str = "部署已取消";
@@ -74,6 +75,9 @@ const HOOK_TIMEOUT_SECS: u64 = 600;
 const HEALTH_POLL_INTERVAL_SECS: u64 = 5;
 /// 健康检查:单轮 `compose ps` 状态查询的执行超时(秒)。
 const HEALTH_PS_TIMEOUT_SECS: u64 = 60;
+/// 整栈拉取失败时并入错误信息的远端输出末尾行数
+/// (供 [`augment_pull_error`] 依据输出识别私有仓库认证问题)。
+const PULL_OUTPUT_TAIL_LINES: usize = 10;
 
 /// 部署运行状态:`cancel_deploy` 置位 `cancelled`,
 /// 部署管线在各步骤之间以及 exec 输出行回调中检查后中止。
@@ -157,10 +161,12 @@ pub fn encrypt_password(plain: String) -> Result<String, String> {
 
 // ===== compose 整栈命令 =====
 
-/// 导入 compose 文件:校验文件存在且可解析后,把 compose(连同同目录 `.env`,
-/// 若存在)复制到 `config/stacks/<uuid>/docker-compose.yml` 持久化,以解析出的
-/// 默认传输分类创建新项目(名称为用户自命名,compose_file 指向副本),写回配置
-/// 并返回完整 ProjectConfig。
+/// 导入 compose 文件:校验文件存在且可解析后,把 compose(连同同目录 `.env`
+/// 与 override 文件,若存在)复制到 `config/stacks/<uuid>/docker-compose.yml`
+/// 持久化,以解析出的默认传输分类创建新项目(名称为用户自命名,compose_file
+/// 指向副本),写回配置并返回完整 ProjectConfig。
+/// (解析时同目录 override 文件已按 [`crate::stack::find_override_files`] 顺序
+/// 做服务级浅合并,分类与镜像基于合并结果。)
 #[tauri::command]
 pub fn import_compose(source_path: String, name: String) -> Result<ProjectConfig, String> {
     let source = PathBuf::from(&source_path);
@@ -196,6 +202,24 @@ pub fn import_compose(source_path: String, name: String) -> Result<ProjectConfig
             let dest_env = dest_dir.join(".env");
             std::fs::copy(&source_env, &dest_env).map_err(|e| {
                 format!("复制 .env 文件失败 ({}): {}", source_env.display(), e)
+            })?;
+        }
+    }
+    // compose 同目录的 override 文件一并复制(同名 basename):
+    // 与解析合并保持一致,远端 pull/up 的 -f 文件链才能指向同名文件
+    if let Some(parent) = source.parent() {
+        for ov_path in find_override_files(parent) {
+            let Some(name) = ov_path.file_name() else {
+                continue;
+            };
+            let dest_ov = dest_dir.join(name);
+            std::fs::copy(&ov_path, &dest_ov).map_err(|e| {
+                format!(
+                    "复制 override 文件失败 ({} -> {}): {}",
+                    ov_path.display(),
+                    dest_ov.display(),
+                    e
+                )
             })?;
         }
     }
@@ -1196,11 +1220,33 @@ async fn exec_forwarded(
     cmd: &str,
     timeout_secs: u64,
 ) -> Result<(), String> {
+    exec_forwarded_inner(app, client, cmd, timeout_secs, 0).await
+}
+
+/// [`exec_forwarded`] 的实现:`tail_lines > 0` 时,非零退出的错误信息额外并入
+/// 远端输出末尾 `tail_lines` 行(供调用方依据输出内容做判定/提示,如
+/// [`augment_pull_error`]);其余行为(日志逐行转发、超时、取消)不变。
+async fn exec_forwarded_inner(
+    app: &AppHandle,
+    client: &mut SshClient,
+    cmd: &str,
+    timeout_secs: u64,
+    tail_lines: usize,
+) -> Result<(), String> {
     let saw_cancel = Arc::new(AtomicBool::new(false));
     let app_for_cb = app.clone();
     let cancel_flag = Arc::clone(&saw_cancel);
+    let tail = Arc::new(Mutex::new(Vec::new()));
+    let tail_for_cb = Arc::clone(&tail);
     let mut on_output = move |line: &str| {
         emit_log(&app_for_cb, line);
+        if tail_lines > 0 {
+            let mut buf = tail_for_cb.lock().unwrap_or_else(|e| e.into_inner());
+            buf.push(line.trim_end().to_string());
+            if buf.len() > tail_lines {
+                buf.remove(0);
+            }
+        }
         if is_cancelled(&app_for_cb) {
             cancel_flag.store(true, Ordering::SeqCst);
         }
@@ -1217,7 +1263,15 @@ async fn exec_forwarded(
         return Err(CANCELLED_MSG.to_string());
     }
     if code != 0 {
-        return Err(format!("远端命令执行失败(退出码 {}): {}", code, cmd));
+        let mut msg = format!("远端命令执行失败(退出码 {}): {}", code, cmd);
+        if tail_lines > 0 {
+            let buf = tail.lock().unwrap_or_else(|e| e.into_inner());
+            if !buf.is_empty() {
+                msg.push_str("\n远端输出(末尾):\n");
+                msg.push_str(&buf.join("\n"));
+            }
+        }
+        return Err(msg);
     }
     // 末尾取消复查:命令可能全程无输出、回调一次都未触发,
     // 结束后再查一次取消标志,保证取消后不会把该步误报为成功。
@@ -1446,46 +1500,45 @@ async fn run_deploy_stack_steps(
     // ---- 步骤 5:拉取 ----
     emit_progress(app, 5, 6, "拉取");
     ensure_not_cancelled(app)?;
+    // override 文件名:按 compose 副本目录检测(与 upload_compose_files 上传的
+    // 一致),pull / up 均按同序 -f 传入,保证远端合并结果与本地解析一致
+    let override_names = compose_override_names(&project.compose_file);
     let pull_names: Vec<String> = pull_choices.iter().map(|s| s.service.clone()).collect();
     if pull_names.is_empty() {
         emit_log(app, "无需要服务器拉取的服务,跳过拉取");
     } else {
         let remote_compose = remote_compose_path(&server.remote_dir);
-        let pull_cmd = compose_pull_cmd(&server.remote_dir, &remote_compose, &pull_names);
-        emit_log(
+        let pull_cmd =
+            compose_pull_cmd(&server.remote_dir, &remote_compose, &override_names, &pull_names);
+        emit_log(app, &format!("拉取远端镜像: {}", pull_cmd));
+        // 远端输出末尾并入错误信息:私有仓库认证失败(401/Unauthorized/denied)
+        // 时由 augment_pull_error 追加 docker login 提示
+        exec_forwarded_inner(
             app,
-            &format!(
-                "拉取远端镜像: docker compose -f {} pull {}",
-                remote_compose,
-                pull_names.join(" ")
-            ),
-        );
-        exec_forwarded(app, &mut client, &pull_cmd, STACK_COMPOSE_TIMEOUT_SECS)
-            .await
-            .map_err(|e| {
-                if e == CANCELLED_MSG {
+            &mut client,
+            &pull_cmd,
+            STACK_COMPOSE_TIMEOUT_SECS,
+            PULL_OUTPUT_TAIL_LINES,
+        )
+        .await
+        .map_err(|e| {
+            if e == CANCELLED_MSG {
+                e
+            } else {
+                augment_pull_error(&format!(
+                    "{}(请检查服务器能否出网访问镜像仓库,或在服务分类中把这些服务改为本地传输)",
                     e
-                } else {
-                    format!(
-                        "{}(请检查服务器能否出网访问镜像仓库,或在服务分类中把这些服务改为本地传输)",
-                        e
-                    )
-                }
-            })?;
+                ))
+            }
+        })?;
     }
 
     // ---- 步骤 6:启动 ----
     emit_progress(app, 6, 6, "启动");
     ensure_not_cancelled(app)?;
     let remote_compose = remote_compose_path(&server.remote_dir);
-    let up_cmd = compose_up_cmd(&server.remote_dir, &remote_compose);
-    emit_log(
-        app,
-        &format!(
-            "启动服务: cd {} && docker compose -f {} up -d",
-            server.remote_dir, remote_compose
-        ),
-    );
+    let up_cmd = compose_up_cmd(&server.remote_dir, &remote_compose, &override_names);
+    emit_log(app, &format!("启动服务: {}", up_cmd));
     exec_forwarded(app, &mut client, &up_cmd, STACK_COMPOSE_TIMEOUT_SECS).await?;
 
     // 健康检查(up 后按预算轮询服务状态;health_wait_secs=0 时跳过)
@@ -1646,10 +1699,13 @@ fn spawn_pack_job(
     }
 }
 
-/// 步骤 3 子步:上传 compose 副本(及同目录 `.env`,若存在)到远端根目录。
+/// 步骤 3 子步:上传 compose 副本(及同目录 `.env`、override 文件,若存在)
+/// 到远端根目录。
 ///
 /// 远端 `docker compose -f` 指向这份副本,服务器上没有它无法启动,
-/// 故先于镜像包上传,失败尽早暴露。`.env` 供服务器端 compose 变量插值。
+/// 故先于镜像包上传,失败尽早暴露。`.env` 供服务器端 compose 变量插值;
+/// override 文件按副本目录 [`find_override_files`] 检测、同名 basename 上传,
+/// 供 pull / up 按同序追加 `-f`(与本地解析合并一致)。
 async fn upload_compose_files(
     app: &AppHandle,
     client: &mut SshClient,
@@ -1666,7 +1722,7 @@ async fn upload_compose_files(
             remote_join(&server.remote_dir, compose_name)
         ),
     );
-    // compose 副本 / .env 内容可变且远端同名,不做续传(全新写覆盖)
+    // compose 副本 / .env / override 内容可变且远端同名,不做续传(全新写覆盖)
     client
         .sftp_upload(&compose_local, &server.remote_dir, compose_name, false, &|_, _| {})
         .await?;
@@ -1677,6 +1733,22 @@ async fn upload_compose_files(
                 .sftp_upload(&env_path, &server.remote_dir, ".env", false, &|_, _| {})
                 .await?;
         }
+    }
+    for ov_path in find_override_files(compose_local.parent().unwrap_or_else(|| Path::new(""))) {
+        let Some(name) = ov_path.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            continue;
+        };
+        emit_log(
+            app,
+            &format!(
+                "上传 override 文件: {} -> {}",
+                ov_path.display(),
+                remote_join(&server.remote_dir, &name)
+            ),
+        );
+        client
+            .sftp_upload(&ov_path, &server.remote_dir, &name, false, &|_, _| {})
+            .await?;
     }
     Ok(())
 }
@@ -1809,6 +1881,17 @@ pub fn remote_compose_path(remote_dir: &str) -> String {
     remote_join(remote_dir, "docker-compose.yml")
 }
 
+/// 检测项目 compose 文件同目录的 override 文件,返回文件名(basename)列表
+/// (按 compose 默认合并顺序;供远端 pull / up 的 `-f` 文件链使用,
+/// 与 [`upload_compose_files`] 上传的 override 文件一致)。
+fn compose_override_names(compose_file: &str) -> Vec<String> {
+    let dir = Path::new(compose_file).parent().unwrap_or_else(|| Path::new(""));
+    find_override_files(dir)
+        .iter()
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        .collect()
+}
+
 /// 拼装 releases 清理命令:按修改时间保留最新 5 个版本目录,其余删除
 /// (`tail -n +6` 从第 6 行起取;`xargs -r` 无输入时不执行 rm)。
 pub fn cleanup_releases_cmd(remote_dir: &str) -> String {
@@ -1818,24 +1901,58 @@ pub fn cleanup_releases_cmd(remote_dir: &str) -> String {
     )
 }
 
-/// 拼装 compose pull 命令;远端路径与服务名逐个单引号包裹防注入。
-pub fn compose_pull_cmd(remote_dir: &str, compose_file: &str, services: &[String]) -> String {
+/// 拼装 compose pull 命令;compose 文件与每个 override 文件(按检测顺序,
+/// 后者覆盖前者)逐个 `-f` 传入,远端路径与服务名逐个单引号包裹防注入。
+pub fn compose_pull_cmd(
+    remote_dir: &str,
+    compose_file: &str,
+    overrides: &[String],
+    services: &[String],
+) -> String {
     let quoted: Vec<String> = services.iter().map(|s| shell_single_quote(s)).collect();
     format!(
-        "cd {} && docker compose -f {} pull {}",
+        "cd {} && docker compose {} pull {}",
         shell_single_quote(remote_dir),
-        shell_single_quote(compose_file),
+        compose_file_flags(compose_file, overrides),
         quoted.join(" ")
     )
 }
 
-/// 拼装 compose up 命令(后台启动全部服务)。
-pub fn compose_up_cmd(remote_dir: &str, compose_file: &str) -> String {
+/// 拼装 compose up 命令(后台启动全部服务;override 文件按序 `-f` 追加)。
+pub fn compose_up_cmd(remote_dir: &str, compose_file: &str, overrides: &[String]) -> String {
     format!(
-        "cd {} && docker compose -f {} up -d",
+        "cd {} && docker compose {} up -d",
         shell_single_quote(remote_dir),
-        shell_single_quote(compose_file)
+        compose_file_flags(compose_file, overrides)
     )
+}
+
+/// 拼装 `-f <base> -f <override>...` 片段(compose 按顺序合并,后者覆盖前者);
+/// 文件路径逐个单引号包裹防注入。
+fn compose_file_flags(compose_file: &str, overrides: &[String]) -> String {
+    let mut flags = vec![format!("-f {}", shell_single_quote(compose_file))];
+    flags.extend(
+        overrides
+            .iter()
+            .map(|o| format!("-f {}", shell_single_quote(o))),
+    );
+    flags.join(" ")
+}
+
+/// pull 失败错误增强(纯函数):错误信息(含并入的远端输出末尾,见
+/// [`PULL_OUTPUT_TAIL_LINES`])含 `401` / `Unauthorized` / `denied`
+/// (不区分大小写)时,判定为私有仓库认证问题,在错误后追加服务器
+/// docker login 提示;其余错误原样返回。
+pub fn augment_pull_error(err: &str) -> String {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("401") || lower.contains("unauthorized") || lower.contains("denied") {
+        format!(
+            "{};检测到私有仓库认证问题,请先在服务器上 docker login 对应 registry",
+            err
+        )
+    } else {
+        err.to_string()
+    }
 }
 
 /// 组装 `docker tag` 指针移动命令:让 target 引用与 source 引用指向同一镜像。
@@ -2381,6 +2498,56 @@ mod tests {
         assert!(!dir.join("config").join("stacks").exists(), "解析失败不应创建栈目录");
     }
 
+    #[test]
+    fn test_import_compose_copies_override_files() {
+        let _guard = crate::config::TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ddtest-import-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
+
+        // 源 compose + 同目录 override(合并后 web 的 image 以 override 为准)
+        let src_dir = dir.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let source = src_dir.join("docker-compose.yml");
+        std::fs::write(
+            &source,
+            "name: demo\nservices:\n  web:\n    build: ./web\n    image: myapp:1\n  db:\n    image: postgres:16\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src_dir.join("compose.override.yaml"),
+            "services:\n  web:\n    image: myapp:2\n",
+        )
+        .unwrap();
+        // 非 override 命名的文件不应被复制
+        std::fs::write(src_dir.join("other.yaml"), "services: {}\n").unwrap();
+
+        let project =
+            import_compose(source.to_string_lossy().to_string(), "override 栈".into()).unwrap();
+        let copy_dir = PathBuf::from(&project.compose_file)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+
+        // override 副本同名落在 stacks/<uuid>/ 下
+        assert!(
+            copy_dir.join("compose.override.yaml").is_file(),
+            "override 副本应存在: {}",
+            copy_dir.display()
+        );
+        assert!(
+            !copy_dir.join("other.yaml").exists(),
+            "非 override 文件不应被复制"
+        );
+        // 解析时已合并 override:web 的 image 以 override 为准(build 保留 → Local)
+        let web = project.service_overrides.iter().find(|o| o.service == "web").unwrap();
+        assert_eq!(web.mode, TransferMode::Local);
+        let db = project.service_overrides.iter().find(|o| o.service == "db").unwrap();
+        assert_eq!(db.mode, TransferMode::Pull);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // ===== 整栈部署:请求反序列化(前端契约,snake_case)=====
 
     /// 构造服务分类项的便捷函数。
@@ -2525,9 +2692,20 @@ mod tests {
             compose_pull_cmd(
                 "/opt/app",
                 "/opt/app/docker-compose.yml",
+                &[],
                 &["web".to_string(), "db".to_string()]
             ),
             "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' pull 'web' 'db'"
+        );
+        // 有 override:按检测顺序追加 -f(compose 后者覆盖前者)
+        assert_eq!(
+            compose_pull_cmd(
+                "/opt/app",
+                "/opt/app/docker-compose.yml",
+                &["compose.override.yaml".to_string(), "docker-compose.override.yml".to_string()],
+                &["web".to_string()]
+            ),
+            "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' -f 'compose.override.yaml' -f 'docker-compose.override.yml' pull 'web'"
         );
     }
 
@@ -2538,9 +2716,20 @@ mod tests {
             compose_pull_cmd(
                 "/opt/app",
                 "/opt/app/docker-compose.yml",
+                &[],
                 &["a'; rm -rf /".to_string()]
             ),
             "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' pull 'a'\\''; rm -rf /'"
+        );
+        // override 文件名同样转义
+        assert_eq!(
+            compose_pull_cmd(
+                "/opt/app",
+                "/opt/app/docker-compose.yml",
+                &["o'.yaml".to_string()],
+                &["web".to_string()]
+            ),
+            "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' -f 'o'\\''.yaml' pull 'web'"
         );
     }
 
@@ -2549,9 +2738,44 @@ mod tests {
     #[test]
     fn test_compose_up_cmd() {
         assert_eq!(
-            compose_up_cmd("/opt/app", "/opt/app/docker-compose.yml"),
+            compose_up_cmd("/opt/app", "/opt/app/docker-compose.yml", &[]),
             "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' up -d"
         );
+        assert_eq!(
+            compose_up_cmd(
+                "/opt/app",
+                "/opt/app/docker-compose.yml",
+                &["compose.override.yaml".to_string()]
+            ),
+            "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' -f 'compose.override.yaml' up -d"
+        );
+    }
+
+    // ===== Task 5:augment_pull_error 私有仓库认证提示 =====
+
+    #[test]
+    fn test_augment_pull_error_auth_variants() {
+        for fragment in [
+            "unauthorized: authentication required",
+            "HTTP 401 Unauthorized",
+            "denied: requested access to the resource is denied",
+            "_ERROR: PERMISSION DENIED_",
+        ] {
+            let err = format!("远端命令执行失败(退出码 1): pull ({})", fragment);
+            let msg = augment_pull_error(&err);
+            assert!(
+                msg.contains("检测到私有仓库认证问题,请先在服务器上 docker login 对应 registry"),
+                "应追加登录提示: {}", msg
+            );
+            assert!(msg.starts_with(&err), "原错误应保留在前: {}", msg);
+        }
+    }
+
+    #[test]
+    fn test_augment_pull_error_other_failure_unchanged() {
+        let err = "远端命令执行失败(退出码 1): pull (no such host)";
+        assert_eq!(augment_pull_error(err), err);
+        assert_eq!(augment_pull_error(""), "");
     }
 
     // ===== 收尾:cleanup_releases_cmd =====
