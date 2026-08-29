@@ -36,6 +36,22 @@ pub struct FileMapping {
     pub is_dir: bool,
 }
 
+/// 镜像传输方式(整栈部署按 compose 服务逐个分类,serde 序列化为 "Local"/"Pull")。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransferMode {
+    /// 本地打包上传(服务在本地构建或本地已有镜像)
+    Local,
+    /// 服务器自行从镜像仓库拉取
+    Pull,
+}
+
+/// 单个 compose 服务的传输方式覆盖(用户在分类表中保存的默认分类)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceOverride {
+    pub service: String,
+    pub mode: TransferMode,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectConfig {
     pub id: String,
@@ -43,6 +59,9 @@ pub struct ProjectConfig {
     pub image_filter: String,
     pub compose_file: String,
     pub file_mappings: Vec<FileMapping>,
+    /// 整栈部署:各服务的传输方式默认分类;旧版配置无此字段,反序列化为空 Vec(旧行为不变)
+    #[serde(default)]
+    pub service_overrides: Vec<ServiceOverride>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -158,11 +177,16 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 
 #[cfg(test)]
+pub(crate) static TEST_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_roundtrip() {
+        // DD_CONFIG_DIR 是进程级环境变量,与 commands 层的导入测试共用锁串行执行
+        let _guard = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("ddtest-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join("config")).unwrap();
         let mut cfg = AppConfig::default();
@@ -172,12 +196,33 @@ mod tests {
             auth: AuthConfig { auth_type: AuthType::Key, key_path: Some("C:/k".into()), password_enc: None },
             remote_dir: "/opt/app".into(),
         });
+        cfg.projects.push(ProjectConfig {
+            id: "p1".into(), name: "栈项目".into(), image_filter: String::new(),
+            compose_file: "C:/app/config/stacks/x/docker-compose.yml".into(),
+            file_mappings: vec![FileMapping { local: "a".into(), remote: "b".into(), is_dir: false }],
+            service_overrides: vec![ServiceOverride { service: "web".into(), mode: TransferMode::Local }],
+        });
         // config_dir 依赖环境变量以便测试注入
         std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
         save_config(&cfg).unwrap();
         let loaded = load_config().unwrap();
         assert_eq!(loaded.servers.len(), 1);
         assert_eq!(loaded.servers[0].host, "1.2.3.4");
+        assert_eq!(loaded.projects.len(), 1);
+        // service_overrides 字段完整 roundtrip
+        assert_eq!(
+            loaded.projects[0].service_overrides,
+            vec![ServiceOverride { service: "web".into(), mode: TransferMode::Local }]
+        );
         assert!(dir.join("config/servers.json").exists());
+        assert!(dir.join("config/projects.json").exists());
+    }
+
+    #[test]
+    fn test_project_config_without_overrides_field() {
+        // 旧版 projects.json 无 service_overrides 字段 → 反序列化为空 Vec(旧行为不变)
+        let json = r#"{"id":"p1","name":"n","image_filter":"","compose_file":"","file_mappings":[]}"#;
+        let p: ProjectConfig = serde_json::from_str(json).unwrap();
+        assert!(p.service_overrides.is_empty());
     }
 }

@@ -3,6 +3,7 @@ pub mod config;
 pub mod crypto;
 pub mod docker;
 pub mod ssh;
+pub mod stack;
 
 use tauri_plugin_log::{Target, TargetKind};
 
@@ -23,6 +24,9 @@ pub fn run() {
       commands::create_remote_dir,
       commands::deploy,
       commands::cancel_deploy,
+      commands::import_compose,
+      commands::parse_compose,
+      commands::preview_compose,
     ])
     .setup(|app| {
       // 日志(不限 debug 构建,release 同样记录,便于现场排查):

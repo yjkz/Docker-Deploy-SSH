@@ -35,6 +35,8 @@ async-trait = "0.1"
 base64 = "0.22"
 # Task 5: 本地磁盘剩余空间查询(host_check 磁盘信息 / 部署导出前空间检查)
 fs4 = "0.12"
+# compose 整栈部署:compose YAML 解析
+serde_yaml = "0.9"
 
 # Task 4: Windows DPAPI 密码加密(CurrentUser 作用域),仅 Windows 构建
 [target.'cfg(windows)'.dependencies]

@@ -26,7 +26,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::config::{load_config, save_config, AppConfig, AuthType, ProjectConfig, ServerConfig};
+use crate::config::{
+    load_config, save_config, AppConfig, AuthType, ProjectConfig, ServerConfig, ServiceOverride,
+};
 use crate::crypto::dpapi_unprotect;
 use crate::docker::{
     check_host, image_exists, image_size, make_deploy_tag, save_gzip, start_daemon, tag_image,
@@ -35,6 +37,7 @@ use crate::docker::{
 use crate::ssh::{
     check_server_env, mkdir_p_cmd, ServerCheckReport, SshClient, INSTALL_DOCKER_CMD,
 };
+use crate::stack::{apply_overrides, parse_compose_file, ComposeStack};
 
 /// 取消提示文案(取消导致的失败统一用它,便于前端识别)。
 const CANCELLED_MSG: &str = "部署已取消";
@@ -102,6 +105,112 @@ pub fn save_config_cmd(cfg: AppConfig) -> Result<(), String> {
 #[tauri::command]
 pub fn encrypt_password(plain: String) -> Result<String, String> {
     crate::crypto::dpapi_protect(&plain)
+}
+
+// ===== compose 整栈命令 =====
+
+/// 导入 compose 文件:校验文件存在且可解析后,把 compose(连同同目录 `.env`,
+/// 若存在)复制到 `config/stacks/<uuid>/docker-compose.yml` 持久化,以解析出的
+/// 默认传输分类创建新项目(名称为用户自命名,compose_file 指向副本),写回配置
+/// 并返回完整 ProjectConfig。
+#[tauri::command]
+pub fn import_compose(source_path: String, name: String) -> Result<ProjectConfig, String> {
+    let source = PathBuf::from(&source_path);
+    if !source.is_file() {
+        return Err(format!("compose 文件不存在:{}", source_path));
+    }
+    // 先解析校验并取默认分类(解析失败不落盘、不改配置;导入阶段不做本地匹配)
+    let stack = parse_compose_file(&source, &[])?;
+    let name = if name.trim().is_empty() {
+        // 未命名时回退为 compose 的项目名(顶层 name 或文件名去扩展名)
+        stack.project_name.clone()
+    } else {
+        name.trim().to_string()
+    };
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let dest_dir = crate::config::config_dir().join("stacks").join(&id);
+    std::fs::create_dir_all(&dest_dir)
+        .map_err(|e| format!("创建栈目录失败 ({}): {}", dest_dir.display(), e))?;
+    let dest = dest_dir.join("docker-compose.yml");
+    std::fs::copy(&source, &dest).map_err(|e| {
+        format!(
+            "复制 compose 文件失败 ({} -> {}): {}",
+            source.display(),
+            dest.display(),
+            e
+        )
+    })?;
+    // compose 同目录的 .env 一并复制(不存在则跳过),保证后续解析/部署插值一致
+    if let Some(parent) = source.parent() {
+        let source_env = parent.join(".env");
+        if source_env.is_file() {
+            let dest_env = dest_dir.join(".env");
+            std::fs::copy(&source_env, &dest_env).map_err(|e| {
+                format!("复制 .env 文件失败 ({}): {}", source_env.display(), e)
+            })?;
+        }
+    }
+
+    let project = ProjectConfig {
+        id,
+        name,
+        image_filter: String::new(),
+        compose_file: dest.to_string_lossy().to_string(),
+        file_mappings: Vec::new(),
+        service_overrides: stack
+            .services
+            .iter()
+            .map(|s| ServiceOverride {
+                service: s.service.clone(),
+                mode: s.mode.clone(),
+            })
+            .collect(),
+    };
+    let mut cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    cfg.projects.push(project.clone());
+    save_config(&cfg).map_err(|e| format!("保存配置失败: {}", e))?;
+    Ok(project)
+}
+
+/// 解析项目持久化的 compose:`docker images` 一次 → parse_compose_file
+/// → 应用该项目的 service_overrides 覆盖默认分类。供部署页渲染服务分类表。
+#[tauri::command]
+pub async fn parse_compose(project_id: String) -> Result<ComposeStack, String> {
+    let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    let project = find_project(&cfg, &project_id)?.clone();
+    if project.compose_file.trim().is_empty() {
+        return Err(format!("项目「{}」未配置 compose 文件", project.name));
+    }
+    let compose_path = PathBuf::from(&project.compose_file);
+    if !compose_path.is_file() {
+        return Err(format!("compose 文件不存在:{}", project.compose_file));
+    }
+    let mut stack = parse_with_local_images(&compose_path).await?;
+    apply_overrides(&mut stack.services, &project.service_overrides);
+    Ok(stack)
+}
+
+/// 对任意路径的 compose 做静态只读解析(不落盘、不改配置),供导入前预览。
+#[tauri::command]
+pub async fn preview_compose(source_path: String) -> Result<ComposeStack, String> {
+    let path = PathBuf::from(&source_path);
+    if !path.is_file() {
+        return Err(format!("compose 文件不存在:{}", source_path));
+    }
+    parse_with_local_images(&path).await
+}
+
+/// `docker images` 一次 → repo/tag 对 → `parse_compose_file`。
+async fn parse_with_local_images(compose_path: &Path) -> Result<ComposeStack, String> {
+    let images = tauri::async_runtime::spawn_blocking(crate::docker::list_images)
+        .await
+        .map_err(|e| format!("获取镜像列表任务失败: {}", e))??;
+    let pairs: Vec<(String, String)> = images
+        .into_iter()
+        .map(|i| (i.repository, i.tag))
+        .collect();
+    parse_compose_file(compose_path, &pairs)
 }
 
 // ===== 宿主机 Docker 命令 =====
@@ -770,6 +879,7 @@ fn shell_single_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TransferMode;
 
     // ===== remote_join =====
 
@@ -884,5 +994,83 @@ mod tests {
     fn test_resolve_password_bad_enc() {
         // 密文无效(base64 非法)→ 报错
         assert!(resolve_password(&AuthType::Password, None, Some("不是base64!!")).is_err());
+    }
+
+    // ===== import_compose =====
+
+    #[test]
+    fn test_import_compose_copies_parse_and_saves() {
+        // DD_CONFIG_DIR 是进程级环境变量,与 config 层测试共用锁串行执行
+        let _guard = crate::config::TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ddtest-import-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
+
+        // 源 compose(文件名故意不是 docker-compose.yml)+ 同目录 .env
+        let src_dir = dir.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let source = src_dir.join("my-stack.yaml");
+        std::fs::write(
+            &source,
+            "name: demo\nservices:\n  web:\n    build: ./web\n    image: ${IMAGE}:v1\n  db:\n    image: postgres:16\n",
+        )
+        .unwrap();
+        std::fs::write(src_dir.join(".env"), "IMAGE=myapp\n").unwrap();
+
+        let project =
+            import_compose(source.to_string_lossy().to_string(), "测试栈".into()).unwrap();
+
+        // 副本位于 config/stacks/<uuid>/docker-compose.yml,内容与源一致
+        let copy = PathBuf::from(&project.compose_file);
+        assert!(copy.is_file(), "compose 副本应存在: {}", project.compose_file);
+        assert_eq!(copy.file_name().unwrap().to_string_lossy(), "docker-compose.yml");
+        let stacks_dir = dir.join("config").join("stacks");
+        assert_eq!(
+            copy.parent().unwrap().parent().unwrap(),
+            stacks_dir.as_path(),
+            "副本应在 config/stacks/<uuid>/ 下"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&copy).unwrap(),
+            std::fs::read_to_string(&source).unwrap(),
+            "副本内容应与源一致(原样复制,不做插值)"
+        );
+        // 同目录 .env 一并复制
+        assert!(copy.parent().unwrap().join(".env").is_file(), ".env 副本应存在");
+
+        // service_overrides 取解析默认:web=Local(build),db=Pull(仅 image)
+        assert_eq!(project.service_overrides.len(), 2);
+        let web = project.service_overrides.iter().find(|o| o.service == "web").unwrap();
+        assert_eq!(web.mode, TransferMode::Local);
+        let db = project.service_overrides.iter().find(|o| o.service == "db").unwrap();
+        assert_eq!(db.mode, TransferMode::Pull);
+
+        // 返回的 compose_file 指向副本而非源路径;配置已保存
+        assert_ne!(project.compose_file, source.to_string_lossy().to_string());
+        let cfg = load_config().unwrap();
+        assert!(cfg.projects.iter().any(|p| p.id == project.id && p.name == "测试栈"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_import_compose_missing_file() {
+        let err = import_compose("Z:/definitely/not/compose.yml".into(), "x".into()).unwrap_err();
+        assert!(err.contains("不存在"), "实际: {}", err);
+    }
+
+    #[test]
+    fn test_import_compose_invalid_yaml() {
+        let _guard = crate::config::TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ddtest-import-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
+        let source = dir.join("bad.yml");
+        std::fs::write(&source, "services: [unclosed\n").unwrap();
+        let err = import_compose(source.to_string_lossy().to_string(), "x".into()).unwrap_err();
+        std::fs::remove_dir_all(&dir).ok();
+        // 解析失败不落盘:不应产生 stacks 目录
+        assert!(err.contains("YAML"), "实际: {}", err);
+        assert!(!dir.join("config").join("stacks").exists(), "解析失败不应创建栈目录");
     }
 }
