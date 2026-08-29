@@ -1,26 +1,43 @@
 /* ============================================================
    DockerDeploy SSH — 全站样式(ark light / 纸面反转 重构)
-   设计契约:data-ark-theme="ark" + data-ark-depth="complex"
+   设计契约:data-ark-theme="ark" + data-ark-depth="complex" + data-ark-scheme="light|dark"
    墨黑(ink)负责文字/规则线/黑壳;纸白(paper)≥75% 构图;
    青(signal)仅激活/进行中/主操作;酸绿仅成功徽章底;琥珀仅警示。
+   暗色 scheme 仅翻转 :root token 值,组件规则不复制;常暗表面(dock/终端)例外。
    禁圆角(radius 0,输入框最多 2px)、禁 emoji 图标、禁氛围动效。
    ============================================================ */
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root[data-ark-theme="ark"] {
+  color-scheme: light;
   --ark-ink: #080a0b;        /* 墨黑:文字 / 1px 规则线 / 黑壳 */
-  --ark-paper: #f4f6f6;      /* 纸白:主表面 */
+  --ark-paper: #f4f6f6;      /* 纸白:主表面(舞台) */
   --ark-paper-dim: #e8ebec;  /* 次级表面:表头 / 悬停 / 分隔带 */
+  --ark-surface: #f4f6f6;    /* 面板/卡片表面(暗色下独立于舞台) */
+  --ark-dock-bg: var(--ark-ink);     /* edge dock 黑壳 */
+  --ark-terminal-bg: var(--ark-ink); /* 日志/终端面板底(常暗表面) */
+  --ark-terminal-fg: #f4f6f6;        /* 终端文字(常暗表面,两主题固定浅色) */
   --ark-signal: #18d1ff;     /* 青:激活 / 进行中 / 主操作 */
   --ark-signal-dim: #d7f4fd; /* 青 12% 淡底:通过水印 / 选中底 */
-  --ark-ok: #c8eb21;         /* 酸绿:仅成功徽章底(配墨字) */
+  --ark-ok: #c8eb21;         /* 酸绿:仅成功徽章底(配墨字,当前组件未引用,预留) */
   --ark-warn: #ffd23f;       /* 琥珀:仅警示底(墨字) */
-  --ark-fail: #080a0b;       /* 失败:墨底白字(双色纪律,不用红) */
+  --ark-fail: var(--ark-ink); /* 失败:墨底白字(双色纪律,不用红;暗色随墨纸翻转) */
   --ark-line: rgba(8, 10, 11, .85);
   --ark-line-soft: rgba(8, 10, 11, .18);
   --ark-paper-dim-ink: rgba(8, 10, 11, .5);   /* 微标签墨 */
   --ark-paper-ink-65: rgba(8, 10, 11, .65);   /* 次级文字墨 */
+  --ark-ink-35: rgba(8, 10, 11, .35);         /* 占位符 / 弱化 mono 文字 */
+  --ark-on-signal: #080a0b;            /* 青色实心底上的文字(青恒亮,两主题固定墨色) */
+  --ark-on-warn: #080a0b;              /* 琥珀底上的文字(琥珀恒亮,两主题固定墨色) */
+  --ark-on-signal-dim: var(--ark-ink); /* 青淡底上的文字(暗色翻为青字) */
+  --ark-on-ink-55: rgba(244, 246, 246, .55); /* 墨底(含反转行)上的弱化文字,随墨纸翻转 */
+  --ark-dock-text-strong: #ffffff;     /* dock 激活/悬停文字(dock 常暗,两主题固定纯白) */
+  --ark-overlay: rgba(8, 10, 11, .55); /* 模态遮罩 */
+  --ark-shadow: rgba(8, 10, 11, .35);  /* 模态投影 */
+  --ark-signal-50: rgba(24, 209, 255, .5); /* 进行中脉冲光晕 */
+  --ark-signal-0: rgba(24, 209, 255, 0);
+  /* 以下仅用于常暗表面(dock / 终端黑壳),不随 scheme 翻转 */
   --ink-on-paper-05: rgba(244, 246, 246, .05);
   --ink-on-paper-08: rgba(244, 246, 246, .08);
   --ink-on-paper-30: rgba(244, 246, 246, .30);
@@ -31,6 +48,30 @@
   --font-cond: "Arial Narrow", "Roboto Condensed", "DIN Condensed", sans-serif;
   --font-mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
   --radius: 0;
+}
+
+/* 暗色 scheme(方案 A「作战控制台」):仅翻转 token 值,组件规则零复制。
+   不在此翻转的变量:--ark-signal / --ark-warn / --ark-on-signal / --ark-on-warn /
+   --ark-dock-text-strong / --ink-on-paper-*(常暗表面)/ 字体族 / --radius。 */
+:root[data-ark-theme="ark"][data-ark-scheme="dark"] {
+  color-scheme: dark;
+  --ark-ink: #f4f6f6;                 /* 墨→纸白:文字 / 规则线反转 */
+  --ark-paper: #080a0b;               /* 纸→近黑:舞台 */
+  --ark-paper-dim: #101416;           /* 次级表面 */
+  --ark-surface: #0d1113;             /* 面板/卡片 */
+  --ark-dock-bg: #050607;             /* dock 比舞台更深一档 */
+  --ark-terminal-bg: #0d1113;         /* 终端面板(组件区已附 1px 线描边) */
+  --ark-signal-dim: rgba(24, 209, 255, .14);
+  --ark-ok: rgba(200, 235, 33, .16);
+  --ark-line: rgba(244, 246, 246, .85);
+  --ark-line-soft: rgba(244, 246, 246, .18);
+  --ark-paper-dim-ink: rgba(244, 246, 246, .5);
+  --ark-paper-ink-65: rgba(244, 246, 246, .65);
+  --ark-ink-35: rgba(244, 246, 246, .35);
+  --ark-on-signal-dim: var(--ark-signal); /* 青淡底上改用青字 */
+  --ark-on-ink-55: rgba(8, 10, 11, .55);
+  --ark-overlay: rgba(0, 0, 0, .62);
+  --ark-shadow: rgba(0, 0, 0, .5);
 }
 
 html, body { height: 100%; }
@@ -62,7 +103,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
 .dock {
   width: 64px;
   flex-shrink: 0;
-  background: var(--ark-ink);
+  background: var(--ark-dock-bg);
   display: flex;
   flex-direction: column;
   user-select: none;
@@ -107,10 +148,10 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   letter-spacing: .14em;
   color: var(--ink-on-paper-55);
 }
-.dock-item:hover { color: #ffffff; background: var(--ink-on-paper-05); }
+.dock-item:hover { color: var(--ark-dock-text-strong); background: var(--ink-on-paper-05); }
 
 /* 激活:左缘 3px 青条 + 数字变青 + 文字变白 */
-.dock-item.active { color: #ffffff; }
+.dock-item.active { color: var(--ark-dock-text-strong); }
 .dock-item.active .dock-num { color: var(--ark-signal); }
 .dock-item.active::before {
   content: "";
@@ -135,6 +176,34 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   font-size: 9px;
   letter-spacing: .18em;
 }
+
+/* ---- 主题切换按钮(dock 末端:桌面位于左 dock 底部,窄屏顶栏位于右端)---- */
+.dock-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 10px 0 12px;
+  border-top: 1px solid var(--ink-on-paper-08);
+}
+.scheme-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--ink-on-paper-72);
+  cursor: pointer;
+  transition: color .18s ease, background .18s ease;
+}
+.scheme-toggle:hover { color: var(--ark-dock-text-strong); background: var(--ink-on-paper-05); }
+.scheme-ico { width: 16px; height: 16px; flex: none; }
+/* 亮色显示月亮(可切到暗),暗色显示太阳(可切到亮) */
+.scheme-ico-sun { display: none; }
+:root[data-ark-scheme="dark"] .scheme-ico-sun { display: block; }
+:root[data-ark-scheme="dark"] .scheme-ico-moon { display: none; }
 
 /* ---- 纸白舞台 ---- */
 .stage {
@@ -305,7 +374,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
 .mapping-input:focus { border-bottom-color: var(--ark-signal); }
 .text-input::placeholder,
 .form-input::placeholder,
-.mapping-input::placeholder { color: rgba(8, 10, 11, .35); }
+.mapping-input::placeholder { color: var(--ark-ink-35); }
 
 /* ===== 状态徽章(三态 + 信息空心)===== */
 .badge {
@@ -321,12 +390,12 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   vertical-align: middle;
 }
 .badge-ico { width: 12px; height: 12px; flex: none; }
-/* 通过:青淡底 + 墨字,前置 SVG check 图标 */
-.badge-ok { background: var(--ark-signal-dim); color: var(--ark-ink); }
-/* 未通过:墨底 + 纸白字,前置 SVG cross 图标 */
+/* 通过:青淡底 + 文字随主题(亮墨字 / 暗青字),前置 SVG check 图标 */
+.badge-ok { background: var(--ark-signal-dim); color: var(--ark-on-signal-dim); }
+/* 未通过:墨底 + 纸白字(暗色下随墨纸翻转),前置 SVG cross 图标 */
 .badge-fail { background: var(--ark-ink); color: var(--ark-paper); }
-/* 进行中/警告:琥珀底 + 墨字,前置 SVG run 图标 */
-.badge-warn { background: var(--ark-warn); color: var(--ark-ink); }
+/* 进行中/警告:琥珀底 + 固定墨字,前置 SVG run 图标 */
+.badge-warn { background: var(--ark-warn); color: var(--ark-on-warn); }
 /* 信息/待检测:1px 墨线空心 */
 .badge-info { background: transparent; color: var(--ark-ink); border: 1px solid var(--ark-line); }
 
@@ -343,7 +412,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   width: max-content;
   max-width: 100%;
   background: var(--ark-signal-dim);
-  color: var(--ark-ink);
+  color: var(--ark-on-signal-dim);
   font-family: var(--font-mono);
   font-size: 11px;
   letter-spacing: .14em;
@@ -356,11 +425,11 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   color: var(--ark-paper);
   border-left: 4px solid var(--ark-signal);
 }
-/* 警示/取消:琥珀底墨字窄条 + 左缘 4px 墨楔 */
+/* 警示/取消:琥珀底固定墨字窄条 + 左缘 4px 墨楔(琥珀恒亮,两主题不变) */
 .banner-warn {
   background: var(--ark-warn);
-  color: var(--ark-ink);
-  border-left: 4px solid var(--ark-ink);
+  color: var(--ark-on-warn);
+  border-left: 4px solid var(--ark-on-warn);
 }
 /* 等待/进行中:次级纸面 + 1px 软线 */
 .banner-wait {
@@ -374,7 +443,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
 .images-error {
   border: 1px solid var(--ark-line);
   border-left: 4px solid var(--ark-ink);
-  background: var(--ark-paper);
+  background: var(--ark-surface);
   color: var(--ark-ink);
   padding: 10px 14px;
   margin-bottom: 16px;
@@ -449,7 +518,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   justify-content: space-between;
   gap: 10px;
   border: 1px solid var(--ark-line);
-  background: var(--ark-paper);
+  background: var(--ark-surface);
   padding: 6px 8px 6px 10px;
   font-family: var(--font-mono);
   font-size: 12.5px;
@@ -469,7 +538,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
 
 .table-wrap {
   border: 1px solid var(--ark-line);
-  background: var(--ark-paper);
+  background: var(--ark-surface);
   overflow-x: auto;
 }
 .data-table {
@@ -497,7 +566,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
 .data-table tbody tr + tr { border-top: 1px solid var(--ark-line-soft); }
 /* 装饰性 hover:整行墨底反白(不承载状态) */
 .data-table tbody tr:hover { background: var(--ark-ink); color: var(--ark-paper); }
-.data-table tbody tr:hover .none-text { color: var(--ink-on-paper-55); }
+.data-table tbody tr:hover .none-text { color: var(--ark-on-ink-55); }
 .data-table tbody tr:hover .btn {
   background: var(--ark-paper);
   color: var(--ark-ink);
@@ -519,11 +588,11 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   word-break: break-all;
 }
 .data-table tbody tr:hover .cell-repo { color: var(--ark-paper); }
-/* <none>:rgba 墨 .35 斜体 mono */
+/* <none>:弱化墨 .35 斜体 mono */
 .data-table .none-text {
   font-family: var(--font-mono);
   font-style: italic;
-  color: rgba(8, 10, 11, .35);
+  color: var(--ark-ink-35);
 }
 .data-table .nowrap { white-space: nowrap; }
 .data-table td.empty-cell {
@@ -538,7 +607,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   padding: 18px;
   text-align: center;
   color: var(--ark-paper-dim-ink);
-  background: var(--ark-paper);
+  background: var(--ark-surface);
   border: 1px solid var(--ark-line-soft);
   font-size: 13px;
 }
@@ -546,7 +615,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
 .server-list { display: flex; flex-direction: column; gap: 16px; }
 
 .server-card {
-  background: var(--ark-paper);
+  background: var(--ark-surface);
   border: 1px solid var(--ark-line-soft);
   border-top: 2px solid var(--ark-ink); /* 顶部 2px 墨上边框 */
   padding: 14px 18px 16px;
@@ -670,8 +739,9 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   min-height: 60px;
   max-height: 260px;
   overflow-y: auto;
-  background: var(--ark-ink);
-  color: var(--ark-paper);
+  background: var(--ark-terminal-bg);
+  color: var(--ark-terminal-fg);
+  border: 1px solid var(--ark-line); /* 暗色下终端底与舞台同族,靠 1px 描边区分 */
   border-left: 4px solid var(--ark-signal);
   font-family: var(--font-mono);
   font-size: 11px;
@@ -687,7 +757,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   position: fixed;
   inset: 0;
   z-index: 900;
-  background: rgba(8, 10, 11, .55);
+  background: var(--ark-overlay);
   display: flex;
   align-items: flex-start;
   justify-content: center;
@@ -695,12 +765,12 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   overflow-y: auto;
 }
 .modal-card {
-  background: var(--ark-paper);
+  background: var(--ark-surface);
   border: 1px solid var(--ark-line);
   border-top: 3px solid var(--ark-ink);
   width: 560px;
   max-width: 100%;
-  box-shadow: 0 12px 32px rgba(8, 10, 11, .35);
+  box-shadow: 0 12px 32px var(--ark-shadow);
 }
 .modal-head {
   display: flex;
@@ -744,7 +814,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
 .form-error {
   border: 1px solid var(--ark-line);
   border-left: 4px solid var(--ark-ink);
-  background: var(--ark-paper);
+  background: var(--ark-surface);
   color: var(--ark-ink);
   padding: 8px 10px;
   margin-bottom: 12px;
@@ -968,7 +1038,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   align-items: center;
   justify-content: center;
   border: 1px solid var(--ark-line);
-  background: var(--ark-paper);
+  background: var(--ark-surface);
   color: var(--ark-ink);
 }
 .deploy-step-num {
@@ -977,11 +1047,11 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   font-size: 22px;
   line-height: 1;
 }
-/* 完成:编号压青色实心方块(墨字)+ 右上角 check 墨章 */
+/* 完成:编号压青色实心方块(固定墨字)+ 右上角 check 墨章 */
 .deploy-step.done .deploy-step-box {
   background: var(--ark-signal);
   border-color: var(--ark-signal);
-  color: var(--ark-ink);
+  color: var(--ark-on-signal);
 }
 .deploy-step-tick {
   display: none;
@@ -1000,9 +1070,9 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
 
 /* 进行中:青色 2px 描边 + 呼吸脉冲(1.8s 循环) */
 @keyframes step-pulse {
-  0%   { box-shadow: 0 0 0 0 rgba(24, 209, 255, .5); }
-  70%  { box-shadow: 0 0 0 10px rgba(24, 209, 255, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(24, 209, 255, 0); }
+  0%   { box-shadow: 0 0 0 0 var(--ark-signal-50); }
+  70%  { box-shadow: 0 0 0 10px var(--ark-signal-0); }
+  100% { box-shadow: 0 0 0 0 var(--ark-signal-0); }
 }
 .deploy-step.current .deploy-step-box {
   border: 2px solid var(--ark-signal);
@@ -1037,8 +1107,9 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   padding: 12px 14px 30px 18px;
   height: 320px;
   overflow-y: auto;
-  background: var(--ark-ink);
-  color: var(--ark-paper);
+  background: var(--ark-terminal-bg);
+  color: var(--ark-terminal-fg);
+  border: 1px solid var(--ark-line);
   border-left: 4px solid var(--ark-signal);
   font-family: var(--font-mono);
   font-size: 11.5px;
@@ -1087,6 +1158,20 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
 .toast-warn { border-left-color: var(--ark-warn); }
 .toast-fail { border-left-color: var(--ark-paper); }
 
+/* ===== 主题切换动效:View Transitions,新状态自按钮位置圆形扩散揭示 ===== */
+/* 旧状态定格退为暗淡底,新状态在其上方揭示;圆心/半径由 app.js 写入根节点变量 */
+::view-transition-old(root),
+::view-transition-new(root) { animation: none; mix-blend-mode: normal; }
+::view-transition-old(root) { animation: scheme-fade .5s ease both; }
+::view-transition-new(root) {
+  animation: scheme-reveal .5s cubic-bezier(.22, .61, .36, 1);
+  clip-path: circle(0px at var(--scheme-x, 100%) var(--scheme-y, 0));
+}
+@keyframes scheme-fade { to { opacity: .35; } }
+@keyframes scheme-reveal {
+  to { clip-path: circle(var(--scheme-r, 150%) at var(--scheme-x, 100%) var(--scheme-y, 0)); }
+}
+
 /* ===== 响应式重排(<900px:dock 转顶部横向黑条)===== */
 @media (max-width: 1100px) and (min-width: 901px) {
   .deploy-form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -1101,6 +1186,11 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   }
   .dock-brand, .dock-foot { display: none; }
   .dock-nav { flex-direction: row; }
+  .dock-actions {
+    border-top: none;
+    border-left: 1px solid var(--ink-on-paper-08);
+    padding: 0 12px;
+  }
   .dock-item {
     flex: 1;
     flex-direction: row;
@@ -1141,5 +1231,13 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   *, *::before, *::after {
     animation: none !important;
     transition: none !important;
+  }
+  /* 主题切换揭示伪元素不在元素树上,需显式归零(新状态直接呈现,无揭示) */
+  ::view-transition-group(*),
+  ::view-transition-image-pair(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) {
+    animation: none !important;
+    clip-path: none !important;
   }
 }

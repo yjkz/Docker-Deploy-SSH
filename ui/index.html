@@ -1,9 +1,18 @@
 <!DOCTYPE html>
-<html lang="zh-CN" data-ark-theme="ark" data-ark-depth="complex">
+<html lang="zh-CN" data-ark-theme="ark" data-ark-depth="complex" data-ark-scheme="light">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>DockerDeploy SSH</title>
+  <script>
+    // 防闪白:必须早于样式表执行——恢复上次选择的亮暗主题(异常/未存储时回退 light)
+    try {
+      document.documentElement.dataset.arkScheme =
+        localStorage.getItem('dd_scheme') === 'dark' ? 'dark' : 'light';
+    } catch (e) {
+      document.documentElement.dataset.arkScheme = 'light';
+    }
+  </script>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -42,6 +51,27 @@
           <span class="dock-num">04</span><span class="dock-label">部署向导</span>
         </button>
       </nav>
+      <!-- 亮暗主题切换:位于 dock 末端(桌面=左 dock 底部,窄屏=顶栏右端) -->
+      <div class="dock-actions">
+        <button id="scheme-toggle" class="scheme-toggle" type="button" aria-label="切换亮暗主题" title="切换亮暗主题">
+          <svg class="scheme-ico scheme-ico-moon" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+            <path d="M14 8.53A6 6 0 1 1 7.47 2 4.67 4.67 0 0 0 14 8.53z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="square"/>
+          </svg>
+          <svg class="scheme-ico scheme-ico-sun" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+            <circle cx="8" cy="8" r="3.25" fill="none" stroke="currentColor" stroke-width="1.5"/>
+            <g stroke="currentColor" stroke-width="1.5" stroke-linecap="square">
+              <line x1="8" y1="1" x2="8" y2="3"/>
+              <line x1="8" y1="13" x2="8" y2="15"/>
+              <line x1="1" y1="8" x2="3" y2="8"/>
+              <line x1="13" y1="8" x2="15" y2="8"/>
+              <line x1="3" y1="3" x2="4.5" y2="4.5"/>
+              <line x1="11.5" y1="4.5" x2="13" y2="3"/>
+              <line x1="13" y1="13" x2="11.5" y2="11.5"/>
+              <line x1="4.5" y1="11.5" x2="3" y2="13"/>
+            </g>
+          </svg>
+        </button>
+      </div>
       <div class="dock-foot">v0.1.0</div>
     </aside>
 
