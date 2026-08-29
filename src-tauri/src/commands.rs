@@ -21,7 +21,8 @@
 //! → 上传(compose 副本与 override 文件 + releases/<时间戳>/ 镜像包 + 文件映射;
 //! 镜像包失败后同路径重试一次,激活断点续传)→ 部署前钩子 → 装载(逐包 docker load)
 //! → 拉取(compose pull;私有仓库认证失败时追加 docker login 提示)
-//! → 启动(compose up -d)→ 健康检查 → 部署后钩子
+//! → 启动(compose up -d)→ 健康检查(compose ps/logs 与 pull/up 同序
+//! -f override,override-only 服务不逃逸判定)→ 部署后钩子
 //! → 清理旧 releases(仅留最新 5 个)。
 
 use std::any::Any;
@@ -1010,7 +1011,8 @@ async fn server_deploy(
     exec_forwarded(app, client, &up_cmd, 600).await?;
 
     // 5.4 健康检查(up 后按预算轮询服务状态;health_wait_secs=0 时跳过)
-    health_check(app, client, project, &server.remote_dir, &project.compose_file).await?;
+    // 单镜像管线无 override 文件链(远端 up 亦不带 -f override),传空列表
+    health_check(app, client, project, &server.remote_dir, &project.compose_file, &[]).await?;
 
     // 5.5 部署后钩子(健康检查通过后执行;失败仅告警,不影响部署结果)
     run_hook(app, client, project, HookKind::Post, &server.remote_dir).await?;
@@ -1097,6 +1099,10 @@ async fn run_hook(
 /// 秒轮询一次 [`compose_ps_json_cmd`](`docker compose ps --all --format json`),
 /// 预算为 `health_wait_secs` 秒;判定见 [`health_verdict`]。
 ///
+/// `overrides` 为与 pull/up 同源检测的 override 文件名列表([`compose_override_names`]
+/// → [`upload_compose_files`] 上传的同一批文件):逐个追加 `-f`,保证 override-only
+/// 的服务同样出现在 ps 输出中、不逃逸健康判定。
+///
 /// - 全部服务 running 且(无 healthcheck 或 healthy)→ 通过;
 /// - 任一服务 Restarting/Dead(或 Exited 且退出码非零/字段缺失)→ 立即失败;
 ///   Exited 且退出码 0(一次性服务正常退出)→ 不算失败,继续轮询,预算耗尽
@@ -1111,6 +1117,7 @@ async fn health_check(
     project: &ProjectConfig,
     remote_dir: &str,
     compose_file: &str,
+    overrides: &[String],
 ) -> Result<(), String> {
     if project.health_wait_secs == 0 {
         emit_log(app, "健康检查未启用,跳过");
@@ -1118,7 +1125,7 @@ async fn health_check(
     }
     let budget = Duration::from_secs(project.health_wait_secs as u64);
     let started = std::time::Instant::now();
-    let ps_cmd = compose_ps_json_cmd(remote_dir, compose_file);
+    let ps_cmd = compose_ps_json_cmd(remote_dir, compose_file, overrides);
     emit_log(
         app,
         &format!(
@@ -1158,7 +1165,7 @@ async fn health_check(
                 return Ok(());
             }
             HealthVerdict::Unhealthy { service, state } => {
-                dump_compose_logs(app, client, remote_dir, compose_file).await;
+                dump_compose_logs(app, client, remote_dir, compose_file, overrides).await;
                 return Err(format!("健康检查未通过:{} {}", service, state));
             }
             HealthVerdict::Indeterminate { pending, exited_zero } => {
@@ -1172,7 +1179,7 @@ async fn health_check(
             }
         }
         if started.elapsed() >= budget {
-            dump_compose_logs(app, client, remote_dir, compose_file).await;
+            dump_compose_logs(app, client, remote_dir, compose_file, overrides).await;
             return Err(match (&last_pending, last_exited_zero) {
                 // 一次性服务已正常退出:报错注明,提示关闭健康检查
                 (Some((service, state)), true) => format!(
@@ -1197,14 +1204,16 @@ async fn health_check(
 
 /// 健康检查失败时,拉取各服务最近 50 行日志并逐行转发到 `deploy-log`
 /// (尽力而为:获取失败仅告警,不掩盖原始的健康检查错误)。
+/// `overrides` 与健康检查的 ps 查询同源,保证 override-only 服务日志可查。
 async fn dump_compose_logs(
     app: &AppHandle,
     client: &mut SshClient,
     remote_dir: &str,
     compose_file: &str,
+    overrides: &[String],
 ) {
     emit_log(app, "正在获取服务最近日志(最后 50 行):");
-    let cmd = compose_logs_cmd(remote_dir, compose_file);
+    let cmd = compose_logs_cmd(remote_dir, compose_file, overrides);
     if let Err(e) = exec_forwarded(app, client, &cmd, SSH_EXEC_TIMEOUT_SECS).await {
         emit_log(app, &format!("警告:获取服务日志失败: {}", e));
     }
@@ -1542,7 +1551,16 @@ async fn run_deploy_stack_steps(
     exec_forwarded(app, &mut client, &up_cmd, STACK_COMPOSE_TIMEOUT_SECS).await?;
 
     // 健康检查(up 后按预算轮询服务状态;health_wait_secs=0 时跳过)
-    health_check(app, &mut client, &project, &server.remote_dir, &remote_compose).await?;
+    // overrides 与 pull/up 同源,override-only 服务同样进入健康判定
+    health_check(
+        app,
+        &mut client,
+        &project,
+        &server.remote_dir,
+        &remote_compose,
+        &override_names,
+    )
+    .await?;
 
     // 部署后钩子(健康检查通过后执行;失败仅告警,不影响部署结果)
     run_hook(app, &mut client, &project, HookKind::Post, &server.remote_dir).await?;
@@ -1981,20 +1999,22 @@ pub fn hook_cmd(remote_dir: &str, cmd: &str) -> String {
 ///
 /// 必须带 `--all`:默认的 `docker compose ps` 只列 running 容器,"启动即退出
 /// 且其余服务健康"的多服务栈会因故障服务缺席而被误判通过。
-pub fn compose_ps_json_cmd(remote_dir: &str, compose_file: &str) -> String {
+/// `overrides` 按检测顺序逐个追加 `-f`(与 pull/up 同序合并),否则只存在于
+/// override 中的服务不会出现在 ps 输出、完全逃逸健康判定。
+pub fn compose_ps_json_cmd(remote_dir: &str, compose_file: &str, overrides: &[String]) -> String {
     format!(
-        "cd {} && docker compose -f {} ps --all --format json",
+        "cd {} && docker compose {} ps --all --format json",
         shell_single_quote(remote_dir),
-        shell_single_quote(compose_file)
+        compose_file_flags(compose_file, overrides)
     )
 }
 
-/// 拼装查看 compose 各服务最近日志的命令(最后 50 行)。
-pub fn compose_logs_cmd(remote_dir: &str, compose_file: &str) -> String {
+/// 拼装查看 compose 各服务最近日志的命令(最后 50 行;overrides 同 ps 口径)。
+pub fn compose_logs_cmd(remote_dir: &str, compose_file: &str, overrides: &[String]) -> String {
     format!(
-        "cd {} && docker compose -f {} logs --tail 50",
+        "cd {} && docker compose {} logs --tail 50",
         shell_single_quote(remote_dir),
-        shell_single_quote(compose_file)
+        compose_file_flags(compose_file, overrides)
     )
 }
 
@@ -2921,8 +2941,17 @@ mod tests {
     #[test]
     fn test_compose_ps_json_cmd() {
         assert_eq!(
-            compose_ps_json_cmd("/opt/app", "/opt/app/docker-compose.yml"),
+            compose_ps_json_cmd("/opt/app", "/opt/app/docker-compose.yml", &[]),
             "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' ps --all --format json"
+        );
+        // override 与 pull/up 同序追加 -f:override-only 服务也进入健康判定
+        assert_eq!(
+            compose_ps_json_cmd(
+                "/opt/app",
+                "/opt/app/docker-compose.yml",
+                &["compose.override.yaml".to_string()]
+            ),
+            "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' -f 'compose.override.yaml' ps --all --format json"
         );
     }
 
@@ -2930,7 +2959,7 @@ mod tests {
     fn test_compose_ps_json_cmd_escapes_quote() {
         // 路径内嵌单引号被 '\'' 转义,无法逃出引号注入额外命令
         assert_eq!(
-            compose_ps_json_cmd("/opt/app", "/op't.yml"),
+            compose_ps_json_cmd("/opt/app", "/op't.yml", &[]),
             "cd '/opt/app' && docker compose -f '/op'\\''t.yml' ps --all --format json"
         );
     }
@@ -2938,8 +2967,16 @@ mod tests {
     #[test]
     fn test_compose_logs_cmd() {
         assert_eq!(
-            compose_logs_cmd("/opt/app", "./docker-compose.yml"),
+            compose_logs_cmd("/opt/app", "./docker-compose.yml", &[]),
             "cd '/opt/app' && docker compose -f './docker-compose.yml' logs --tail 50"
+        );
+        assert_eq!(
+            compose_logs_cmd(
+                "/opt/app",
+                "./docker-compose.yml",
+                &["compose.override.yml".to_string()]
+            ),
+            "cd '/opt/app' && docker compose -f './docker-compose.yml' -f 'compose.override.yml' logs --tail 50"
         );
     }
 
