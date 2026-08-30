@@ -26,9 +26,9 @@
 | 文档 | 内容 | 何时读 |
 |---|---|---|
 | [01-架构总览.md](01-架构总览.md) | 技术栈、系统分层、数据流、目录结构 | 第一篇,建立全局图景 |
-| [02-后端模块.md](02-后端模块.md) | 6 个 Rust 模块职责、关键结构体/函数签名、超时常量 | 改后端前 |
+| [02-后端模块.md](02-后端模块.md) | 7 个 Rust 模块职责、关键结构体/函数签名、超时常量 | 改后端前 |
 | [03-前端说明.md](03-前端说明.md) | 页面结构、JS 模块、全局约定(AppState/AppBus)、设计语言 | 改前端前 |
-| [04-契约参考.md](04-契约参考.md) | **16 个命令 + 4 个事件 + 配置 JSON Schema 完整速查** | 跨前后端改动的对账表 |
+| [04-契约参考.md](04-契约参考.md) | **19 个命令 + 4 个事件 + 配置 JSON Schema 完整速查** | 跨前后端改动的对账表 |
 | [05-构建与运行.md](05-构建与运行.md) | 环境要求、dev/build 命令、安装布局、日志、配置文件夹 | 跑起来之前 |
 | [06-部署流程与回滚.md](06-部署流程与回滚.md) | 两条部署管线的逐步语义、releases 回滚操作、环境检测闸门规则 | 理解/调试部署行为 |
 | [07-安全与已知取舍.md](07-安全与已知取舍.md) | 密码数据流、注入防护、设计决策记录、已知限制 | 评估改动影响时 |
@@ -36,13 +36,14 @@
 ## 30 秒速览
 
 ```
-仓库:D:\Github-repositories\docker-deploy-ssh(git,主开发分支 feat/client)
-代码量:Rust ~3,970 行(6 模块)+ 原生 JS/HTML/CSS ~3,660 行(无框架无打包器)
-技术:Tauri 2 + tokio + russh/russh-sftp + flate2 + serde_yaml + windows-dpapi
-前端调用后端:window.__TAURI__.core.invoke(16 个命令),事件 4 个,字段 snake_case
-构建:npm run tauri dev / npm run tauri build(产物 NSIS 安装包 ~2.3MB)
-配置:安装目录 config/ 下 servers.json + projects.json(便携式);日志 logs/app.log
-测试:cargo test(纯函数单测 56+;真机测试 #[ignore])
+仓库:D:\Github-repositories\docker-deploy-ssh(git,主分支 main)
+代码量:Rust ~7,560 行(7 模块)+ 原生 JS/HTML/CSS ~5,000 行(无框架无打包器)
+技术:Tauri 2 + tokio + russh/russh-sftp + flate2 + serde_yaml + windows-dpapi + tauri-plugin-dialog + ureq
+前端调用后端:window.__TAURI__.core.invoke(19 个命令),事件 4 个,字段 snake_case
+构建:npm run tauri dev / npm run tauri build(产物 NSIS 安装包 ~3.0MB)
+配置:安装目录 config/ 下 servers.json + projects.json + deployments.json(便携式);日志 logs/app.log
+测试:cargo test(纯函数单测 134+;真机测试 #[ignore])
+当前版本:v0.4.3
 ```
 
 ## 历史文档(docs/ 下,过程产物)
