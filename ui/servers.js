@@ -884,7 +884,24 @@
     pathInput.type = 'text';
     pathInput.autocomplete = 'off';
     pathInput.placeholder = '如:D:\\apps\\myapp\\docker-compose.yml';
-    pathRow.appendChild(pathInput);
+    var pathInputRow = el('div', 'input-btn-row');
+    pathInputRow.appendChild(pathInput);
+    var pathBrowseBtn = el('button', 'btn', '浏览');
+    pathBrowseBtn.type = 'button';
+    pathBrowseBtn.addEventListener('click', function () {
+      window.AppBus.pickPath({
+        directory: false,
+        filters: [{ name: 'Compose 文件', extensions: ['yml', 'yaml'] }],
+        title: '选择 compose 文件'
+      }).then(function (picked) {
+        if (picked === null) return;
+        pathInput.value = picked;
+        // 与手输一致:触发 input 事件联动(onImportPathInput 绑定在 input 上)
+        pathInput.dispatchEvent(new Event('input'));
+      });
+    });
+    pathInputRow.appendChild(pathBrowseBtn);
+    pathRow.appendChild(pathInputRow);
     pathRow.appendChild(el('div', 'form-hint',
       '填写 compose 文件绝对路径,保存时复制到应用配置目录并按解析结果自动生成服务传输分类;留空则手工填写下方 compose 相对路径'));
     body.appendChild(pathRow);
@@ -1105,7 +1122,7 @@
       authRow.appendChild(radioRow);
       body.appendChild(authRow);
 
-      // 私钥路径(Key)
+      // 私钥路径(Key):输入框 + 「浏览」按钮同行(系统选择对话框)
       var keyBlock = el('div', 'form-row');
       keyBlock.id = 'srvf-key-block';
       var keyLabel = el('label', 'form-label', '私钥路径');
@@ -1118,7 +1135,18 @@
       keyInput.autocomplete = 'off';
       keyInput.value = prevAuth.key_path ? String(prevAuth.key_path) : '';
       keyInput.placeholder = '如:C:\\Users\\you\\.ssh\\id_rsa';
-      keyBlock.appendChild(keyInput);
+      var keyRow = el('div', 'input-btn-row');
+      keyRow.appendChild(keyInput);
+      var keyBrowseBtn = el('button', 'btn', '浏览');
+      keyBrowseBtn.type = 'button';
+      keyBrowseBtn.addEventListener('click', function () {
+        window.AppBus.pickPath({ directory: false, title: '选择私钥文件' })
+          .then(function (picked) {
+            if (picked !== null) keyInput.value = picked;
+          });
+      });
+      keyRow.appendChild(keyBrowseBtn);
+      keyBlock.appendChild(keyRow);
       keyBlock.appendChild(el('div', 'form-hint', '本机私钥文件的绝对路径'));
       body.appendChild(keyBlock);
 
@@ -1394,8 +1422,22 @@
     tr.appendChild(tdDir);
 
     var tdAct = document.createElement('td');
+    var mapBrowseBtn = el('button', 'btn btn-sm', '浏览');
+    mapBrowseBtn.type = 'button';
+    // 闭包引用本行元素:点击时读该行「目录」勾选状态决定选文件还是选目录
+    mapBrowseBtn.addEventListener('click', function () {
+      var isDir = dirBox.checked;
+      window.AppBus.pickPath({
+        directory: isDir,
+        title: isDir ? '选择本地目录' : '选择本地文件'
+      }).then(function (picked) {
+        if (picked !== null) localInput.value = picked;
+      });
+    });
+    tdAct.appendChild(mapBrowseBtn);
     var delBtn = el('button', 'btn btn-sm', '删除');
     delBtn.type = 'button';
+    delBtn.style.marginLeft = '6px';
     delBtn.addEventListener('click', function () { tr.remove(); });
     tdAct.appendChild(delBtn);
     tr.appendChild(tdAct);
