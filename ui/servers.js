@@ -176,7 +176,7 @@
   }
 
   /** 表单内联错误提示(自绘,不调用系统对话框) */
-  function formFailLoud(errId, msg) {
+  function formFail(errId, msg) {
     var box = document.getElementById(errId);
     if (box) {
       box.textContent = msg;
@@ -186,16 +186,26 @@
   }
 
   /**
+   * 把错误框滚入可视区。延迟 60ms:点击保存会触发浏览器对按钮的原生焦点滚动,
+   * 同步滚动会被其覆盖,延后一拍才能生效。
+   */
+  function scrollErrorVisible(errId) {
+    setTimeout(function () {
+      var box = document.getElementById(errId);
+      if (box && box.scrollIntoView) {
+        try { box.scrollIntoView({ block: 'nearest' }); } catch (_) { box.scrollIntoView(); }
+      }
+    }, 60);
+  }
+
+  /**
    * 表单失败强化通道:内联错误框 + 滚动到可视区 + toast。
    * 用于所有表单的校验与保存失败,确保任何失败都不可能被错过
    * (错误框可能位于长表单顶部,而用户视口停在底部操作按钮处)。
    */
   function formFailLoud(errId, msg) {
-    formFailLoud(errId, msg);
-    var box = document.getElementById(errId);
-    if (box && box.scrollIntoView) {
-      try { box.scrollIntoView({ block: 'nearest' }); } catch (_) { box.scrollIntoView(); }
-    }
+    formFail(errId, msg);
+    scrollErrorVisible(errId);
     window.toast(msg, 'fail');
     return false;
   }
