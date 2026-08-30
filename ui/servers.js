@@ -176,12 +176,27 @@
   }
 
   /** 表单内联错误提示(自绘,不调用系统对话框) */
-  function formFail(errId, msg) {
+  function formFailLoud(errId, msg) {
     var box = document.getElementById(errId);
     if (box) {
       box.textContent = msg;
       box.classList.remove('hidden');
     }
+    return false;
+  }
+
+  /**
+   * 表单失败强化通道:内联错误框 + 滚动到可视区 + toast。
+   * 用于所有表单的校验与保存失败,确保任何失败都不可能被错过
+   * (错误框可能位于长表单顶部,而用户视口停在底部操作按钮处)。
+   */
+  function formFailLoud(errId, msg) {
+    formFailLoud(errId, msg);
+    var box = document.getElementById(errId);
+    if (box && box.scrollIntoView) {
+      try { box.scrollIntoView({ block: 'nearest' }); } catch (_) { box.scrollIntoView(); }
+    }
+    window.toast(msg, 'fail');
     return false;
   }
 
@@ -820,7 +835,7 @@
     var healthWait = 0;
     if (healthRaw !== '') {
       if (!/^\d+$/.test(healthRaw) || Number(healthRaw) > 86400) {
-        formFail(errId, '健康检查等待秒数需为 0 - 86400 之间的整数(0 为关闭)');
+        formFailLoud(errId, '健康检查等待秒数需为 0 - 86400 之间的整数(0 为关闭)');
         return null;
       }
       healthWait = Number(healthRaw);
@@ -828,7 +843,7 @@
 
     var webhook = fieldVal('prjf-webhook');
     if (webhook && !/^https?:\/\//i.test(webhook)) {
-      formFail(errId, '完成通知 webhook 需以 http:// 或 https:// 开头,或留空');
+      formFailLoud(errId, '完成通知 webhook 需以 http:// 或 https:// 开头,或留空');
       return null;
     }
 
@@ -939,7 +954,7 @@
   function runImportPreview() {
     var p = fieldVal('prjf-import-path');
     if (!p) {
-      formFail('prjf-error', '请先填写 compose 文件路径');
+      formFailLoud('prjf-error', '请先填写 compose 文件路径');
       return;
     }
     formClearError('prjf-error');
@@ -964,7 +979,7 @@
         importPreview.stack = null;
         var box = document.getElementById('prjf-preview-box');
         if (box) box.classList.add('hidden');
-        formFail('prjf-error', '解析失败:' + (errText(err) || '未知错误'));
+        formFailLoud('prjf-error', '解析失败:' + (errText(err) || '未知错误'));
         if (status) status.textContent = '';
       })
       .then(function () {
@@ -1167,13 +1182,16 @@
     var passNode = document.getElementById('srvf-password');
     var newPass = passNode ? passNode.value : '';
 
-    if (!name) return fail('请填写名称');
-    if (!host) return fail('请填写主机地址');
+    // 缺项聚合提示:一次告知所有未填的必填项
+    var missing = [];
+    if (!name) missing.push('名称');
+    if (!host) missing.push('主机地址');
+    if (!username) missing.push('用户名');
+    if (!remoteDir) missing.push('远程部署目录');
+    if (missing.length > 0) return fail('请填写:' + missing.join('、'));
     if (!/^\d+$/.test(portRaw) || Number(portRaw) < 1 || Number(portRaw) > 65535) {
       return fail('端口需为 1 - 65535 之间的整数');
     }
-    if (!username) return fail('请填写用户名');
-    if (!remoteDir) return fail('请填写远程部署目录');
     if (authType === 'Key' && !keyPath) return fail('私钥认证需填写私钥路径');
 
     var prevAuth = (prev && prev.auth) ? prev.auth : {};
@@ -1388,7 +1406,7 @@
       var remote = remoteNode ? remoteNode.value.trim() : '';
       if (!local && !remote) continue; // 两格都空:忽略该行
       if (!local || !remote) {
-        formFail(errId,
+        formFailLoud(errId,
           '文件映射第 ' + (i + 1) + ' 行需同时填写本地路径与服务器相对路径');
         return null;
       }
@@ -1410,7 +1428,11 @@
     var compose = fieldVal('prjf-compose');
     var importPath = fieldVal('prjf-import-path'); // 编辑表单无此输入框,得空串
 
-    if (!name) return formFail('prjf-error', '请填写名称');
+    // 缺项聚合提示:一次告知所有未填的必填项
+    var missing = [];
+    if (!name) missing.push('名称');
+    if (!importPath && !compose) missing.push('compose 文件相对路径');
+    if (missing.length > 0) return formFailLoud('prjf-error', '请填写:' + missing.join('、'));
 
     var mappings = collectMappings('prjf-error');
     if (mappings === null) return false;
@@ -1424,8 +1446,6 @@
       saveProjectViaImport(name, filter, importPath, mappings, extras);
       return false;
     }
-
-    if (!compose) return formFail('prjf-error', '请填写 compose 文件相对路径');
 
     window.AppBus.invoke('get_config')
       .then(function (cfg) {
@@ -1468,7 +1488,7 @@
         return loadConfig();
       })
       .catch(function (err) {
-        formFail('prjf-error', errText(err) || '保存失败');
+        formFailLoud('prjf-error', errText(err) || '保存失败');
         saveToastFail(err, '保存失败');
       });
   }
@@ -1490,7 +1510,7 @@
       .then(function (stack) {
         var errors = stack && Array.isArray(stack.errors) ? stack.errors : [];
         if (errors.length > 0) {
-          formFail('prjf-error', 'compose 存在未解决问题,已阻止保存:' + errors.join(';'));
+          formFailLoud('prjf-error', 'compose 存在未解决问题,已阻止保存:' + errors.join(';'));
           return null;
         }
         return window.AppBus.invoke('import_compose', { sourcePath: importPath, name: name })
@@ -1533,7 +1553,7 @@
         return loadConfig();
       })
       .catch(function (err) {
-        formFail('prjf-error', errText(err) || '导入失败');
+        formFailLoud('prjf-error', errText(err) || '导入失败');
         saveToastFail(err, '导入失败');
       });
   }
