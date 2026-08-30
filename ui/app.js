@@ -6,6 +6,8 @@
  * - window.AppState.hostOk        全局环境检测状态(镜像到 localStorage['dd_hostOk'])
  * - window.refreshNav()           根据 AppState.hostOk 刷新导航禁用态
  * - window.AppBus.invoke / on     Tauri 命令与事件的薄封装
+ * - window.AppBus.pickPath(opts)  系统文件/目录选择对话框(tauri-plugin-dialog)
+ *                                 → Promise<string|null>(null = 取消/不可用)
  * - window.toast(msg, type)       右下角 Toast(2.5 秒自动消失)
  * - window.copyText(text)         复制文本到剪贴板(成功 toast「已复制」)
  * - window.toggleScheme(evt)      亮暗主题切换(View Transitions 圆形扩散揭示,
@@ -39,6 +41,17 @@
     window.AppState.hostOk = saved === 'true';
   })();
 
+  /** 上一次选择对话框所在的父目录(跨表单记忆,defaultPath 起点) */
+  var lastPickDir = null;
+
+  /** 取路径的父目录(D:/a/b/c.txt → D:/a/b);无分隔符(非绝对路径)返回 null */
+  function dirnameOf(p) {
+    var s = String(p);
+    var idx = Math.max(s.lastIndexOf('\\'), s.lastIndexOf('/'));
+    if (idx <= 0) return null;
+    return s.slice(0, idx);
+  }
+
   // ===== AppBus:Tauri 2 全局 API(window.__TAURI__)薄封装 =====
   window.AppBus = {
     /**
@@ -62,6 +75,38 @@
         return Promise.reject(new Error('Tauri 事件 API 不可用,请在桌面窗口中运行'));
       }
       return ev.listen(event, handler);
+    },
+    /**
+     * 系统文件/目录选择对话框(tauri-plugin-dialog,经全局对象 __TAURI__.dialog)。
+     * @param {Object} [opts] { directory:boolean=false, filters:Array|null=null, title:string='选择文件' }
+     * @returns {Promise<string|null>} 选中路径;取消/组件不可用/调用失败返回 null
+     */
+    pickPath: function (opts) {
+      var options = opts || {};
+      var dialog = (window.__TAURI__ || {}).dialog;
+      // 防御:插件命名空间未挂载(非桌面环境 / withGlobalTauri 未暴露)时不抛异常
+      if (!dialog || typeof dialog.open !== 'function') {
+        window.toast('对话框组件不可用', 'fail');
+        return Promise.resolve(null);
+      }
+      var openOpts = {
+        multiple: false,
+        directory: options.directory === true,
+        title: options.title || '选择文件'
+      };
+      if (options.filters) openOpts.filters = options.filters;
+      if (lastPickDir) openOpts.defaultPath = lastPickDir;
+      return dialog.open(openOpts).then(function (picked) {
+        // multiple=false 时返回 string | null(null = 用户取消)
+        if (typeof picked !== 'string' || !picked) return null;
+        var dir = dirnameOf(picked);
+        if (dir) lastPickDir = dir; // 记住上次目录,下次对话框从这里开始
+        return picked;
+      }, function (err) {
+        // 调用失败(权限缺失等)不静默:toast 提示后按取消处理
+        window.toast('打开选择对话框失败:' + (err && err.message ? err.message : err), 'fail');
+        return null;
+      });
     }
   };
 

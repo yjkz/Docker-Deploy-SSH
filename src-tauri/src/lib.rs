@@ -11,6 +11,8 @@ use tauri_plugin_log::{Target, TargetKind};
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
+    // 文件/目录选择对话框插件(前端 __TAURI__.dialog 经 dialog:default 权限调用)
+    .plugin(tauri_plugin_dialog::init())
     .manage(commands::DeployState::default())
     .invoke_handler(tauri::generate_handler![
       commands::get_config,

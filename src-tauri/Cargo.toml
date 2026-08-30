@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.4.1"
+version = "0.4.2"
 description = "A Tauri App"
 authors = ["you"]
 license = ""
@@ -24,6 +24,8 @@ uuid = { version = "1", features = ["v4"] }
 log = "0.4"
 tauri = { version = "2.11.3", features = [] }
 tauri-plugin-log = "2"
+# 表单路径「浏览」按钮:系统文件/目录选择对话框(前端经全局对象 __TAURI__.dialog 调用)
+tauri-plugin-dialog = "2"
 flate2 = "1"
 chrono = "0.4"
 # Task 3: SSH/SFTP(russh 0.46 起 re-export russh_keys 为 russh::keys)
