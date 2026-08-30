@@ -18,6 +18,9 @@
 //! - `build` 字段存在即可(字符串或映射都算 has_build);
 //! - image 与 build 都缺失的服务仍保留在 services 中,同时记入 `errors`
 //!   (部署前由前端红框阻断);
+//! - 服务只有 `build:` 未写 `image:` 字段时,按 compose v2 默认镜像命名
+//!   (`<compose 目录名>-<服务名>` / `_` 变体等候选)扫描本地镜像兜底:
+//!   命中自动填入该镜像并记 Exact,未命中保持 Local + Missing 并提示先构建;
 //! - 镜像引用无标签时按 Docker 约定补 `latest` 参与匹配;
 //! - Pull 类服务的 image 首段为私有仓库主机名([`registry_of`],Docker Hub
 //!   官方别名 docker.io / index.docker.io / registry-1.docker.io 除外)时,
@@ -45,7 +48,7 @@ pub enum MatchState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StackService {
     pub service: String,
-    /// 插值后的镜像引用;compose 未设 image 字段时为 None
+    /// 插值后的镜像引用;compose 未设 image 字段且默认命名兜底未命中时为 None
     pub image: Option<String>,
     /// compose 是否有 build 字段(字符串或映射都算)
     pub has_build: bool,
@@ -54,8 +57,8 @@ pub struct StackService {
     pub match_state: MatchState,
     /// 本地实际存在的标签(Exact 时与 compose 相同;RepoOnly 时为本地任一标签)
     pub local_tag: Option<String>,
-    /// 非阻断警告(插值未定义变量 / 标签不一致 / 本地不存在 / 未设 image /
-    /// 私有仓库需登录)
+    /// 非阻断警告(插值未定义变量 / 标签不一致 / 本地不存在 / 未设 image 的
+    /// 默认命名兜底结果 / 私有仓库需登录)
     pub warning: Option<String>,
     /// 私有仓库主机名(image 首段,见 [`registry_of`]);docker.io 官方仓库为 None
     #[serde(default)]
@@ -204,7 +207,7 @@ pub fn parse_compose_file(
 
         // env 插值只作用于 image 字段
         let mut warnings: Vec<String> = Vec::new();
-        let image = image_raw
+        let mut image = image_raw
             .map(|raw| {
                 let interpolated = interpolate_env_inner(&raw, &env_map, &mut warnings);
                 let trimmed = interpolated.trim().to_string();
@@ -216,29 +219,56 @@ pub fn parse_compose_file(
             })
             .flatten();
 
-        // 私有仓库判定:image 首段为 registry 主机名时记录(前端展示/提示用)
-        let registry = image.as_deref().and_then(registry_of);
-
-        let (mode, match_state, local_tag, match_warning) =
+        let (mode, mut match_state, mut local_tag, match_warning) =
             classify(image.as_deref(), has_build, local_images);
         if let Some(w) = match_warning {
             warnings.push(w);
         }
-        // Pull 类且来自私有仓库:提醒服务器需先 docker login
-        if matches!(mode, TransferMode::Pull) && registry.is_some() {
-            warnings.push("私有仓库,请确认服务器已 docker login".to_string());
-        }
+        // has_build 且未设 image 字段:按 compose v2 默认命名
+        // (<compose 目录名>-<服务名> / _ 变体等候选)扫描本地镜像兜底;
+        // 命中视同 compose 显式写了该镜像(Exact),未命中保持 Missing 并提示
+        // 先构建/补 image。image 字段已存在(即使本地 Missing)不参与兜底:
+        // 此时构建产物的命名就是该字段,默认命名不适用。
         if image.is_none() {
             if has_build {
-                warnings.push(
-                    "未设 image 字段,无法核验/传输,请在 compose 补 image:".to_string(),
-                );
+                let projects = compose_project_name_candidates(compose_path);
+                let candidates = default_image_candidates(&projects, service_name);
+                match scan_default_image(&candidates, local_images) {
+                    Some((repo, tag)) => {
+                        warnings.push(format!(
+                            "未设 image 字段,已按 compose 默认命名匹配到本地镜像 {}:{};建议在 compose 中显式写 image: 固化命名",
+                            repo, tag
+                        ));
+                        image = Some(format!("{}:{}", repo, tag));
+                        match_state = MatchState::Exact;
+                        local_tag = Some(tag);
+                    }
+                    None => {
+                        let shown = candidates
+                            .iter()
+                            .take(2)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(" / ");
+                        warnings.push(format!(
+                            "未设 image 字段,且未在本地找到默认命名镜像({});请先构建或在 compose 中补 image: 字段",
+                            shown
+                        ));
+                    }
+                }
             } else {
                 errors.push(format!(
                     "服务「{}」未设置 image 且没有 build 配置,无法部署",
                     service_name
                 ));
             }
+        }
+
+        // 私有仓库判定:image(可能被兜底填充)首段为 registry 主机名时记录
+        let registry = image.as_deref().and_then(registry_of);
+        // Pull 类且来自私有仓库:提醒服务器需先 docker login
+        if matches!(mode, TransferMode::Pull) && registry.is_some() {
+            warnings.push("私有仓库,请确认服务器已 docker login".to_string());
         }
         let warning = if warnings.is_empty() {
             None
@@ -291,6 +321,79 @@ pub fn find_override_files(compose_dir: &Path) -> Vec<PathBuf> {
     .map(|name| compose_dir.join(name))
     .filter(|path| path.is_file())
     .collect()
+}
+
+/// 推导 compose v2 的项目名候选(纯函数)。
+///
+/// compose 未显式写顶层 `name:` 时,默认项目名取 compose 文件所在目录名;
+/// 不同 compose 版本/平台对大小写与非法字符的处理不一,生成按序去重的候选:
+/// 目录名原样 → 全小写 → 合规化小写(小写化后剔除 [^a-z0-9_-] 字符;
+/// 首字符是否字母数字不再额外修补,不合规时小写原样已作为候选覆盖)。
+/// 无父目录(或目录名不可得)返回空列表。
+pub fn compose_project_name_candidates(compose_path: &Path) -> Vec<String> {
+    let Some(dir_name) = compose_path.parent().and_then(Path::file_name) else {
+        return Vec::new();
+    };
+    let dir_name = dir_name.to_string_lossy().to_string();
+    let lower = dir_name.to_lowercase();
+    let normalized: String = lower
+        .chars()
+        .filter(|c| matches!(c, 'a'..='z' | '0'..='9' | '_' | '-'))
+        .collect();
+    let mut candidates: Vec<String> = Vec::with_capacity(3);
+    for candidate in [dir_name, lower, normalized] {
+        if !candidate.is_empty() && !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    candidates
+}
+
+/// 由项目名候选 × compose 默认镜像命名生成默认镜像名候选(纯函数)。
+///
+/// 只写 `build:` 的服务,compose v2 构建产物的默认镜像名为
+/// `<项目名>-<服务名>`(早期版本为 `<项目名>_<服务名>`),每个项目名候选
+/// 依次拼两种分隔符,按序去重。服务名保持原样(不做大小写变换)。
+pub fn default_image_candidates(project_names: &[String], service: &str) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    for project in project_names {
+        for sep in ["-", "_"] {
+            let candidate = format!("{}{}{}", project, sep, service);
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
+    candidates
+}
+
+/// 在本地镜像列表中按候选顺序查找默认命名的镜像(纯函数)。
+///
+/// 逐个候选收集 repo 完全相等的所有 (repo, tag):标签优先取 `latest`
+/// (compose 构建未写标签时的默认标签),否则取字典序第一个;
+/// 第一个有命中的候选即返回 `Some((repo, tag))`,全部未命中返回 `None`。
+pub fn scan_default_image(
+    candidates: &[String],
+    local_images: &[(String, String)],
+) -> Option<(String, String)> {
+    for candidate in candidates {
+        let mut tags: Vec<&str> = local_images
+            .iter()
+            .filter(|(repo, _)| repo == candidate)
+            .map(|(_, tag)| tag.as_str())
+            .collect();
+        if tags.is_empty() {
+            continue;
+        }
+        let tag = if tags.contains(&"latest") {
+            "latest".to_string()
+        } else {
+            tags.sort();
+            tags[0].to_string()
+        };
+        return Some((candidate.clone(), tag));
+    }
+    None
 }
 
 /// 把 override 文件的 `services` 映射按服务级浅合并进 base 顶层文档:
@@ -358,7 +461,7 @@ fn merge_override_services(base: &mut serde_yaml::Value, override_services: &ser
 ///
 /// 规则:has_build→Local;仅 image→Pull;Missing 且无 build→Pull+警告
 /// “本地不存在,将由服务器拉取”;RepoOnly→标签不一致警告;
-/// image 缺失时匹配状态记 Missing(image 缺失的警告/错误由调用方处理)。
+/// image 缺失时匹配状态记 Missing(警告与默认命名兜底匹配由调用方处理)。
 /// 返回 `(传输方式, 匹配状态, 本地实际标签, 匹配类警告)`。
 fn classify(
     image: Option<&str>,
@@ -789,7 +892,7 @@ mod tests {
         assert_eq!(c.warning.as_deref(), Some("本地不存在,将由服务器拉取"));
     }
 
-    // ===== 5. build 无 image 字段 → warning;无 image 无 build → errors =====
+    // ===== 5. build 无 image 字段 → 默认命名兜底;无 image 无 build → errors =====
 
     #[test]
     fn test_build_without_image_and_no_image_no_build() {
@@ -800,16 +903,20 @@ mod tests {
             "services:\n  worker:\n    build: .\n  broken:\n    ports:\n      - \"80:80\"\n",
         )
         .unwrap();
+        // 本地为空:默认命名兜底必然未命中 → 保持 Missing + 提示构建/补 image
         let stack = parse_compose_file(&path, &[]).unwrap();
         std::fs::remove_dir_all(&dir).ok();
 
-        // has_build 且 image 缺失 → Local + 指定警告文案
+        // has_build 且 image 缺失、默认命名未命中 → Local + Missing + 指定警告
         let worker = find_svc(&stack, "worker");
         assert_eq!(worker.mode, TransferMode::Local);
         assert_eq!(worker.image, None);
-        assert_eq!(
-            worker.warning.as_deref(),
-            Some("未设 image 字段,无法核验/传输,请在 compose 补 image:")
+        assert_eq!(worker.match_state, MatchState::Missing);
+        let warning = worker.warning.as_deref().unwrap_or_default();
+        assert!(warning.contains("未设 image 字段"), "实际: {}", warning);
+        assert!(
+            warning.contains("默认命名镜像"),
+            "未命中应提示默认命名: {}", warning
         );
         // 无 image 且无 build → 记入 errors(阻断部署),服务仍保留在列表中
         assert!(stack
@@ -820,6 +927,197 @@ mod tests {
         assert_eq!(broken.image, None);
         assert!(!broken.has_build);
         assert_eq!(broken.match_state, MatchState::Missing);
+    }
+
+    // ===== compose_project_name_candidates:常规 / 大写 / 含空格连字符 =====
+
+    #[test]
+    fn test_compose_project_name_candidates() {
+        // 常规小写目录名:原样与小写重合,单候选
+        assert_eq!(
+            compose_project_name_candidates(Path::new("/tmp/myproj/compose.yaml")),
+            vec!["myproj".to_string()]
+        );
+        // 大写目录名:原样 + 全小写
+        assert_eq!(
+            compose_project_name_candidates(Path::new("C:/work/MyApp/docker-compose.yml")),
+            vec!["MyApp".to_string(), "myapp".to_string()]
+        );
+        // 含空格与连字符的目录名:原样 + 小写 + 合规化(剔除空格等非法字符)
+        assert_eq!(
+            compose_project_name_candidates(Path::new("/srv/My App-1/compose.yaml")),
+            vec![
+                "My App-1".to_string(),
+                "my app-1".to_string(),
+                "myapp-1".to_string()
+            ]
+        );
+        // 无父目录 / 目录名不可得 → 空候选
+        assert!(compose_project_name_candidates(Path::new("compose.yaml")).is_empty());
+    }
+
+    // ===== default_image_candidates:序与去重 =====
+
+    #[test]
+    fn test_default_image_candidates() {
+        // 每个项目名 × [-, _],按序去重
+        let projects = vec!["MyApp".to_string(), "myapp".to_string()];
+        assert_eq!(
+            default_image_candidates(&projects, "web"),
+            vec![
+                "MyApp-web".to_string(),
+                "MyApp_web".to_string(),
+                "myapp-web".to_string(),
+                "myapp_web".to_string(),
+            ]
+        );
+        // 重复项目名去重
+        let dup = vec!["myproj".to_string(), "myproj".to_string()];
+        assert_eq!(
+            default_image_candidates(&dup, "api"),
+            vec!["myproj-api".to_string(), "myproj_api".to_string()]
+        );
+        // 空项目名列表 → 空
+        assert!(default_image_candidates(&[], "web").is_empty());
+    }
+
+    // ===== scan_default_image:latest 优先 / 多 tag 排序取首 / 未命中 =====
+
+    #[test]
+    fn test_scan_default_image() {
+        let candidates = vec!["myproj-web".to_string(), "myproj_web".to_string()];
+        let mk = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(r, t)| (r.to_string(), t.to_string()))
+                .collect()
+        };
+        // 多 tag:latest 优先
+        assert_eq!(
+            scan_default_image(
+                &candidates,
+                &mk(&[("myproj-web", "v1"), ("myproj-web", "latest")])
+            ),
+            Some(("myproj-web".to_string(), "latest".to_string()))
+        );
+        // 无 latest:多 tag 取字典序第一个("v1" < "v10" < "v2")
+        assert_eq!(
+            scan_default_image(
+                &candidates,
+                &mk(&[("myproj-web", "v2"), ("myproj-web", "v10"), ("myproj-web", "v1")])
+            ),
+            Some(("myproj-web".to_string(), "v1".to_string()))
+        );
+        // 首候选未命中,次候选(下划线变体)命中
+        assert_eq!(
+            scan_default_image(&candidates, &mk(&[("myproj_web", "v2")])),
+            Some(("myproj_web".to_string(), "v2".to_string()))
+        );
+        // 全部未命中 / 本地为空 → None
+        assert_eq!(scan_default_image(&candidates, &mk(&[("other", "v1")])), None);
+        assert_eq!(scan_default_image(&candidates, &[]), None);
+    }
+
+    // ===== 兜底集成:build 无 image → 默认命名扫描命中(- 变体)=====
+
+    #[test]
+    fn test_fallback_matches_dash_variant() {
+        let root = temp_fixture_dir();
+        let proj = root.join("myproj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let path = proj.join("compose.yaml");
+        std::fs::write(&path, "services:\n  web:\n    build: ./web\n").unwrap();
+        let local = vec![("myproj-web".to_string(), "latest".to_string())];
+        let stack = parse_compose_file(&path, &local).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+
+        let web = find_svc(&stack, "web");
+        assert_eq!(web.mode, TransferMode::Local);
+        assert_eq!(web.image.as_deref(), Some("myproj-web:latest"), "应自动填入命中的镜像");
+        assert_eq!(web.match_state, MatchState::Exact);
+        assert_eq!(web.local_tag.as_deref(), Some("latest"));
+        let warning = web.warning.as_deref().unwrap_or_default();
+        assert!(warning.contains("默认命名"), "应含默认命名提示: {}", warning);
+        assert!(
+            warning.contains("myproj-web:latest"),
+            "应含命中镜像引用: {}", warning
+        );
+        assert!(warning.contains("image:"), "应建议显式固化命名: {}", warning);
+    }
+
+    // ===== 兜底集成:下划线变体命中 =====
+
+    #[test]
+    fn test_fallback_matches_underscore_variant() {
+        let root = temp_fixture_dir();
+        let proj = root.join("myproj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let path = proj.join("compose.yaml");
+        std::fs::write(&path, "services:\n  web:\n    build: ./web\n").unwrap();
+        let local = vec![("myproj_web".to_string(), "v2".to_string())];
+        let stack = parse_compose_file(&path, &local).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+
+        let web = find_svc(&stack, "web");
+        assert_eq!(web.image.as_deref(), Some("myproj_web:v2"));
+        assert_eq!(web.match_state, MatchState::Exact);
+        assert_eq!(web.local_tag.as_deref(), Some("v2"));
+    }
+
+    // ===== 兜底集成:全部未命中 → Local+Missing,warning 含"默认命名" =====
+
+    #[test]
+    fn test_fallback_miss_keeps_missing_with_hint() {
+        let root = temp_fixture_dir();
+        let proj = root.join("myproj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let path = proj.join("compose.yaml");
+        std::fs::write(&path, "services:\n  web:\n    build: ./web\n").unwrap();
+        let stack = parse_compose_file(&path, &[]).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+
+        let web = find_svc(&stack, "web");
+        assert_eq!(web.mode, TransferMode::Local);
+        assert_eq!(web.image, None);
+        assert_eq!(web.match_state, MatchState::Missing);
+        let warning = web.warning.as_deref().unwrap_or_default();
+        assert!(
+            warning.contains("默认命名镜像"),
+            "未命中应提示默认命名: {}", warning
+        );
+        // 候选展示(- 与 _ 变体)
+        assert!(warning.contains("myproj-web"), "实际: {}", warning);
+        assert!(warning.contains("myproj_web"), "实际: {}", warning);
+    }
+
+    // ===== image 字段存在但本地 Missing → 不参与兜底 =====
+
+    #[test]
+    fn test_image_field_present_missing_not_fallback_scanned() {
+        // image 字段已存在:构建命名就是该字段,默认命名兜底不适用
+        let root = temp_fixture_dir();
+        let proj = root.join("myproj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let path = proj.join("compose.yaml");
+        std::fs::write(
+            &path,
+            "services:\n  web:\n    build: ./web\n    image: custom:1\n",
+        )
+        .unwrap();
+        let stack = parse_compose_file(&path, &[]).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+
+        let web = find_svc(&stack, "web");
+        assert_eq!(
+            web.image.as_deref(),
+            Some("custom:1"),
+            "image 不应被默认命名覆盖"
+        );
+        assert_eq!(web.match_state, MatchState::Missing);
+        assert_eq!(
+            web.warning, None,
+            "Local 类 image 缺失不告警,更不应出现默认命名兜底提示"
+        );
     }
 
     // ===== 6. service_overrides 覆盖默认分类 =====
