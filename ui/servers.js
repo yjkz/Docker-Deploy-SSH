@@ -758,6 +758,7 @@
     actions.appendChild(cancel);
     actions.appendChild(save);
     body.appendChild(actions);
+    return save;
   }
 
   function appendErrorBox(body, errId) {
@@ -1126,15 +1127,35 @@
       appendField(body, '远程部署目录', 'srvf-remote-dir', 'text',
         prev ? prev.remote_dir : '', '如:/opt/myapp');
 
-      appendActions(body, 'srvf-error', closeModal, function () {
-        saveServer(prev);
+      var saveBtn = appendActions(body, 'srvf-error', closeModal, function () {
+        saveServer(prev, saveBtn);
       });
     });
   }
 
-  /** 服务器表单保存:校验 → (密码加密) → get_config → 全量写回 */
-  function saveServer(prev) {
+  /**
+   * 服务器表单保存:校验 → (密码加密) → get_config → 全量写回。
+   * 任何失败双通道提示(表单内联错误框滚动到可视区 + toast),避免"点了没反应"。
+   * 保存成功后自动对新服务器发起一次「测试连接」,结果呈现在卡片上。
+   */
+  function saveServer(prev, saveBtn) {
     formClearError('srvf-error');
+
+    function fail(msg) {
+      formFail('srvf-error', msg);
+      var boxNode = document.getElementById('srvf-error');
+      if (boxNode && boxNode.scrollIntoView) {
+        try { boxNode.scrollIntoView({ block: 'nearest' }); } catch (_) { boxNode.scrollIntoView(); }
+      }
+      window.toast(msg, 'fail');
+      return false;
+    }
+    function setSaving(saving) {
+      if (saveBtn) {
+        saveBtn.disabled = saving;
+        saveBtn.textContent = saving ? '保存中…' : '保存';
+      }
+    }
 
     var name = fieldVal('srvf-name');
     var host = fieldVal('srvf-host');
@@ -1146,20 +1167,21 @@
     var passNode = document.getElementById('srvf-password');
     var newPass = passNode ? passNode.value : '';
 
-    if (!name) return formFail('srvf-error', '请填写名称');
-    if (!host) return formFail('srvf-error', '请填写主机地址');
+    if (!name) return fail('请填写名称');
+    if (!host) return fail('请填写主机地址');
     if (!/^\d+$/.test(portRaw) || Number(portRaw) < 1 || Number(portRaw) > 65535) {
-      return formFail('srvf-error', '端口需为 1 - 65535 之间的整数');
+      return fail('端口需为 1 - 65535 之间的整数');
     }
-    if (!username) return formFail('srvf-error', '请填写用户名');
-    if (!remoteDir) return formFail('srvf-error', '请填写远程部署目录');
-    if (authType === 'Key' && !keyPath) return formFail('srvf-error', '私钥认证需填写私钥路径');
+    if (!username) return fail('请填写用户名');
+    if (!remoteDir) return fail('请填写远程部署目录');
+    if (authType === 'Key' && !keyPath) return fail('私钥认证需填写私钥路径');
 
     var prevAuth = (prev && prev.auth) ? prev.auth : {};
     var hasSavedPassword = authType === 'Password' && !!prevAuth.password_enc;
     if (authType === 'Password' && !newPass && !hasSavedPassword) {
-      return formFail('srvf-error', '密码认证需填写登录密码');
+      return fail('密码认证需填写登录密码');
     }
+    setSaving(true);
 
     // Key → 只存 key_path(password_enc 原样保留,便于切回密码认证);
     // Password → 输入了新密码时先加密,否则沿用已存密文
@@ -1173,6 +1195,7 @@
       ? window.AppBus.invoke('encrypt_password', { plain: newPass })
       : Promise.resolve(null);
 
+    var savedId = null;
     encPromise
       .then(function (enc) {
         if (authType === 'Password' && enc) auth.password_enc = enc;
@@ -1189,6 +1212,7 @@
           auth: auth,
           remote_dir: remoteDir
         };
+        savedId = server.id;
         var idx = -1;
         for (var i = 0; i < cfg.servers.length; i++) {
           if (cfg.servers[i].id === server.id) { idx = i; break; }
@@ -1199,12 +1223,17 @@
       })
       .then(function () {
         closeModal();
-        window.toast('已保存', 'ok');
+        window.toast('已保存,正在测试连接…', 'ok');
         return loadConfig();
       })
+      .then(function () {
+        // 保存成功后自动发起一次「测试连接」,结果呈现在服务器卡片上
+        if (savedId) runEnvCheck({ id: savedId }, 'test');
+      })
       .catch(function (err) {
-        formFail('srvf-error', errText(err) || '保存失败');
+        fail(errText(err) || '保存失败');
         saveToastFail(err, '保存失败');
+        setSaving(false);
       });
   }
 
