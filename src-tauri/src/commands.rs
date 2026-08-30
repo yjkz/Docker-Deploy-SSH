@@ -177,8 +177,10 @@ pub fn encrypt_password(plain: String) -> Result<String, String> {
 
 /// 导入 compose 文件:校验文件存在且可解析后,把 compose(连同同目录 `.env`
 /// 与 override 文件,若存在)复制到 `config/stacks/<uuid>/docker-compose.yml`
-/// 持久化,以解析出的默认传输分类创建新项目(名称为用户自命名,compose_file
-/// 指向副本),写回配置并返回完整 ProjectConfig。
+/// 持久化,同时写入 `origin.json` 记录导入时的原始父目录名(供副本路径解析
+/// 推导 compose 默认镜像名兜底候选,写入失败仅告警不阻断),以解析出的默认
+/// 传输分类创建新项目(名称为用户自命名,compose_file 指向副本),写回配置
+/// 并返回完整 ProjectConfig。
 /// (解析时同目录 override 文件已按 [`crate::stack::find_override_files`] 顺序
 /// 做服务级浅合并,分类与镜像基于合并结果。)
 #[tauri::command]
@@ -235,6 +237,15 @@ pub fn import_compose(source_path: String, name: String) -> Result<ProjectConfig
                     e
                 )
             })?;
+        }
+    }
+
+    // 记录导入来源的原始 compose 父目录名(origin.json):副本父目录是 uuid,
+    // 后续解析推导 compose 默认镜像名兜底候选(<原目录名>-<服务名>)需要它。
+    // 失败仅告警不阻断导入(缺失时候选退化为 uuid 目录名,兜底扫描不可用)。
+    if let Some(dir_name) = source.parent().and_then(Path::file_name) {
+        if let Err(e) = crate::stack::save_origin_file(&dest_dir, &dir_name.to_string_lossy()) {
+            log::warn!("导入栈「{}」记录来源目录名失败: {}", name, e);
         }
     }
 
@@ -2883,6 +2894,12 @@ mod tests {
         );
         // 同目录 .env 一并复制
         assert!(copy.parent().unwrap().join(".env").is_file(), ".env 副本应存在");
+        // origin.json 记录导入来源的原始父目录名(供副本路径解析默认镜像名兜底)
+        let origin: crate::stack::StackOrigin = serde_json::from_str(
+            &std::fs::read_to_string(copy.parent().unwrap().join("origin.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(origin.dir_name, "src", "origin.json 应记录源的父目录名");
 
         // service_overrides 取解析默认:web=Local(build),db=Pull(仅 image)
         assert_eq!(project.service_overrides.len(), 2);

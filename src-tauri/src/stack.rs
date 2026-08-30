@@ -18,6 +18,11 @@
 //! - `build` 字段存在即可(字符串或映射都算 has_build);
 //! - image 与 build 都缺失的服务仍保留在 services 中,同时记入 `errors`
 //!   (部署前由前端红框阻断);
+//! - 服务只有 `build:` 未写 `image:` 字段时,按 compose v2 默认镜像命名
+//!   (`<项目名>-<服务名>` / `_` 变体等候选)扫描本地镜像兜底:命中自动填入
+//!   该镜像并记 Exact,未命中保持 Local + Missing 并提示先构建。项目名候选
+//!   来源按序:顶层 `name:` → 同目录 `origin.json` 记录的导入原始目录名 →
+//!   compose 父目录名(副本目录名为 uuid 时候选仅参与扫描,提示中剔除);
 //! - 镜像引用无标签时按 Docker 约定补 `latest` 参与匹配;
 //! - Pull 类服务的 image 首段为私有仓库主机名([`registry_of`],Docker Hub
 //!   官方别名 docker.io / index.docker.io / registry-1.docker.io 除外)时,
@@ -45,7 +50,7 @@ pub enum MatchState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StackService {
     pub service: String,
-    /// 插值后的镜像引用;compose 未设 image 字段时为 None
+    /// 插值后的镜像引用;compose 未设 image 字段且默认命名兜底未命中时为 None
     pub image: Option<String>,
     /// compose 是否有 build 字段(字符串或映射都算)
     pub has_build: bool,
@@ -54,8 +59,8 @@ pub struct StackService {
     pub match_state: MatchState,
     /// 本地实际存在的标签(Exact 时与 compose 相同;RepoOnly 时为本地任一标签)
     pub local_tag: Option<String>,
-    /// 非阻断警告(插值未定义变量 / 标签不一致 / 本地不存在 / 未设 image /
-    /// 私有仓库需登录)
+    /// 非阻断警告(插值未定义变量 / 标签不一致 / 本地不存在 / 未设 image 的
+    /// 默认命名兜底结果 / 私有仓库需登录)
     pub warning: Option<String>,
     /// 私有仓库主机名(image 首段,见 [`registry_of`]);docker.io 官方仓库为 None
     #[serde(default)]
@@ -145,12 +150,15 @@ pub fn parse_compose_file(
         }
     }
 
-    // 项目名:顶层 name(字符串且非空)优先,否则取文件名去扩展名
-    let project_name = value
+    // 项目名:顶层 name(字符串且非空)优先,否则取文件名去扩展名。
+    // 显式声明的 name 同时是默认镜像名兜底的最高优先级候选来源。
+    let declared_name = value
         .get("name")
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty());
+    let project_name = declared_name
+        .clone()
         .unwrap_or_else(|| {
             compose_path
                 .file_stem()
@@ -204,7 +212,7 @@ pub fn parse_compose_file(
 
         // env 插值只作用于 image 字段
         let mut warnings: Vec<String> = Vec::new();
-        let image = image_raw
+        let mut image = image_raw
             .map(|raw| {
                 let interpolated = interpolate_env_inner(&raw, &env_map, &mut warnings);
                 let trimmed = interpolated.trim().to_string();
@@ -216,29 +224,64 @@ pub fn parse_compose_file(
             })
             .flatten();
 
-        // 私有仓库判定:image 首段为 registry 主机名时记录(前端展示/提示用)
-        let registry = image.as_deref().and_then(registry_of);
-
-        let (mode, match_state, local_tag, match_warning) =
+        let (mode, mut match_state, mut local_tag, match_warning) =
             classify(image.as_deref(), has_build, local_images);
         if let Some(w) = match_warning {
             warnings.push(w);
         }
-        // Pull 类且来自私有仓库:提醒服务器需先 docker login
-        if matches!(mode, TransferMode::Pull) && registry.is_some() {
-            warnings.push("私有仓库,请确认服务器已 docker login".to_string());
-        }
+        // has_build 且未设 image 字段:按 compose v2 默认命名
+        // (<项目名>-<服务名> / _ 变体等候选,项目名候选来源见
+        // [`compose_project_name_candidates`])扫描本地镜像兜底;命中视同
+        // compose 显式写了该镜像(Exact),未命中保持 Missing 并提示先构建/
+        // 补 image。image 字段已存在(即使本地 Missing)不参与兜底:此时构建
+        // 产物的命名就是该字段,默认命名不适用。
         if image.is_none() {
             if has_build {
-                warnings.push(
-                    "未设 image 字段,无法核验/传输,请在 compose 补 image:".to_string(),
-                );
+                let projects =
+                    compose_project_name_candidates(compose_path, declared_name.as_deref());
+                let candidates = default_image_candidates(&projects, service_name);
+                match scan_default_image(&candidates, local_images) {
+                    Some((repo, tag)) => {
+                        warnings.push(format!(
+                            "未设 image 字段,已按 compose 默认命名匹配到本地镜像 {}:{};建议在 compose 中显式写 image: 固化命名",
+                            repo, tag
+                        ));
+                        image = Some(format!("{}:{}", repo, tag));
+                        match_state = MatchState::Exact;
+                        local_tag = Some(tag);
+                    }
+                    None => {
+                        // 展示用候选剔除 uuid 副本目录名派生的候选,避免误导
+                        let visible = visible_candidates(&candidates, compose_path);
+                        let shown = if visible.is_empty() {
+                            "未能识别原始项目目录名".to_string()
+                        } else {
+                            visible
+                                .iter()
+                                .take(2)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(" / ")
+                        };
+                        warnings.push(format!(
+                            "未设 image 字段,且未在本地找到默认命名镜像({});请先构建或在 compose 中补 image: 字段",
+                            shown
+                        ));
+                    }
+                }
             } else {
                 errors.push(format!(
                     "服务「{}」未设置 image 且没有 build 配置,无法部署",
                     service_name
                 ));
             }
+        }
+
+        // 私有仓库判定:image(可能被兜底填充)首段为 registry 主机名时记录
+        let registry = image.as_deref().and_then(registry_of);
+        // Pull 类且来自私有仓库:提醒服务器需先 docker login
+        if matches!(mode, TransferMode::Pull) && registry.is_some() {
+            warnings.push("私有仓库,请确认服务器已 docker login".to_string());
         }
         let warning = if warnings.is_empty() {
             None
@@ -291,6 +334,168 @@ pub fn find_override_files(compose_dir: &Path) -> Vec<PathBuf> {
     .map(|name| compose_dir.join(name))
     .filter(|path| path.is_file())
     .collect()
+}
+
+/// 推导 compose v2 的项目名候选(纯函数,读 `compose_path` 同目录文件)。
+///
+/// compose 未用 `-p` 指定项目名时,默认项目名优先级为 顶层 `name:` →
+/// compose 所在目录名。本应用把 compose 复制到 `config/stacks/<uuid>/` 持久化,
+/// 副本路径的父目录名是 uuid 而非用户原始目录,故候选来源按序:
+/// ① 顶层 `name:`(`declared_name`,解析自 compose 文档);
+/// ② 同目录 `origin.json` 记录的导入时原始父目录名(存在才取,损坏/缺失忽略);
+/// ③ compose 文件父目录名(原始路径直接解析时的真实目录名,最后手段)。
+/// 每个来源再派生:原样 → 全小写 → 合规化小写(小写化后剔除 [^a-z0-9_-]
+/// 字符;首字符是否字母数字不再额外修补,不合规时小写原样已作为候选覆盖),
+/// 全体按序去重。无任何来源时返回空列表。
+pub fn compose_project_name_candidates(
+    compose_path: &Path,
+    declared_name: Option<&str>,
+) -> Vec<String> {
+    let mut bases: Vec<String> = Vec::new();
+    if let Some(name) = declared_name.map(str::trim).filter(|s| !s.is_empty()) {
+        bases.push(name.to_string());
+    }
+    if let Some(dir) = compose_path.parent() {
+        if let Some(origin_dir) = load_origin_dir_name(dir) {
+            bases.push(origin_dir);
+        }
+        if let Some(dir_name) = dir.file_name() {
+            bases.push(dir_name.to_string_lossy().to_string());
+        }
+    }
+    let mut candidates: Vec<String> = Vec::new();
+    for base in bases {
+        let lower = base.to_lowercase();
+        let normalized: String = lower
+            .chars()
+            .filter(|c| matches!(c, 'a'..='z' | '0'..='9' | '_' | '-'))
+            .collect();
+        for candidate in [base, lower, normalized] {
+            if !candidate.is_empty() && !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
+    candidates
+}
+
+/// uuid 常规连字符形态判定(8-4-4-4-12 十六进制段,大小写均可)。
+/// 导入副本位于 `config/stacks/<uuid>/`,uuid 目录名派生的默认镜像候选
+/// 不可能对应用户的构建产物,warning 展示时需剔除以免误导。
+fn is_uuid_like(s: &str) -> bool {
+    let group_lens = [8, 4, 4, 4, 12];
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.len() == 5
+        && parts
+            .iter()
+            .zip(group_lens)
+            .all(|(p, len)| p.len() == len && p.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// 过滤 warning 展示用的镜像候选:剔除由 uuid 形态副本目录名派生的候选
+/// (`<uuid>-<服务>` / `<uuid>_<服务>` 及其小写变体),其余原样保留。
+fn visible_candidates(candidates: &[String], compose_path: &Path) -> Vec<String> {
+    let uuid_base = compose_path
+        .parent()
+        .and_then(Path::file_name)
+        .map(|n| n.to_string_lossy().to_string())
+        .filter(|n| is_uuid_like(n));
+    let Some(uuid_base) = uuid_base else {
+        return candidates.to_vec();
+    };
+    let prefixes: Vec<String> = [uuid_base.clone(), uuid_base.to_lowercase()]
+        .iter()
+        .flat_map(|b| [format!("{}-", b), format!("{}_", b)])
+        .collect();
+    candidates
+        .iter()
+        .filter(|c| !prefixes.iter().any(|p| c.starts_with(p)))
+        .cloned()
+        .collect()
+}
+
+/// 由项目名候选 × compose 默认镜像命名生成默认镜像名候选(纯函数)。
+///
+/// 只写 `build:` 的服务,compose v2 构建产物的默认镜像名为
+/// `<项目名>-<服务名>`(早期版本为 `<项目名>_<服务名>`),每个项目名候选
+/// 依次拼两种分隔符,按序去重。服务名保持原样(不做大小写变换)。
+pub fn default_image_candidates(project_names: &[String], service: &str) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    for project in project_names {
+        for sep in ["-", "_"] {
+            let candidate = format!("{}{}{}", project, sep, service);
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
+    candidates
+}
+
+/// 在本地镜像列表中按候选顺序查找默认命名的镜像(纯函数)。
+///
+/// 逐个候选收集 repo 完全相等的所有 (repo, tag):标签优先取 `latest`
+/// (compose 构建未写标签时的默认标签),否则取字典序第一个;
+/// 第一个有命中的候选即返回 `Some((repo, tag))`,全部未命中返回 `None`。
+pub fn scan_default_image(
+    candidates: &[String],
+    local_images: &[(String, String)],
+) -> Option<(String, String)> {
+    for candidate in candidates {
+        let mut tags: Vec<&str> = local_images
+            .iter()
+            .filter(|(repo, _)| repo == candidate)
+            .map(|(_, tag)| tag.as_str())
+            .collect();
+        if tags.is_empty() {
+            continue;
+        }
+        let tag = if tags.contains(&"latest") {
+            "latest".to_string()
+        } else {
+            tags.sort();
+            tags[0].to_string()
+        };
+        return Some((candidate.clone(), tag));
+    }
+    None
+}
+
+/// 导入来源信息(compose 同目录 `origin.json` 的内容)。
+///
+/// 本应用把 compose 复制到 `config/stacks/<uuid>/` 持久化,副本父目录名是
+/// uuid;记录导入时的原始父目录名,供副本路径解析时推导 compose 默认
+/// 项目名 / 默认镜像名兜底候选([`compose_project_name_candidates`])。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StackOrigin {
+    pub dir_name: String,
+}
+
+/// 读取 compose 同目录 `origin.json` 的原始目录名。
+/// 文件不存在 / JSON 损坏 / 字段缺失或为空 → `None`(兜底推导静默降级)。
+fn load_origin_dir_name(compose_dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(compose_dir.join("origin.json")).ok()?;
+    let origin: StackOrigin = serde_json::from_str(&text).ok()?;
+    let name = origin.dir_name.trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// 把导入来源信息写入 compose 同目录的 `origin.json`(导入流程调用)。
+/// 失败由调用方 `log::warn` 告警,不阻断导入主流程(缺失时候选退化为
+/// uuid 目录名,默认镜像兜底对旧导入不可用,仅影响提示文案)。
+pub fn save_origin_file(compose_dir: &Path, dir_name: &str) -> Result<(), String> {
+    let origin = StackOrigin {
+        dir_name: dir_name.trim().to_string(),
+    };
+    let path = compose_dir.join("origin.json");
+    let text =
+        serde_json::to_string_pretty(&origin).map_err(|e| format!("序列化 origin 失败: {}", e))?;
+    std::fs::write(&path, text)
+        .map_err(|e| format!("写入 origin.json 失败 ({}): {}", path.display(), e))
 }
 
 /// 把 override 文件的 `services` 映射按服务级浅合并进 base 顶层文档:
@@ -358,7 +563,7 @@ fn merge_override_services(base: &mut serde_yaml::Value, override_services: &ser
 ///
 /// 规则:has_build→Local;仅 image→Pull;Missing 且无 build→Pull+警告
 /// “本地不存在,将由服务器拉取”;RepoOnly→标签不一致警告;
-/// image 缺失时匹配状态记 Missing(image 缺失的警告/错误由调用方处理)。
+/// image 缺失时匹配状态记 Missing(警告与默认命名兜底匹配由调用方处理)。
 /// 返回 `(传输方式, 匹配状态, 本地实际标签, 匹配类警告)`。
 fn classify(
     image: Option<&str>,
@@ -789,7 +994,7 @@ mod tests {
         assert_eq!(c.warning.as_deref(), Some("本地不存在,将由服务器拉取"));
     }
 
-    // ===== 5. build 无 image 字段 → warning;无 image 无 build → errors =====
+    // ===== 5. build 无 image 字段 → 默认命名兜底;无 image 无 build → errors =====
 
     #[test]
     fn test_build_without_image_and_no_image_no_build() {
@@ -800,16 +1005,20 @@ mod tests {
             "services:\n  worker:\n    build: .\n  broken:\n    ports:\n      - \"80:80\"\n",
         )
         .unwrap();
+        // 本地为空:默认命名兜底必然未命中 → 保持 Missing + 提示构建/补 image
         let stack = parse_compose_file(&path, &[]).unwrap();
         std::fs::remove_dir_all(&dir).ok();
 
-        // has_build 且 image 缺失 → Local + 指定警告文案
+        // has_build 且 image 缺失、默认命名未命中 → Local + Missing + 指定警告
         let worker = find_svc(&stack, "worker");
         assert_eq!(worker.mode, TransferMode::Local);
         assert_eq!(worker.image, None);
-        assert_eq!(
-            worker.warning.as_deref(),
-            Some("未设 image 字段,无法核验/传输,请在 compose 补 image:")
+        assert_eq!(worker.match_state, MatchState::Missing);
+        let warning = worker.warning.as_deref().unwrap_or_default();
+        assert!(warning.contains("未设 image 字段"), "实际: {}", warning);
+        assert!(
+            warning.contains("默认命名镜像"),
+            "未命中应提示默认命名: {}", warning
         );
         // 无 image 且无 build → 记入 errors(阻断部署),服务仍保留在列表中
         assert!(stack
@@ -820,6 +1029,384 @@ mod tests {
         assert_eq!(broken.image, None);
         assert!(!broken.has_build);
         assert_eq!(broken.match_state, MatchState::Missing);
+    }
+
+    // ===== compose_project_name_candidates:常规 / 大写 / 含空格连字符 =====
+
+    #[test]
+    fn test_compose_project_name_candidates() {
+        // 常规小写目录名:原样与小写重合,单候选
+        assert_eq!(
+            compose_project_name_candidates(Path::new("/tmp/myproj/compose.yaml"), None),
+            vec!["myproj".to_string()]
+        );
+        // 大写目录名:原样 + 全小写
+        assert_eq!(
+            compose_project_name_candidates(
+                Path::new("C:/work/MyApp/docker-compose.yml"),
+                None
+            ),
+            vec!["MyApp".to_string(), "myapp".to_string()]
+        );
+        // 含空格与连字符的目录名:原样 + 小写 + 合规化(剔除空格等非法字符)
+        assert_eq!(
+            compose_project_name_candidates(Path::new("/srv/My App-1/compose.yaml"), None),
+            vec![
+                "My App-1".to_string(),
+                "my app-1".to_string(),
+                "myapp-1".to_string()
+            ]
+        );
+        // 无父目录 → 无来源 → 空候选;有显式 name 时仍可从 name 推导
+        assert!(compose_project_name_candidates(Path::new("compose.yaml"), None).is_empty());
+        assert_eq!(
+            compose_project_name_candidates(Path::new("compose.yaml"), Some("MyApp")),
+            vec!["MyApp".to_string(), "myapp".to_string()]
+        );
+        // 顶层 name:优先于父目录名(去重后排在前面)
+        assert_eq!(
+            compose_project_name_candidates(Path::new("/tmp/myproj/compose.yaml"), Some("Alpha")),
+            vec!["Alpha".to_string(), "alpha".to_string(), "myproj".to_string()]
+        );
+        // 同目录 origin.json 的 dir_name 优先于父目录名(副本路径场景)
+        let dir = temp_fixture_dir();
+        std::fs::write(
+            dir.join("origin.json"),
+            r#"{"dir_name": "original-proj"}"#,
+        )
+        .unwrap();
+        let path = dir.join("docker-compose.yml");
+        let parent_name = dir.file_name().unwrap().to_string_lossy().to_string();
+        assert_eq!(
+            compose_project_name_candidates(&path, None),
+            vec!["original-proj".to_string(), parent_name.clone()],
+            "origin.json 的 dir_name 应优先于父目录名"
+        );
+        // origin.json 损坏 → 静默忽略,退回父目录名
+        std::fs::write(dir.join("origin.json"), "not json").unwrap();
+        assert_eq!(
+            compose_project_name_candidates(&path, None),
+            vec![parent_name]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ===== is_uuid_like / visible_candidates:uuid 副本目录名候选过滤 =====
+
+    #[test]
+    fn test_is_uuid_like_and_visible_candidates() {
+        // 标准 uuid(v4 连字符形态,大小写均可)判定
+        assert!(is_uuid_like("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(is_uuid_like("550E8400-E29B-41D4-A716-446655440000"));
+        assert!(!is_uuid_like("myproj"));
+        assert!(!is_uuid_like("550e8400-e29b-41d4-a716-4466554400")); // 末段 11 位
+        assert!(!is_uuid_like("550e8400e29b41d4a716446655440000")); // 无连字符
+
+        // uuid 形态父目录:派生候选(-/_ 及小写变体)全部被剔除
+        let uuid_dir = uuid::Uuid::new_v4().to_string();
+        let path = Path::new("/tmp").join(&uuid_dir).join("docker-compose.yml");
+        let candidates = vec![
+            format!("{}-web", uuid_dir),
+            format!("{}_web", uuid_dir),
+            format!("{}-web", uuid_dir.to_lowercase()),
+            "myproj-web".to_string(),
+            "myproj_web".to_string(),
+        ];
+        let visible = visible_candidates(&candidates, &path);
+        assert_eq!(
+            visible,
+            vec!["myproj-web".to_string(), "myproj_web".to_string()],
+            "uuid 派生候选应被剔除: {:?}",
+            visible
+        );
+        // 非 uuid 父目录:候选原样保留
+        assert_eq!(
+            visible_candidates(&candidates, Path::new("/tmp/myproj/docker-compose.yml")),
+            candidates
+        );
+    }
+
+    // ===== default_image_candidates:序与去重 =====
+
+    #[test]
+    fn test_default_image_candidates() {
+        // 每个项目名 × [-, _],按序去重
+        let projects = vec!["MyApp".to_string(), "myapp".to_string()];
+        assert_eq!(
+            default_image_candidates(&projects, "web"),
+            vec![
+                "MyApp-web".to_string(),
+                "MyApp_web".to_string(),
+                "myapp-web".to_string(),
+                "myapp_web".to_string(),
+            ]
+        );
+        // 重复项目名去重
+        let dup = vec!["myproj".to_string(), "myproj".to_string()];
+        assert_eq!(
+            default_image_candidates(&dup, "api"),
+            vec!["myproj-api".to_string(), "myproj_api".to_string()]
+        );
+        // 空项目名列表 → 空
+        assert!(default_image_candidates(&[], "web").is_empty());
+    }
+
+    // ===== scan_default_image:latest 优先 / 多 tag 排序取首 / 未命中 =====
+
+    #[test]
+    fn test_scan_default_image() {
+        let candidates = vec!["myproj-web".to_string(), "myproj_web".to_string()];
+        let mk = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(r, t)| (r.to_string(), t.to_string()))
+                .collect()
+        };
+        // 多 tag:latest 优先
+        assert_eq!(
+            scan_default_image(
+                &candidates,
+                &mk(&[("myproj-web", "v1"), ("myproj-web", "latest")])
+            ),
+            Some(("myproj-web".to_string(), "latest".to_string()))
+        );
+        // 无 latest:多 tag 取字典序第一个("v1" < "v10" < "v2")
+        assert_eq!(
+            scan_default_image(
+                &candidates,
+                &mk(&[("myproj-web", "v2"), ("myproj-web", "v10"), ("myproj-web", "v1")])
+            ),
+            Some(("myproj-web".to_string(), "v1".to_string()))
+        );
+        // 首候选未命中,次候选(下划线变体)命中
+        assert_eq!(
+            scan_default_image(&candidates, &mk(&[("myproj_web", "v2")])),
+            Some(("myproj_web".to_string(), "v2".to_string()))
+        );
+        // 全部未命中 / 本地为空 → None
+        assert_eq!(scan_default_image(&candidates, &mk(&[("other", "v1")])), None);
+        assert_eq!(scan_default_image(&candidates, &[]), None);
+    }
+
+    /// 模拟导入副本结构:临时 stacks 根下 `<uuid>/docker-compose.yml` +
+    /// 可选 `origin.json`(dir_name)。返回 (compose 副本路径, 临时根目录)。
+    fn copy_fixture(origin_dir_name: Option<&str>, compose_yaml: &str) -> (PathBuf, PathBuf) {
+        let root = temp_fixture_dir();
+        let copy_dir = root.join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&copy_dir).unwrap();
+        if let Some(origin) = origin_dir_name {
+            std::fs::write(
+                copy_dir.join("origin.json"),
+                format!(r#"{{"dir_name": "{origin}"}}"#),
+            )
+            .unwrap();
+        }
+        let path = copy_dir.join("docker-compose.yml");
+        std::fs::write(&path, compose_yaml).unwrap();
+        (path, root)
+    }
+
+    // ===== 兜底集成(副本结构):origin.json 记录原目录名 → 默认命名命中 =====
+
+    #[test]
+    fn test_fallback_matches_dash_variant() {
+        // 副本父目录名是 uuid,真实目录名 myproj 来自 origin.json
+        let (path, root) = copy_fixture(
+            Some("myproj"),
+            "services:\n  web:\n    build: ./web\n",
+        );
+        let local = vec![("myproj-web".to_string(), "latest".to_string())];
+        let stack = parse_compose_file(&path, &local).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+
+        let web = find_svc(&stack, "web");
+        assert_eq!(web.mode, TransferMode::Local);
+        assert_eq!(
+            web.image.as_deref(),
+            Some("myproj-web:latest"),
+            "应按 origin 记录的原目录名自动填入命中的镜像"
+        );
+        assert_eq!(web.match_state, MatchState::Exact);
+        assert_eq!(web.local_tag.as_deref(), Some("latest"));
+        let warning = web.warning.as_deref().unwrap_or_default();
+        assert!(warning.contains("默认命名"), "应含默认命名提示: {}", warning);
+        assert!(
+            warning.contains("myproj-web:latest"),
+            "应含命中镜像引用: {}", warning
+        );
+        assert!(warning.contains("image:"), "应建议显式固化命名: {}", warning);
+    }
+
+    // ===== 兜底集成(副本结构):下划线变体命中 =====
+
+    #[test]
+    fn test_fallback_matches_underscore_variant() {
+        let (path, root) = copy_fixture(
+            Some("myproj"),
+            "services:\n  web:\n    build: ./web\n",
+        );
+        let local = vec![("myproj_web".to_string(), "v2".to_string())];
+        let stack = parse_compose_file(&path, &local).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+
+        let web = find_svc(&stack, "web");
+        assert_eq!(web.image.as_deref(), Some("myproj_web:v2"));
+        assert_eq!(web.match_state, MatchState::Exact);
+        assert_eq!(web.local_tag.as_deref(), Some("v2"));
+    }
+
+    // ===== 兜底集成(副本结构):全部未命中 → Local+Missing,候选不含 uuid =====
+
+    #[test]
+    fn test_fallback_miss_keeps_missing_with_hint() {
+        let (path, root) = copy_fixture(
+            Some("myproj"),
+            "services:\n  web:\n    build: ./web\n",
+        );
+        let uuid_dir = path
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let stack = parse_compose_file(&path, &[]).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+
+        let web = find_svc(&stack, "web");
+        assert_eq!(web.mode, TransferMode::Local);
+        assert_eq!(web.image, None);
+        assert_eq!(web.match_state, MatchState::Missing);
+        let warning = web.warning.as_deref().unwrap_or_default();
+        assert!(
+            warning.contains("默认命名镜像"),
+            "未命中应提示默认命名: {}", warning
+        );
+        // 候选展示(- 与 _ 变体),且不出现 uuid 目录名派生的候选
+        assert!(warning.contains("myproj-web"), "实际: {}", warning);
+        assert!(warning.contains("myproj_web"), "实际: {}", warning);
+        assert!(
+            !warning.contains(&uuid_dir),
+            "warning 不应展示 uuid 副本目录名: {}", warning
+        );
+    }
+
+    // ===== 兜底集成:uuid 副本目录名且无 origin.json → 展示剔除 uuid =====
+
+    #[test]
+    fn test_fallback_miss_filters_uuid_dir_name() {
+        // 旧版本导入的栈没有 origin.json:uuid 候选只参与扫描,不进 warning
+        let (path, root) = copy_fixture(None, "services:\n  web:\n    build: ./web\n");
+        let uuid_dir = path
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let stack = parse_compose_file(&path, &[]).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+
+        let warning = find_svc(&stack, "web").warning.as_deref().unwrap_or_default();
+        assert!(
+            warning.contains("默认命名镜像"),
+            "未命中应提示默认命名: {}", warning
+        );
+        assert!(
+            !warning.contains(&uuid_dir),
+            "warning 不应展示 uuid 副本目录名: {}", warning
+        );
+        assert!(
+            warning.contains("未能识别原始项目目录名"),
+            "候选全被剔除时应如实说明: {}", warning
+        );
+    }
+
+    // ===== 兜底集成:顶层 name: 参与候选(无 origin.json)=====
+
+    #[test]
+    fn test_fallback_uses_top_level_name() {
+        let (path, root) = copy_fixture(
+            None,
+            "name: myproj\nservices:\n  web:\n    build: ./web\n",
+        );
+        let local = vec![("myproj-web".to_string(), "latest".to_string())];
+        let stack = parse_compose_file(&path, &local).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+
+        let web = find_svc(&stack, "web");
+        assert_eq!(
+            web.image.as_deref(),
+            Some("myproj-web:latest"),
+            "顶层 name: 应作为候选来源(优先于 uuid 目录名)"
+        );
+        assert_eq!(web.match_state, MatchState::Exact);
+    }
+
+    // ===== 兜底集成:顶层 name: 优先于 origin.json 目录名 =====
+
+    #[test]
+    fn test_fallback_declared_name_wins_over_origin() {
+        let (path, root) = copy_fixture(
+            Some("origproj"),
+            "name: myproj\nservices:\n  web:\n    build: ./web\n",
+        );
+        let local = vec![
+            ("myproj-web".to_string(), "v1".to_string()),
+            ("origproj-web".to_string(), "v9".to_string()),
+        ];
+        let stack = parse_compose_file(&path, &local).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+
+        // compose v2 项目名优先级:name: > 目录名,两者都在本地时 name: 命中在前
+        let web = find_svc(&stack, "web");
+        assert_eq!(web.image.as_deref(), Some("myproj-web:v1"));
+        assert_eq!(web.match_state, MatchState::Exact);
+    }
+
+    // ===== 兜底集成:原始路径直接解析(无 origin.json)回退父目录名 =====
+
+    #[test]
+    fn test_fallback_no_origin_falls_back_to_parent_dir() {
+        // 非副本路径(preview_compose / 导入前预览场景):父目录名即真实目录名
+        let root = temp_fixture_dir();
+        let proj = root.join("myproj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let path = proj.join("compose.yaml");
+        std::fs::write(&path, "services:\n  web:\n    build: ./web\n").unwrap();
+        let local = vec![("myproj-web".to_string(), "latest".to_string())];
+        let stack = parse_compose_file(&path, &local).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+
+        let web = find_svc(&stack, "web");
+        assert_eq!(web.image.as_deref(), Some("myproj-web:latest"));
+        assert_eq!(web.match_state, MatchState::Exact);
+    }
+
+    // ===== image 字段存在但本地 Missing → 不参与兜底 =====
+
+    #[test]
+    fn test_image_field_present_missing_not_fallback_scanned() {
+        // image 字段已存在:构建命名就是该字段,默认命名兜底不适用
+        // (即便 origin.json 提供的候选能命中也不得覆盖)
+        let (path, root) = copy_fixture(
+            Some("myproj"),
+            "services:\n  web:\n    build: ./web\n    image: custom:1\n",
+        );
+        let stack = parse_compose_file(&path, &[]).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+
+        let web = find_svc(&stack, "web");
+        assert_eq!(
+            web.image.as_deref(),
+            Some("custom:1"),
+            "image 不应被默认命名覆盖"
+        );
+        assert_eq!(web.match_state, MatchState::Missing);
+        assert_eq!(
+            web.warning, None,
+            "Local 类 image 缺失不告警,更不应出现默认命名兜底提示"
+        );
     }
 
     // ===== 6. service_overrides 覆盖默认分类 =====
