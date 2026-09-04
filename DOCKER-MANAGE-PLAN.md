@@ -4,6 +4,8 @@
 >
 > 硬约束：**低耦合，禁止对已有功能及代码修改造成功能失效。**
 
+**进度**：A 阶段 ✅ 已完成（v4.5.0 / 2026-09-05）｜B 阶段 ⬜ 待开始｜C 阶段 ⬜ 待开始
+
 ---
 
 ## 1. 设计原则（低耦合）
@@ -60,7 +62,7 @@
 
 ---
 
-## 3. A 阶段：核心双对象（MVP）
+## 3. A 阶段：核心双对象（MVP）✅ 已完成
 
 > 目标：容器 + 镜像的完整查看与操作，覆盖日常 80% 运维场景。
 
@@ -162,6 +164,15 @@ struct ImageInfo {
 - 镜像：不做 push、build、save/load、prune（prune 现有「服务器管理」页已有 `prune_server`）
 - 不做实时资源监控（docker stats 流式 CPU/内存指标在 C 阶段）；A 阶段提供手动刷新 + 可自定义间隔的定时自动刷新（见 3.3.1）
 - 不做多服务器同时监控，单时刻只操作一台选中的服务器
+
+### 3.5 完成记录（v4.5.0 / 2026-09-05）
+
+- **后端**：`manage.rs` 10 个命令全部实现并通过 `cargo build` / `cargo test`（136 passed）
+- **前端**：`manage.js` 容器/镜像双 Tab + 定时自动刷新（5/10/30/60s 预设 + 自定义 3-300s）+ localStorage 持久化
+- **UI 美化**：操作按钮统一幽灵风格（删除用琥珀色暗示，行 hover 不反白）；表格固定列宽 + 文本截断；端口智能折叠（+N 徽章 + 点击展开）；创建时间格式化
+- **低耦合验证**：`git diff` 确认 commands.rs / docker.rs / ssh.rs / config.rs / crypto.rs / 旧前端 JS 零改动；lib.rs / index.html / style.css 仅末尾追加
+- **已知技术坑**：Docker `--format json` 的 ID 字段是全大写 `ID`（非 PascalCase 的 `Id`），需 `#[serde(rename = "ID")]`；不存在 `.Created` 字段，绝对时间是 `CreatedAt`
+- **Release**：NSIS 安装包 2.93 MB（LTO + strip + opt-level=s），已发布至 GitHub Release v4.5
 
 ---
 
@@ -319,12 +330,12 @@ struct ImageInfo {
 
 ## 9. 实施顺序建议
 
-1. **A 阶段后端**：manage.rs 骨架 + 连接辅助 + list_servers + overview + list_containers + list_images（先跑通只读）
-2. **A 阶段前端骨架**：index.html 追加 + manage.js 页面框架 + 服务器选择 + 概览渲染 + 手动刷新
-3. **A 阶段容器操作**：action / inspect / logs + 前端交互
-4. **A 阶段镜像操作**：pull / remove / tag + 前端交互
-5. **A 阶段定时自动刷新**：开关 + 预设/自定义间隔 + 定时器生命周期（离页清理、防重入、操作期暂停、按 ID 差异更新）+ localStorage 持久化
-6. **A 阶段样式**：style.css 追加 + 亮暗适配
-7. **回归验证**：编译 + 测试 + 手动 5 页回归 + 自动刷新并发/泄漏检查
-8. **B 阶段**：卷 / 网络（纯追加）
-9. **C 阶段**：ssh.rs 追加 exec_interactive → Compose / stats / exec（按需）
+1. ✅ **A 阶段后端**：manage.rs 骨架 + 连接辅助 + list_servers + overview + list_containers + list_images（先跑通只读）
+2. ✅ **A 阶段前端骨架**：index.html 追加 + manage.js 页面框架 + 服务器选择 + 概览渲染 + 手动刷新
+3. ✅ **A 阶段容器操作**：action / inspect / logs + 前端交互
+4. ✅ **A 阶段镜像操作**：pull / remove / tag + 前端交互
+5. ✅ **A 阶段定时自动刷新**：开关 + 预设/自定义间隔 + 定时器生命周期（离页清理、防重入、操作期暂停、按 ID 差异更新）+ localStorage 持久化
+6. ✅ **A 阶段样式**：style.css 追加 + 亮暗适配 + 按钮美化 + 列表优化（固定列宽/端口折叠/时间格式化）
+7. ✅ **回归验证**：编译 + 测试 + 手动 5 页回归 + 自动刷新并发/泄漏检查
+8. ⬜ **B 阶段**：卷 / 网络（纯追加）
+9. ⬜ **C 阶段**：ssh.rs 追加 exec_interactive → Compose / stats / exec（按需）
