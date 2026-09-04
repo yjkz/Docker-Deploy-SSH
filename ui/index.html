@@ -50,6 +50,10 @@
         <button class="dock-item disabled" type="button" data-nav="deploy" title="环境检测未通过" aria-disabled="true">
           <span class="dock-num">04</span><span class="dock-label">部署向导</span>
         </button>
+        <!-- 远程管理:纯远程 SSH 操作,不依赖本机 Docker,始终可进入(参照 03) -->
+        <button class="dock-item" type="button" data-nav="manage">
+          <span class="dock-num">05</span><span class="dock-label">远程管理</span>
+        </button>
       </nav>
       <!-- 亮暗主题切换:位于 dock 末端(桌面=左 dock 底部,窄屏=顶栏右端) -->
       <div class="dock-actions">
@@ -374,6 +378,105 @@
           <div id="deploy-log-count" class="log-count"></div>
         </div>
       </section>
+
+      <!-- 05 远程管理 REMOTE -->
+      <section data-page="manage" class="page">
+        <header class="page-head">
+          <div class="page-index">05</div>
+          <div class="page-titles">
+            <h1 class="page-title">远程管理</h1>
+            <span class="page-sub">REMOTE</span>
+          </div>
+          <div class="page-tools">
+            <button id="manage-refresh-btn" class="btn" type="button">刷新</button>
+          </div>
+        </header>
+
+        <!-- 服务器选择栏:下拉 + 状态徽章 + 自动刷新开关 + 间隔 -->
+        <div class="manage-server-bar">
+          <select id="manage-server-select" class="form-input manage-server-select"></select>
+          <span id="manage-status-badge" class="badge badge-info">未连接</span>
+          <label class="manage-autorefresh">
+            <input type="checkbox" id="manage-autorefresh-toggle">
+            <span>自动刷新</span>
+          </label>
+          <select id="manage-interval-select" class="form-input manage-interval-select" disabled>
+            <option value="5">5s</option>
+            <option value="10">10s</option>
+            <option value="30" selected>30s</option>
+            <option value="60">60s</option>
+            <option value="custom">自定义…</option>
+          </select>
+        </div>
+
+        <div id="manage-error" class="check-error hidden"></div>
+
+        <!-- 概览技术面板 -->
+        <div id="manage-overview" class="manage-overview">
+          <div class="manage-overview-label">概览 OVERVIEW</div>
+          <div id="manage-overview-grid" class="manage-overview-grid">
+            <div class="overview-item"><span class="overview-label">Docker 版本</span><span class="overview-value" id="ov-version">—</span></div>
+            <div class="overview-item"><span class="overview-label">操作系统</span><span class="overview-value" id="ov-os">—</span></div>
+            <div class="overview-item"><span class="overview-label">内核</span><span class="overview-value" id="ov-kernel">—</span></div>
+            <div class="overview-item"><span class="overview-label">架构</span><span class="overview-value" id="ov-arch">—</span></div>
+            <div class="overview-item"><span class="overview-label">容器(运行/暂停/停止/总数)</span><span class="overview-value" id="ov-containers">—</span></div>
+            <div class="overview-item"><span class="overview-label">镜像数</span><span class="overview-value" id="ov-images">—</span></div>
+            <div class="overview-item overview-item-wide"><span class="overview-label">磁盘占用</span><span class="overview-value" id="ov-disk">—</span></div>
+          </div>
+        </div>
+
+        <!-- Tab 分段控件 -->
+        <div class="manage-tabs">
+          <button class="manage-tab active" data-tab="containers" type="button">容器 CONTAINERS</button>
+          <button class="manage-tab" data-tab="images" type="button">镜像 IMAGES</button>
+        </div>
+
+        <!-- 容器列表面板 -->
+        <div id="manage-containers-panel" class="manage-tab-panel">
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>状态 STATE</th>
+                  <th>名称 NAME</th>
+                  <th>镜像 IMAGE</th>
+                  <th>端口 PORTS</th>
+                  <th>创建时间 CREATED</th>
+                  <th class="col-action">操作 ACTION</th>
+                </tr>
+              </thead>
+              <tbody id="manage-containers-tbody">
+                <tr><td class="empty-cell" colspan="6">选择服务器后加载</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- 镜像列表面板 -->
+        <div id="manage-images-panel" class="manage-tab-panel hidden">
+          <div class="manage-pull-bar">
+            <input id="manage-pull-input" class="text-input manage-pull-input" type="text" placeholder="输入镜像名，如 nginx:latest" autocomplete="off">
+            <button id="manage-pull-btn" class="btn btn-primary btn-sm" type="button">拉取镜像</button>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>仓库 REPO</th>
+                  <th>标签 TAG</th>
+                  <th>ID</th>
+                  <th>大小 SIZE</th>
+                  <th>创建时间 CREATED</th>
+                  <th class="col-action">操作 ACTION</th>
+                </tr>
+              </thead>
+              <tbody id="manage-images-tbody">
+                <tr><td class="empty-cell" colspan="6">选择服务器后加载</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
     </main>
   </div>
 
@@ -391,10 +494,22 @@
     </div>
   </div>
 
+  <!-- 远程管理独立模态框(日志/确认/打标签,内容由 manage.js 构建) -->
+  <div id="manage-modal" class="modal-overlay hidden">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="manage-modal-title">
+      <div class="modal-head">
+        <div id="manage-modal-title" class="modal-title"></div>
+        <button id="manage-modal-close" class="modal-close" type="button" title="关闭">关闭</button>
+      </div>
+      <div id="manage-modal-body" class="modal-body"></div>
+    </div>
+  </div>
+
   <script src="app.js"></script>
   <script src="check.js"></script>
   <script src="images.js"></script>
   <script src="servers.js"></script>
   <script src="deploy.js"></script>
+  <script src="manage.js"></script>
 </body>
 </html>

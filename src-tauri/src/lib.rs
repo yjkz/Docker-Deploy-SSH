@@ -3,6 +3,7 @@ pub mod config;
 pub mod crypto;
 pub mod docker;
 pub mod history;
+pub mod manage;
 pub mod ssh;
 pub mod stack;
 
@@ -34,6 +35,16 @@ pub fn run() {
       commands::preview_compose,
       commands::preview_stack_changes,
       commands::get_history,
+      manage::manage_list_servers,
+      manage::manage_overview,
+      manage::manage_list_containers,
+      manage::manage_container_inspect,
+      manage::manage_container_action,
+      manage::manage_container_logs,
+      manage::manage_list_images,
+      manage::manage_image_pull,
+      manage::manage_image_remove,
+      manage::manage_image_tag,
     ])
     .setup(|app| {
       // 日志(不限 debug 构建,release 同样记录,便于现场排查):

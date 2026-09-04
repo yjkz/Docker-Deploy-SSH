@@ -1315,3 +1315,485 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
     clip-path: none !important;
   }
 }
+
+/* ============================================================
+   05 远程管理 REMOTE — manage 页面样式(末尾追加,不修改已有规则)
+   设计契约:data-ark-theme="ark" + data-ark-depth="complex"
+   ============================================================ */
+
+/* 等宽字体工具类 */
+.mono { font-family: var(--font-mono); font-size: 13px; }
+
+/* 小尺寸表单控件 */
+.form-input-sm {
+  padding: 4px 8px;
+  font-size: 12px;
+  min-height: 28px;
+  width: auto;
+}
+
+/* ===== 服务器选择栏 ===== */
+.manage-server-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--ark-line-soft);
+  margin-bottom: 16px;
+}
+.manage-server-select {
+  min-width: 240px;
+  max-width: 360px;
+}
+.manage-autorefresh {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  user-select: none;
+  margin-left: auto;
+}
+.manage-autorefresh input { cursor: pointer; }
+.manage-interval-select {
+  min-width: 72px;
+  width: auto;
+}
+.manage-interval-select:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* ===== 概览技术面板 ===== */
+.manage-overview {
+  border: 1px solid var(--ark-line);
+  background: var(--ark-surface);
+  margin-bottom: 20px;
+  position: relative;
+}
+.manage-overview-label {
+  position: absolute;
+  top: 0;
+  left: 0;
+  padding: 4px 10px;
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  background: var(--ark-ink);
+  color: var(--ark-paper);
+  font-family: var(--font-cond);
+}
+.manage-overview-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0;
+  padding-top: 28px;
+}
+.overview-item {
+  padding: 12px 16px;
+  border-right: 1px solid var(--ark-line-soft);
+  border-bottom: 1px solid var(--ark-line-soft);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.overview-item:nth-child(4n) { border-right: none; }
+.overview-item-wide {
+  grid-column: span 4;
+  border-right: none;
+  border-bottom: none;
+}
+.overview-label {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ark-paper-dim-ink);
+  font-family: var(--font-cond);
+}
+.overview-value {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ark-ink);
+  font-variant-numeric: tabular-nums;
+  word-break: break-all;
+}
+
+/* ===== Tab 分段控件 ===== */
+.manage-tabs {
+  display: flex;
+  border-bottom: 2px solid var(--ark-line);
+  margin-bottom: 16px;
+}
+.manage-tab {
+  padding: 10px 20px;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -2px;
+  font-family: var(--font-cjk);
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  color: var(--ark-paper-ink-65);
+  cursor: pointer;
+  transition: color 0.15s;
+}
+.manage-tab:hover { color: var(--ark-ink); }
+.manage-tab.active {
+  color: var(--ark-ink);
+  border-bottom-color: var(--ark-signal);
+  font-weight: 600;
+}
+
+/* ===== 镜像拉取栏 ===== */
+.manage-pull-bar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+  align-items: center;
+}
+.manage-pull-input {
+  flex: 1;
+  max-width: 400px;
+}
+
+/* ===== 容器行与详情面板 ===== */
+.container-row { cursor: default; }
+.container-name-cell { font-weight: 500; }
+.container-name-cell:hover { color: var(--ark-signal); }
+
+.container-detail-row td {
+  padding: 0;
+  background: var(--ark-paper-dim);
+}
+.manage-detail-panel {
+  padding: 16px 20px;
+  font-size: 13px;
+}
+.inspect-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px 24px;
+}
+.inspect-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.inspect-item-wide { grid-column: span 3; }
+.inspect-label {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ark-paper-dim-ink);
+  font-family: var(--font-cond);
+}
+.inspect-value {
+  font-size: 13px;
+  color: var(--ark-ink);
+  word-break: break-all;
+}
+
+/* ===== 日志模态框 ===== */
+.log-tail-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+  font-size: 13px;
+}
+.manage-log-body {
+  background: var(--ark-terminal-bg);
+  color: var(--ark-terminal-fg);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 12px;
+  max-height: 400px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  border: 1px solid var(--ark-line);
+}
+
+/* ===== 操作按钮组 ===== */
+.action-btn-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+/* ===== 确认对话框 ===== */
+.confirm-msg {
+  font-size: 14px;
+  line-height: 1.6;
+  margin-bottom: 16px;
+  color: var(--ark-ink);
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+/* ===== 容器状态徽章变体 ===== */
+.badge-running {
+  background: var(--ark-signal);
+  color: var(--ark-on-signal);
+  border-color: var(--ark-signal);
+}
+.badge-exited {
+  background: transparent;
+  color: var(--ark-paper-ink-65);
+  border-color: var(--ark-line-soft);
+}
+.badge-paused {
+  background: var(--ark-warn);
+  color: var(--ark-on-warn);
+  border-color: var(--ark-warn);
+}
+.badge-created {
+  background: transparent;
+  color: var(--ark-paper-ink-65);
+  border-color: var(--ark-line-soft);
+}
+
+/* ===== 响应式:窄屏概览网格降列 ===== */
+@media (max-width: 900px) {
+  .manage-overview-grid { grid-template-columns: repeat(2, 1fr); }
+  .overview-item:nth-child(4n) { border-right: 1px solid var(--ark-line-soft); }
+  .overview-item:nth-child(2n) { border-right: none; }
+  .overview-item-wide { grid-column: span 2; }
+  .inspect-grid { grid-template-columns: repeat(2, 1fr); }
+  .inspect-item-wide { grid-column: span 2; }
+  .manage-server-select { min-width: 160px; }
+  .manage-autorefresh { margin-left: 0; }
+}
+
+/* ============================================================
+   列表操作按钮美化(覆盖初始 .action-btn-group 样式)
+   统一幽灵风格:透明底+软边框,删除用琥珀色暗示,行hover不反白
+   ============================================================ */
+
+/* 操作按钮组:紧凑内联,不换行 */
+.action-btn-group {
+  display: inline-flex;
+  gap: 6px;
+  flex-wrap: nowrap;
+  align-items: center;
+}
+
+/* 统一幽灵按钮基础:透明底+软边框+弱化墨字 */
+.action-btn-group .btn-sm {
+  padding: 3px 10px 3px 12px;
+  font-size: 11.5px;
+  font-weight: 500;
+  min-width: 46px;
+  height: 26px;
+  background: transparent;
+  border-color: var(--ark-line-soft);
+  color: var(--ark-paper-ink-65);
+  transition: background .15s ease, color .15s ease,
+              border-color .15s ease, transform .15s ease;
+}
+.action-btn-group .btn-sm::before {
+  width: 3px;
+  background: var(--ark-line-soft);
+  transition: background .15s ease;
+}
+
+/* 普通按钮 hover:纸底+墨边+青楔形 */
+.action-btn-group .btn-sm:hover {
+  background: var(--ark-paper);
+  border-color: var(--ark-ink);
+  color: var(--ark-ink);
+  transform: translate(1px, 1px);
+}
+.action-btn-group .btn-sm:hover::before {
+  background: var(--ark-signal);
+}
+.action-btn-group .btn-sm:active {
+  transform: translate(2px, 2px);
+}
+
+/* 删除按钮:琥珀文字+琥珀楔形,暗示危险(不搞黑底反白) */
+.action-btn-group .btn-sm.btn-danger {
+  background: transparent;
+  border-color: var(--ark-line-soft);
+  color: #7a5f00;
+}
+.action-btn-group .btn-sm.btn-danger::before {
+  background: rgba(255, 210, 63, .6);
+}
+
+/* 删除按钮 hover:琥珀底+墨字 */
+.action-btn-group .btn-sm.btn-danger:hover {
+  background: var(--ark-warn);
+  border-color: var(--ark-warn);
+  color: var(--ark-on-warn);
+}
+.action-btn-group .btn-sm.btn-danger:hover::before {
+  background: var(--ark-on-warn);
+}
+
+/* ===== 行 hover:覆盖默认的按钮反白,保持幽灵风格 ===== */
+.data-table tbody tr:hover .action-btn-group .btn-sm {
+  background: transparent;
+  border-color: rgba(244, 246, 246, .28);
+  color: rgba(244, 246, 246, .85);
+}
+.data-table tbody tr:hover .action-btn-group .btn-sm::before {
+  background: rgba(244, 246, 246, .28);
+}
+
+/* 行 hover + 普通按钮 hover:纸底反白+青楔形 */
+.data-table tbody tr:hover .action-btn-group .btn-sm:hover {
+  background: var(--ark-paper);
+  border-color: var(--ark-paper);
+  color: var(--ark-ink);
+}
+.data-table tbody tr:hover .action-btn-group .btn-sm:hover::before {
+  background: var(--ark-signal);
+}
+
+/* 行 hover + 删除按钮:琥珀文字+浅琥珀边 */
+.data-table tbody tr:hover .action-btn-group .btn-sm.btn-danger {
+  color: var(--ark-warn);
+  border-color: rgba(255, 210, 63, .45);
+}
+.data-table tbody tr:hover .action-btn-group .btn-sm.btn-danger::before {
+  background: rgba(255, 210, 63, .5);
+}
+
+/* 行 hover + 删除按钮 hover:琥珀底墨字 */
+.data-table tbody tr:hover .action-btn-group .btn-sm.btn-danger:hover {
+  background: var(--ark-warn);
+  border-color: var(--ark-warn);
+  color: var(--ark-on-warn);
+}
+.data-table tbody tr:hover .action-btn-group .btn-sm.btn-danger:hover::before {
+  background: var(--ark-on-warn);
+}
+
+/* 详情展开行不参与整行反白 hover */
+.data-table tbody tr.container-detail-row:hover {
+  background: var(--ark-paper-dim);
+  color: var(--ark-ink);
+}
+
+/* 操作列:右对齐+不换行,给足按钮空间 */
+.manage-tab-panel .col-action {
+  text-align: right;
+  white-space: nowrap;
+  min-width: 200px;
+}
+
+/* ===== 按钮美化修正:行 hover 用 token 替代硬编码 rgba,兼容暗色主题 ===== */
+.data-table tbody tr:hover .action-btn-group .btn-sm {
+  background: transparent;
+  border-color: var(--ark-on-ink-55);
+  color: var(--ark-on-ink-55);
+}
+.data-table tbody tr:hover .action-btn-group .btn-sm::before {
+  background: var(--ark-on-ink-55);
+}
+/* 行 hover + 普通按钮 hover:纸底反白+青楔形(两主题通用) */
+.data-table tbody tr:hover .action-btn-group .btn-sm:hover {
+  background: var(--ark-paper);
+  border-color: var(--ark-paper);
+  color: var(--ark-ink);
+}
+.data-table tbody tr:hover .action-btn-group .btn-sm:hover::before {
+  background: var(--ark-signal);
+}
+/* 行 hover + 删除按钮:琥珀色(两主题通用,琥珀恒亮) */
+.data-table tbody tr:hover .action-btn-group .btn-sm.btn-danger {
+  color: var(--ark-warn);
+  border-color: color-mix(in srgb, var(--ark-warn) 45%, transparent);
+}
+.data-table tbody tr:hover .action-btn-group .btn-sm.btn-danger::before {
+  background: color-mix(in srgb, var(--ark-warn) 50%, transparent);
+}
+.data-table tbody tr:hover .action-btn-group .btn-sm.btn-danger:hover {
+  background: var(--ark-warn);
+  border-color: var(--ark-warn);
+  color: var(--ark-on-warn);
+}
+.data-table tbody tr:hover .action-btn-group .btn-sm.btn-danger:hover::before {
+  background: var(--ark-on-warn);
+}
+
+/* ============================================================
+   方案D:固定列宽 + 文本截断 + 端口展开徽章
+   ============================================================ */
+
+/* 管理页表格:固定布局,杜绝列间互相挤压 */
+.manage-tab-panel .data-table {
+  table-layout: fixed;
+  width: 100%;
+}
+
+/* 通用文本截断(单行省略号) */
+.text-truncate {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+/* 容器表列宽:状态|名称|镜像|端口|创建时间|操作 */
+#manage-containers-panel .data-table th:nth-child(1),
+#manage-containers-panel .data-table td:nth-child(1) { width: 80px; }
+#manage-containers-panel .data-table th:nth-child(2),
+#manage-containers-panel .data-table td:nth-child(2) { width: 140px; }
+#manage-containers-panel .data-table th:nth-child(3),
+#manage-containers-panel .data-table td:nth-child(3) { width: 200px; }
+#manage-containers-panel .data-table th:nth-child(4),
+#manage-containers-panel .data-table td:nth-child(4) { width: 210px; }
+#manage-containers-panel .data-table th:nth-child(5),
+#manage-containers-panel .data-table td:nth-child(5) { width: 110px; }
+#manage-containers-panel .data-table th:nth-child(6),
+#manage-containers-panel .data-table td:nth-child(6) { width: 210px; }
+
+/* 镜像表列宽:仓库|标签|ID|大小|创建时间|操作 */
+#manage-images-panel .data-table th:nth-child(1),
+#manage-images-panel .data-table td:nth-child(1) { width: 200px; }
+#manage-images-panel .data-table th:nth-child(2),
+#manage-images-panel .data-table td:nth-child(2) { width: 100px; }
+#manage-images-panel .data-table th:nth-child(3),
+#manage-images-panel .data-table td:nth-child(3) { width: 140px; }
+#manage-images-panel .data-table th:nth-child(4),
+#manage-images-panel .data-table td:nth-child(4) { width: 80px; }
+#manage-images-panel .data-table th:nth-child(5),
+#manage-images-panel .data-table td:nth-child(5) { width: 110px; }
+#manage-images-panel .data-table th:nth-child(6),
+#manage-images-panel .data-table td:nth-child(6) { width: 180px; }
+
+/* 端口单元格:折叠态单行截断 */
+.port-cell {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+}
+/* 端口展开态:每行一个原始端口,允许换行 */
+.port-cell .port-line {
+  white-space: normal;
+  word-break: break-all;
+  line-height: 1.55;
+  font-size: 12px;
+}
+/* +N 徽章(琥珀底墨字) */
+.port-badge {
+  display: inline-block;
+  margin-left: 5px;
+  padding: 0 5px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .02em;
+  background: var(--ark-warn);
+  color: var(--ark-on-warn);
+  vertical-align: middle;
+  line-height: 16px;
+}
