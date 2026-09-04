@@ -36,7 +36,7 @@
 ## 30 秒速览
 
 ```
-仓库:D:\Github-repositories\docker-deploy-ssh(git,主分支 main)
+仓库:E:\github\Docker-Deploy-SSH(git,主分支 main)
 代码量:Rust ~7,560 行(7 模块)+ 原生 JS/HTML/CSS ~5,000 行(无框架无打包器)
 技术:Tauri 2 + tokio + russh/russh-sftp + flate2 + serde_yaml + windows-dpapi + tauri-plugin-dialog + ureq
 前端调用后端:window.__TAURI__.core.invoke(19 个命令),事件 4 个,字段 snake_case

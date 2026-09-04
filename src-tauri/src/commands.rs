@@ -894,6 +894,8 @@ async fn run_deploy_steps(
     // ---- 步骤 4:同步文件 ----
     emit_progress(app, 4, 5, "同步项目文件");
     ensure_not_cancelled(app)?;
+    let single_compose =
+        prepare_single_compose(app, &mut client, &server, &project).await?;
     sync_files(app, &mut client, &server, &project).await?;
     emit_log(app, "项目文件同步完成");
     // 部署前钩子(归入步骤 4:装载前执行,旧容器仍在运行;失败即中止部署)
@@ -909,7 +911,17 @@ async fn run_deploy_steps(
     } else {
         None
     };
-    server_deploy(app, &mut client, &server, &project, &tar_name, retag).await?;
+    server_deploy(
+        app,
+        &mut client,
+        &server,
+        &project,
+        &single_compose.remote_file,
+        &single_compose.override_names,
+        &tar_name,
+        retag,
+    )
+    .await?;
 
     emit_log(app, "部署完成");
     Ok(())
@@ -1099,6 +1111,59 @@ async fn sync_files(
     Ok(())
 }
 
+/// 单镜像部署使用的远端 compose 文件及 override 文件名。
+struct SingleComposeTarget {
+    remote_file: String,
+    override_names: Vec<String>,
+}
+
+/// 准备单镜像部署所需的 compose 文件。
+///
+/// 导入项目的 `compose_file` 是本地副本路径,需要先上传并改用远端副本;
+/// 旧版手工项目则把它作为远端路径保存,继续直接使用。不存在的 Windows
+/// 盘符路径明确报错,避免把本机路径拼进 SSH 命令。
+async fn prepare_single_compose(
+    app: &AppHandle,
+    client: &mut SshClient,
+    server: &ServerConfig,
+    project: &ProjectConfig,
+) -> Result<SingleComposeTarget, String> {
+    if project.compose_file.trim().is_empty() {
+        return Err(format!("项目「{}」未配置 compose 文件", project.name));
+    }
+
+    let local = PathBuf::from(&project.compose_file);
+    if local.is_file() {
+        upload_compose_files(app, client, server, project).await?;
+        return Ok(SingleComposeTarget {
+            remote_file: remote_compose_path(&server.remote_dir),
+            override_names: compose_override_names(&project.compose_file),
+        });
+    }
+
+    if is_windows_absolute_path(&project.compose_file) {
+        return Err(format!(
+            "本地 compose 文件不存在:{};请确认路径或重新导入 compose 文件",
+            project.compose_file
+        ));
+    }
+
+    Ok(SingleComposeTarget {
+        remote_file: project.compose_file.clone(),
+        override_names: Vec::new(),
+    })
+}
+
+/// 判断 Windows 盘符绝对路径或 UNC 路径,不把它误当作远端路径。
+fn is_windows_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/'))
+        || path.starts_with("\\\\")
+}
+
 /// 步骤 5:服务器部署 —— `docker load` → 同步原标签 → `compose up -d` → 健康检查 → 部署后钩子 → 删除远端 tar。
 ///
 /// 每条命令超时 600 秒(清理 60 秒),输出实时转发到 `deploy-log`,收到输出行时检查取消标志。
@@ -1111,6 +1176,8 @@ async fn server_deploy(
     client: &mut SshClient,
     server: &ServerConfig,
     project: &ProjectConfig,
+    remote_compose: &str,
+    override_names: &[String],
     tar_name: &str,
     retag: Option<(String, String)>,
 ) -> Result<(), String> {
@@ -1128,24 +1195,31 @@ async fn server_deploy(
         exec_forwarded(app, client, &tag_cmd, 60).await?;
     }
 
-    // 5.3 启动服务(cd 到远端目录后按相对 compose 文件启动)
+    // 5.3 启动服务:这里只使用已解析的远端 compose 路径
     let up_cmd = format!(
         "cd {} && docker compose -f {} up -d",
         shell_single_quote(&server.remote_dir),
-        shell_single_quote(&project.compose_file),
+        shell_single_quote(remote_compose),
     );
     emit_log(
         app,
         &format!(
             "启动服务: cd {} && docker compose -f {} up -d",
-            server.remote_dir, project.compose_file
+            server.remote_dir, remote_compose
         ),
     );
     exec_forwarded(app, client, &up_cmd, 600).await?;
 
     // 5.4 健康检查(up 后按预算轮询服务状态;health_wait_secs=0 时跳过)
-    // 单镜像管线无 override 文件链(远端 up 亦不带 -f override),传空列表
-    health_check(app, client, project, &server.remote_dir, &project.compose_file, &[]).await?;
+    health_check(
+        app,
+        client,
+        project,
+        &server.remote_dir,
+        remote_compose,
+        override_names,
+    )
+    .await?;
 
     // 5.5 部署后钩子(健康检查通过后执行;失败仅告警,不影响部署结果)
     run_hook(app, client, project, HookKind::Post, &server.remote_dir).await?;
@@ -2799,6 +2873,33 @@ mod tests {
     fn test_shell_single_quote() {
         assert_eq!(shell_single_quote("/opt/app"), "'/opt/app'");
         assert_eq!(shell_single_quote("/opt/a'b"), "'/opt/a'\\''b'");
+    }
+
+    // ===== 单镜像 compose 路径 =====
+
+    #[test]
+    fn test_is_windows_absolute_path() {
+        assert!(is_windows_absolute_path(
+            r"E:\github\Docker-Deploy-SSH\docker-compose.yml"
+        ));
+        assert!(is_windows_absolute_path(
+            "E:/github/Docker-Deploy-SSH/docker-compose.yml"
+        ));
+        assert!(is_windows_absolute_path(r"\\server\share\docker-compose.yml"));
+        assert!(!is_windows_absolute_path("docker-compose.yml"));
+        assert!(!is_windows_absolute_path("/opt/app/docker-compose.yml"));
+    }
+
+    #[test]
+    fn test_single_image_command_uses_remote_compose_path() {
+        let local = r"E:\github\Docker-Deploy-SSH\config\stacks\id\docker-compose.yml";
+        let remote = remote_compose_path("/home/henghao");
+        let cmd = compose_up_cmd("/home/henghao", &remote, &[]);
+        assert!(!cmd.contains(local));
+        assert_eq!(
+            cmd,
+            "cd '/home/henghao' && docker compose -f '/home/henghao/docker-compose.yml' up -d"
+        );
     }
 
     // ===== resolve_password =====
