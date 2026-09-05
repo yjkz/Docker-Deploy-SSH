@@ -37,7 +37,7 @@
     <aside class="dock">
       <div class="dock-brand">DOCKERDEPLOY</div>
       <nav class="dock-nav">
-        <button class="dock-item active" type="button" data-nav="check">
+        <button class="dock-item active" type="button" data-nav="check" aria-current="page">
           <span class="dock-num">01</span><span class="dock-label">环境检测</span>
         </button>
         <button class="dock-item disabled" type="button" data-nav="images" title="环境检测未通过" aria-disabled="true">
@@ -120,11 +120,11 @@
           <table class="data-table">
             <thead>
               <tr>
-                <th>仓库 REPO</th>
-                <th>TAG</th>
-                <th>大小 SIZE</th>
-                <th>创建时间 CREATED</th>
-                <th class="col-action">操作 ACTION</th>
+                <th scope="col">仓库 REPO</th>
+                <th scope="col">TAG</th>
+                <th scope="col">大小 SIZE</th>
+                <th scope="col">创建时间 CREATED</th>
+                <th scope="col" class="col-action">操作 ACTION</th>
               </tr>
             </thead>
             <tbody id="images-tbody">
@@ -165,11 +165,11 @@
           <table class="data-table">
             <thead>
               <tr>
-                <th>名称 NAME</th>
-                <th>镜像过滤 FILTER</th>
-                <th>compose 文件 COMPOSE</th>
-                <th>映射数 MAPS</th>
-                <th class="col-action">操作 ACTION</th>
+                <th scope="col">名称 NAME</th>
+                <th scope="col">镜像过滤 FILTER</th>
+                <th scope="col">compose 文件 COMPOSE</th>
+                <th scope="col">映射数 MAPS</th>
+                <th scope="col" class="col-action">操作 ACTION</th>
               </tr>
             </thead>
             <tbody id="projects-tbody">
@@ -206,9 +206,9 @@
         </div>
         <div class="deploy-form" id="deploy-form">
           <!-- 模式切换:单镜像 / 整栈部署(compose);激活 tab 墨底纸白字 + 青色下条 -->
-          <div class="deploy-mode-tabs" id="deploy-mode-tabs">
-            <button id="deploy-mode-single" class="mode-tab active" type="button">单镜像</button>
-            <button id="deploy-mode-stack" class="mode-tab" type="button">整栈部署(compose)</button>
+          <div class="deploy-mode-tabs" id="deploy-mode-tabs" role="tablist" aria-label="部署模式">
+            <button id="deploy-mode-single" class="mode-tab active" type="button" role="tab" aria-selected="true">单镜像</button>
+            <button id="deploy-mode-stack" class="mode-tab" type="button" role="tab" aria-selected="false">整栈部署(compose)</button>
           </div>
           <div class="deploy-form-grid">
             <div class="form-row mode-single-only">
@@ -250,10 +250,10 @@
               <table class="data-table">
                 <thead>
                   <tr>
-                    <th>服务 SERVICE</th>
-                    <th>镜像 IMAGE</th>
-                    <th>匹配 MATCH</th>
-                    <th class="col-action">传输方式 TRANSFER</th>
+                    <th scope="col">服务 SERVICE</th>
+                    <th scope="col">镜像 IMAGE</th>
+                    <th scope="col">匹配 MATCH</th>
+                    <th scope="col" class="col-action">传输方式 TRANSFER</th>
                   </tr>
                 </thead>
                 <tbody id="deploy-stack-tbody">
@@ -269,9 +269,9 @@
                 <table class="data-table">
                   <thead>
                     <tr>
-                      <th>服务 SERVICE</th>
-                      <th>镜像 IMAGE</th>
-                      <th>变更 CHANGE</th>
+                      <th scope="col">服务 SERVICE</th>
+                      <th scope="col">镜像 IMAGE</th>
+                      <th scope="col">变更 CHANGE</th>
                     </tr>
                   </thead>
                   <tbody id="deploy-preview-tbody">
@@ -304,12 +304,12 @@
               <table class="data-table">
                 <thead>
                   <tr>
-                    <th>时间 TIME</th>
-                    <th>模式 MODE</th>
-                    <th>项目 / 服务器 TARGET</th>
-                    <th>镜像 IMAGES</th>
-                    <th>结果 RESULT</th>
-                    <th>耗时 DURATION</th>
+                    <th scope="col">时间 TIME</th>
+                    <th scope="col">模式 MODE</th>
+                    <th scope="col">项目 / 服务器 TARGET</th>
+                    <th scope="col">镜像 IMAGES</th>
+                    <th scope="col">结果 RESULT</th>
+                    <th scope="col">耗时 DURATION</th>
                   </tr>
                 </thead>
                 <tbody id="deploy-history-tbody">
@@ -425,28 +425,28 @@
           </div>
         </div>
 
-        <!-- Tab 分段控件 -->
-        <div class="manage-tabs">
-          <button class="manage-tab active" data-tab="containers" type="button">容器 CONTAINERS</button>
-          <button class="manage-tab" data-tab="images" type="button">镜像 IMAGES</button>
-          <button class="manage-tab" data-tab="volumes" type="button">卷 VOLUMES</button>
-          <button class="manage-tab" data-tab="networks" type="button">网络 NETWORKS</button>
-          <button class="manage-tab" data-tab="stacks" type="button">栈 STACKS</button>
-          <button class="manage-tab" data-tab="monitor" type="button">监控 MONITOR</button>
+        <!-- Tab 分段控件(role=tablist;aria-selected 由 manage.js switchTab 同步) -->
+        <div class="manage-tabs" role="tablist" aria-label="远程管理分类">
+          <button class="manage-tab active" data-tab="containers" type="button" role="tab" aria-selected="true">容器 CONTAINERS</button>
+          <button class="manage-tab" data-tab="images" type="button" role="tab" aria-selected="false">镜像 IMAGES</button>
+          <button class="manage-tab" data-tab="volumes" type="button" role="tab" aria-selected="false">卷 VOLUMES</button>
+          <button class="manage-tab" data-tab="networks" type="button" role="tab" aria-selected="false">网络 NETWORKS</button>
+          <button class="manage-tab" data-tab="stacks" type="button" role="tab" aria-selected="false">栈 STACKS</button>
+          <button class="manage-tab" data-tab="monitor" type="button" role="tab" aria-selected="false">监控 MONITOR</button>
         </div>
 
-        <!-- 容器列表面板 -->
-        <div id="manage-containers-panel" class="manage-tab-panel">
+        <!-- 容器列表面板(隐藏语义沿用 .hidden 类 = display:none,已从无障碍树移除,不再叠加 aria-hidden) -->
+        <div id="manage-containers-panel" class="manage-tab-panel" role="tabpanel" aria-label="容器">
           <div class="table-wrap">
             <table class="data-table manage-table">
               <thead>
                 <tr>
-                  <th>状态 STATE</th>
-                  <th>名称 NAME</th>
-                  <th>镜像 IMAGE</th>
-                  <th>端口 PORTS</th>
-                  <th>创建时间 CREATED</th>
-                  <th class="col-action">操作 ACTION</th>
+                  <th scope="col">状态 STATE</th>
+                  <th scope="col">名称 NAME</th>
+                  <th scope="col">镜像 IMAGE</th>
+                  <th scope="col">端口 PORTS</th>
+                  <th scope="col">创建时间 CREATED</th>
+                  <th scope="col" class="col-action">操作 ACTION</th>
                 </tr>
               </thead>
               <tbody id="manage-containers-tbody">
@@ -457,7 +457,7 @@
         </div>
 
         <!-- 镜像列表面板 -->
-        <div id="manage-images-panel" class="manage-tab-panel hidden">
+        <div id="manage-images-panel" class="manage-tab-panel hidden" role="tabpanel" aria-label="镜像">
           <div class="manage-pull-bar">
             <input id="manage-pull-input" class="text-input manage-pull-input" type="text" placeholder="输入镜像名，如 nginx:latest" autocomplete="off">
             <button id="manage-pull-btn" class="btn btn-primary btn-sm" type="button">拉取镜像</button>
@@ -466,12 +466,12 @@
             <table class="data-table manage-table">
               <thead>
                 <tr>
-                  <th>仓库 REPO</th>
-                  <th>标签 TAG</th>
-                  <th>ID</th>
-                  <th>大小 SIZE</th>
-                  <th>创建时间 CREATED</th>
-                  <th class="col-action">操作 ACTION</th>
+                  <th scope="col">仓库 REPO</th>
+                  <th scope="col">标签 TAG</th>
+                  <th scope="col">ID</th>
+                  <th scope="col">大小 SIZE</th>
+                  <th scope="col">创建时间 CREATED</th>
+                  <th scope="col" class="col-action">操作 ACTION</th>
                 </tr>
               </thead>
               <tbody id="manage-images-tbody">
@@ -482,7 +482,7 @@
         </div>
 
         <!-- 卷列表面板(B 阶段追加) -->
-        <div id="manage-volumes-panel" class="manage-tab-panel hidden">
+        <div id="manage-volumes-panel" class="manage-tab-panel hidden" role="tabpanel" aria-label="卷">
           <div class="manage-pull-bar">
             <button id="manage-volume-create-btn" class="btn btn-primary btn-sm" type="button">创建卷</button>
           </div>
@@ -490,11 +490,11 @@
             <table class="data-table manage-table">
               <thead>
                 <tr>
-                  <th>名称 NAME</th>
-                  <th>驱动 DRIVER</th>
-                  <th>挂载点 MOUNTPOINT</th>
-                  <th>创建时间 CREATED</th>
-                  <th class="col-action">操作 ACTION</th>
+                  <th scope="col">名称 NAME</th>
+                  <th scope="col">驱动 DRIVER</th>
+                  <th scope="col">挂载点 MOUNTPOINT</th>
+                  <th scope="col">创建时间 CREATED</th>
+                  <th scope="col" class="col-action">操作 ACTION</th>
                 </tr>
               </thead>
               <tbody id="manage-volumes-tbody">
@@ -505,7 +505,7 @@
         </div>
 
         <!-- 网络列表面板(B 阶段追加) -->
-        <div id="manage-networks-panel" class="manage-tab-panel hidden">
+        <div id="manage-networks-panel" class="manage-tab-panel hidden" role="tabpanel" aria-label="网络">
           <div class="manage-pull-bar">
             <button id="manage-network-create-btn" class="btn btn-primary btn-sm" type="button">创建网络</button>
           </div>
@@ -513,11 +513,11 @@
             <table class="data-table manage-table">
               <thead>
                 <tr>
-                  <th>名称 NAME</th>
-                  <th>驱动 DRIVER</th>
-                  <th>范围 SCOPE</th>
-                  <th>已连接容器 CONTAINERS</th>
-                  <th class="col-action">操作 ACTION</th>
+                  <th scope="col">名称 NAME</th>
+                  <th scope="col">驱动 DRIVER</th>
+                  <th scope="col">范围 SCOPE</th>
+                  <th scope="col">已连接容器 CONTAINERS</th>
+                  <th scope="col" class="col-action">操作 ACTION</th>
                 </tr>
               </thead>
               <tbody id="manage-networks-tbody">
@@ -528,7 +528,7 @@
         </div>
 
         <!-- Compose 栈列表面板(C 阶段追加) -->
-        <div id="manage-stacks-panel" class="manage-tab-panel hidden">
+        <div id="manage-stacks-panel" class="manage-tab-panel hidden" role="tabpanel" aria-label="栈">
           <div class="manage-pull-bar">
             <button id="manage-stack-refresh-btn" class="btn btn-sm" type="button">刷新栈</button>
           </div>
@@ -536,9 +536,9 @@
             <table class="data-table manage-table">
               <thead>
                 <tr>
-                  <th>目录 DIR</th>
-                  <th>COMPOSE 文件</th>
-                  <th class="col-action">操作 ACTION</th>
+                  <th scope="col">目录 DIR</th>
+                  <th scope="col">COMPOSE 文件</th>
+                  <th scope="col" class="col-action">操作 ACTION</th>
                 </tr>
               </thead>
               <tbody id="manage-stacks-tbody">
@@ -549,7 +549,7 @@
         </div>
 
         <!-- 实时监控面板(C 阶段追加) -->
-        <div id="manage-monitor-panel" class="manage-tab-panel hidden">
+        <div id="manage-monitor-panel" class="manage-tab-panel hidden" role="tabpanel" aria-label="监控">
           <div class="manage-pull-bar">
             <button id="monitor-start-btn" class="btn btn-primary btn-sm" type="button">开始监控</button>
             <button id="monitor-stop-btn" class="btn btn-sm" type="button" disabled>停止监控</button>
@@ -568,13 +568,13 @@
             <table class="data-table manage-table">
               <thead>
                 <tr>
-                  <th>容器名 NAME</th>
-                  <th>CPU%</th>
-                  <th>内存占用 MEM</th>
-                  <th>内存% MEM%</th>
-                  <th>网络 IO NET IO</th>
-                  <th>块 IO BLOCK IO</th>
-                  <th>PID</th>
+                  <th scope="col">容器名 NAME</th>
+                  <th scope="col">CPU%</th>
+                  <th scope="col">内存占用 MEM</th>
+                  <th scope="col">内存% MEM%</th>
+                  <th scope="col">网络 IO NET IO</th>
+                  <th scope="col">块 IO BLOCK IO</th>
+                  <th scope="col">PID</th>
                 </tr>
               </thead>
               <tbody id="monitor-tbody">

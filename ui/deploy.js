@@ -558,6 +558,9 @@
     var tabStack = document.getElementById('deploy-mode-stack');
     if (tabSingle) tabSingle.classList.toggle('active', mode === 'single');
     if (tabStack) tabStack.classList.toggle('active', mode === 'stack');
+    // ARIA 状态同步:与 active 类保持一致(初始态见 index.html 的 aria-selected)
+    if (tabSingle) tabSingle.setAttribute('aria-selected', String(mode === 'single'));
+    if (tabStack) tabStack.setAttribute('aria-selected', String(mode === 'stack'));
 
     var panel = document.getElementById('deploy-stack-panel');
     if (panel) panel.classList.toggle('hidden', mode !== 'stack');

@@ -98,9 +98,15 @@
     var closeBtn = $('manage-modal-close');
     if (closeBtn) closeBtn.addEventListener('click', closeModal);
     var overlay = $('manage-modal');
-    if (overlay) overlay.addEventListener('click', function (e) {
-      if (e.target === overlay) closeModal();
-    });
+    if (overlay) {
+      overlay.addEventListener('click', function (e) {
+        if (e.target === overlay) closeModal();
+      });
+      // Esc 关闭(仅管理模态可见时,避免误伤其他模态;参照 help.js 先例)
+      document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape' && !overlay.classList.contains('hidden')) closeModal();
+      });
+    }
 
     // B 阶段:创建卷 / 创建网络入口
     var vBtn = $('manage-volume-create-btn');
@@ -286,7 +292,10 @@
       : null;
     var tabs = document.querySelectorAll('.manage-tab');
     for (var i = 0; i < tabs.length; i++) {
-      tabs[i].classList.toggle('active', tabs[i].getAttribute('data-tab') === tab);
+      var tabActive = tabs[i].getAttribute('data-tab') === tab;
+      tabs[i].classList.toggle('active', tabActive);
+      // ARIA 状态同步:与 active 类保持一致(初始态见 index.html 的 aria-selected)
+      tabs[i].setAttribute('aria-selected', tabActive ? 'true' : 'false');
     }
     $('manage-containers-panel').classList.toggle('hidden', tab !== 'containers');
     $('manage-images-panel').classList.toggle('hidden', tab !== 'images');
@@ -738,6 +747,8 @@
     var tail = 100;
 
     var body = document.createElement('div');
+    // 查看类弹窗放大标记:openModal 据此给共用 modal-card 加 .modal-wide
+    body.className = 'manage-wide-modal';
     body.innerHTML =
       '<div class="log-tail-bar">' +
       '<label>显示行数:' +
@@ -1544,7 +1555,8 @@
   function showResourceInspect(command, resourceId, title, paramName) {
     openModal(title, (function () {
       var pre = document.createElement('pre');
-      pre.className = 'manage-log-body';
+      // 查看类弹窗放大标记:openModal 据此给共用 modal-card 加 .modal-wide
+      pre.className = 'manage-log-body manage-wide-modal';
       pre.textContent = '加载中…';
       var params = { serverId: state.serverId };
       params[paramName] = resourceId;
@@ -1630,22 +1642,35 @@
   }
 
   // ===== 模态框 =====
+  // 触发元素记忆:openModal 时记录 document.activeElement,closeModal 时归还焦点
+  var modalTriggerEl = null;
+
   function openModal(title, bodyEl) {
     var modal = $('manage-modal');
     var titleEl = $('manage-modal-title');
     var body = $('manage-modal-body');
     if (!modal || !body) return;
+    // 仅在模态从关闭态打开时记录触发元素(模态内重开不覆盖)
+    if (modal.classList.contains('hidden')) {
+      modalTriggerEl = document.activeElement || null;
+    }
     if (titleEl) titleEl.textContent = title;
     body.innerHTML = '';
     if (bodyEl) body.appendChild(bodyEl);
     // 终端会话专用放大:仅当本次打开的是终端弹窗(body 带 .manage-terminal-modal
     // 标记)时给共用 modal-card 加修饰类;其余弹窗(日志/确认/打标签等)显式移除,
     // 保证共用模态的尺寸互不影响
+    // 查看类弹窗放大:body 带 .manage-wide-modal 标记(容器/栈日志、栈服务状态、
+    // 卷/网络 inspect)时给 modal-card 加 .modal-wide;其余弹窗显式移除,
+    // 与 modal-terminal 同款互斥写法,保证共用模态的尺寸互不影响
     var card = modal.querySelector('.modal-card');
     if (card) {
       var isTerm = !!(bodyEl && bodyEl.classList && bodyEl.classList.contains('manage-terminal-modal'));
       if (isTerm) card.classList.add('modal-terminal');
       else card.classList.remove('modal-terminal');
+      var isWide = !!(bodyEl && bodyEl.classList && bodyEl.classList.contains('manage-wide-modal'));
+      if (isWide) card.classList.add('modal-wide');
+      else card.classList.remove('modal-wide');
     }
     modal.classList.remove('hidden');
   }
@@ -1654,6 +1679,12 @@
     var modal = $('manage-modal');
     if (modal) modal.classList.add('hidden');
     execOnModalClose(); // C 阶段追加:模态框关闭时清理终端会话
+    // 焦点归还:模态关闭后把焦点还给打开它的元素(仅在元素仍于 DOM 时),
+    // 若该元素已被重渲染移除则静默跳过
+    if (modalTriggerEl) {
+      if (document.contains(modalTriggerEl)) modalTriggerEl.focus();
+      modalTriggerEl = null;
+    }
   }
 
   function buildConfirmBody(message, confirmLabel, onConfirm, showForce) {
@@ -1887,6 +1918,8 @@
   // 栈服务状态:模态框内小表格
   function showStackPs(st) {
     var body = document.createElement('div');
+    // 查看类弹窗放大标记:openModal 据此给共用 modal-card 加 .modal-wide
+    body.className = 'manage-wide-modal';
     body.innerHTML =
       '<div class="table-wrap"><table class="data-table stack-ps-table">' +
       '<thead><tr><th>服务 SERVICE</th><th>状态 STATE</th></tr></thead>' +
@@ -1934,6 +1967,8 @@
   function showStackLogs(st) {
     var tail = 100;
     var body = document.createElement('div');
+    // 查看类弹窗放大标记:openModal 据此给共用 modal-card 加 .modal-wide
+    body.className = 'manage-wide-modal';
     body.innerHTML =
       '<div class="log-tail-bar">' +
       '<label>显示行数:' +
@@ -2420,14 +2455,17 @@
     }
   }
 
-  // closeModal 钩子:模态框被关闭(含遮罩点击/关闭按钮)时清理终端会话
+  // closeModal 钩子:模态框被关闭(含遮罩点击/关闭按钮/Esc)时清理终端会话
   function execOnModalClose() {
-    // 还原共用模态尺寸:任何关闭路径(关闭按钮/遮罩点击/关闭终端)都经
-    // closeModal 走到这里,移除终端态修饰类
+    // 还原共用模态尺寸:任何关闭路径(关闭按钮/遮罩点击/Esc/关闭终端)都经
+    // closeModal 走到这里,无条件移除终端态/查看态修饰类
     var modal = $('manage-modal');
     if (modal) {
       var card = modal.querySelector('.modal-card');
-      if (card) card.classList.remove('modal-terminal');
+      if (card) {
+        card.classList.remove('modal-terminal');
+        card.classList.remove('modal-wide');
+      }
     }
     var ex = cState.exec;
     if (ex.sessionId || ex.unlisten) {

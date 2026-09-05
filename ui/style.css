@@ -96,7 +96,7 @@
   --ark-line-soft: rgba(8, 10, 11, .18);
   --ark-paper-dim-ink: rgba(8, 10, 11, .62);  /* 微标签墨(alpha .62:亮色纸面上对比过 AA,审计 P1-1;暗色保持 .5) */
   --ark-paper-ink-65: rgba(8, 10, 11, .65);   /* 次级文字墨 */
-  --ark-ink-35: rgba(8, 10, 11, .35);         /* 占位符 / 弱化 mono 文字 */
+  --ark-ink-35: rgba(8, 10, 11, .45);         /* 占位符 / 弱化 mono 文字(P2-1:亮侧 .35→.45,纸面 ≈2.6:1→≈3.1:1;token 名保留 -35 记录沿用史,值以注释为准) */
   --ark-on-signal: #080a0b;            /* 青色实心底上的文字(青恒亮,两主题固定墨色) */
   --ark-on-warn: #080a0b;              /* 琥珀底上的文字(琥珀恒亮,两主题固定墨色) */
   --ark-stat-warm: #7a5f00;            /* 预警状态文字(亮):纸面上的暗琥珀,过 AA */
@@ -139,7 +139,7 @@
   --ark-line-soft: rgba(244, 246, 246, .18);
   --ark-paper-dim-ink: rgba(244, 246, 246, .5);
   --ark-paper-ink-65: rgba(244, 246, 246, .65);
-  --ark-ink-35: rgba(244, 246, 246, .35);
+  --ark-ink-35: rgba(244, 246, 246, .35); /* 暗侧保持 .35(P2-1):近黑上 ≈3.0:1,与亮侧 .45 的 ≈3.1:1 持平,同 --ark-paper-dim-ink 的按 scheme 调 alpha 先例 */
   --ark-on-signal-dim: var(--ark-signal); /* 青淡底上改用青字 */
   --ark-on-ink-55: rgba(8, 10, 11, .6); /* alpha .6:反白行(纸白底)上对比度过 WCAG AA */
   --ark-overlay: rgba(0, 0, 0, .62);
@@ -190,7 +190,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   text-align: center;
   color: var(--ink-on-paper-40);
   font-family: var(--font-mono);
-  font-size: 9px;
+  font-size: 10px; /* P2-2:9px → 10px,墨底上 9px 过小不可读 */
   letter-spacing: .18em;
   line-height: 1.8;
   word-break: break-all;
@@ -249,7 +249,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   text-align: center;
   color: var(--ink-on-paper-40);
   font-family: var(--font-mono);
-  font-size: 9px;
+  font-size: 10px; /* P2-2:9px → 10px,与 .dock-brand 对齐 */
   letter-spacing: .18em;
 }
 
@@ -304,12 +304,15 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
 }
 .page.active { display: block; }
 
-/* 切页动画:clip-path 从右向左 masked reveal(app.js 挂 page-reveal 触发一次) */
+/* 切页动画:clip-path 从右向左 masked reveal(app.js 挂 page-reveal 触发一次)
+   P2-8:时长 .3s → .45s。契约 section reveal 带 500-900ms,但切页属导航级
+   交互,500ms+ 会拖慢高频切页;取 .45s 折中 —— 比交互带上限略高,让 masked
+   reveal 有可读的过程,又不至于滞涩。仍为方向性 clip 揭示,非透明度淡入。 */
 @keyframes page-reveal {
   from { clip-path: inset(0 0 0 100%); }
   to   { clip-path: inset(0 0 0 0); }
 }
-.page.page-reveal { animation: page-reveal .3s ease-out; }
+.page.page-reveal { animation: page-reveal .45s ease-out; }
 
 /* ===== 页首体系:超大 condensed 编号 + 双语标题 + 右侧工具 ===== */
 .page-head {
@@ -651,11 +654,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
 .data-table tbody tr:hover .btn::before { background: var(--ark-signal); }
 
 .data-table .col-action { text-align: right; white-space: nowrap; }
-.data-table .mono {
-  font-family: var(--font-mono);
-  font-variant-numeric: tabular-nums;
-  word-break: break-all;
-}
+/* 审计 P2-15:原 .data-table .mono 规则已并入 05 段的 .mono 工具类(渲染不变)。 */
 /* 仓库名列:15px 墨粗 */
 .data-table .cell-repo {
   font-size: 15px;
@@ -1022,7 +1021,13 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
 
 /* ===== 04 部署向导 DEPLOY ===== */
 
-/* 模式切换 tab:激活项墨底纸白字 + 底缘 3px 青色下条(压在 1px 分隔线上) */
+/* 模式切换 tab:激活项墨底纸白字 + 底缘 3px 青色下条(压在 1px 分隔线上)
+   [审计 P2-7 决策] 与 05 的 .manage-tabs 是有意的两级 tab 语言,不做样式合并:
+   本组是「页面级主切换」(04 部署模式,单镜像/整栈决定整个表单结构),激活态用
+   墨底填充 + 3px 青条,权重最高,与 .btn-primary 的墨底主操作语言同族;
+   05 的 .manage-tabs 是「面板级高频导航」,激活态仅青色下划线 + 600 字重,
+   刻意更轻,避免六栏全用墨底的沉重感。两组共享青色激活信号、激活态均不止
+   靠颜色(填充/下条 vs 下划线/字重),符合 a11y「激活不得只靠颜色」。 */
 .deploy-mode-tabs {
   display: flex;
   align-items: stretch;
@@ -1397,8 +1402,17 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
    设计契约:data-ark-theme="ark" + data-ark-depth="complex"
    ============================================================ */
 
-/* 等宽字体工具类 */
-.mono { font-family: var(--font-mono); font-size: 13px; }
+/* 等宽字体工具类(审计 P2-15:与原 .data-table .mono 双定义合并为单一来源)
+   合并进 tabular-nums / word-break:表内 mono 单元格(manage/servers/deploy/
+   images 各表,均 .data-table 后代)属性集合不变;唯一表外消费方
+   .inspect-value.mono 本就 break-all,tabular-nums 在等宽字体上是 no-op,
+   渲染均不变。cell-repo 等更高特异性规则照常覆盖字号。 */
+.mono {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  word-break: break-all;
+}
 
 /* 小尺寸表单控件 */
 .form-input-sm {
@@ -1495,7 +1509,10 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   word-break: break-all;
 }
 
-/* ===== Tab 分段控件 ===== */
+/* ===== Tab 分段控件 =====
+   [审计 P2-7 决策] 面板级 tab:激活态 = 青色下划线 + 600 字重、无墨底填充,
+   保持 05 页轻量导航的辨识度;与 04 .deploy-mode-tabs(页面级主切换,墨底
+   填充激活)的两级语言声明见该处注释,样式不互相靠拢。 */
 .manage-tabs {
   display: flex;
   border-bottom: 2px solid var(--ark-line);
@@ -1512,7 +1529,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   letter-spacing: 0.04em;
   color: var(--ark-paper-ink-65);
   cursor: pointer;
-  transition: color 0.15s;
+  transition: color .18s; /* 审计 P2-8:.15s → .18s,归入契约交互带 180-350ms */
 }
 .manage-tab:hover { color: var(--ark-ink); }
 .manage-tab.active {
@@ -1670,13 +1687,13 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   background: transparent;
   border-color: var(--ark-line-soft);
   color: var(--ark-paper-ink-65);
-  transition: background .15s ease, color .15s ease,
-              border-color .15s ease, transform .15s ease;
+  transition: background .18s ease, color .18s ease,
+              border-color .18s ease, transform .18s ease; /* P2-8:.15s → .18s */
 }
 .action-btn-group .btn-sm::before {
   width: 3px;
   background: var(--ark-line-soft);
-  transition: background .15s ease;
+  transition: background .18s ease; /* P2-8:.15s → .18s */
 }
 
 /* 普通按钮 hover:纸底+墨边+青楔形 */
@@ -1875,16 +1892,22 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
 .stack-ps-table th:nth-child(1),
 .stack-ps-table td:nth-child(1) { width: 60%; }
 
-/* 终端输出区:亮暗主题均固定黑底等宽终端风格 */
+/* 终端输出区:亮暗主题均固定黑底等宽终端风格(审计 P2-9:hex → 既有 token)
+   - bg/fg 复用 pass 1 已有的 --ark-terminal-bg / --ark-terminal-fg(与 .deploy-log /
+     .log-body / .manage-log-body 同源,不新增重复 token;暗色 scheme 下随 token
+     变 #0d1113,与其余终端面板一致)
+   - 边框用 --ark-line(同 .deploy-log/.manage-log-body 先例):亮色下终端是纸面上
+     的黑块,描边可隐;暗色下终端底 #0d1113 与模态表面同族,必须靠这条 1px 描边
+     区分(--ink-on-paper-08 的 8% 白在暗色下过弱,会融底)
+   - radius 归零(项目块面禁圆角;同 .deploy-log 无 radius) */
 .manage-terminal {
   margin: 0 0 8px;
   padding: 10px 12px;
   height: 320px;
   overflow-y: auto;
-  background: #080a0b;
-  color: #d7e0e2;
-  border: 1px solid #1a2124;
-  border-radius: 4px;
+  background: var(--ark-terminal-bg);
+  color: var(--ark-terminal-fg);
+  border: 1px solid var(--ark-line);
   font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.5;
@@ -1893,24 +1916,27 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
 }
 .manage-terminal::selection,
 .manage-terminal *::selection {
-  background: #18d1ff;
-  color: #080a0b;
+  background: var(--ark-signal);
+  color: var(--ark-on-signal);
 }
 
-/* 终端输入行 */
+/* 终端输入行(P2-9:hex → token;输入框 radius 上限 2px,同 .form-input;
+   边框走常暗表面 alpha token --ink-on-paper-08,在 #080a0b 上 ≈ #1b1d1e,
+   数值上复现原 #1a2124 的幽灵描边;焦点环由 --ark-signal 边框 + 全局
+   :focus-visible outline 承担) */
 .manage-terminal-input {
   width: 100%;
   padding: 8px 10px;
-  background: #080a0b;
-  color: #18d1ff;
-  border: 1px solid #1a2124;
-  border-radius: 4px;
+  background: var(--ark-terminal-bg);
+  color: var(--ark-signal);
+  border: 1px solid var(--ink-on-paper-08);
+  border-radius: 2px;
   font-family: var(--font-mono);
   font-size: 12px;
   outline: none;
 }
 .manage-terminal-input:focus {
-  border-color: #18d1ff;
+  border-color: var(--ark-signal);
 }
 .manage-terminal-input:disabled {
   opacity: .45;
@@ -2336,4 +2362,52 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
 pre,
 code {
   font-variant-ligatures: none;
+}
+
+/* ============================================================
+   审计修复追加块 P2(pass 2,末尾追加)
+   ============================================================ */
+
+/* ---- P2-6:文本输入类 focus-visible(契约:2px 信号色 outline + offset) ----
+   基础规则里的 outline:none(0,1,0,且声明晚于全局 :focus-visible)会吞掉
+   键盘焦点环;此处以 (0,2,0) 恢复。鼠标点击走 :focus(底边 2px 变信号色),
+   不弹 outline;键盘 Tab 才触发 :focus-visible。 */
+.text-input:focus-visible,
+.form-input:focus-visible,
+.mapping-input:focus-visible,
+.form-textarea:focus-visible {
+  outline: 2px solid var(--ark-signal);
+  outline-offset: 1px;
+}
+
+/* ---- P2-13:滚动条主题补缺(参照 .deploy-log / .stage 既有写法与 token) ----
+   终端类常暗表面:8px + --ink-on-paper-30(同 .deploy-log/.log-body),
+   修复暗色终端块内出现系统亮色滚动条的问题;.manage-log-body 与
+   .manage-terminal 同为 --ark-terminal-bg 暗色终端块、同样滚动,属同一缺陷,
+   一并纳入。模态正文(.modal-body 随主题表面):10px + --ark-line-soft
+   (同 .stage/.help-content),供 .modal-wide 的 65vh 滚动使用。 */
+.manage-terminal::-webkit-scrollbar,
+.manage-log-body::-webkit-scrollbar { width: 8px; }
+.manage-terminal::-webkit-scrollbar-thumb,
+.manage-log-body::-webkit-scrollbar-thumb { background: var(--ink-on-paper-30); }
+.modal-body::-webkit-scrollbar { width: 10px; }
+.modal-body::-webkit-scrollbar-thumb { background: var(--ark-line-soft); }
+.modal-body::-webkit-scrollbar-track { background: transparent; }
+
+/* ---- P2-9 配套:查看类弹窗放大(manage.js:body.manage-wide-modal → card.modal-wide) ----
+   尺寸与 .modal-terminal 同规格(width min(1000px,94vw),<760px 收 96vw):
+   两处宽度值相同,即使 JS 同时给卡片挂 modal-wide + modal-terminal 也取同值,
+   无冲突。正文 65vh 滚动上限用 :not(.modal-terminal) 排除终端弹窗 —— 终端态
+   保持「约 60vh 终端区 + 输入行」自身布局,不叠加 body 级第二条滚动条;查看类
+   弹窗(容器/栈日志、栈服务状态、卷/网络 inspect)超高时由 .modal-body 自滚。
+   .modal-body 现状仅 padding,无既有 max-height/overflow,不冲突。
+   窄窗口兜底同 .modal-terminal:overlay 16px 侧内边距 + .modal-card
+   max-width:100% 收口,96vw 不会溢出。 */
+.modal-card.modal-wide { width: min(1000px, 94vw); }
+.modal-card.modal-wide:not(.modal-terminal) .modal-body {
+  max-height: 65vh;
+  overflow-y: auto;
+}
+@media (max-width: 759px) {
+  .modal-card.modal-wide { width: 96vw; }
 }

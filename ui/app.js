@@ -136,7 +136,11 @@
 
     var items = document.querySelectorAll('.dock-item');
     for (i = 0; i < items.length; i++) {
-      items[i].classList.toggle('active', items[i].getAttribute('data-nav') === name);
+      var isActive = items[i].getAttribute('data-nav') === name;
+      items[i].classList.toggle('active', isActive);
+      // ARIA 当前页标记:与 active 类同步维护(当前项设 page,其余移除)
+      if (isActive) items[i].setAttribute('aria-current', 'page');
+      else items[i].removeAttribute('aria-current');
     }
 
     // 派发页面切换事件(window 上的 'pagechange',detail.page = 页面名),
