@@ -196,6 +196,9 @@
             <h1 class="page-title">部署向导</h1>
             <span class="page-sub">DEPLOY</span>
           </div>
+          <div class="page-tools">
+            <button id="notify-entry-btn" class="btn" type="button">通知<span id="notify-entry-badge" class="badge badge-info">未配置</span></button>
+          </div>
         </header>
 
         <!-- 预检未通过 / 预检失败 / 数据加载失败错误框(内容由 deploy.js 构建) -->
@@ -645,6 +648,17 @@
     </div>
   </div>
 
+  <!-- 通知中心模态框(桌面/邮件通知与事件订阅,内容由 notify.js 构建) -->
+  <div id="notify-modal" class="modal-overlay hidden">
+    <div class="modal-card notify-modal-card" role="dialog" aria-modal="true" aria-labelledby="notify-modal-title">
+      <div class="modal-head">
+        <div id="notify-modal-title" class="modal-title">通知设置<span class="help-title-en">NOTIFICATIONS</span></div>
+        <button id="notify-modal-close" class="modal-close" type="button" title="关闭">关闭</button>
+      </div>
+      <div id="notify-modal-body" class="modal-body"></div>
+    </div>
+  </div>
+
   <!-- 帮助:右下角悬浮按钮(所有页面可见)+ 章节式帮助模态框(静态内容由 help.js 渲染) -->
   <button id="help-fab" class="help-fab" type="button" aria-haspopup="dialog"
           aria-controls="help-modal" aria-label="打开使用帮助" title="使用帮助">?</button>
@@ -667,6 +681,7 @@
   <script src="servers.js"></script>
   <script src="deploy.js"></script>
   <script src="manage.js"></script>
+  <script src="notify.js"></script>
   <script src="help.js"></script>
 </body>
 </html>

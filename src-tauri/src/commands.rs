@@ -639,9 +639,12 @@ pub fn deploy_stack(req: StackDeployRequest, app: AppHandle) -> Result<(), Strin
 
 /// 后台部署任务的统一启动器:panic 兜底([`CatchPanic`])+ 收尾事件 + 部署历史
 /// + webhook 通知,保证任何路径(成功/失败/panic)下 `deploy-done` 恰好 emit 一次;
+///
 /// 正常结束路径(成功/失败/取消)在 emit `deploy-done` 之后落地部署历史记录
 /// (由管线组装的 [`DeployRecord`],append 失败仅告警,不影响收尾),并按项目
-/// 配置的 `notify_webhook` 异步发送 webhook 通知(尽力而为,失败仅告警)。
+/// 配置的 `notify_webhook` 异步发送 webhook 通知(尽力而为,失败仅告警);
+/// 同样在 emit 之后调用 [`crate::notify::fire`] 分发通知中心通知(桌面/邮件,
+/// 按 AppConfig.notify 的事件订阅与渠道开关,失败仅告警)。
 fn spawn_deploy_task<F>(app: AppHandle, fut: F)
 where
     F: std::future::Future<Output = (Result<(), String>, DeployRecord, Option<String>)>
@@ -653,7 +656,9 @@ where
             Ok(triple) => (triple.0, Some(triple.1), triple.2),
             Err(panic_info) => {
                 log::error!("部署管线发生 panic: {}", panic_info);
-                // 管线内组装的部署记录随 panic 丢失,此路径不写历史、不发通知
+                // 管线内组装的部署记录随 panic 丢失:此路径不写历史、不发
+                // webhook,但统一错误文案会走下方失败分支发送 failure 通知
+                // (正文为 record 缺失时的兜底文案)
                 (
                     Err("部署过程发生内部错误,详情见日志".to_string()),
                     None,
@@ -670,10 +675,18 @@ where
                         message: "部署完成".to_string(),
                     },
                 );
+                // 通知中心:部署成功(按 notify 配置的事件订阅与渠道开关异步分发)
+                let (title, body) = deploy_notify_text(true, "部署完成", &record);
+                crate::notify::fire(app.clone(), "success", title, body).await;
             }
             Err(e) => {
                 emit_log(&app, &format!("部署失败: {}", e));
+                // 取消导致的失败(固定文案 CANCELLED_MSG)按 cancel 事件分发
+                let kind = if e == CANCELLED_MSG { "cancel" } else { "failure" };
+                let (title, body) = deploy_notify_text(false, &e, &record);
                 let _ = app.emit("deploy-done", DeployDone { success: false, message: e });
+                // 通知中心:部署失败/取消(emit deploy-done 之后异步分发,不阻塞收尾)
+                crate::notify::fire(app.clone(), kind, title, body).await;
             }
         }
         // deploy-done 之后落地部署历史(成功/失败/取消统一记录)
@@ -687,6 +700,33 @@ where
             append_record(record);
         }
     });
+}
+
+/// 组装部署收尾通知的标题与正文(纯函数,便于单测)。
+///
+/// 标题:成功=「部署成功」;取消(错误文案为 CANCELLED_MSG)=「部署已取消」;
+/// 其余失败=「部署失败」。正文含项目名 + 服务器名 + 结果消息 + 耗时;
+/// `record` 为 `None`(管线 panic,记录丢失)时用兜底文案。
+fn deploy_notify_text(
+    success: bool,
+    message: &str,
+    record: &Option<DeployRecord>,
+) -> (String, String) {
+    let title = if success {
+        "部署成功".to_string()
+    } else if message == CANCELLED_MSG {
+        "部署已取消".to_string()
+    } else {
+        "部署失败".to_string()
+    };
+    let body = match record {
+        Some(r) => format!(
+            "项目「{}」@ 服务器「{}」:{}(耗时 {} 秒)",
+            r.project_name, r.server_name, message, r.duration_secs
+        ),
+        None => format!("{}(部署详情缺失,详见应用日志)", message),
+    };
+    (title, body)
 }
 
 /// Future 的 panic 兜底包装:被包裹 future 在 poll 中 panic 时返回 `Err(panic 信息)`,
@@ -1356,6 +1396,23 @@ impl HookKind {
     }
 }
 
+/// 钩子执行失败的结果映射(纯函数,便于单测)。
+///
+/// - 取消(错误文案为 [`CANCELLED_MSG`])一律原样透传,Pre/Post 同口径
+///   (与 pull 步骤一致):`spawn_deploy_task` 按该文案判定 cancel 事件,
+///   包装成其他文案会判定失配,把用户取消误报为部署失败(通知走 failure);
+/// - `Pre` 其余失败:包装为「<钩子名>执行失败,部署中止:<原因>」;
+/// - `Post` 其余失败:返回 `None`,由调用方仅告警、不影响部署结果。
+fn hook_failure_result(which: HookKind, e: &str) -> Option<String> {
+    if e == CANCELLED_MSG {
+        return Some(e.to_string());
+    }
+    match which {
+        HookKind::Pre => Some(format!("{}执行失败,部署中止: {}", which.label(), e)),
+        HookKind::Post => None,
+    }
+}
+
 /// 执行项目的部署前/后钩子命令(远端执行,可选)。
 ///
 /// - 未配置或空白 → 直接返回 `Ok(())`;
@@ -1381,18 +1438,14 @@ async fn run_hook(
             emit_log(app, &format!("{}执行完成", which.label()));
             Ok(())
         }
-        Err(e) => match which {
-            HookKind::Pre => Err(format!("{}执行失败,部署中止: {}", which.label(), e)),
-            HookKind::Post => {
-                if e == CANCELLED_MSG {
-                    Err(e)
-                } else {
-                    emit_log(
-                        app,
-                        &format!("警告:{}执行失败(不影响部署结果): {}", which.label(), e),
-                    );
-                    Ok(())
-                }
+        Err(e) => match hook_failure_result(which, &e) {
+            Some(err) => Err(err),
+            None => {
+                emit_log(
+                    app,
+                    &format!("警告:{}执行失败(不影响部署结果): {}", which.label(), e),
+                );
+                Ok(())
             }
         },
     }
@@ -3316,9 +3369,40 @@ async fn rollback_execute_single_inner(
     Ok(record)
 }
 
+/// 组装回滚收尾通知的标题与正文(纯函数,便于单测)。
+///
+/// 标题:成功=「回滚成功」;取消(错误文案为 CANCELLED_MSG)=「回滚已取消」;
+/// 其余失败=「回滚失败」。正文含项目名 + 服务器名 + 结果消息 + 耗时
+/// (成功时消息为「回滚到 <目标 release ts / 镜像标签>」,回滚目标随之入文);
+/// `record` 为 `None`(panic 或配置读取等早期失败,记录未组装/随错误丢失)
+/// 时用兜底文案。
+fn rollback_notify_text(
+    success: bool,
+    message: &str,
+    record: &Option<DeployRecord>,
+) -> (String, String) {
+    let title = if success {
+        "回滚成功".to_string()
+    } else if message == CANCELLED_MSG {
+        "回滚已取消".to_string()
+    } else {
+        "回滚失败".to_string()
+    };
+    let body = match record {
+        Some(r) => format!(
+            "项目「{}」@ 服务器「{}」:{}(耗时 {} 秒)",
+            r.project_name, r.server_name, message, r.duration_secs
+        ),
+        None => format!("{}(回滚详情缺失,详见应用日志)", message),
+    };
+    (title, body)
+}
+
 /// 回滚命令的统一收尾:任何路径(成功/失败/panic)下 `deploy-done` 恰好
 /// emit 一次;成功后落地 `mode = "rollback"` 的部署历史记录(append 失败
-/// 仅告警,不影响回滚结果)。
+/// 仅告警,不影响回滚结果);emit 之后调 [`crate::notify::fire`] 分发通知
+/// 中心通知(成功/失败/取消,事件订阅复用部署的 AppConfig.notify.events,
+/// 失败仅告警,不影响回滚结果)。
 async fn finish_rollback<F>(app: &AppHandle, fut: F) -> Result<(), String>
 where
     F: std::future::Future<Output = Result<DeployRecord, String>> + Send,
@@ -3332,6 +3416,8 @@ where
     };
     match result {
         Ok(record) => {
+            // 通知文案在 record 被消费前组装(正文含项目名与回滚目标)
+            let (title, body) = rollback_notify_text(true, &record.message, &Some(record.clone()));
             let _ = app.emit(
                 "deploy-done",
                 DeployDone {
@@ -3339,12 +3425,19 @@ where
                     message: "回滚完成".to_string(),
                 },
             );
+            // 通知中心:回滚成功(emit deploy-done 之后异步分发,不阻塞收尾)
+            crate::notify::fire(app.clone(), "success", title, body).await;
             append_record(record);
             Ok(())
         }
         Err(e) => {
             emit_log(app, &format!("回滚失败: {}", e));
+            // 取消导致的失败(固定文案 CANCELLED_MSG)按 cancel 事件分发
+            let kind = if e == CANCELLED_MSG { "cancel" } else { "failure" };
+            let (title, body) = rollback_notify_text(false, &e, &None);
             let _ = app.emit("deploy-done", DeployDone { success: false, message: e.clone() });
+            // 通知中心:回滚失败/取消(emit deploy-done 之后异步分发)
+            crate::notify::fire(app.clone(), kind, title, body).await;
             Err(e)
         }
     }
@@ -3731,6 +3824,115 @@ fn shell_single_quote(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::TransferMode;
+
+    // ===== deploy_notify_text(通知中心挂点文案)=====
+
+    #[test]
+    fn test_deploy_notify_text_success() {
+        let record = DeployRecord {
+            ts: "2026-09-05 12:00:00".into(),
+            mode: MODE_SINGLE.into(),
+            server_name: "生产".into(),
+            project_name: "博客".into(),
+            images: vec![],
+            success: true,
+            message: "部署完成".into(),
+            duration_secs: 42,
+            release_dir: None,
+        };
+        let (title, body) = deploy_notify_text(true, "部署完成", &Some(record));
+        assert_eq!(title, "部署成功");
+        assert!(body.contains("博客"));
+        assert!(body.contains("生产"));
+        assert!(body.contains("部署完成"));
+        assert!(body.contains("42"));
+    }
+
+    #[test]
+    fn test_deploy_notify_text_failure_and_cancel() {
+        let record = DeployRecord {
+            ts: String::new(),
+            mode: MODE_STACK.into(),
+            server_name: "s".into(),
+            project_name: "p".into(),
+            images: vec![],
+            success: false,
+            message: CANCELLED_MSG.into(),
+            duration_secs: 3,
+            release_dir: None,
+        };
+        // 取消(固定文案)→ cancel 标题
+        let (title, body) = deploy_notify_text(false, CANCELLED_MSG, &Some(record));
+        assert_eq!(title, "部署已取消");
+        assert!(body.contains(CANCELLED_MSG));
+        // 普通失败 → failure 标题
+        let (title, _) = deploy_notify_text(false, "健康检查未通过", &None);
+        assert_eq!(title, "部署失败");
+        // panic 路径(无记录)→ 兜底正文
+        let (_, body) = deploy_notify_text(false, "部署过程发生内部错误", &None);
+        assert!(body.contains("部署详情缺失"));
+    }
+
+    // ===== hook_failure_result(钩子失败映射)=====
+
+    #[test]
+    fn test_hook_failure_result_cancel_passthrough() {
+        // 取消错误原样透传(Pre/Post 同口径):包装成其他文案会让
+        // spawn_deploy_task 的 cancel 判定失配,把取消误报为部署失败
+        assert_eq!(
+            hook_failure_result(HookKind::Pre, CANCELLED_MSG),
+            Some(CANCELLED_MSG.to_string())
+        );
+        assert_eq!(
+            hook_failure_result(HookKind::Post, CANCELLED_MSG),
+            Some(CANCELLED_MSG.to_string())
+        );
+    }
+
+    #[test]
+    fn test_hook_failure_result_pre_wraps_post_swallows() {
+        // Pre 普通失败 → 「执行失败,部署中止」;Post 普通失败 → None(仅告警)
+        assert_eq!(
+            hook_failure_result(HookKind::Pre, "exit code 1"),
+            Some("部署前钩子执行失败,部署中止: exit code 1".to_string())
+        );
+        assert_eq!(hook_failure_result(HookKind::Post, "exit code 1"), None);
+    }
+
+    // ===== rollback_notify_text(回滚通知文案)=====
+
+    #[test]
+    fn test_rollback_notify_text_success() {
+        let record = DeployRecord {
+            ts: "2026-09-05 12:00:00".into(),
+            mode: MODE_ROLLBACK.into(),
+            server_name: "生产".into(),
+            project_name: "博客".into(),
+            images: vec![],
+            success: true,
+            message: "回滚到 20260905120000".into(),
+            duration_secs: 7,
+            release_dir: None,
+        };
+        let message = record.message.clone();
+        let (title, body) = rollback_notify_text(true, &message, &Some(record));
+        assert_eq!(title, "回滚成功");
+        assert!(body.contains("博客"));
+        // 目标 release ts 随「回滚到 …」消息进入正文
+        assert!(body.contains("20260905120000"));
+        assert!(body.contains("7"));
+    }
+
+    #[test]
+    fn test_rollback_notify_text_failure_and_cancel() {
+        // 取消(固定文案)→ cancel 标题;普通失败 → failure 标题
+        let (title, _) = rollback_notify_text(false, CANCELLED_MSG, &None);
+        assert_eq!(title, "回滚已取消");
+        let (title, body) = rollback_notify_text(false, "回滚目标发布目录不存在", &None);
+        assert_eq!(title, "回滚失败");
+        // 无记录(panic/早期失败)→ 兜底正文
+        assert!(body.contains("回滚详情缺失"));
+    }
 
     // ===== remote_join =====
 

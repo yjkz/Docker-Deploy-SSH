@@ -7,6 +7,7 @@ pub mod manage;
 pub mod manage_exec;
 pub mod manage_stacks;
 pub mod manage_stats;
+pub mod notify;
 pub mod ssh;
 pub mod stack;
 
@@ -17,12 +18,19 @@ pub fn run() {
   tauri::Builder::default()
     // 文件/目录选择对话框插件(前端 __TAURI__.dialog 经 dialog:default 权限调用)
     .plugin(tauri_plugin_dialog::init())
+    // 通知中心:本地系统桌面通知(后端 Rust 侧经 NotificationExt 直接调用,
+    // 不走 IPC;capabilities 的 notification:default 权限备前端通道使用)
+    .plugin(tauri_plugin_notification::init())
     .manage(commands::DeployState::default())
     .manage(manage_stats::StatsState::default())
     .manage(manage_exec::ExecState::default())
     .invoke_handler(tauri::generate_handler![
       commands::get_config,
       commands::save_config_cmd,
+      notify::notify_get_config,
+      notify::notify_save_config,
+      notify::notify_test_desktop,
+      notify::notify_test_email,
       commands::host_check,
       commands::start_docker,
       commands::list_images,

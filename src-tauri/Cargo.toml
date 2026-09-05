@@ -41,6 +41,10 @@ fs4 = "0.12"
 serde_yaml = "0.9"
 # Task 6: 部署完成 webhook 通知(阻塞 HTTP 客户端,调用方放 blocking 线程池)
 ureq = "2"
+# 通知中心:SMTP 邮件发送(rustls 后端,避免引入 openssl 原生依赖)
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "rustls-tls", "builder"] }
+# 通知中心:本地系统桌面通知(Rust 侧直接调用,无需前端 IPC)
+tauri-plugin-notification = "2"
 
 # Task 4: Windows DPAPI 密码加密(CurrentUser 作用域),仅 Windows 构建
 [target.'cfg(windows)'.dependencies]

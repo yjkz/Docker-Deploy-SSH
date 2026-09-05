@@ -2468,3 +2468,41 @@ code {
   font-size: 12.5px;
   color: var(--ark-ink);
 }
+
+/* ===== 通知中心(notify.js;复用 modal/form-row/form-textarea/deploy-checkbox/badge 体系) ===== */
+
+/* 入口按钮内状态徽标:fillBadge 会整体重写 className,
+   故间距挂在 ID 选择器上,不随 badge-ok/badge-info 切换丢失 */
+#notify-entry-badge { margin-left: 8px; }
+
+/* 通知模态卡片:比默认 560px 略宽,容纳邮件表单(同 .deploy-modal-card 的加宽先例) */
+.notify-modal-card { width: min(640px, 94vw); }
+
+/* 分组标题(mono 小字,同 .server-check-title 的语言;首个分组不留顶距) */
+.notify-group-title {
+  margin: 18px 0 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--ark-paper-dim-ink);
+}
+.notify-group-title:first-child { margin-top: 0; }
+/* 紧跟分组标题的开关行去掉上内距,归入该分组视觉 */
+.notify-group-title + .deploy-checkbox { padding-top: 0; }
+
+/* 测试结果行:行内回显;失败用 --ark-stat-hot(暗红/柔和红,两主题均过 AA) */
+.notify-test-result {
+  min-height: 18px;
+  margin-top: 12px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  word-break: break-all;
+}
+.notify-test-ok { color: var(--ark-ink); }
+.notify-test-info { color: var(--ark-paper-ink-65); }
+.notify-test-fail { color: var(--ark-stat-hot); }
+
+/* 底部按钮行:左侧测试按钮组(margin-right:auto 推开)+ 右侧「保存配置」主按钮 */
+.notify-actions { flex-wrap: wrap; }
+.notify-test-group { display: flex; gap: 8px; margin-right: auto; }
