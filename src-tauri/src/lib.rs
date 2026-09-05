@@ -4,6 +4,9 @@ pub mod crypto;
 pub mod docker;
 pub mod history;
 pub mod manage;
+pub mod manage_exec;
+pub mod manage_stacks;
+pub mod manage_stats;
 pub mod ssh;
 pub mod stack;
 
@@ -15,6 +18,8 @@ pub fn run() {
     // 文件/目录选择对话框插件(前端 __TAURI__.dialog 经 dialog:default 权限调用)
     .plugin(tauri_plugin_dialog::init())
     .manage(commands::DeployState::default())
+    .manage(manage_stats::StatsState::default())
+    .manage(manage_exec::ExecState::default())
     .invoke_handler(tauri::generate_handler![
       commands::get_config,
       commands::save_config_cmd,
@@ -45,6 +50,26 @@ pub fn run() {
       manage::manage_image_pull,
       manage::manage_image_remove,
       manage::manage_image_tag,
+      manage::manage_list_volumes,
+      manage::manage_volume_inspect,
+      manage::manage_volume_create,
+      manage::manage_volume_remove,
+      manage::manage_list_networks,
+      manage::manage_network_inspect,
+      manage::manage_network_create,
+      manage::manage_network_remove,
+      manage::manage_network_connect,
+      manage::manage_network_disconnect,
+      manage_stacks::manage_list_stacks,
+      manage_stacks::manage_stack_action,
+      manage_stacks::manage_stack_ps,
+      manage_stacks::manage_stack_logs,
+      manage_stats::manage_stats_start,
+      manage_stats::manage_stats_stop,
+      manage_exec::manage_exec_start,
+      manage_exec::manage_exec_write,
+      manage_exec::manage_exec_resize,
+      manage_exec::manage_exec_stop,
     ])
     .setup(|app| {
       // 日志(不限 debug 构建,release 同样记录,便于现场排查):

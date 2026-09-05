@@ -4,7 +4,7 @@
 >
 > 硬约束：**低耦合，禁止对已有功能及代码修改造成功能失效。**
 
-**进度**：A 阶段 ✅ 已完成（v4.5.0 / 2026-09-05）｜B 阶段 ⬜ 待开始｜C 阶段 ⬜ 待开始
+**进度**：A 阶段 ✅ 已完成（v4.5.0 / 2026-09-05）｜B 阶段 ✅ 已完成（2026-09-05）｜C 阶段 ✅ 已完成（2026-09-05）
 
 ---
 
@@ -202,6 +202,14 @@ struct ImageInfo {
 - 网络列表：名称、驱动、范围、已连接容器数、操作（查看 / 删除 / 连接容器 / 断开容器）
 - 创建卷 / 创建网络：模态框表单（名称 + 驱动选择）
 
+### 4.3 完成记录（2026-09-05）
+
+- **后端**：manage.rs 纯追加 341 行，10 个命令全部实现；`manage_list_networks` 在一次 SSH 连接内先 `network ls` 再 `network inspect <全部网络名>` 统计各网络已连接容器数（inspect 失败按 0 计，不阻塞列表）
+- **前端**：manage.js 追加卷/网络双 Tab，复用现有按 ID 差异更新与自动刷新逻辑；卷/网络查看用模态框展示原始 JSON（等宽字体）；网络内置网络（bridge/host/none）不显示删除按钮
+- **UI**：复用 `.manage-pull-bar` / `.data-table` / `.btn` / 模态框组件，style.css 零改动
+- **验证**：`cargo build` / `cargo test`（136 passed）/ `cargo clippy`（manage.rs 无新增 warning）；`node --check` 通过
+- **低耦合验证**：`git diff --numstat` 确认仅 manage.rs（341+/0-）、lib.rs（10+/0-）、index.html（48+/0-）、manage.js（445+/3-，3 行为 switchTab/refreshAll 路由改写）；commands.rs / docker.rs / ssh.rs / config.rs / crypto.rs / style.css / 旧页面 JS 零改动
+
 ---
 
 ## 5. C 阶段：全功能面板
@@ -337,5 +345,26 @@ struct ImageInfo {
 5. ✅ **A 阶段定时自动刷新**：开关 + 预设/自定义间隔 + 定时器生命周期（离页清理、防重入、操作期暂停、按 ID 差异更新）+ localStorage 持久化
 6. ✅ **A 阶段样式**：style.css 追加 + 亮暗适配 + 按钮美化 + 列表优化（固定列宽/端口折叠/时间格式化）
 7. ✅ **回归验证**：编译 + 测试 + 手动 5 页回归 + 自动刷新并发/泄漏检查
-8. ⬜ **B 阶段**：卷 / 网络（纯追加）
-9. ⬜ **C 阶段**：ssh.rs 追加 exec_interactive → Compose / stats / exec（按需）
+8. ✅ **B 阶段**：卷 / 网络（纯追加）
+9. ✅ **C 阶段**：ssh.rs 追加 exec_interactive → Compose / stats / exec（按需）
+
+---
+
+## 10. C 阶段完成记录（2026-09-05）
+
+> 实施方式：3 个后端子代理并行开发（独立新文件避免冲突）→ 协调者统一注册 lib.rs 并集成 → 前端子代理实现 UI → 验证代理与代码审查代理并行审查 → 协调者修复审查发现的问题并最终验收。
+
+- **后端（三个独立新模块，纯追加）**
+  - `manage_stacks.rs`：`manage_list_stacks`（find 扫描 remote_dir 深度 ≤2 的 4 种 compose 文件名）/ `manage_stack_action`（up -d / down，120s 超时）/ `manage_stack_ps`（compose ps --format json）/ `manage_stack_logs`
+  - `manage_stats.rs`：`manage_stats_start` / `manage_stats_stop`，tokio::spawn 轮询 `docker stats --no-stream --format json`（默认 2s，1-60s 可调），事件 `manage-stats` 推送 `{server_id, stats[], error, stopped}`；全局单会话（generation 代号机制），连续 3 轮连接失败或权限拒绝自动停止（payload.stopped=true）；单轮套 with_timeout 防 hang 死循环
+  - `manage_exec.rs` + `ssh.rs` 末尾追加 `exec_interactive`（PTY 通道，russh 0.46 Channel<Msg> + request_pty + make_writer，纯追加 0 删改）：`manage_exec_start/write/resize/stop`，事件 `manage-exec-output` 推送 `{session_id, data, eof}`；会话先注册后启动读任务（避免僵尸会话竞态）；resize 经 mpsc 转发 window_change 真实实现
+  - `manage.rs`：仅将连接助手改为 pub(crate) 供新模块复用（ActionResult 字段同步）
+- **前端（manage.js / index.html / style.css）**
+  - Tab 扩展到 6 个；栈列表（启动/停止二次确认、ps 小表格、日志 tail 选择）；监控面板（CPU% 阈值着色 <50 正常 / 50-80 黄 / >80 红，仅 stopped 错误才停止本地监控，普通单轮错误提示并等待重试）；简易终端模态框（bash/sh 选择、ANSI 剥除 + \r 行首覆盖 + \t、命令历史、跨 chunk 转义序列缓存、eof 处理、单会话防护）
+  - 事件订阅先于 invoke（缓冲重放竞态修复）；切服务器/切 Tab/离页统一清理监控与终端
+- **审查与修复记录**（并行双代理审查：验证代理 7 项全 PASS；代码审查代理 0×P0、3×P1、7×P2）
+  - 已修复 P1：exec 读任务"先清理后插入"竞态（先 insert 后 spawn）；前端任意 error 即停监控（改为仅 stopped=true 才停）；eof 事件早于订阅丢失（先订阅后 invoke + 缓冲重放）
+  - 已修复 P2：stats 单轮无超时；切服务器不停旧服务器监控/终端
+  - 遗留 P2（接受，不影响功能）：stats 连接失败判定依赖中文错误文案子串（结构化错误码为后续改进）；ANSI 剥除对 OSC/ST 与部分 CSI 边界不全；manage_exec_resize 前端未接线（行式终端无 resize 场景）
+- **验证**：cargo build ✅ / cargo test 136 passed ✅ / clippy 新文件 0 warning ✅ / node --check ✅
+- **低耦合验证**：ssh.rs 纯末尾追加（0 删改）；commands.rs / docker.rs / config.rs / crypto.rs / stack.rs / history.rs / Cargo.toml / 旧前端 JS 零改动；lib.rs 仅追加注册

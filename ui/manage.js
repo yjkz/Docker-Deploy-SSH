@@ -11,6 +11,10 @@
  * - 镜像列表 + 拉取 / 删除 / 打标签
  * - 定时自动刷新(开关 + 预设/自定义间隔 3-300s,localStorage 持久化)
  * - 定时器生命周期:离页清理、切服务器/切 Tab 重置、防重入、操作期暂停
+ *
+ * B 阶段追加:
+ * - 卷列表:查看(inspect) / 删除 / 创建(名称+驱动)
+ * - 网络列表:查看 / 删除 / 创建(名称+驱动) / 连接容器 / 断开容器
  * ============================================================ */
 (function () {
   'use strict';
@@ -34,7 +38,9 @@
     expandedPorts: {},  // containerId -> true (端口列表展开)
     inspectCache: {},   // containerId -> inspect JSON (避免重复请求)
     containers: [],
-    images: []
+    images: [],
+    volumes: [],   // B 阶段追加
+    networks: []   // B 阶段追加
   };
 
   // ===== DOM 引用(延迟获取,确保 DOM 就绪) =====
@@ -95,6 +101,12 @@
     if (overlay) overlay.addEventListener('click', function (e) {
       if (e.target === overlay) closeModal();
     });
+
+    // B 阶段:创建卷 / 创建网络入口
+    var vBtn = $('manage-volume-create-btn');
+    if (vBtn) vBtn.addEventListener('click', showVolumeCreateModal);
+    var nBtn = $('manage-network-create-btn');
+    if (nBtn) nBtn.addEventListener('click', showNetworkCreateModal);
   }
 
   function restorePrefs() {
@@ -143,6 +155,7 @@
 
   function onLeave() {
     stopTimer();
+    onLeaveC(); // C 阶段追加:离开 05 页清理监控 / 终端会话
   }
 
   // ===== 服务器列表 =====
@@ -185,6 +198,9 @@
     var sel = $('manage-server-select');
     if (!sel) return;
     state.serverId = sel.value || null;
+    // C 阶段追加:切换服务器时停掉旧服务器上的监控与终端会话
+    monitorStop(true);
+    stopExecSession(true);
     // 切换服务器:清空展开状态与缓存
     state.expanded = {};
     state.expandedPorts = {};
@@ -204,10 +220,22 @@
     }
     $('manage-containers-panel').classList.toggle('hidden', tab !== 'containers');
     $('manage-images-panel').classList.toggle('hidden', tab !== 'images');
+    var vp = $('manage-volumes-panel');
+    if (vp) vp.classList.toggle('hidden', tab !== 'volumes');
+    var np = $('manage-networks-panel');
+    if (np) np.classList.toggle('hidden', tab !== 'networks');
+    var sp = $('manage-stacks-panel');   // C 阶段追加
+    if (sp) sp.classList.toggle('hidden', tab !== 'stacks');
+    var mp = $('manage-monitor-panel');  // C 阶段追加
+    if (mp) mp.classList.toggle('hidden', tab !== 'monitor');
+    if (tab !== 'monitor') monitorStop(true); // C 阶段追加:离开监控 Tab 自动停止
     // 切到对应 Tab 时若尚未加载过则加载
     if (state.serverId) {
       if (tab === 'containers') refreshContainers();
-      else refreshImages();
+      else if (tab === 'images') refreshImages();
+      else if (tab === 'volumes') refreshVolumes();
+      else if (tab === 'networks') refreshNetworks();
+      else if (tab === 'stacks') refreshStacks(); // C 阶段追加
     }
     resetTimer();
   }
@@ -217,7 +245,10 @@
     if (!state.serverId) return;
     refreshOverview();
     if (state.tab === 'containers') refreshContainers();
-    else refreshImages();
+    else if (state.tab === 'images') refreshImages();
+    else if (state.tab === 'volumes') refreshVolumes();
+    else if (state.tab === 'networks') refreshNetworks();
+    else if (state.tab === 'stacks') refreshStacks(); // C 阶段追加
   }
 
   // ===== 概览 =====
@@ -468,6 +499,16 @@
     if (s === 'running') {
       wrap.appendChild(makeActionBtn('停止', 'stop', c.id));
       wrap.appendChild(makeActionBtn('重启', 'restart', c.id));
+      // C 阶段追加:终端按钮(仅 running 容器)
+      var execBtn = document.createElement('button');
+      execBtn.type = 'button';
+      execBtn.className = 'btn btn-sm';
+      execBtn.textContent = '终端';
+      execBtn.addEventListener('click', function (e) {
+        e.stopPropagation();
+        openTerminal(c.id, c.names || c.id);
+      });
+      wrap.appendChild(execBtn);
     } else {
       wrap.appendChild(makeActionBtn('启动', 'start', c.id));
     }
@@ -685,6 +726,13 @@
       tbody.innerHTML = '<tr><td class="empty-cell" colspan="6">暂无镜像</td></tr>';
       state.images = [];
       return;
+    }
+
+    // 移除初始占位行(参照 renderContainers,否则占位行残留在数据行上方)
+    var emptyCell = tbody.querySelector('.empty-cell');
+    if (emptyCell) {
+      var emptyRow = emptyCell.closest('tr');
+      if (emptyRow) emptyRow.remove();
     }
 
     // 按复合 key(repo:tag:id)做差异更新
@@ -918,6 +966,506 @@
     });
   }
 
+  // ===== 卷列表(B 阶段追加) =====
+  function refreshVolumes() {
+    if (!state.serverId || state.inFlight) return;
+    state.inFlight = true;
+    AppBus.invoke('manage_list_volumes', { serverId: state.serverId }).then(function (list) {
+      state.inFlight = false;
+      renderVolumes(list || []);
+    }).catch(function (err) {
+      state.inFlight = false;
+      var msg = err && err.message ? err.message : String(err);
+      showError('加载卷列表失败: ' + msg);
+    });
+  }
+
+  function renderVolumes(list) {
+    var tbody = $('manage-volumes-tbody');
+    if (!tbody) return;
+
+    if (list.length === 0) {
+      tbody.innerHTML = '<tr><td class="empty-cell" colspan="5">暂无卷</td></tr>';
+      state.volumes = [];
+      return;
+    }
+
+    // 移除初始占位行(参照 renderContainers,否则占位行残留在数据行上方)
+    var emptyCell = tbody.querySelector('.empty-cell');
+    if (emptyCell) {
+      var emptyRow = emptyCell.closest('tr');
+      if (emptyRow) emptyRow.remove();
+    }
+
+    // 按卷名(唯一)做差异更新
+    var rowMap = {};
+    var rows = tbody.querySelectorAll('tr[data-vid]');
+    for (var i = 0; i < rows.length; i++) {
+      rowMap[rows[i].getAttribute('data-vid')] = rows[i];
+    }
+
+    var seen = {};
+    var frag = document.createDocumentFragment();
+
+    for (var j = 0; j < list.length; j++) {
+      var v = list[j];
+      seen[v.name] = true;
+      var row = rowMap[v.name];
+      if (row) {
+        updateVolumeRow(row, v);
+      } else {
+        row = document.createElement('tr');
+        row.setAttribute('data-vid', v.name);
+        updateVolumeRow(row, v);
+      }
+      frag.appendChild(row);
+    }
+
+    for (var k in rowMap) {
+      if (!seen[k]) rowMap[k].remove();
+    }
+
+    tbody.appendChild(frag);
+    state.volumes = list;
+  }
+
+  function updateVolumeRow(tr, v) {
+    tr.innerHTML = '';
+    // 名称
+    var tdName = document.createElement('td');
+    tdName.className = 'mono text-truncate';
+    tdName.textContent = v.name || '—';
+    if (v.name) tdName.title = v.name;
+    tr.appendChild(tdName);
+    // 驱动
+    var tdDriver = document.createElement('td');
+    tdDriver.textContent = v.driver || '—';
+    tr.appendChild(tdDriver);
+    // 挂载点(超长截断+tooltip)
+    var tdMount = document.createElement('td');
+    tdMount.className = 'mono text-truncate';
+    tdMount.textContent = v.mountpoint || '—';
+    if (v.mountpoint) tdMount.title = v.mountpoint;
+    tr.appendChild(tdMount);
+    // 创建时间(Docker 25+ 才有,缺失显示 —)
+    var tdCreated = document.createElement('td');
+    tdCreated.textContent = v.created_at ? formatTime(v.created_at) : '—';
+    if (v.created_at) tdCreated.title = v.created_at;
+    tr.appendChild(tdCreated);
+    // 操作:查看 / 删除
+    var tdAction = document.createElement('td');
+    tdAction.className = 'col-action';
+    var wrap = document.createElement('div');
+    wrap.className = 'action-btn-group';
+
+    var viewBtn = document.createElement('button');
+    viewBtn.type = 'button';
+    viewBtn.className = 'btn btn-sm';
+    viewBtn.textContent = '查看';
+    viewBtn.addEventListener('click', function () { showResourceInspect('manage_volume_inspect', v.name, '卷详情 — ' + v.name, 'volumeName'); });
+    wrap.appendChild(viewBtn);
+
+    var rmBtn = document.createElement('button');
+    rmBtn.type = 'button';
+    rmBtn.className = 'btn btn-sm btn-danger';
+    rmBtn.textContent = '删除';
+    rmBtn.addEventListener('click', function () { confirmRemoveVolume(v.name); });
+    wrap.appendChild(rmBtn);
+
+    tdAction.appendChild(wrap);
+    tr.appendChild(tdAction);
+  }
+
+  function confirmRemoveVolume(name) {
+    openModal('删除卷', buildConfirmBody(
+      '确定删除卷「' + name + '」吗?如果该卷正被容器使用将删除失败。',
+      '删除',
+      function () {
+        closeModal();
+        state.opInProgress = true;
+        stopTimer();
+        AppBus.invoke('manage_volume_remove', {
+          serverId: state.serverId,
+          volumeName: name
+        }).then(function (res) {
+          state.opInProgress = false;
+          if (res.success) {
+            toast('卷删除成功', 'ok');
+            refreshVolumes();
+          } else {
+            toast('删除失败: ' + (res.message || '未知错误'), 'fail');
+          }
+          startTimerIfEnabled();
+        }).catch(function (err) {
+          state.opInProgress = false;
+          var msg = err && err.message ? err.message : String(err);
+          toast('删除失败: ' + msg, 'fail');
+          startTimerIfEnabled();
+        });
+      }
+    ));
+  }
+
+  // ===== 创建卷(B 阶段追加) =====
+  function showVolumeCreateModal() {
+    var body = document.createElement('div');
+    body.innerHTML =
+      '<div class="form-row">' +
+      '<label class="form-label" for="volume-name-input">卷名称</label>' +
+      '<input id="volume-name-input" class="form-input" type="text" placeholder="例如:mydata">' +
+      '</div>' +
+      '<div class="form-row">' +
+      '<label class="form-label" for="volume-driver-input">驱动(留空默认 local)</label>' +
+      '<input id="volume-driver-input" class="form-input" type="text" placeholder="local">' +
+      '</div>' +
+      '<div class="modal-actions">' +
+      '<button id="volume-create-confirm" class="btn btn-primary" type="button">创建</button>' +
+      '</div>';
+
+    openModal('创建卷', body);
+    var nameInput = $('volume-name-input');
+    if (nameInput) {
+      nameInput.focus();
+      nameInput.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') doVolumeCreate();
+      });
+    }
+    var confirmBtn = $('volume-create-confirm');
+    if (confirmBtn) confirmBtn.addEventListener('click', doVolumeCreate);
+  }
+
+  function doVolumeCreate() {
+    var nameInput = $('volume-name-input');
+    var driverInput = $('volume-driver-input');
+    if (!nameInput) return;
+    var name = nameInput.value.trim();
+    if (!name) { toast('请输入卷名称', 'warn'); return; }
+    var driver = driverInput ? driverInput.value.trim() : '';
+
+    state.opInProgress = true;
+    stopTimer();
+    AppBus.invoke('manage_volume_create', {
+      serverId: state.serverId,
+      volumeName: name,
+      driver: driver || null
+    }).then(function (res) {
+      state.opInProgress = false;
+      if (res.success) {
+        toast('卷创建成功: ' + name, 'ok');
+        closeModal();
+        refreshVolumes();
+      } else {
+        toast('创建失败: ' + (res.message || '未知错误'), 'fail');
+      }
+      startTimerIfEnabled();
+    }).catch(function (err) {
+      state.opInProgress = false;
+      var msg = err && err.message ? err.message : String(err);
+      toast('创建失败: ' + msg, 'fail');
+      startTimerIfEnabled();
+    });
+  }
+
+  // ===== 网络列表(B 阶段追加) =====
+  function refreshNetworks() {
+    if (!state.serverId || state.inFlight) return;
+    state.inFlight = true;
+    AppBus.invoke('manage_list_networks', { serverId: state.serverId }).then(function (list) {
+      state.inFlight = false;
+      renderNetworks(list || []);
+    }).catch(function (err) {
+      state.inFlight = false;
+      var msg = err && err.message ? err.message : String(err);
+      showError('加载网络列表失败: ' + msg);
+    });
+  }
+
+  function renderNetworks(list) {
+    var tbody = $('manage-networks-tbody');
+    if (!tbody) return;
+
+    if (list.length === 0) {
+      tbody.innerHTML = '<tr><td class="empty-cell" colspan="5">暂无网络</td></tr>';
+      state.networks = [];
+      return;
+    }
+
+    // 移除初始占位行(参照 renderContainers,否则占位行残留在数据行上方)
+    var emptyCell = tbody.querySelector('.empty-cell');
+    if (emptyCell) {
+      var emptyRow = emptyCell.closest('tr');
+      if (emptyRow) emptyRow.remove();
+    }
+
+    // 按网络 ID(唯一)做差异更新
+    var rowMap = {};
+    var rows = tbody.querySelectorAll('tr[data-nid]');
+    for (var i = 0; i < rows.length; i++) {
+      rowMap[rows[i].getAttribute('data-nid')] = rows[i];
+    }
+
+    var seen = {};
+    var frag = document.createDocumentFragment();
+
+    for (var j = 0; j < list.length; j++) {
+      var n = list[j];
+      seen[n.id] = true;
+      var row = rowMap[n.id];
+      if (row) {
+        updateNetworkRow(row, n);
+      } else {
+        row = document.createElement('tr');
+        row.setAttribute('data-nid', n.id);
+        updateNetworkRow(row, n);
+      }
+      frag.appendChild(row);
+    }
+
+    for (var k in rowMap) {
+      if (!seen[k]) rowMap[k].remove();
+    }
+
+    tbody.appendChild(frag);
+    state.networks = list;
+  }
+
+  function updateNetworkRow(tr, n) {
+    tr.innerHTML = '';
+    // 名称
+    var tdName = document.createElement('td');
+    tdName.className = 'mono text-truncate';
+    tdName.textContent = n.name || '—';
+    if (n.name) tdName.title = n.name;
+    tr.appendChild(tdName);
+    // 驱动
+    var tdDriver = document.createElement('td');
+    tdDriver.textContent = n.driver || '—';
+    tr.appendChild(tdDriver);
+    // 范围
+    var tdScope = document.createElement('td');
+    tdScope.textContent = n.scope || '—';
+    tr.appendChild(tdScope);
+    // 已连接容器数
+    var tdCount = document.createElement('td');
+    tdCount.className = 'mono';
+    tdCount.textContent = String(n.containers != null ? n.containers : 0);
+    tr.appendChild(tdCount);
+    // 操作:查看 / 连接容器 / 断开容器 / 删除
+    var tdAction = document.createElement('td');
+    tdAction.className = 'col-action';
+    var wrap = document.createElement('div');
+    wrap.className = 'action-btn-group';
+
+    var viewBtn = document.createElement('button');
+    viewBtn.type = 'button';
+    viewBtn.className = 'btn btn-sm';
+    viewBtn.textContent = '查看';
+    viewBtn.addEventListener('click', function () { showResourceInspect('manage_network_inspect', n.id, '网络详情 — ' + (n.name || n.id), 'networkId'); });
+    wrap.appendChild(viewBtn);
+
+    var connectBtn = document.createElement('button');
+    connectBtn.type = 'button';
+    connectBtn.className = 'btn btn-sm';
+    connectBtn.textContent = '连接容器';
+    connectBtn.addEventListener('click', function () { showNetworkContainerModal(n, 'connect'); });
+    wrap.appendChild(connectBtn);
+
+    var disconnectBtn = document.createElement('button');
+    disconnectBtn.type = 'button';
+    disconnectBtn.className = 'btn btn-sm';
+    disconnectBtn.textContent = '断开容器';
+    disconnectBtn.addEventListener('click', function () { showNetworkContainerModal(n, 'disconnect'); });
+    wrap.appendChild(disconnectBtn);
+
+    // 内置网络(bridge/host/none)不可删除
+    var builtin = n.name === 'bridge' || n.name === 'host' || n.name === 'none';
+    if (!builtin) {
+      var rmBtn = document.createElement('button');
+      rmBtn.type = 'button';
+      rmBtn.className = 'btn btn-sm btn-danger';
+      rmBtn.textContent = '删除';
+      rmBtn.addEventListener('click', function () { confirmRemoveNetwork(n.id, n.name); });
+      wrap.appendChild(rmBtn);
+    }
+
+    tdAction.appendChild(wrap);
+    tr.appendChild(tdAction);
+  }
+
+  function confirmRemoveNetwork(id, name) {
+    openModal('删除网络', buildConfirmBody(
+      '确定删除网络「' + (name || id) + '」吗?如果有容器连接在该网络上将删除失败。',
+      '删除',
+      function () {
+        closeModal();
+        state.opInProgress = true;
+        stopTimer();
+        AppBus.invoke('manage_network_remove', {
+          serverId: state.serverId,
+          networkId: id
+        }).then(function (res) {
+          state.opInProgress = false;
+          if (res.success) {
+            toast('网络删除成功', 'ok');
+            refreshNetworks();
+          } else {
+            toast('删除失败: ' + (res.message || '未知错误'), 'fail');
+          }
+          startTimerIfEnabled();
+        }).catch(function (err) {
+          state.opInProgress = false;
+          var msg = err && err.message ? err.message : String(err);
+          toast('删除失败: ' + msg, 'fail');
+          startTimerIfEnabled();
+        });
+      }
+    ));
+  }
+
+  // ===== 创建网络(B 阶段追加) =====
+  function showNetworkCreateModal() {
+    var body = document.createElement('div');
+    body.innerHTML =
+      '<div class="form-row">' +
+      '<label class="form-label" for="network-name-input">网络名称</label>' +
+      '<input id="network-name-input" class="form-input" type="text" placeholder="例如:mynet">' +
+      '</div>' +
+      '<div class="form-row">' +
+      '<label class="form-label" for="network-driver-input">驱动(留空默认 bridge)</label>' +
+      '<input id="network-driver-input" class="form-input" type="text" placeholder="bridge">' +
+      '</div>' +
+      '<div class="modal-actions">' +
+      '<button id="network-create-confirm" class="btn btn-primary" type="button">创建</button>' +
+      '</div>';
+
+    openModal('创建网络', body);
+    var nameInput = $('network-name-input');
+    if (nameInput) {
+      nameInput.focus();
+      nameInput.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') doNetworkCreate();
+      });
+    }
+    var confirmBtn = $('network-create-confirm');
+    if (confirmBtn) confirmBtn.addEventListener('click', doNetworkCreate);
+  }
+
+  function doNetworkCreate() {
+    var nameInput = $('network-name-input');
+    var driverInput = $('network-driver-input');
+    if (!nameInput) return;
+    var name = nameInput.value.trim();
+    if (!name) { toast('请输入网络名称', 'warn'); return; }
+    var driver = driverInput ? driverInput.value.trim() : '';
+
+    state.opInProgress = true;
+    stopTimer();
+    AppBus.invoke('manage_network_create', {
+      serverId: state.serverId,
+      networkName: name,
+      driver: driver || null
+    }).then(function (res) {
+      state.opInProgress = false;
+      if (res.success) {
+        toast('网络创建成功: ' + name, 'ok');
+        closeModal();
+        refreshNetworks();
+      } else {
+        toast('创建失败: ' + (res.message || '未知错误'), 'fail');
+      }
+      startTimerIfEnabled();
+    }).catch(function (err) {
+      state.opInProgress = false;
+      var msg = err && err.message ? err.message : String(err);
+      toast('创建失败: ' + msg, 'fail');
+      startTimerIfEnabled();
+    });
+  }
+
+  // ===== 连接 / 断开容器(B 阶段追加) =====
+  function showNetworkContainerModal(n, mode) {
+    var isConnect = mode === 'connect';
+    var title = (isConnect ? '连接容器到网络 — ' : '从网络断开容器 — ') + (n.name || n.id);
+    var body = document.createElement('div');
+    body.innerHTML =
+      '<p class="confirm-msg">' +
+      (isConnect
+        ? '输入要连接到该网络的容器名或容器 ID(运行中的容器)'
+        : '输入要从该网络断开的容器名或容器 ID') +
+      '</p>' +
+      '<div class="form-row">' +
+      '<label class="form-label" for="network-container-input">容器名 / 容器 ID</label>' +
+      '<input id="network-container-input" class="form-input" type="text" placeholder="例如:myapp-web">' +
+      '</div>' +
+      '<div class="modal-actions">' +
+      '<button id="network-container-confirm" class="btn ' + (isConnect ? 'btn-primary' : 'btn-danger') + '" type="button">' +
+      (isConnect ? '连接' : '断开') +
+      '</button>' +
+      '</div>';
+
+    openModal(title, body);
+    var input = $('network-container-input');
+    if (input) {
+      input.focus();
+      input.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') doNetworkContainer(n.id, isConnect);
+      });
+    }
+    var confirmBtn = $('network-container-confirm');
+    if (confirmBtn) confirmBtn.addEventListener('click', function () { doNetworkContainer(n.id, isConnect); });
+  }
+
+  function doNetworkContainer(networkId, isConnect) {
+    var input = $('network-container-input');
+    if (!input) return;
+    var container = input.value.trim();
+    if (!container) { toast('请输入容器名或容器 ID', 'warn'); return; }
+
+    state.opInProgress = true;
+    stopTimer();
+    var cmd = isConnect ? 'manage_network_connect' : 'manage_network_disconnect';
+    AppBus.invoke(cmd, {
+      serverId: state.serverId,
+      networkId: networkId,
+      containerId: container
+    }).then(function (res) {
+      state.opInProgress = false;
+      if (res.success) {
+        toast((isConnect ? '已连接容器: ' : '已断开容器: ') + container, 'ok');
+        closeModal();
+        refreshNetworks();
+      } else {
+        toast((isConnect ? '连接失败: ' : '断开失败: ') + (res.message || '未知错误'), 'fail');
+      }
+      startTimerIfEnabled();
+    }).catch(function (err) {
+      state.opInProgress = false;
+      var msg = err && err.message ? err.message : String(err);
+      toast((isConnect ? '连接失败: ' : '断开失败: ') + msg, 'fail');
+      startTimerIfEnabled();
+    });
+  }
+
+  // ===== 资源 inspect 查看(卷 / 网络通用,B 阶段追加) =====
+  function showResourceInspect(command, resourceId, title, paramName) {
+    openModal(title, (function () {
+      var pre = document.createElement('pre');
+      pre.className = 'manage-log-body';
+      pre.textContent = '加载中…';
+      var params = { serverId: state.serverId };
+      params[paramName] = resourceId;
+      AppBus.invoke(command, params).then(function (data) {
+        // inspect 返回数组,取 [0]
+        var info = Array.isArray(data) ? data[0] : data;
+        pre.textContent = info ? JSON.stringify(info, null, 2) : '无数据';
+      }).catch(function (err) {
+        var msg = err && err.message ? err.message : String(err);
+        pre.textContent = '加载详情失败: ' + msg;
+      });
+      return pre;
+    })());
+  }
+
   // ===== 自动刷新定时器 =====
   function onAutoRefreshToggle() {
     var toggle = $('manage-autorefresh-toggle');
@@ -1002,6 +1550,7 @@
   function closeModal() {
     var modal = $('manage-modal');
     if (modal) modal.classList.add('hidden');
+    execOnModalClose(); // C 阶段追加:模态框关闭时清理终端会话
   }
 
   function buildConfirmBody(message, confirmLabel, onConfirm, showForce) {
@@ -1043,6 +1592,672 @@
     var div = document.createElement('div');
     div.textContent = String(s == null ? '' : s);
     return div.innerHTML;
+  }
+
+  /* ============================================================
+   * C 阶段追加:Compose 栈 / 实时监控 / 容器 Exec 终端
+   * - 栈列表:启动 / 停止(二次确认) / 服务状态 / 日志,按 compose_file 行差异更新
+   * - 监控:manage_stats_start/stop + manage-stats 事件整表刷新,CPU% 阈值着色
+   * - 终端:manage_exec_start/write/stop + manage-exec-output 事件,简易 ANSI 处理
+   * 生命周期:切走监控 Tab / 离开 05 页自动停止监控与终端会话,unlisten 防泄漏
+   * ============================================================ */
+
+  // ===== C 阶段独立状态(不触碰上方 state 对象) =====
+  var cState = {
+    stacks: [],
+    mon: { running: false, unlisten: null },
+    exec: {
+      sessionId: null, unlisten: null, containerId: null, name: '',
+      lines: [], cur: '', curIdx: 0, eof: false, pend: '',
+      history: [], histIdx: -1
+    }
+  };
+
+  document.addEventListener('DOMContentLoaded', bindEventsC);
+
+  function bindEventsC() {
+    var sr = $('manage-stack-refresh-btn');
+    if (sr) sr.addEventListener('click', function () { refreshStacks(); });
+
+    var ms = $('monitor-start-btn');
+    if (ms) ms.addEventListener('click', monitorStart);
+    var mstop = $('monitor-stop-btn');
+    if (mstop) mstop.addEventListener('click', function () { monitorStop(false); });
+  }
+
+  // ===== Compose 栈列表 =====
+  function refreshStacks() {
+    if (!state.serverId || state.inFlight) return;
+    state.inFlight = true;
+    AppBus.invoke('manage_list_stacks', { serverId: state.serverId }).then(function (list) {
+      state.inFlight = false;
+      renderStacks(list || []);
+    }).catch(function (err) {
+      state.inFlight = false;
+      var msg = err && err.message ? err.message : String(err);
+      showError('加载栈列表失败: ' + msg);
+    });
+  }
+
+  function renderStacks(list) {
+    var tbody = $('manage-stacks-tbody');
+    if (!tbody) return;
+
+    if (list.length === 0) {
+      tbody.innerHTML = '<tr><td class="empty-cell" colspan="3">未在服务器目录中发现 compose 项目</td></tr>';
+      cState.stacks = [];
+      return;
+    }
+
+    // 移除初始占位行(参照 renderContainers,否则占位行残留在数据行上方)
+    var emptyCell = tbody.querySelector('.empty-cell');
+    if (emptyCell) {
+      var emptyRow = emptyCell.closest('tr');
+      if (emptyRow) emptyRow.remove();
+    }
+
+    // 按 compose_file 做行差异更新(同 B 阶段卷/网络模式)
+    var rowMap = {};
+    var rows = tbody.querySelectorAll('tr[data-skid]');
+    for (var i = 0; i < rows.length; i++) {
+      rowMap[rows[i].getAttribute('data-skid')] = rows[i];
+    }
+
+    var seen = {};
+    var frag = document.createDocumentFragment();
+    for (var j = 0; j < list.length; j++) {
+      var st = list[j];
+      seen[st.compose_file] = true;
+      var row = rowMap[st.compose_file];
+      if (row) updateStackRow(row, st);
+      else {
+        row = document.createElement('tr');
+        row.setAttribute('data-skid', st.compose_file);
+        updateStackRow(row, st);
+      }
+      frag.appendChild(row);
+    }
+    for (var k in rowMap) {
+      if (!seen[k]) rowMap[k].remove();
+    }
+    tbody.appendChild(frag);
+    cState.stacks = list;
+  }
+
+  function updateStackRow(tr, st) {
+    tr.innerHTML = '';
+    // 目录
+    var tdDir = document.createElement('td');
+    tdDir.className = 'mono text-truncate';
+    tdDir.textContent = st.dir || '—';
+    if (st.dir) tdDir.title = st.dir;
+    tr.appendChild(tdDir);
+    // compose 文件
+    var tdFile = document.createElement('td');
+    tdFile.className = 'mono text-truncate';
+    tdFile.textContent = st.compose_file || '—';
+    if (st.compose_file) tdFile.title = st.compose_file;
+    tr.appendChild(tdFile);
+    // 操作:启动 / 停止 / 服务状态 / 日志
+    var tdAction = document.createElement('td');
+    tdAction.className = 'col-action';
+    var wrap = document.createElement('div');
+    wrap.className = 'action-btn-group';
+
+    var upBtn = document.createElement('button');
+    upBtn.type = 'button';
+    upBtn.className = 'btn btn-sm';
+    upBtn.textContent = '启动';
+    upBtn.addEventListener('click', function () { confirmStackAction(st, 'up'); });
+    wrap.appendChild(upBtn);
+
+    var downBtn = document.createElement('button');
+    downBtn.type = 'button';
+    downBtn.className = 'btn btn-sm';
+    downBtn.textContent = '停止';
+    downBtn.addEventListener('click', function () { confirmStackAction(st, 'down'); });
+    wrap.appendChild(downBtn);
+
+    var psBtn = document.createElement('button');
+    psBtn.type = 'button';
+    psBtn.className = 'btn btn-sm';
+    psBtn.textContent = '服务状态';
+    psBtn.addEventListener('click', function () { showStackPs(st); });
+    wrap.appendChild(psBtn);
+
+    var logBtn = document.createElement('button');
+    logBtn.type = 'button';
+    logBtn.className = 'btn btn-sm';
+    logBtn.textContent = '日志';
+    logBtn.addEventListener('click', function () { showStackLogs(st); });
+    wrap.appendChild(logBtn);
+
+    tdAction.appendChild(wrap);
+    tr.appendChild(tdAction);
+  }
+
+  function confirmStackAction(st, action) {
+    var label = action === 'up' ? '启动' : '停止';
+    openModal(label + '栈', buildConfirmBody(
+      '确定' + label + ' compose 栈「' + (st.dir || st.compose_file) + '」吗?',
+      label,
+      function () {
+        closeModal();
+        doStackAction(st, action);
+      }
+    ));
+  }
+
+  function doStackAction(st, action) {
+    if (!state.serverId) return;
+    state.opInProgress = true;
+    stopTimer();
+    AppBus.invoke('manage_stack_action', {
+      serverId: state.serverId,
+      composeFile: st.compose_file,
+      action: action
+    }).then(function (res) {
+      state.opInProgress = false;
+      var label = action === 'up' ? '启动' : '停止';
+      if (res.success) {
+        toast(label + '成功', 'ok');
+        refreshStacks();
+        refreshOverview();
+      } else {
+        toast(label + '失败: ' + (res.message || '未知错误'), 'fail');
+      }
+      startTimerIfEnabled();
+    }).catch(function (err) {
+      state.opInProgress = false;
+      var msg = err && err.message ? err.message : String(err);
+      var label = action === 'up' ? '启动' : '停止';
+      toast(label + '失败: ' + msg, 'fail');
+      startTimerIfEnabled();
+    });
+  }
+
+  // 栈服务状态:模态框内小表格
+  function showStackPs(st) {
+    var body = document.createElement('div');
+    body.innerHTML =
+      '<div class="table-wrap"><table class="data-table stack-ps-table">' +
+      '<thead><tr><th>服务 SERVICE</th><th>状态 STATE</th></tr></thead>' +
+      '<tbody id="stack-ps-tbody"><tr><td class="empty-cell" colspan="2">加载中…</td></tr></tbody>' +
+      '</table></div>';
+    openModal('服务状态 — ' + (st.dir || st.compose_file), body);
+
+    AppBus.invoke('manage_stack_ps', {
+      serverId: state.serverId,
+      composeFile: st.compose_file
+    }).then(function (list) {
+      var tb = $('stack-ps-tbody');
+      if (!tb) return;
+      list = list || [];
+      if (list.length === 0) {
+        tb.innerHTML = '<tr><td class="empty-cell" colspan="2">无运行中的服务</td></tr>';
+        return;
+      }
+      tb.innerHTML = '';
+      for (var i = 0; i < list.length; i++) {
+        var svc = list[i];
+        var tr = document.createElement('tr');
+        var tdName = document.createElement('td');
+        tdName.className = 'mono';
+        tdName.textContent = svc.name || svc.service || '—';
+        tr.appendChild(tdName);
+        var tdState = document.createElement('td');
+        var s = (svc.state || '').toLowerCase();
+        var badge = document.createElement('span');
+        badge.className = 'badge ' +
+          (s === 'running' ? 'badge-running' : (s === 'exited' ? 'badge-exited' : 'badge-info'));
+        badge.textContent = svc.state || '未知';
+        tdState.appendChild(badge);
+        tr.appendChild(tdState);
+        tb.appendChild(tr);
+      }
+    }).catch(function (err) {
+      var tb = $('stack-ps-tbody');
+      var msg = err && err.message ? err.message : String(err);
+      if (tb) tb.innerHTML = '<tr><td class="empty-cell" colspan="2">加载失败: ' + escHtml(msg) + '</td></tr>';
+    });
+  }
+
+  // 栈日志:复用日志模态的 tail 选择模式
+  function showStackLogs(st) {
+    var tail = 100;
+    var body = document.createElement('div');
+    body.innerHTML =
+      '<div class="log-tail-bar">' +
+      '<label>显示行数:' +
+      '<select id="stack-log-tail-select" class="form-input form-input-sm">' +
+      '<option value="100">100</option>' +
+      '<option value="500">500</option>' +
+      '<option value="1000">1000</option>' +
+      '<option value="0">全部</option>' +
+      '</select></label>' +
+      '</div>' +
+      '<pre id="stack-log-content" class="manage-log-body">加载中…</pre>';
+
+    openModal('栈日志 — ' + (st.dir || st.compose_file), body);
+
+    var tailSel = $('stack-log-tail-select');
+    if (tailSel) tailSel.addEventListener('change', function () {
+      tail = parseInt(tailSel.value, 10) || 100;
+      fetchStackLogs(st, tail);
+    });
+    fetchStackLogs(st, tail);
+  }
+
+  function fetchStackLogs(st, tail) {
+    var content = $('stack-log-content');
+    if (!content) return;
+    content.textContent = '加载中…';
+    AppBus.invoke('manage_stack_logs', {
+      serverId: state.serverId,
+      composeFile: st.compose_file,
+      tail: tail
+    }).then(function (logs) {
+      content.textContent = logs || '(无日志输出)';
+    }).catch(function (err) {
+      var msg = err && err.message ? err.message : String(err);
+      content.textContent = '加载日志失败: ' + msg;
+    });
+  }
+
+  // ===== 实时监控 =====
+  function monitorStart() {
+    if (!state.serverId) { toast('请先选择服务器', 'warn'); return; }
+    if (cState.mon.running) { toast('监控已在运行中', 'info'); return; }
+    var ivSel = $('monitor-interval-select');
+    var intervalSecs = ivSel ? (parseInt(ivSel.value, 10) || 2) : 2;
+    hideMonitorError();
+
+    AppBus.invoke('manage_stats_start', {
+      serverId: state.serverId,
+      intervalSecs: intervalSecs
+    }).then(function () {
+      // 启动成功后再订阅事件,避免残留订阅
+      return AppBus.on('manage-stats', onStatsEvent).then(function (unlisten) {
+        cState.mon.unlisten = unlisten;
+        cState.mon.running = true;
+        updateMonitorUi();
+      });
+    }).catch(function (err) {
+      var msg = err && err.message ? err.message : String(err);
+      toast('启动监控失败: ' + msg, 'fail');
+    });
+  }
+
+  function monitorStop(silent) {
+    var had = cState.mon.running || cState.mon.unlisten;
+    if (!had) return;
+    cState.mon.running = false;
+    if (cState.mon.unlisten) {
+      try { cState.mon.unlisten(); } catch (e) { /* 忽略 */ }
+      cState.mon.unlisten = null;
+    }
+    AppBus.invoke('manage_stats_stop', {}).catch(function () { /* 后端已停止时忽略 */ });
+    updateMonitorUi();
+    if (!silent) toast('监控已停止', 'info');
+  }
+
+  function updateMonitorUi() {
+    var badge = $('monitor-badge');
+    if (badge) {
+      if (cState.mon.running) fillBadge(badge, 'running', '监控中');
+      else fillBadge(badge, 'info', '已停止');
+    }
+    var startBtn = $('monitor-start-btn');
+    if (startBtn) startBtn.disabled = cState.mon.running;
+    var stopBtn = $('monitor-stop-btn');
+    if (stopBtn) stopBtn.disabled = !cState.mon.running;
+    var ivSel = $('monitor-interval-select');
+    if (ivSel) ivSel.disabled = cState.mon.running;
+  }
+
+  function showMonitorError(msg, stopped) {
+    var el = $('monitor-error');
+    if (!el) return;
+    el.textContent = '监控数据错误: ' + msg + (stopped ? '(监控已自动停止)' : '(下一轮将自动重试)');
+    el.classList.remove('hidden');
+  }
+
+  function hideMonitorError() {
+    var el = $('monitor-error');
+    if (el) el.classList.add('hidden');
+  }
+
+  // 注意:Tauri 2 listen 回调参数是事件包裹对象 { event, id, payload },
+  // 真实数据在 .payload 上(与 deploy.js / servers.js 的既有事件处理一致)
+  function onStatsEvent(event) {
+    var payload = event ? event.payload : null;
+    if (!payload) return;
+    // 其他服务器的数据(已切换服务器但未重启监控)直接丢弃
+    if (payload.server_id && state.serverId && payload.server_id !== state.serverId) return;
+    if (payload.error) {
+      // 仅在后端已自行终止(权限拒绝/连续连接失败,payload.stopped=true)时
+      // 停止本地监控;普通单轮失败后端会继续轮询,前端只提示不打断
+      showMonitorError(String(payload.error), !!payload.stopped);
+      if (payload.stopped) monitorStop(true);
+      return;
+    }
+    hideMonitorError();
+    renderStats(payload.stats || []);
+  }
+
+  function renderStats(list) {
+    var tbody = $('monitor-tbody');
+    if (!tbody) return;
+    if (list.length === 0) {
+      tbody.innerHTML = '<tr><td class="empty-cell" colspan="7">暂无数据</td></tr>';
+      return;
+    }
+    // 行数少,每次事件直接重建 tbody
+    tbody.innerHTML = '';
+    for (var i = 0; i < list.length; i++) {
+      var s = list[i];
+      var tr = document.createElement('tr');
+      tr.appendChild(mkStatTd(s.name || s.container_id || '—', true));
+      tr.appendChild(mkCpuTd(s.cpu_percent));
+      tr.appendChild(mkStatTd(s.mem_usage || '—', true));
+      tr.appendChild(mkStatTd(s.mem_percent != null ? String(s.mem_percent) : '—', false));
+      tr.appendChild(mkStatTd(s.net_io || '—', true));
+      tr.appendChild(mkStatTd(s.block_io || '—', true));
+      tr.appendChild(mkStatTd(s.pids != null ? String(s.pids) : '—', false));
+      tbody.appendChild(tr);
+    }
+  }
+
+  function mkStatTd(text, mono) {
+    var td = document.createElement('td');
+    if (mono) td.className = 'mono';
+    td.textContent = text;
+    return td;
+  }
+
+  function mkCpuTd(val) {
+    var td = document.createElement('td');
+    td.className = 'mono';
+    var num = parseFloat(val);
+    if (!isNaN(num)) {
+      td.textContent = String(val);
+      // CPU% 阈值着色:<50 正常,50-80 黄,>80 红
+      if (num > 80) td.classList.add('stat-hot');
+      else if (num >= 50) td.classList.add('stat-warm');
+    } else {
+      td.textContent = val || '—';
+    }
+    return td;
+  }
+
+  // ===== 容器 Exec 终端 =====
+  function openTerminal(containerId, name) {
+    // 多开防护:同一时间只允许一个终端会话
+    if (cState.exec.sessionId || cState.exec.unlisten) {
+      toast('已有终端会话,请先关闭当前终端', 'warn');
+      return;
+    }
+
+    var body = document.createElement('div');
+    body.innerHTML =
+      '<div class="log-tail-bar">' +
+      '<label>Shell:' +
+      '<select id="term-shell-select" class="form-input form-input-sm">' +
+      '<option value="bash">bash</option>' +
+      '<option value="sh">sh</option>' +
+      '</select></label>' +
+      '<button id="term-close-btn" class="btn btn-sm btn-danger" type="button">关闭终端</button>' +
+      '</div>' +
+      '<pre id="term-output" class="manage-terminal">正在连接…</pre>' +
+      '<input id="term-input" class="manage-terminal-input" type="text" autocomplete="off" ' +
+      'spellcheck="false" placeholder="输入命令,Enter 发送;↑/↓ 切换历史">';
+
+    openModal('终端 — ' + name, body);
+
+    var shellSel = $('term-shell-select');
+    if (shellSel) shellSel.addEventListener('change', function () {
+      // 切换 shell:停掉当前会话,用新 shell 重开
+      stopExecSession(true);
+      var out = $('term-output');
+      resetTermBuffer();
+      if (out) out.textContent = '正在连接…';
+      startExec(containerId, name, shellSel.value);
+    });
+
+    var closeBtn = $('term-close-btn');
+    if (closeBtn) closeBtn.addEventListener('click', function () {
+      stopExecSession(false);
+      closeModal();
+    });
+
+    var input = $('term-input');
+    if (input) {
+      input.addEventListener('keydown', onTermInputKey);
+      input.focus();
+    }
+    var out = $('term-output');
+    if (out) {
+      // 用户向上滚动时暂停自动滚
+      out.addEventListener('scroll', function () { /* 渲染时按位置判断,无需额外状态 */ });
+    }
+
+    startExec(containerId, name, shellSel ? shellSel.value : 'bash');
+  }
+
+  function startExec(containerId, name, shell) {
+    // 先订阅再 invoke:后端在命令返回前就可能开始推送(快速失败场景 eof
+    // 会先于订阅到达),订阅期间的事件先入缓冲,拿到 session_id 后重放
+    var buffered = [];
+    var buffering = true;
+    function bufferedHandler(payload) {
+      if (buffering) { buffered.push(payload); return; }
+      onExecOutput(payload);
+    }
+    var unsubscribe = null;
+
+    AppBus.on('manage-exec-output', bufferedHandler).then(function (unlisten) {
+      unsubscribe = unlisten;
+      // invoke 已返回(正常路径):直接进入实时处理并重放缓冲;
+      // 否则保持缓冲,由 invoke 的 then 分支接管
+      if (!buffering) {
+        cState.exec.unlisten = unlisten;
+        var list = buffered || [];
+        buffered = null;
+        for (var i = 0; i < list.length; i++) onExecOutput(list[i]);
+      }
+    });
+
+    AppBus.invoke('manage_exec_start', {
+      serverId: state.serverId,
+      containerId: containerId,
+      shell: shell || 'bash'
+    }).then(function (res) {
+      // 模态框可能在等待期间被关闭
+      if (!$('term-output')) {
+        buffering = false;
+        if (unsubscribe) { try { unsubscribe(); } catch (e) { /* 忽略 */ } }
+        AppBus.invoke('manage_exec_stop', { sessionId: res.session_id }).catch(function () {});
+        return;
+      }
+      cState.exec.sessionId = res.session_id;
+      cState.exec.containerId = containerId;
+      cState.exec.name = name || containerId;
+      resetTermBuffer();
+      termAppendLine('已连接到容器「' + cState.exec.name + '」(shell: ' + (shell || 'bash') + ')');
+      renderTerm();
+      buffering = false;
+      // 订阅已就绪:挂载正式 unlisten 并重放缓冲中的早期事件(含快速 eof);
+      // 订阅尚未 resolve:保持缓冲,由其 then 分支重放
+      if (unsubscribe) {
+        cState.exec.unlisten = unsubscribe;
+        var list = buffered || [];
+        buffered = null;
+        for (var i = 0; i < list.length; i++) onExecOutput(list[i]);
+      }
+    }).catch(function (err) {
+      buffering = false;
+      if (unsubscribe) { try { unsubscribe(); } catch (e) { /* 忽略 */ } }
+      var msg = err && err.message ? err.message : String(err);
+      var out = $('term-output');
+      if (out) out.textContent = '连接失败: ' + msg;
+      toast('打开终端失败: ' + msg, 'fail');
+    });
+  }
+
+  // 注意:Tauri 2 listen 回调参数是事件包裹对象 { event, id, payload }(同 onStatsEvent)
+  function onExecOutput(event) {
+    var payload = event ? event.payload : null;
+    if (!payload) return;
+    // 只处理当前会话的数据(旧会话残留事件丢弃)
+    if (payload.session_id !== cState.exec.sessionId) return;
+    if (payload.data) termWrite(String(payload.data));
+    if (payload.eof) {
+      termAppendLine('[会话已结束]');
+      cState.exec.eof = true;
+      // eof 后释放会话与监听,避免泄漏
+      releaseExecListener();
+      cState.exec.sessionId = null;
+      var input = $('term-input');
+      if (input) input.disabled = true;
+      renderTerm();
+    }
+  }
+
+  // 简易 ANSI 处理:剥除 ESC 转义序列;\r 回到行首覆盖;\n 换行
+  function termWrite(data) {
+    // 先拼接上一块残留的不完整 ESC 序列,再缓存本块尾部的不完整序列
+    if (cState.exec.pend) {
+      data = cState.exec.pend + data;
+      cState.exec.pend = '';
+    }
+    var idx = data.lastIndexOf('\x1b');
+    if (idx !== -1 && /^\x1b(\[[0-9;?]*|\][^\x07]*)?$/.test(data.slice(idx))) {
+      cState.exec.pend = data.slice(idx);
+      data = data.slice(0, idx);
+    }
+    data = data.replace(/\x1b(\[[0-9;?]*[A-Za-z]|\][^\x07]*\x07|[@-Z\\-_])/g, '')
+               .replace(/\x07/g, '');
+
+    var ex = cState.exec;
+    for (var i = 0; i < data.length; i++) {
+      var ch = data[i];
+      if (ch === '\n') {
+        ex.lines.push(ex.cur);
+        if (ex.lines.length > 1000) ex.lines.shift();
+        ex.cur = '';
+        ex.curIdx = 0;
+      } else if (ch === '\r') {
+        ex.curIdx = 0; // 回到行首,后续字符覆盖
+      } else if (ch === '\t') {
+        var pad = 4 - (ex.cur.length % 4);
+        for (var t = 0; t < pad; t++) { ex.cur += ' '; ex.curIdx++; }
+      } else if (ch >= ' ') {
+        if (ex.curIdx < ex.cur.length) {
+          ex.cur = ex.cur.slice(0, ex.curIdx) + ch + ex.cur.slice(ex.curIdx + 1);
+        } else {
+          ex.cur += ch;
+        }
+        ex.curIdx++;
+      }
+    }
+    renderTerm();
+  }
+
+  function termAppendLine(text) {
+    cState.exec.lines.push(text);
+    if (cState.exec.lines.length > 1000) cState.exec.lines.shift();
+  }
+
+  function resetTermBuffer() {
+    cState.exec.lines = [];
+    cState.exec.cur = '';
+    cState.exec.curIdx = 0;
+    cState.exec.pend = '';
+    cState.exec.eof = false;
+  }
+
+  function renderTerm() {
+    var out = $('term-output');
+    if (!out) return;
+    // 用户未向上滚动(贴近底部)时才自动滚到底
+    var atBottom = out.scrollTop + out.clientHeight >= out.scrollHeight - 40;
+    var ex = cState.exec;
+    out.textContent = ex.lines.join('\n') + (ex.lines.length ? '\n' : '') + ex.cur;
+    if (atBottom) out.scrollTop = out.scrollHeight;
+  }
+
+  function onTermInputKey(e) {
+    var input = e.target;
+    var ex = cState.exec;
+    if (e.key === 'Enter') {
+      var line = input.value;
+      if (!ex.sessionId) { toast('会话已结束,请关闭终端', 'warn'); return; }
+      AppBus.invoke('manage_exec_write', { sessionId: ex.sessionId, data: line + '\r' })
+        .catch(function () { /* 写失败忽略,输出流会体现 */ });
+      if (line) {
+        ex.history.push(line);
+        if (ex.history.length > 100) ex.history.shift();
+      }
+      ex.histIdx = -1;
+      input.value = '';
+      e.preventDefault();
+    } else if (e.key === 'ArrowUp') {
+      if (ex.history.length === 0) return;
+      if (ex.histIdx === -1) ex.histIdx = ex.history.length - 1;
+      else if (ex.histIdx > 0) ex.histIdx--;
+      input.value = ex.history[ex.histIdx];
+      e.preventDefault();
+    } else if (e.key === 'ArrowDown') {
+      if (ex.histIdx === -1) return;
+      if (ex.histIdx < ex.history.length - 1) {
+        ex.histIdx++;
+        input.value = ex.history[ex.histIdx];
+      } else {
+        ex.histIdx = -1;
+        input.value = '';
+      }
+      e.preventDefault();
+    }
+  }
+
+  // 关闭终端:通知后端停止会话 + unlisten(防泄漏)
+  function stopExecSession(quiet) {
+    var ex = cState.exec;
+    if (ex.sessionId) {
+      var sid = ex.sessionId;
+      ex.sessionId = null;
+      AppBus.invoke('manage_exec_stop', { sessionId: sid }).catch(function () { /* 忽略 */ });
+    }
+    releaseExecListener();
+    ex.containerId = null;
+    ex.history = [];
+    ex.histIdx = -1;
+    if (!quiet) toast('终端已关闭', 'info');
+  }
+
+  function releaseExecListener() {
+    var ex = cState.exec;
+    if (ex.unlisten) {
+      try { ex.unlisten(); } catch (e) { /* 忽略 */ }
+      ex.unlisten = null;
+    }
+  }
+
+  // closeModal 钩子:模态框被关闭(含遮罩点击/关闭按钮)时清理终端会话
+  function execOnModalClose() {
+    var ex = cState.exec;
+    if (ex.sessionId || ex.unlisten) {
+      stopExecSession(true);
+    }
+  }
+
+  // ===== C 阶段:离开 05 页清理 =====
+  function onLeaveC() {
+    monitorStop(true);
+    if (cState.exec.sessionId || cState.exec.unlisten) {
+      stopExecSession(true);
+    }
+    hideMonitorError();
   }
 
 })();

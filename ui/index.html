@@ -429,12 +429,16 @@
         <div class="manage-tabs">
           <button class="manage-tab active" data-tab="containers" type="button">容器 CONTAINERS</button>
           <button class="manage-tab" data-tab="images" type="button">镜像 IMAGES</button>
+          <button class="manage-tab" data-tab="volumes" type="button">卷 VOLUMES</button>
+          <button class="manage-tab" data-tab="networks" type="button">网络 NETWORKS</button>
+          <button class="manage-tab" data-tab="stacks" type="button">栈 STACKS</button>
+          <button class="manage-tab" data-tab="monitor" type="button">监控 MONITOR</button>
         </div>
 
         <!-- 容器列表面板 -->
         <div id="manage-containers-panel" class="manage-tab-panel">
           <div class="table-wrap">
-            <table class="data-table">
+            <table class="data-table manage-table">
               <thead>
                 <tr>
                   <th>状态 STATE</th>
@@ -459,7 +463,7 @@
             <button id="manage-pull-btn" class="btn btn-primary btn-sm" type="button">拉取镜像</button>
           </div>
           <div class="table-wrap">
-            <table class="data-table">
+            <table class="data-table manage-table">
               <thead>
                 <tr>
                   <th>仓库 REPO</th>
@@ -472,6 +476,109 @@
               </thead>
               <tbody id="manage-images-tbody">
                 <tr><td class="empty-cell" colspan="6">选择服务器后加载</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- 卷列表面板(B 阶段追加) -->
+        <div id="manage-volumes-panel" class="manage-tab-panel hidden">
+          <div class="manage-pull-bar">
+            <button id="manage-volume-create-btn" class="btn btn-primary btn-sm" type="button">创建卷</button>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table manage-table">
+              <thead>
+                <tr>
+                  <th>名称 NAME</th>
+                  <th>驱动 DRIVER</th>
+                  <th>挂载点 MOUNTPOINT</th>
+                  <th>创建时间 CREATED</th>
+                  <th class="col-action">操作 ACTION</th>
+                </tr>
+              </thead>
+              <tbody id="manage-volumes-tbody">
+                <tr><td class="empty-cell" colspan="5">选择服务器后加载</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- 网络列表面板(B 阶段追加) -->
+        <div id="manage-networks-panel" class="manage-tab-panel hidden">
+          <div class="manage-pull-bar">
+            <button id="manage-network-create-btn" class="btn btn-primary btn-sm" type="button">创建网络</button>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table manage-table">
+              <thead>
+                <tr>
+                  <th>名称 NAME</th>
+                  <th>驱动 DRIVER</th>
+                  <th>范围 SCOPE</th>
+                  <th>已连接容器 CONTAINERS</th>
+                  <th class="col-action">操作 ACTION</th>
+                </tr>
+              </thead>
+              <tbody id="manage-networks-tbody">
+                <tr><td class="empty-cell" colspan="5">选择服务器后加载</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Compose 栈列表面板(C 阶段追加) -->
+        <div id="manage-stacks-panel" class="manage-tab-panel hidden">
+          <div class="manage-pull-bar">
+            <button id="manage-stack-refresh-btn" class="btn btn-sm" type="button">刷新栈</button>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table manage-table">
+              <thead>
+                <tr>
+                  <th>目录 DIR</th>
+                  <th>COMPOSE 文件</th>
+                  <th class="col-action">操作 ACTION</th>
+                </tr>
+              </thead>
+              <tbody id="manage-stacks-tbody">
+                <tr><td class="empty-cell" colspan="3">选择服务器后加载</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- 实时监控面板(C 阶段追加) -->
+        <div id="manage-monitor-panel" class="manage-tab-panel hidden">
+          <div class="manage-pull-bar">
+            <button id="monitor-start-btn" class="btn btn-primary btn-sm" type="button">开始监控</button>
+            <button id="monitor-stop-btn" class="btn btn-sm" type="button" disabled>停止监控</button>
+            <label class="manage-autorefresh">间隔
+              <select id="monitor-interval-select" class="form-input manage-interval-select">
+                <option value="1">1s</option>
+                <option value="2" selected>2s</option>
+                <option value="5">5s</option>
+                <option value="10">10s</option>
+              </select>
+            </label>
+            <span id="monitor-badge" class="badge badge-info">已停止</span>
+          </div>
+          <div id="monitor-error" class="banner banner-fail hidden"></div>
+          <div class="table-wrap">
+            <table class="data-table manage-table">
+              <thead>
+                <tr>
+                  <th>容器名 NAME</th>
+                  <th>CPU%</th>
+                  <th>内存占用 MEM</th>
+                  <th>内存% MEM%</th>
+                  <th>网络 IO NET IO</th>
+                  <th>块 IO BLOCK IO</th>
+                  <th>PID</th>
+                </tr>
+              </thead>
+              <tbody id="monitor-tbody">
+                <tr><td class="empty-cell" colspan="7">点击「开始监控」获取实时数据</td></tr>
               </tbody>
             </table>
           </div>
@@ -505,11 +612,28 @@
     </div>
   </div>
 
+  <!-- 帮助:右下角悬浮按钮(所有页面可见)+ 章节式帮助模态框(静态内容由 help.js 渲染) -->
+  <button id="help-fab" class="help-fab" type="button" aria-haspopup="dialog"
+          aria-controls="help-modal" aria-label="打开使用帮助" title="使用帮助">?</button>
+  <div id="help-modal" class="modal-overlay hidden">
+    <div class="modal-card help-modal-card" role="dialog" aria-modal="true" aria-labelledby="help-modal-title">
+      <div class="modal-head">
+        <div id="help-modal-title" class="modal-title">使用帮助<span class="help-title-en">HELP</span></div>
+        <button id="help-modal-close" class="modal-close" type="button" title="关闭">关闭</button>
+      </div>
+      <div class="help-layout">
+        <nav id="help-nav" class="help-nav" aria-label="帮助章节导航"></nav>
+        <div id="help-content" class="help-content"></div>
+      </div>
+    </div>
+  </div>
+
   <script src="app.js"></script>
   <script src="check.js"></script>
   <script src="images.js"></script>
   <script src="servers.js"></script>
   <script src="deploy.js"></script>
   <script src="manage.js"></script>
+  <script src="help.js"></script>
 </body>
 </html>

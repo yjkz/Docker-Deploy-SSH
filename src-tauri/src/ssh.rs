@@ -736,3 +736,42 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 }
+
+/// C 阶段追加:交互式 exec 相关方法(独立 impl 块,纯追加,不改任何既有代码)。
+impl SshClient {
+    /// C 阶段追加:打开交互式 PTY 会话执行命令,返回可读写的通道流。
+    /// 与一次性 exec 不同,通道在调用方 Drop/关闭前保持打开,支持双向传输。
+    ///
+    /// 流程:channel_open_session → request_pty(xterm-256color, cols/rows, 其余默认)
+    /// → exec(true, cmd) → 返回 [`russh::Channel`]。
+    ///
+    /// 返回 `Channel<client::Msg>` 而非 `ChannelStream`:调用方需要在同一通道上
+    /// 并发做三件事 —— 读输出(`wait()`)、写 stdin(`make_writer()`)、
+    /// 终端resize(`window_change()`);`into_stream()` 会消费通道且不再暴露
+    /// `window_change`,`make_reader`/`make_writer` 的具体类型
+    /// (`channels::io::ChannelTx`)因 `mod channels` 为私有而不可命名。
+    /// 保留完整 `Channel` 后,写入端用 `make_writer()`(0.46 中该返回值
+    /// 不借用 self,可安全移交给独立写任务),resize 直接走通道上的
+    /// `window_change`,关闭走 `close()`。
+    pub async fn exec_interactive(
+        &mut self,
+        cmd: &str,
+        cols: u32,
+        rows: u32,
+    ) -> Result<russh::Channel<client::Msg>, String> {
+        let channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .map_err(|e| format!("SSH 打开交互式会话通道失败: {}", e))?;
+        channel
+            .request_pty(true, "xterm-256color", cols, rows, 0, 0, &[])
+            .await
+            .map_err(|e| format!("SSH 请求伪终端(PTY)失败: {}", e))?;
+        channel
+            .exec(true, cmd)
+            .await
+            .map_err(|e| format!("SSH 启动交互式命令 ({}) 失败: {}", cmd, e))?;
+        Ok(channel)
+    }
+}

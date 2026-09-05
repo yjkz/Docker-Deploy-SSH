@@ -1797,3 +1797,428 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   vertical-align: middle;
   line-height: 16px;
 }
+
+/* ============================================================
+ * C 阶段追加:Compose 栈 / 实时监控 / 容器 Exec 终端
+ * 遵循 ark-ui:墨 #080a0b / 纸 #f4f6f6 / 信号青 #18d1ff / 状态黄 #c8eb21
+ * ============================================================ */
+
+/* 监控面板 CPU% 阈值着色 */
+.stat-warm {
+  color: var(--ark-warn, #c8eb21);
+  font-weight: 700;
+}
+.stat-hot {
+  color: var(--ark-danger, #ff4d5e);
+  font-weight: 700;
+}
+
+/* 监控面板控件行 */
+#manage-monitor-panel .manage-pull-bar {
+  align-items: center;
+  gap: 10px;
+}
+#manage-monitor-panel .manage-pull-bar label.manage-autorefresh {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+#manage-monitor-panel #monitor-interval-select {
+  width: 72px;
+}
+
+/* 栈服务状态小表格 */
+.stack-ps-table {
+  min-width: 320px;
+}
+.stack-ps-table th:nth-child(1),
+.stack-ps-table td:nth-child(1) { width: 60%; }
+
+/* 终端输出区:亮暗主题均固定黑底等宽终端风格 */
+.manage-terminal {
+  margin: 0 0 8px;
+  padding: 10px 12px;
+  height: 320px;
+  overflow-y: auto;
+  background: #080a0b;
+  color: #d7e0e2;
+  border: 1px solid #1a2124;
+  border-radius: 4px;
+  font-family: 'IBM Plex Mono', Consolas, 'Courier New', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.manage-terminal::selection,
+.manage-terminal *::selection {
+  background: #18d1ff;
+  color: #080a0b;
+}
+
+/* 终端输入行 */
+.manage-terminal-input {
+  width: 100%;
+  padding: 8px 10px;
+  background: #080a0b;
+  color: #18d1ff;
+  border: 1px solid #1a2124;
+  border-radius: 4px;
+  font-family: 'IBM Plex Mono', Consolas, 'Courier New', monospace;
+  font-size: 12px;
+  outline: none;
+}
+.manage-terminal-input:focus {
+  border-color: #18d1ff;
+}
+.manage-terminal-input:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}
+
+/* ============================================================
+   05 远程管理表格列宽终版优化(末尾追加,覆盖上方「方案D」的 px 列宽)
+   目标:六个 Tab 的表格在 1280px 窗口下无横向滚动,操作列始终可见。
+   手段:
+   1）.manage-table 固定布局 + 百分比列宽(替换 px:窄窗口按比例收缩,
+      不再出现「列宽合计 > 表宽 → 表格溢出 100% → 横向滚动条」)
+   2）表头/单元格水平内边距 14px → 10px,为截断文本列腾出宽度
+   3）操作按钮精简(字号 11px / 内边距收窄 / 去掉 46px 最小宽),
+      按钮组允许换行 —— 两行排布优于横向滚动
+   4）min-width 780px 兜底:窗口极窄时由 .table-wrap 既有的
+      overflow-x:auto 接管,横滚仅在此极端情况出现
+   ============================================================ */
+
+/* ---- 基础布局:固定 + 百分比 + 最小宽度兜底 ---- */
+.manage-table {
+  table-layout: fixed;
+  width: 100%;
+  min-width: 780px;
+}
+.manage-table th { padding: 9px 10px; }
+.manage-table td { padding: 0 10px; }
+
+/* ---- 操作列:抵消上方 .manage-tab-panel .col-action 的 min-width:200px ---- */
+.manage-table .col-action {
+  min-width: 0;
+  text-align: right;
+}
+/* 覆盖 .action-btn-group 的 nowrap:放不下时折两行,右对齐保持齐整 */
+.manage-table .action-btn-group {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 4px;
+}
+/* 操作按钮精简:2 字按钮约 42px 宽(原约 47px),4 字按钮约 64px */
+.manage-table .action-btn-group .btn-sm {
+  min-width: 0;
+  height: 24px;
+  padding: 2px 8px 2px 10px;
+  font-size: 11px;
+}
+
+/* ---- 容器表:状态9 | 名称18 | 镜像23 | 端口18 | 创建时间13 | 操作19 ---- */
+#manage-containers-panel .manage-table th:nth-child(1),
+#manage-containers-panel .manage-table td:nth-child(1) { width: 9%; }
+#manage-containers-panel .manage-table th:nth-child(2),
+#manage-containers-panel .manage-table td:nth-child(2) { width: 18%; }
+#manage-containers-panel .manage-table th:nth-child(3),
+#manage-containers-panel .manage-table td:nth-child(3) { width: 23%; }
+#manage-containers-panel .manage-table th:nth-child(4),
+#manage-containers-panel .manage-table td:nth-child(4) { width: 18%; }
+#manage-containers-panel .manage-table th:nth-child(5),
+#manage-containers-panel .manage-table td:nth-child(5) { width: 13%; }
+#manage-containers-panel .manage-table th:nth-child(6),
+#manage-containers-panel .manage-table td:nth-child(6) { width: 19%; }
+
+/* ---- 镜像表:仓库32 | 标签13 | ID15 | 大小10 | 创建时间14 | 操作16 ---- */
+#manage-images-panel .manage-table th:nth-child(1),
+#manage-images-panel .manage-table td:nth-child(1) { width: 32%; }
+#manage-images-panel .manage-table th:nth-child(2),
+#manage-images-panel .manage-table td:nth-child(2) { width: 13%; }
+#manage-images-panel .manage-table th:nth-child(3),
+#manage-images-panel .manage-table td:nth-child(3) { width: 15%; }
+#manage-images-panel .manage-table th:nth-child(4),
+#manage-images-panel .manage-table td:nth-child(4) { width: 10%; }
+#manage-images-panel .manage-table th:nth-child(5),
+#manage-images-panel .manage-table td:nth-child(5) { width: 14%; }
+#manage-images-panel .manage-table th:nth-child(6),
+#manage-images-panel .manage-table td:nth-child(6) { width: 16%; }
+
+/* ---- 卷表:名称26 | 驱动10 | 挂载点34 | 创建时间14 | 操作16 ---- */
+#manage-volumes-panel .manage-table th:nth-child(1),
+#manage-volumes-panel .manage-table td:nth-child(1) { width: 26%; }
+#manage-volumes-panel .manage-table th:nth-child(2),
+#manage-volumes-panel .manage-table td:nth-child(2) { width: 10%; }
+#manage-volumes-panel .manage-table th:nth-child(3),
+#manage-volumes-panel .manage-table td:nth-child(3) { width: 34%; }
+#manage-volumes-panel .manage-table th:nth-child(4),
+#manage-volumes-panel .manage-table td:nth-child(4) { width: 14%; }
+#manage-volumes-panel .manage-table th:nth-child(5),
+#manage-volumes-panel .manage-table td:nth-child(5) { width: 16%; }
+
+/* ---- 网络表:名称35 | 驱动11 | 范围9 | 已连接容器19 | 操作26(4 按钮单行) ---- */
+#manage-networks-panel .manage-table th:nth-child(1),
+#manage-networks-panel .manage-table td:nth-child(1) { width: 35%; }
+#manage-networks-panel .manage-table th:nth-child(2),
+#manage-networks-panel .manage-table td:nth-child(2) { width: 11%; }
+#manage-networks-panel .manage-table th:nth-child(3),
+#manage-networks-panel .manage-table td:nth-child(3) { width: 9%; }
+#manage-networks-panel .manage-table th:nth-child(4),
+#manage-networks-panel .manage-table td:nth-child(4) { width: 19%; }
+#manage-networks-panel .manage-table th:nth-child(5),
+#manage-networks-panel .manage-table td:nth-child(5) { width: 26%; }
+
+/* ---- 栈表:目录38 | COMPOSE 文件39 | 操作23(4 按钮单行) ---- */
+#manage-stacks-panel .manage-table th:nth-child(1),
+#manage-stacks-panel .manage-table td:nth-child(1) { width: 38%; }
+#manage-stacks-panel .manage-table th:nth-child(2),
+#manage-stacks-panel .manage-table td:nth-child(2) { width: 39%; }
+#manage-stacks-panel .manage-table th:nth-child(3),
+#manage-stacks-panel .manage-table td:nth-child(3) { width: 23%; }
+
+/* ---- 监控表(无操作列):容器名28 | CPU8 | 内存16 | 内存%10 | NET IO14 | BLOCK IO14 | PID10 ---- */
+#manage-monitor-panel .manage-table th:nth-child(1),
+#manage-monitor-panel .manage-table td:nth-child(1) { width: 28%; }
+#manage-monitor-panel .manage-table th:nth-child(2),
+#manage-monitor-panel .manage-table td:nth-child(2) { width: 8%; }
+#manage-monitor-panel .manage-table th:nth-child(3),
+#manage-monitor-panel .manage-table td:nth-child(3) { width: 16%; }
+#manage-monitor-panel .manage-table th:nth-child(4),
+#manage-monitor-panel .manage-table td:nth-child(4) { width: 10%; }
+#manage-monitor-panel .manage-table th:nth-child(5),
+#manage-monitor-panel .manage-table td:nth-child(5) { width: 14%; }
+#manage-monitor-panel .manage-table th:nth-child(6),
+#manage-monitor-panel .manage-table td:nth-child(6) { width: 14%; }
+#manage-monitor-panel .manage-table th:nth-child(7),
+#manage-monitor-panel .manage-table td:nth-child(7) { width: 10%; }
+
+/* ============================================================
+   使用帮助 HELP — help-fab 悬浮按钮 + help-modal 章节式模态框
+   (末尾追加,不修改已有规则;全部使用 ark token,亮暗主题自动适配)
+   ============================================================ */
+
+/* ---- 悬浮帮助按钮:右下角,方形(radius 2px),墨底纸字 + 底缘青条 ----
+   z-index 880:高于普通内容,低于模态遮罩(.modal-overlay 的 900) */
+.help-fab {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  z-index: 880;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 1px solid var(--ark-line);
+  border-bottom: 3px solid var(--ark-signal);
+  border-radius: 2px;
+  background: var(--ark-ink);
+  color: var(--ark-paper);
+  font-family: var(--font-mono);
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 6px 16px var(--ark-shadow);
+  transition: background .18s ease, color .18s ease, border-color .18s ease,
+    transform .18s ease;
+}
+/* hover 反白:墨底纸字 → 纸底墨字(青色底条不变) */
+.help-fab:hover {
+  background: var(--ark-paper);
+  color: var(--ark-ink);
+  border-color: var(--ark-ink);
+  border-bottom-color: var(--ark-signal);
+  transform: translate(0, -2px);
+}
+
+/* ---- 帮助模态框:复用 .modal-overlay / .modal-card,加宽加高 ---- */
+.help-modal-card {
+  display: flex;
+  flex-direction: column;
+  width: min(960px, 92vw);
+  /* 96px = .modal-overlay 的上下 padding(48px×2) */
+  height: min(80vh, calc(100vh - 96px));
+}
+.help-title-en {
+  margin-left: 8px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 400;
+  letter-spacing: .18em;
+  color: var(--ark-paper-dim-ink);
+}
+
+/* ---- 左右布局:左侧章节导航 + 右侧内容区 ---- */
+.help-layout {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: stretch;
+}
+.help-nav {
+  width: 216px;
+  flex: none;
+  padding: 10px 0;
+  border-right: 1px solid var(--ark-line-soft);
+  overflow-y: auto;
+}
+.help-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 14px;
+  border: none;
+  border-left: 3px solid transparent;
+  background: transparent;
+  color: var(--ark-ink);
+  font-family: inherit;
+  font-size: 12.5px;
+  line-height: 1.4;
+  text-align: left;
+  cursor: pointer;
+  transition: background .18s ease, border-color .18s ease;
+}
+.help-nav-item:hover { background: var(--ark-paper-dim); }
+/* 当前章节:左缘青条 + 青淡底(亮墨字/暗青字随 token 翻转) */
+.help-nav-item.active {
+  border-left-color: var(--ark-signal);
+  background: var(--ark-signal-dim);
+  color: var(--ark-on-signal-dim);
+  font-weight: 700;
+}
+.help-nav-num {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: .12em;
+  color: var(--ark-paper-dim-ink);
+}
+.help-nav-item.active .help-nav-num { color: var(--ark-on-signal-dim); }
+
+/* ---- 内容区排版 ---- */
+.help-content {
+  flex: 1;
+  min-width: 0;
+  padding: 18px 22px 26px;
+  overflow-y: auto;
+}
+.help-content::-webkit-scrollbar { width: 10px; }
+.help-content::-webkit-scrollbar-thumb { background: var(--ark-line-soft); }
+.help-content h3 {
+  margin: 0 0 14px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--ark-line-soft);
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--ark-ink);
+}
+/* 小节标题:左缘 3px 青条(ark edge-bar 语言) */
+.help-content h4 {
+  margin: 18px 0 8px;
+  padding-left: 8px;
+  border-left: 3px solid var(--ark-signal);
+  font-size: 13.5px;
+  font-weight: 700;
+  line-height: 1.5;
+  color: var(--ark-ink);
+}
+.help-content p {
+  margin: 0 0 10px;
+  font-size: 13px;
+  line-height: 1.85;
+  color: var(--ark-ink);
+}
+.help-content ul,
+.help-content ol {
+  margin: 0 0 12px;
+  padding-left: 20px;
+}
+.help-content li {
+  font-size: 13px;
+  line-height: 1.85;
+  margin-bottom: 4px;
+  color: var(--ark-ink);
+}
+.help-content strong { font-weight: 700; }
+.help-content code {
+  padding: 1px 5px;
+  border: 1px solid var(--ark-line-soft);
+  background: var(--ark-paper-dim);
+  color: var(--ark-ink);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  word-break: break-all;
+}
+.help-content table {
+  width: 100%;
+  margin: 0 0 12px;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+.help-content th,
+.help-content td {
+  border: 1px solid var(--ark-line-soft);
+  padding: 6px 10px;
+  text-align: left;
+  vertical-align: top;
+  line-height: 1.7;
+  color: var(--ark-ink);
+}
+.help-content th {
+  background: var(--ark-paper-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: .08em;
+  white-space: nowrap;
+}
+
+/* 重要警示:琥珀恒亮底 + 固定墨字(与 .banner-warn 同视觉语言) */
+.help-warn {
+  margin: 0 0 12px;
+  padding: 9px 12px;
+  background: var(--ark-warn);
+  color: var(--ark-on-warn);
+  border-left: 4px solid var(--ark-on-warn);
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.7;
+}
+
+/* ---- 窄窗口(<900px):左右布局退化为上下,导航横向滚动 ---- */
+@media (max-width: 900px) {
+  .help-modal-card {
+    width: 94vw;
+    /* 64px = 窄屏下 overlay 上下 padding(16px×2)+ 余量 */
+    height: min(84vh, calc(100vh - 64px));
+  }
+  .help-layout { flex-direction: column; }
+  .help-nav {
+    display: flex;
+    width: 100%;
+    flex: none;
+    padding: 0;
+    border-right: none;
+    border-bottom: 1px solid var(--ark-line-soft);
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  .help-nav-item {
+    width: auto;
+    flex: none;
+    white-space: nowrap;
+    padding: 9px 12px;
+    border-left: none;
+    border-bottom: 3px solid transparent;
+  }
+  /* 窄屏激活态:下缘青条替代左缘青条 */
+  .help-nav-item.active {
+    border-left: none;
+    border-bottom-color: var(--ark-signal);
+    background: transparent;
+  }
+  .help-content { padding: 14px 16px 22px; }
+}
