@@ -73,6 +73,9 @@ pub struct ExecOutputPayload {
     pub data: String,
     /// true 表示通道已关闭(会话结束),前端据此提示并停用输入。
     pub eof: bool,
+    /// 会话结束原因(eof=true 时携带,数据帧为 None):写失败 / 远端退出码 /
+    /// 通道异常关闭,前端显示给用户,不再只给一个无声的「会话已结束」。
+    pub error: Option<String>,
 }
 
 // ===== Tauri 命令 =====
@@ -106,12 +109,28 @@ pub async fn manage_exec_start(
     let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
 
     let session_id = next_session_id();
+    log::info!(
+        "交互式终端启动: session={} container={} shell={}",
+        session_id,
+        container_id,
+        shell
+    );
 
-    // 写任务:队列字节 → 通道 stdin;队列关闭时发 EOF
+    // 写任务错误槽位:write_all 失败时记录原因,读任务退出时并入 eof 事件
+    // (写失败意味着会话已不可用,连接层随即将关闭,wait() 返回 None)
+    let write_err: std::sync::Arc<Mutex<Option<String>>> =
+        std::sync::Arc::new(Mutex::new(None));
+
+    // 写任务:队列字节 → 通道 stdin;写失败记录原因;队列关闭时发 EOF
+    let sid_w = session_id.clone();
+    let write_err_w = std::sync::Arc::clone(&write_err);
     tokio::spawn(async move {
         let mut writer = writer;
         while let Some(bytes) = write_rx.recv().await {
-            if writer.write_all(&bytes).await.is_err() {
+            if let Err(e) = writer.write_all(&bytes).await {
+                let reason = format!("写入远端失败: {}", e);
+                log::warn!("交互式终端写入失败: session={} {}", sid_w, reason);
+                *write_err_w.lock().unwrap() = Some(reason);
                 break;
             }
             let _ = writer.flush().await;
@@ -133,10 +152,16 @@ pub async fn manage_exec_start(
         });
 
     // 读任务:wait() 输出 → 事件推送;resize/stop 经 select 并发处理;
-    // 结束(远端 Close / 用户 stop)时发 eof 事件并自清理会话
+    // 结束时组装原因(用户停止 / 远端退出码 / 写失败 / 通道关闭)随 eof 事件
+    // 推给前端,并移除会话。注意 russh 0.46 客户端在收到远端 CHANNEL_CLOSE
+    // 或连接断开时并不投递 ChannelMsg::Close,而是移除内部 ChannelRef 使
+    // wait() 返回 None(client/encrypted.rs 的 CHANNEL_CLOSE 分支),故正常
+    // 的「远端进程退出」走的是 None 分支。
     let sid = session_id.clone();
     tokio::spawn(async move {
         let mut channel = channel;
+        let mut exit_status: Option<u32> = None; // 远端 ExitStatus(正常 exit / exec 失败均有)
+        let mut user_stop = false; // 用户点「停止」触发的退出(前端已自清,无需再提示)
         loop {
             tokio::select! {
                 msg = channel.wait() => match msg {
@@ -146,30 +171,57 @@ pub async fn manage_exec_start(
                             session_id: sid.clone(),
                             data: String::from_utf8_lossy(data).into_owned(),
                             eof: false,
+                            error: None,
                         };
                         let _ = app.emit(EXEC_EVENT, payload);
                     }
-                    Some(russh::ChannelMsg::ExitStatus { .. })
-                    | Some(russh::ChannelMsg::Eof)
-                    | Some(russh::ChannelMsg::Success) => {
-                        // Eof:远端不再输出但通道可能仍收尾;ExitStatus/Success:忽略
+                    Some(russh::ChannelMsg::ExitStatus { exit_status: code }) => {
+                        exit_status = Some(code);
                     }
-                    Some(russh::ChannelMsg::Close) | None => break,
+                    Some(russh::ChannelMsg::Eof)
+                    | Some(russh::ChannelMsg::Success) => {
+                        // Eof:远端不再输出但通道可能仍收尾;Success:忽略
+                    }
+                    Some(russh::ChannelMsg::Close) => break,
+                    None => break,
                     _ => {}
                 },
                 Some((cols, rows)) = resize_rx.recv() => {
                     let _ = channel.window_change(cols, rows, 0, 0).await;
                 }
                 _ = stop_rx.recv() => {
+                    user_stop = true;
                     let _ = channel.close().await;
                     break;
                 }
             }
         }
-        // 通道关闭:通知前端会话结束并移除会话
+        // 会话结束原因:写任务失败 > 远端退出码 > 通道异常关闭;用户主动停止不提示
+        let reason = if user_stop {
+            None
+        } else if let Some(err) = write_err.lock().unwrap().clone() {
+            Some(format!("终端输入通道异常({})", err))
+        } else if let Some(code) = exit_status {
+            if code == 127 {
+                Some(format!(
+                    "远端命令未找到(容器内可能没有 {},可在 Shell 下拉框切换为 sh 后重试)",
+                    shell
+                ))
+            } else {
+                Some(format!("远端进程已退出 (退出码 {})", code))
+            }
+        } else {
+            Some("SSH 通道已关闭(网络中断或远端关闭了会话)".to_string())
+        };
+        log::info!(
+            "交互式终端结束: session={} 原因={}",
+            sid,
+            reason.as_deref().unwrap_or("用户主动关闭")
+        );
+        // 通道关闭:通知前端会话结束(带原因)并移除会话
         let _ = app.emit(
             EXEC_EVENT,
-            ExecOutputPayload { session_id: sid.clone(), data: String::new(), eof: true },
+            ExecOutputPayload { session_id: sid.clone(), data: String::new(), eof: true, error: reason },
         );
         app.state::<ExecState>().sessions.lock().unwrap().remove(&sid);
     });

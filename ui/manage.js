@@ -1699,7 +1699,7 @@
   // ===== C 阶段独立状态(不触碰上方 state 对象) =====
   var cState = {
     stacks: [],
-    mon: { running: false, unlisten: null },
+    mon: { running: false, unlisten: null, errShown: false },
     exec: {
       sessionId: null, unlisten: null, containerId: null, name: '',
       lines: [], cur: '', curIdx: 0, eof: false, pend: '',
@@ -1970,6 +1970,7 @@
     var ivSel = $('monitor-interval-select');
     var intervalSecs = ivSel ? (parseInt(ivSel.value, 10) || 2) : 2;
     hideMonitorError();
+    cState.mon.errShown = false;
 
     AppBus.invoke('manage_stats_start', {
       serverId: state.serverId,
@@ -2035,13 +2036,26 @@
     if (payload.server_id && state.serverId && payload.server_id !== state.serverId) return;
     if (payload.error) {
       // 仅在后端已自行终止(权限拒绝/连续连接失败,payload.stopped=true)时
-      // 停止本地监控;普通单轮失败后端会继续轮询,前端只提示不打断
+      // 停止本地监控;普通单轮失败后端会继续轮询,前端只提示不打断。
+      // 每轮失败都有 banner;首轮失败再加 toast 强化提醒(避免用户没注意
+      // banner 误以为「只刷了一次就停了」),同一失败段内不重复弹。
       showMonitorError(String(payload.error), !!payload.stopped);
+      if (!cState.mon.errShown) {
+        cState.mon.errShown = true;
+        toast('监控数据异常: ' + String(payload.error), 'warn');
+      }
       if (payload.stopped) monitorStop(true);
       return;
     }
     hideMonitorError();
+    cState.mon.errShown = false;
     renderStats(payload.stats || []);
+    // 徽章带上最后更新时间:帧是否还在持续到达一目了然
+    // (docker stats 采集本身可能每轮 2~10s 以上,慢不等于停)
+    var badge = $('monitor-badge');
+    if (badge && cState.mon.running) {
+      fillBadge(badge, 'running', '监控中 · ' + new Date().toTimeString().slice(0, 8));
+    }
   }
 
   function renderStats(list) {
@@ -2252,7 +2266,13 @@
     if (payload.session_id !== cState.exec.sessionId) return;
     if (payload.data) termWrite(String(payload.data));
     if (payload.eof) {
-      termAppendLine('[会话已结束]');
+      // 后端附带结束原因(写失败/远端退出码/通道关闭);用户主动关闭不带原因
+      if (payload.error) {
+        termAppendLine('[会话已结束: ' + String(payload.error) + ']');
+        toast('终端会话结束: ' + String(payload.error), 'warn');
+      } else {
+        termAppendLine('[会话已结束]');
+      }
       cState.exec.eof = true;
       // eof 后释放会话与监听,避免泄漏
       releaseExecListener();
