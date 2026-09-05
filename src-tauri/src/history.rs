@@ -12,6 +12,8 @@ use std::path::PathBuf;
 pub const MODE_SINGLE: &str = "single";
 /// 部署模式:compose 整栈部署。
 pub const MODE_STACK: &str = "stack";
+/// 部署模式:回滚(整栈回滚到历史 release / 单镜像回滚到历史标签)。
+pub const MODE_ROLLBACK: &str = "rollback";
 
 /// 历史记录上限:超过后从最旧开始裁剪。
 const MAX_RECORDS: usize = 200;
@@ -32,6 +34,10 @@ pub struct DeployRecord {
     pub message: String,
     /// 部署耗时(整秒)
     pub duration_secs: u64,
+    /// 整栈部署成功时的远端发布目录完整路径(`releases/<时间戳>`,供回滚定位);
+    /// 单镜像部署 / 失败记录为 `None`。旧记录文件缺该字段时按 `None` 反序列化。
+    #[serde(default)]
+    pub release_dir: Option<String>,
 }
 
 impl DeployRecord {
@@ -52,6 +58,7 @@ impl DeployRecord {
             success: false,
             message: String::new(),
             duration_secs: 0,
+            release_dir: None,
         }
     }
 }
@@ -142,6 +149,7 @@ mod tests {
             success: true,
             message: "部署完成".into(),
             duration_secs: idx as u64,
+            release_dir: None,
         }
     }
 
@@ -233,8 +241,25 @@ mod tests {
         assert!(!sk.success);
         assert_eq!(sk.message, "");
         assert_eq!(sk.duration_secs, 0);
+        assert_eq!(sk.release_dir, None);
         // ts 为本地时间 %F %T 格式
         let today = chrono::Local::now().format("%F").to_string();
         assert!(sk.ts.starts_with(&today), "ts 应为本地日期开头: {}", sk.ts);
+    }
+
+    #[test]
+    fn test_release_dir_roundtrip_and_legacy_record() {
+        with_isolated_dir(|_| {
+            // 整栈成功记录带 release_dir,完整往返
+            let mut r = record(1);
+            r.mode = MODE_STACK.into();
+            r.release_dir = Some("/opt/app/releases/20260905-101010".into());
+            append_record(r.clone());
+            assert_eq!(load_history(), vec![r]);
+            // 旧版本记录(无 release_dir 字段)→ serde(default) 补 None,不报损坏
+            let legacy = r#"{"ts":"2026-01-01 00:00:00","mode":"stack","server_name":"s","project_name":"p","images":["a:1"],"success":true,"message":"部署完成","duration_secs":1}"#;
+            let parsed: DeployRecord = serde_json::from_str(legacy).unwrap();
+            assert_eq!(parsed.release_dir, None);
+        });
     }
 }

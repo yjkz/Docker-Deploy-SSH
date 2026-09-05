@@ -30,6 +30,15 @@
 //! 部署流程):建连后对比本地 compose 解析结果与远端实际状态(远端镜像 ID +
 //! compose 项目现存容器),逐服务分类为 重建/新建/不变/拉取/缺失;纯只读,
 //! 不落盘、不改远端状态。
+//!
+//! 智能传输(`skip_unchanged` / `force_archive`):打包前建连对比本地与远端
+//! 同标签镜像 ID(`same_image_id` 口径),未变化的服务跳过传输或仅打包留档;
+//! 整栈成功时向 release 目录写入 `manifest.json` 与 compose 副本存档。
+//!
+//! 一键回滚(`rollback_*` 命令):整栈回滚 = 逐包 `docker load` 历史 release,
+//! 恢复 compose 副本后 `compose up -d`;单镜像回滚 = `docker tag` 把目标
+//! 引用指回历史标签后 `compose up -d`。复用 deploy-log / deploy-done 事件体系,
+//! 成功后落一条 `mode = "rollback"` 的部署历史。
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -41,6 +50,8 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -49,10 +60,12 @@ use crate::config::{
     TransferMode,
 };
 use crate::crypto::dpapi_unprotect;
-use crate::history::{append_record, load_history, DeployRecord, MODE_SINGLE, MODE_STACK};
 use crate::docker::{
-    check_host, image_exists, image_size, make_deploy_tag, save_gzip, start_daemon, tag_image,
-    HostCheckReport, ImageInfo,
+    check_host, image_exists, image_id_by_ref, image_size, make_deploy_tag, save_gzip,
+    start_daemon, tag_image, HostCheckReport, ImageInfo,
+};
+use crate::history::{
+    append_record, load_history, DeployRecord, MODE_ROLLBACK, MODE_SINGLE, MODE_STACK,
 };
 use crate::ssh::{
     check_server_env, exec_collect, mkdir_p_cmd, ServerCheckReport, SshClient, INSTALL_DOCKER_CMD,
@@ -90,8 +103,18 @@ const HEALTH_PS_TIMEOUT_SECS: u64 = 60;
 const PULL_OUTPUT_TAIL_LINES: usize = 10;
 /// 部署完成 webhook 通知的 HTTP 超时(秒)。
 const WEBHOOK_TIMEOUT_SECS: u64 = 10;
-/// 整栈部署预览:远端查询镜像列表的命令(JSON 输出,每行一条)。
+/// 整栈部署预览:远端查询镜像列表的命令(JSON 输出,每行一条;ID 为 12 位
+/// 截断口径,与预览本地侧 `list_images` 的 ID 口径一致,**不要单独加
+/// `--no-trunc`**,否则破坏预览两侧同口径对比)。
 const REMOTE_IMAGES_CMD: &str = "docker images --format '{{json .}}'";
+/// 智能传输跳过判定:远端查询镜像列表的命令(`--no-trunc` 输出完整 64 位 ID,
+/// 含 `sha256:` 前缀)。
+///
+/// 仅用于部署跳过判定的数据源 [`query_remote_image_id_map`]:本地侧
+/// [`crate::docker::image_id_by_ref`] 返回完整 64 位 ID,远端必须同为完整口径,
+/// [`same_image_id`] 才能正确判定相等(12 位截断 ID 与完整 ID 永不相等,
+/// 会导致跳过逻辑永不触发)。
+const REMOTE_IMAGES_CMD_FULL: &str = "docker images --no-trunc --format '{{json .}}'";
 
 /// 部署运行状态:`cancel_deploy` 置位 `cancelled`,
 /// 部署管线在各步骤之间以及 exec 输出行回调中检查后中止。
@@ -130,6 +153,10 @@ pub struct DeployRequest {
     pub use_date_tag: bool,
     /// 前端临时输入的 SSH 密码(密码认证时优先于已保存的密文)
     pub password_plain: Option<String>,
+    /// 智能传输:本地与远端同标签镜像 ID 一致时跳过导出/上传/装载
+    /// (仅 `use_date_tag = false` 时生效,日期标签是全新 tag 必然有变化;
+    /// 缺省 = false,向后兼容)
+    pub skip_unchanged: Option<bool>,
 }
 
 /// `deploy_stack` 命令的请求参数(整栈部署)。
@@ -141,6 +168,12 @@ pub struct StackDeployRequest {
     pub services: Vec<StackServiceChoice>,
     /// 前端临时输入的 SSH 密码(密码认证时优先于已保存的密文)
     pub password_plain: Option<String>,
+    /// 智能传输:未变化(远端同标签且镜像 ID 一致)的服务跳过打包/上传/装载
+    /// (缺省 = false,向后兼容)
+    pub skip_unchanged: Option<bool>,
+    /// 智能传输的强制留档:未变化的服务仍打包上传进 release 目录(供回滚
+    /// `docker load`),仅跳过装载步骤(缺省 = false,向后兼容)
+    pub force_archive: Option<bool>,
 }
 
 /// 整栈部署中单个 compose 服务的传输分类。
@@ -817,6 +850,10 @@ async fn run_deploy(
 
 /// 部署管线主体(严格顺序,任一步失败即中止)。`record` 为组装中的部署历史
 /// 记录,随步骤推进回填服务器/项目名称与实际部署的镜像引用。
+///
+/// 智能传输(`skip_unchanged`,仅 `use_date_tag = false` 生效):对比本地与
+/// 远端同标签镜像 ID,一致时跳过步骤 2/3 的导出上传与步骤 5 的装载,
+/// compose up 照常执行。
 async fn run_deploy_steps(
     app: &AppHandle,
     req: DeployRequest,
@@ -860,36 +897,86 @@ async fn run_deploy_steps(
     // 历史记录登记实际部署的镜像引用(勾选日期标签时为生成的部署标签)
     record.images = vec![image_ref.clone()];
 
-    // ---- 步骤 2:导出压缩 ----
-    emit_progress(app, 2, 5, "导出压缩镜像");
-    ensure_not_cancelled(app)?;
-    let tar_name = format!("{}.tar.gz", uuid::Uuid::new_v4());
-    let out_path = std::env::temp_dir().join(&tar_name);
-    // 本地 tar 用完即删:Drop guard 覆盖成功/失败全部路径
-    let _tar_guard = TempFileGuard(out_path.clone());
-
-    // 空间预检:导出目标盘(临时目录所在盘)剩余空间 ≥ 镜像大小 × 1.5
-    // (镜像大小暂存,供步骤 3 的远端磁盘预检复用,避免二次查询)
-    let image_bytes = image_size(&image_ref);
-    match image_bytes {
-        Some(size) => check_export_disk_space(size)?,
-        None => emit_log(app, "警告:无法获取镜像大小,跳过磁盘剩余空间检查"),
+    // ---- 智能传输判定(仅 use_date_tag = false 生效)----
+    // 日期标签每次部署都生成全新 tag,远端必然没有同 tag 镜像,检测无意义;
+    // 对比口径与整栈一致:远端同标签镜像 ID == 本地镜像 ID(见 [`same_image_id`])。
+    let mut skip_transfer = false;
+    // 判定"未变化"时保住对比阶段的连接,步骤 3 直接复用(不再重连);
+    // 判定"有变化"则丢弃,维持原有「先导出、后建连上传」的时序
+    let mut probe: Option<SshClient> = None;
+    if req.skip_unchanged.unwrap_or(false) {
+        if req.use_date_tag {
+            emit_log(app, "使用日期标签部署,每次均为全新 tag,跳过未变化检测");
+        } else {
+            ensure_not_cancelled(app)?;
+            emit_log(app, "智能传输:正在对比本地与远端镜像 ID…");
+            let mut probe_client = SshClient::connect(&server, password.as_deref()).await?;
+            let remote_ids = query_remote_image_id_map(&mut probe_client).await?;
+            let (repo, tag) = split_image_ref(&image_ref);
+            let full_ref = format!("{}:{}", repo, tag);
+            if let (Some(remote_id), Ok(Some(local_id))) = (
+                remote_ids.get(&full_ref),
+                image_id_by_ref(&image_ref).await,
+            ) {
+                if same_image_id(remote_id, &local_id) {
+                    skip_transfer = true;
+                    emit_log(app, &format!("未变化,跳过导出与上传: {}", image_ref));
+                }
+            }
+            if skip_transfer {
+                probe = Some(probe_client);
+            }
+        }
     }
 
-    let total_bytes = export_image(app, &image_ref, &out_path).await?;
-    emit_log(app, &format!("导出完成,共 {} MB", total_bytes / 1024 / 1024));
+    // ---- 步骤 2:导出压缩(镜像未变化时整步跳过)----
+    // `packed` 为 `None` 表示跳过传输:不产生本地 tar,也没有装载步骤
+    let packed: Option<(String, PathBuf, TempFileGuard, Option<u64>)> = if skip_transfer {
+        emit_progress(app, 2, 5, "跳过导出(镜像未变化)");
+        emit_log(app, "镜像与远端一致,跳过导出压缩");
+        None
+    } else {
+        emit_progress(app, 2, 5, "导出压缩镜像");
+        ensure_not_cancelled(app)?;
+        let tar_name = format!("{}.tar.gz", uuid::Uuid::new_v4());
+        let out_path = std::env::temp_dir().join(&tar_name);
+        // 本地 tar 用完即删:Drop guard 覆盖成功/失败全部路径
+        let guard = TempFileGuard(out_path.clone());
 
-    // ---- 步骤 3:上传镜像 ----
-    emit_progress(app, 3, 5, "上传镜像到服务器");
-    ensure_not_cancelled(app)?;
-    let mut client = SshClient::connect(&server, password.as_deref()).await?;
-    // 远端磁盘预检:上传前确认 Docker 根目录所在盘剩余空间 ≥ 镜像大小 × 1.5
-    // (镜像大小未知 → 告警跳过;不足 → 中文报错中止)
-    let need_bytes = image_bytes.map(|size| (size as f64 * 1.5) as u64);
-    remote_disk_precheck(app, &mut client, need_bytes).await?;
-    // 镜像包同名即同内容(uuid 命名),启用断点续传
-    upload_tar(app, &mut client, &out_path, &tar_name).await?;
-    emit_log(app, "镜像上传完成");
+        // 空间预检:导出目标盘(临时目录所在盘)剩余空间 ≥ 镜像大小 × 1.5
+        // (镜像大小暂存,供步骤 3 的远端磁盘预检复用,避免二次查询)
+        let image_bytes = image_size(&image_ref);
+        match image_bytes {
+            Some(size) => check_export_disk_space(size)?,
+            None => emit_log(app, "警告:无法获取镜像大小,跳过磁盘剩余空间检查"),
+        }
+
+        let total_bytes = export_image(app, &image_ref, &out_path).await?;
+        emit_log(app, &format!("导出完成,共 {} MB", total_bytes / 1024 / 1024));
+        Some((tar_name, out_path, guard, image_bytes))
+    };
+
+    // ---- 步骤 3:上传镜像(镜像未变化时跳过)----
+    let mut client = if skip_transfer {
+        emit_progress(app, 3, 5, "跳过上传(镜像未变化)");
+        emit_log(app, "镜像与远端一致,跳过上传");
+        probe.take().expect("镜像未变化路径必然持有对比阶段连接")
+    } else {
+        emit_progress(app, 3, 5, "上传镜像到服务器");
+        ensure_not_cancelled(app)?;
+        let (tar_name, out_path, _, image_bytes) = packed
+            .as_ref()
+            .expect("未跳过传输时导出产物必然存在");
+        let mut client = SshClient::connect(&server, password.as_deref()).await?;
+        // 远端磁盘预检:上传前确认 Docker 根目录所在盘剩余空间 ≥ 镜像大小 × 1.5
+        // (镜像大小未知 → 告警跳过;不足 → 中文报错中止)
+        let need_bytes = image_bytes.map(|size| (size as f64 * 1.5) as u64);
+        remote_disk_precheck(app, &mut client, need_bytes).await?;
+        // 镜像包同名即同内容(uuid 命名),启用断点续传
+        upload_tar(app, &mut client, out_path, tar_name).await?;
+        emit_log(app, "镜像上传完成");
+        client
+    };
 
     // ---- 步骤 4:同步文件 ----
     emit_progress(app, 4, 5, "同步项目文件");
@@ -918,7 +1005,8 @@ async fn run_deploy_steps(
         &project,
         &single_compose.remote_file,
         &single_compose.override_names,
-        &tar_name,
+        // 智能传输判定未变化时无本地包 → 跳过 docker load(远端已是该镜像)
+        packed.as_ref().map(|(tar_name, _, _, _)| tar_name.as_str()),
         retag,
     )
     .await?;
@@ -1167,10 +1255,11 @@ fn is_windows_absolute_path(path: &str) -> bool {
 /// 步骤 5:服务器部署 —— `docker load` → 同步原标签 → `compose up -d` → 健康检查 → 部署后钩子 → 删除远端 tar。
 ///
 /// 每条命令超时 600 秒(清理 60 秒),输出实时转发到 `deploy-log`,收到输出行时检查取消标志。
+/// `tar_name` 为 `None`(智能传输判定镜像未变化,无本地包)时跳过装载与 tar
+/// 清理 —— 远端已是同 tag 同 ID 的镜像,compose up 即可完成回退。
 /// `retag` 为 `Some((日期tag, 原引用))` 时,装载后把原引用(如 myapp:latest)也指向
 /// 新镜像,否则 compose 引用原 tag 时感知不到变化、不会重建容器。
-/// up 之后先做健康检查(未启用则跳过),再执行部署后钩子(失败仅告警),
-/// 最后清理远端 tar。
+/// up 之后先做健康检查(未启用则跳过),再执行部署后钩子(失败仅告警)。
 async fn server_deploy(
     app: &AppHandle,
     client: &mut SshClient,
@@ -1178,15 +1267,19 @@ async fn server_deploy(
     project: &ProjectConfig,
     remote_compose: &str,
     override_names: &[String],
-    tar_name: &str,
+    tar_name: Option<&str>,
     retag: Option<(String, String)>,
 ) -> Result<(), String> {
-    let remote_tar = remote_join("/tmp", tar_name);
-
-    // 5.1 加载镜像
-    emit_log(app, &format!("加载镜像到服务器: docker load -i {}", remote_tar));
-    let load_cmd = format!("docker load -i {}", shell_single_quote(&remote_tar));
-    exec_forwarded(app, client, &load_cmd, 600).await?;
+    // 5.1 加载镜像(镜像未变化时跳过:ID 已在远端,无需 load)
+    match tar_name {
+        Some(tar_name) => {
+            let remote_tar = remote_join("/tmp", tar_name);
+            emit_log(app, &format!("加载镜像到服务器: docker load -i {}", remote_tar));
+            let load_cmd = format!("docker load -i {}", shell_single_quote(&remote_tar));
+            exec_forwarded(app, client, &load_cmd, 600).await?;
+        }
+        None => emit_log(app, "镜像与远端一致,跳过 docker load(远端已是该镜像)"),
+    }
 
     // 5.2 同步原标签(仅勾选日期标签时):零拷贝的指针移动,让 compose 的变更检测生效
     if let Some((date_tag, original)) = &retag {
@@ -1224,10 +1317,13 @@ async fn server_deploy(
     // 5.5 部署后钩子(健康检查通过后执行;失败仅告警,不影响部署结果)
     run_hook(app, client, project, HookKind::Post, &server.remote_dir).await?;
 
-    // 5.6 清理远端 tar(尽力而为,失败不影响部署结果)
-    let rm_cmd = format!("rm -f {}", shell_single_quote(&remote_tar));
-    if let Err(e) = exec_forwarded(app, client, &rm_cmd, 60).await {
-        emit_log(app, &format!("警告:清理远端临时文件失败: {}", e));
+    // 5.6 清理远端 tar(尽力而为,失败不影响部署结果;未装载时无 tar 可清理)
+    if let Some(tar_name) = tar_name {
+        let remote_tar = remote_join("/tmp", tar_name);
+        let rm_cmd = format!("rm -f {}", shell_single_quote(&remote_tar));
+        if let Err(e) = exec_forwarded(app, client, &rm_cmd, 60).await {
+            emit_log(app, &format!("警告:清理远端临时文件失败: {}", e));
+        }
     }
     Ok(())
 }
@@ -1562,6 +1658,38 @@ async fn remote_disk_precheck(
     Ok(())
 }
 
+// ===== 智能传输(跳过未变化镜像)=====
+
+/// 智能传输:查询远端镜像列表并构建 `repo:tag` → 镜像 ID 映射。
+///
+/// 使用 [`REMOTE_IMAGES_CMD_FULL`](完整 64 位 ID 口径,与本地
+/// [`crate::docker::image_id_by_ref`] 同口径,跳过判定 [`same_image_id`] 才能
+/// 相等;预览走 [`REMOTE_IMAGES_CMD`] 的 12 位截断口径,两侧独立);
+/// 行解析复用 [`parse_image_lines`](单行解析失败仅告警跳过);退出码非 0
+/// (远端 Docker 不可用等)以中文错误返回,由调用方决定中止或降级。
+/// 单镜像 / 整栈两条部署管线共用的对比数据源。
+async fn query_remote_image_id_map(
+    client: &mut SshClient,
+) -> Result<HashMap<String, String>, String> {
+    let (code, out) = with_timeout(
+        SSH_EXEC_TIMEOUT_SECS,
+        "查询远端镜像超时",
+        "请检查服务器网络后重试",
+        exec_collect(client, REMOTE_IMAGES_CMD_FULL),
+    )
+    .await?;
+    if code != 0 {
+        return Err(format!(
+            "查询远端镜像列表失败(退出码 {}),请确认服务器 Docker 可用",
+            code
+        ));
+    }
+    Ok(parse_image_lines(&out)
+        .into_iter()
+        .map(|i| (format!("{}:{}", i.repository, i.tag), i.id))
+        .collect())
+}
+
 // ===== 整栈部署管线(六步,任一步失败即中止)=====
 
 /// 整栈部署管线入口:组装部署历史记录骨架(含开始计时),执行管线主体,
@@ -1637,10 +1765,83 @@ async fn run_deploy_stack_steps(
         ),
     );
 
+    // ---- 智能传输:对比本地/远端同标签镜像 ID,标记未变化的 Local 服务 ----
+    // 行为矩阵(skip_unchanged × force_archive,均缺省 false):
+    // - 未启用:全部 Local 服务正常打包/上传/装载(与旧版本一致);
+    // - skip=true, force=false:未变化服务从打包/上传/装载全链路剔除;
+    // - skip=true, force=true:未变化服务仍打包上传留档(供回滚 load),
+    //   仅跳过装载(其镜像 ID 已在远端)。
+    let skip_unchanged = req.skip_unchanged.unwrap_or(false);
+    let force_archive = req.force_archive.unwrap_or(false);
+    let smart_transfer = skip_unchanged || force_archive;
+    let mut unchanged: Vec<bool> = vec![false; local_choices.len()];
+    if smart_transfer && !local_choices.is_empty() {
+        // 专用建连完成对比(用后即断,不占用打包阶段;与 deploy 的建连口径一致)
+        emit_log(app, "智能传输:正在对比本地与远端镜像 ID…");
+        let (_server, mut probe) =
+            connect_server(&req.server_id, req.password_plain.as_deref()).await?;
+        let remote_ids = query_remote_image_id_map(&mut probe).await?;
+        for (i, svc) in local_choices.iter().enumerate() {
+            let (repo, tag) = split_image_ref(&svc.image);
+            let full_ref = format!("{}:{}", repo, tag);
+            let (Some(remote_id), Ok(Some(local_id))) = (
+                remote_ids.get(&full_ref),
+                image_id_by_ref(&svc.image).await,
+            ) else {
+                continue;
+            };
+            if same_image_id(remote_id, &local_id) {
+                unchanged[i] = true;
+                if force_archive {
+                    emit_log(app, &format!("未变化,打包留档(跳过装载): {}", svc.image));
+                } else {
+                    emit_log(app, &format!("未变化,跳过传输: {}", svc.image));
+                }
+            }
+        }
+    }
+
+    // 打包列表:skip 且非 force 时剔除未变化服务;其余情况保持全部 Local。
+    // `pack_unchanged` 与打包列表按下标对齐,供装载步骤跳过留档的未变化镜像。
+    let pack_list: Vec<&StackServiceChoice> = local_choices
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| force_archive || !unchanged[*i])
+        .map(|(_, s)| *s)
+        .collect();
+    let pack_unchanged: Vec<bool> = pack_list
+        .iter()
+        .map(|s| {
+            local_choices
+                .iter()
+                .position(|c| c.service == s.service)
+                .map(|i| unchanged[i])
+                .unwrap_or(false)
+        })
+        .collect();
+
     // ---- 步骤 2:打包 ----
     emit_progress(app, 2, 6, "打包");
     ensure_not_cancelled(app)?;
-    let tars = pack_local_images(app, &local_choices).await?;
+    let tars = if pack_list.is_empty() {
+        if local_choices.is_empty() {
+            emit_log(app, "所有服务均由服务器拉取镜像,跳过本地打包");
+        } else {
+            emit_log(app, "全部本地镜像均未变化,跳过打包与传输");
+        }
+        LocalTars {
+            files: Vec::new(),
+            _guards: Vec::new(),
+        }
+    } else {
+        pack_local_images(app, &pack_list).await?
+    };
+
+    // manifest 镜像条目(整栈成功收尾写入 manifest.json):逐个 Local 服务一条,
+    // 被跳过传输(未留档)的服务 file = null,其余按打包顺序携带镜像包文件名
+    let skip_flags: Vec<bool> = unchanged.iter().map(|u| *u && !force_archive).collect();
+    let packed_files: Vec<String> = tars.files.iter().map(|(_, n)| n.clone()).collect();
+    let manifest_images = build_manifest_images(&local_choices, &skip_flags, &packed_files);
 
     // ---- 步骤 3:上传 ----
     emit_progress(app, 3, 6, "上传");
@@ -1702,6 +1903,11 @@ async fn run_deploy_stack_steps(
     }
     for (i, (_, name)) in tars.files.iter().enumerate() {
         ensure_not_cancelled(app)?;
+        // force_archive 留档的未变化镜像:ID 已在远端,仅归档进 release 目录,不装载
+        if pack_unchanged[i] {
+            emit_log(app, &format!("镜像未变化,跳过装载(仅留档): {}", name));
+            continue;
+        }
         let remote_tar = remote_join(&release_dir, name);
         emit_log(
             app,
@@ -1775,7 +1981,14 @@ async fn run_deploy_stack_steps(
     // 部署后钩子(健康检查通过后执行;失败仅告警,不影响部署结果)
     run_hook(app, &mut client, &project, HookKind::Post, &server.remote_dir).await?;
 
-    // ---- 收尾:清理旧 releases(仅留最新 5 个,尽力而为,失败仅告警)----
+    // ---- 收尾:向发布目录写入回滚资料(manifest.json + compose 副本)----
+    // 尽力而为:失败仅告警(缺 manifest/副本时回滚命令会优雅降级),不推翻
+    // 已成功的部署结果;须在清理旧 releases 之前写入,避免目录先被清掉
+    ensure_not_cancelled(app)?;
+    let manifest = ReleaseManifest::new(project.name.clone(), ts.clone(), manifest_images);
+    write_release_artifacts(app, &mut client, &project, &release_dir, &manifest).await;
+
+    // ---- 清理旧 releases(仅留最新 5 个,尽力而为,失败仅告警)----
     ensure_not_cancelled(app)?;
     let cleanup_cmd = cleanup_releases_cmd(&server.remote_dir);
     if let Err(e) = exec_forwarded(app, &mut client, &cleanup_cmd, SSH_EXEC_TIMEOUT_SECS).await {
@@ -1783,6 +1996,8 @@ async fn run_deploy_stack_steps(
     }
 
     // 本地 tar 由 tars 的 TempFileGuard 在本函数返回(成功/失败)时统一删除
+    // 整栈成功:登记本次发布目录,供前端一键回滚定位
+    record.release_dir = Some(release_dir.clone());
     emit_log(app, "整栈部署完成");
     Ok(())
 }
@@ -2468,6 +2683,711 @@ fn parse_container_line(line: &str) -> Option<(String, String)> {
     }
     let image = v.get("Image")?.as_str()?.to_string();
     Some((service, image))
+}
+
+// ===== 发布清单(manifest.json,智能传输收尾写入,供一键回滚)=====
+
+/// manifest.json 中单个服务的镜像条目。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestImage {
+    /// compose 服务名
+    pub service: String,
+    /// 镜像引用(`repo:tag`;`docker load` 会恢复包内镜像的原引用)
+    pub tag: String,
+    /// 发布目录内的镜像包文件名;未打包(跳过传输)为 `null`
+    pub file: Option<String>,
+}
+
+/// 整栈部署成功时写入发布目录的 `manifest.json` 结构(回滚列表页据此展示
+/// 各 release 包含的服务;`docker-compose.yml` 副本随清单一并归档)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseManifest {
+    pub project: String,
+    /// 发布时间戳(即 release 目录名,形如 20260905-101010)
+    pub ts: String,
+    pub compose_copy: String,
+    pub images: Vec<ManifestImage>,
+}
+
+impl ReleaseManifest {
+    /// `compose_copy` 固定为发布目录内的归档文件名。
+    pub fn new(project: String, ts: String, images: Vec<ManifestImage>) -> Self {
+        Self {
+            project,
+            ts,
+            compose_copy: "docker-compose.yml".to_string(),
+            images,
+        }
+    }
+}
+
+/// 组装 manifest 的镜像条目(纯函数,便于单测):逐个 Local 服务一条;
+/// `skip[i] == true` 表示该服务未打包(skip_unchanged 剔除且未留档),
+/// `file` 记 `None`,其余按顺序消费 `packed_files` 中的镜像包文件名。
+/// `tag` 存完整镜像引用(无标签时按 Docker 约定补 latest,见 [`split_image_ref`])。
+fn build_manifest_images(
+    local: &[&StackServiceChoice],
+    skip: &[bool],
+    packed_files: &[String],
+) -> Vec<ManifestImage> {
+    let mut files = packed_files.iter();
+    local
+        .iter()
+        .enumerate()
+        .map(|(i, svc)| {
+            let (repo, tag) = split_image_ref(&svc.image);
+            let file = if skip.get(i).copied().unwrap_or(false) {
+                None
+            } else {
+                files.next().cloned()
+            };
+            ManifestImage {
+                service: svc.service.clone(),
+                tag: format!("{}:{}", repo, tag),
+                file,
+            }
+        })
+        .collect()
+}
+
+/// 整栈部署收尾子步:向发布目录写入回滚资料 —— compose 副本(sftp 上传,
+/// 归档名 `docker-compose.yml`,内容即本次部署使用的本地副本)与
+/// `manifest.json`(base64 经远端 exec 解码写入,避免 JSON 引号/换行的
+/// shell 转义问题)。
+///
+/// 尽力而为:任一失败仅告警 —— 发布目录缺 manifest/副本时,回滚命令会优雅
+/// 降级(服务列表为空、沿用服务器现有 compose 文件),不推翻已成功的部署。
+async fn write_release_artifacts(
+    app: &AppHandle,
+    client: &mut SshClient,
+    project: &ProjectConfig,
+    release_dir: &str,
+    manifest: &ReleaseManifest,
+) {
+    // 1) compose 副本(部署前置已校验本地副本存在,直接复用)
+    let compose_local = PathBuf::from(&project.compose_file);
+    let archived = client
+        .sftp_upload(&compose_local, release_dir, "docker-compose.yml", false, &|_, _| {})
+        .await;
+    match archived {
+        Ok(()) => emit_log(app, "已存档 compose 副本到发布目录"),
+        Err(e) => emit_log(
+            app,
+            &format!(
+                "警告:存档 compose 副本失败(回滚时将沿用服务器现有 compose 文件): {}",
+                e
+            ),
+        ),
+    }
+
+    // 2) manifest.json:echo <b64> | base64 -d > '<release_dir>/manifest.json'
+    let json = match serde_json::to_string(manifest) {
+        Ok(j) => j,
+        Err(e) => {
+            emit_log(app, &format!("警告:序列化 manifest.json 失败: {}", e));
+            return;
+        }
+    };
+    let manifest_path = remote_join(release_dir, "manifest.json");
+    let cmd = format!(
+        "echo {} | base64 -d > {}",
+        BASE64_STANDARD.encode(json.as_bytes()),
+        shell_single_quote(&manifest_path)
+    );
+    let code = with_timeout(
+        SSH_EXEC_TIMEOUT_SECS,
+        "写入发布清单超时",
+        "请检查服务器网络后重试",
+        async {
+            client
+                .exec(&cmd, &mut |_| {})
+                .await
+                .map_err(|e| format!("远端写入 manifest.json 失败: {}", e))
+        },
+    )
+    .await;
+    match code {
+        Ok(0) => emit_log(app, "已写入发布清单 manifest.json"),
+        Ok(c) => emit_log(
+            app,
+            &format!("警告:写入 manifest.json 失败(退出码 {}): {}", c, manifest_path),
+        ),
+        Err(e) => emit_log(app, &format!("警告:{}", e)),
+    }
+}
+
+// ===== 一键回滚(整栈回滚到历史 release / 单镜像回滚到历史标签)=====
+
+/// `rollback_list_releases` 返回的单个历史发布条目。
+/// (Tauri 序列化为 camelCase,与前端 deploy.js 读取的 `hasManifest` /
+/// `hasComposeCopy` 字段名一致。)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseBrief {
+    /// 发布时间戳(releases 目录名,形如 20260905-101010)
+    pub ts: String,
+    /// 发布目录内的文件名列表(镜像包 + manifest.json / docker-compose.yml)
+    pub files: Vec<String>,
+    /// manifest.json 里记录的服务名列表;无清单(旧版本发布)为空
+    pub services: Vec<String>,
+    pub has_manifest: bool,
+    pub has_compose_copy: bool,
+}
+
+/// `rollback_list_tags` 返回的单个本地镜像标签条目(按创建时间倒序)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TagBrief {
+    pub tag: String,
+    /// 镜像 ID(`docker images` 的 ID 字段,含 `sha256:` 前缀原样返回)
+    pub id: String,
+    /// docker 的 CreatedAt 文本(如 `2026-08-01 10:00:00 +0800 CST`)
+    pub created: String,
+}
+
+/// 列出项目服务器上的历史发布(新 → 旧),供前端渲染一键回滚列表。
+///
+/// `releases` 目录不存在(从未整栈部署)返回空列表,不是错误;单个发布目录
+/// 缺 manifest.json / 读取失败时相应字段优雅降级(`services` 空、
+/// `has_manifest` false),不让整个列表功能失败。
+#[tauri::command]
+pub async fn rollback_list_releases(
+    server_id: String,
+    password_plain: Option<String>,
+    project_id: String,
+) -> Result<Vec<ReleaseBrief>, String> {
+    let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    let server = find_server(&cfg, &server_id)?.clone();
+    // 校验项目存在(前端按项目发起回滚;remote_dir 取自服务器配置)
+    find_project(&cfg, &project_id)?;
+    let password = resolve_password(
+        &server.auth.auth_type,
+        password_plain.as_deref(),
+        server.auth.password_enc.as_deref(),
+    )?;
+    let mut client = with_timeout(
+        SSH_CONNECT_TIMEOUT_SECS,
+        "连接超时",
+        "请检查服务器地址与网络",
+        SshClient::connect(&server, password.as_deref()),
+    )
+    .await?;
+
+    let releases_root = remote_join(&server.remote_dir, "releases");
+    let (code, out) = with_timeout(
+        SSH_EXEC_TIMEOUT_SECS,
+        "查询发布列表超时",
+        "请检查服务器网络后重试",
+        exec_collect(&mut client, &ls_dir_cmd(&releases_root)),
+    )
+    .await?;
+    if code != 0 {
+        // releases 目录不存在(从未整栈部署)→ 空列表
+        return Ok(Vec::new());
+    }
+    let mut briefs = Vec::new();
+    for ts in parse_ls_lines(&out) {
+        let dir = remote_join(&releases_root, &ts);
+        let (code, out) = with_timeout(
+            SSH_EXEC_TIMEOUT_SECS,
+            "查询发布目录超时",
+            "请检查服务器网络后重试",
+            exec_collect(&mut client, &ls_dir_cmd(&dir)),
+        )
+        .await?;
+        if code != 0 {
+            // 目录可能刚被清理或不可读,跳过该条目,不拖垮整个列表
+            log::warn!("跳过无法读取的发布目录 {} (退出码 {})", dir, code);
+            continue;
+        }
+        let files = parse_ls_lines(&out);
+        let has_manifest = files.iter().any(|f| f == "manifest.json");
+        let has_compose_copy = files.iter().any(|f| f == "docker-compose.yml");
+        let mut services = Vec::new();
+        if has_manifest {
+            let manifest_path = remote_join(&dir, "manifest.json");
+            let (code, out) = with_timeout(
+                SSH_EXEC_TIMEOUT_SECS,
+                "读取发布清单超时",
+                "请检查服务器网络后重试",
+                exec_collect(&mut client, &cat_file_cmd(&manifest_path)),
+            )
+            .await?;
+            if code == 0 {
+                if let Some(m) = parse_release_manifest(&out) {
+                    services = m.images.into_iter().map(|i| i.service).collect();
+                }
+            } else {
+                log::warn!("读取发布清单失败 ({}): 退出码 {}", manifest_path, code);
+            }
+        }
+        briefs.push(ReleaseBrief {
+            ts,
+            files,
+            services,
+            has_manifest,
+            has_compose_copy,
+        });
+    }
+    // 新 → 旧:时间戳形如 20260905-101010,字符串倒序即时间倒序
+    briefs.sort_by(|a, b| b.ts.cmp(&a.ts));
+    Ok(briefs)
+}
+
+/// 列出项目服务器上指定仓库的全部镜像标签(创建时间倒序),
+/// 供单镜像回滚选择"回到哪个历史标签"。
+#[tauri::command]
+pub async fn rollback_list_tags(
+    server_id: String,
+    password_plain: Option<String>,
+    project_id: String,
+    repository: String,
+) -> Result<Vec<TagBrief>, String> {
+    let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    find_project(&cfg, &project_id)?;
+    let (_server, mut client) = connect_server(&server_id, password_plain.as_deref()).await?;
+    let cmd = format!(
+        "docker images {} --format '{{{{json .}}}}'",
+        shell_single_quote(&repository)
+    );
+    let (code, out) = with_timeout(
+        SSH_EXEC_TIMEOUT_SECS,
+        "查询远端标签超时",
+        "请检查服务器网络后重试",
+        exec_collect(&mut client, &cmd),
+    )
+    .await?;
+    if code != 0 {
+        return Err(format!(
+            "查询远端镜像标签失败(退出码 {}),请确认服务器 Docker 可用",
+            code
+        ));
+    }
+    let mut tags: Vec<TagBrief> = parse_image_lines(&out)
+        .into_iter()
+        .map(|i| TagBrief {
+            tag: i.tag,
+            id: i.id,
+            created: i.created,
+        })
+        .collect();
+    // 创建时间倒序(docker 的 CreatedAt 文本按字典序即时间序)
+    tags.sort_by(|a, b| b.created.cmp(&a.created));
+    Ok(tags)
+}
+
+/// 整栈一键回滚:把指定历史 release 的镜像包重新 `docker load`(自动恢复
+/// 镜像原标签),恢复 compose 副本并 `compose up -d`。复用 deploy-log /
+/// deploy-done 事件体系,`deploy-done` 恰好 emit 一次;成功后落一条
+/// `mode = "rollback"` 的部署历史。
+#[tauri::command]
+pub async fn rollback_execute_stack(
+    app: AppHandle,
+    server_id: String,
+    password_plain: Option<String>,
+    project_id: String,
+    release_ts: String,
+) -> Result<(), String> {
+    finish_rollback(
+        &app,
+        rollback_execute_stack_inner(
+            &app,
+            &server_id,
+            password_plain.as_deref(),
+            &project_id,
+            &release_ts,
+        ),
+    )
+    .await
+}
+
+/// [`rollback_execute_stack`] 的管线主体:成功返回组装好的部署历史记录
+/// (由 [`finish_rollback`] 落历史),失败返回中文错误。
+async fn rollback_execute_stack_inner(
+    app: &AppHandle,
+    server_id: &str,
+    password_plain: Option<&str>,
+    project_id: &str,
+    release_ts: &str,
+) -> Result<DeployRecord, String> {
+    let started = std::time::Instant::now();
+    // 每次回滚开始时重置取消标志(与部署管线一致)
+    reset_cancelled(app);
+
+    let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    let server = find_server(&cfg, server_id)?.clone();
+    let project = find_project(&cfg, project_id)?.clone();
+    let password = resolve_password(
+        &server.auth.auth_type,
+        password_plain,
+        server.auth.password_enc.as_deref(),
+    )?;
+    let mut record = DeployRecord::new_skeleton(MODE_ROLLBACK, &server.name, &project.name, Vec::new());
+
+    emit_log(
+        app,
+        &format!(
+            "开始整栈回滚:服务器「{}」/ 项目「{}」,目标发布 {}",
+            server.name, project.name, release_ts
+        ),
+    );
+
+    let mut client = with_timeout(
+        SSH_CONNECT_TIMEOUT_SECS,
+        "连接超时",
+        "请检查服务器地址与网络",
+        SshClient::connect(&server, password.as_deref()),
+    )
+    .await?;
+
+    let release_dir = releases_dir(&server.remote_dir, release_ts);
+
+    // ---- 校验发布目录存在 ----
+    ensure_not_cancelled(app)?;
+    let (code, _) = with_timeout(
+        SSH_EXEC_TIMEOUT_SECS,
+        "校验发布目录超时",
+        "请检查服务器网络后重试",
+        exec_collect(&mut client, &test_dir_cmd(&release_dir)),
+    )
+    .await?;
+    if code != 0 {
+        return Err(format!("回滚目标发布目录不存在: {}", release_dir));
+    }
+
+    // ---- 列出发布目录内容(镜像包 + manifest.json + compose 副本)----
+    ensure_not_cancelled(app)?;
+    let (code, out) = with_timeout(
+        SSH_EXEC_TIMEOUT_SECS,
+        "查询发布目录超时",
+        "请检查服务器网络后重试",
+        exec_collect(&mut client, &ls_dir_cmd(&release_dir)),
+    )
+    .await?;
+    if code != 0 {
+        return Err(format!(
+            "查询发布目录内容失败(退出码 {}): {}",
+            code, release_dir
+        ));
+    }
+    let files = parse_ls_lines(&out);
+    let packages: Vec<String> = files
+        .iter()
+        .filter(|f| f.ends_with(".tar.gz"))
+        .cloned()
+        .collect();
+    let has_compose_copy = files.iter().any(|f| f == "docker-compose.yml");
+
+    // ---- 读 manifest(存在才解析):校验留档归属并登记镜像引用,供回滚历史展示 ----
+    if files.iter().any(|f| f == "manifest.json") {
+        let manifest_path = remote_join(&release_dir, "manifest.json");
+        let (code, out) = with_timeout(
+            SSH_EXEC_TIMEOUT_SECS,
+            "读取发布清单超时",
+            "请检查服务器网络后重试",
+            exec_collect(&mut client, &cat_file_cmd(&manifest_path)),
+        )
+        .await?;
+        if code == 0 {
+            if let Some(m) = parse_release_manifest(&out) {
+                // 留档归属校验:同服务器多项目共用 remote_dir 时,防止误回滚
+                // 对方项目的留档(manifest 在任何 docker load 之前读取,此处
+                // 中止时远端状态未被改动)
+                if m.project != project.name {
+                    return Err(format!(
+                        "留档 {} 属于项目「{}」,与当前项目「{}」不符,已中止",
+                        release_ts, m.project, project.name
+                    ));
+                }
+                record.images = m.images.into_iter().map(|i| i.tag).collect();
+            }
+        } else {
+            emit_log(app, "警告:读取发布清单失败,按无清单处理");
+        }
+    }
+
+    // ---- 逐包 docker load(load 自动恢复镜像原标签)----
+    let n = packages.len();
+    if n == 0 {
+        emit_log(app, "发布目录内无镜像包,跳过 docker load");
+    }
+    for (i, name) in packages.iter().enumerate() {
+        ensure_not_cancelled(app)?;
+        let remote_tar = remote_join(&release_dir, name);
+        emit_log(
+            app,
+            &format!(
+                "回滚装载镜像包 ({}/{}): docker load -i {}",
+                i + 1,
+                n,
+                remote_tar
+            ),
+        );
+        let load_cmd = format!("docker load -i {}", shell_single_quote(&remote_tar));
+        if let Err(e) = exec_forwarded(app, &mut client, &load_cmd, STACK_LOAD_TIMEOUT_SECS).await {
+            // 部分失败提示:中止时点之前的包已装载成功(镜像标签已恢复),
+            // 但容器尚未重建 —— 明确当前状态,避免误以为回滚未产生任何效果
+            return Err(format!(
+                "装载镜像包 {}/{} 失败:{};已装载 {}/{} 个镜像包,这些包的镜像标签已恢复,容器未重建(可排除问题后重新发起回滚)",
+                i + 1,
+                n,
+                e,
+                i,
+                n
+            ));
+        }
+    }
+
+    // ---- 恢复 compose 副本(发布目录归档了本次部署使用的 compose 文件)----
+    ensure_not_cancelled(app)?;
+    let remote_compose = remote_compose_path(&server.remote_dir);
+    if has_compose_copy {
+        let cp_cmd = format!(
+            "cp {} {}",
+            shell_single_quote(&remote_join(&release_dir, "docker-compose.yml")),
+            shell_single_quote(&remote_compose)
+        );
+        emit_log(app, &format!("恢复 compose 文件: {}", cp_cmd));
+        if let Err(e) = exec_forwarded(app, &mut client, &cp_cmd, SSH_EXEC_TIMEOUT_SECS).await {
+            // 降级继续(与"无副本沿用现有 compose"同口径):base compose 仍在
+            // 远端根目录(部署时已上传),副本恢复失败不阻断回滚语义
+            emit_log(
+                app,
+                &format!(
+                    "警告:恢复 compose 副本失败({}),沿用服务器现有 compose 文件继续回滚",
+                    e
+                ),
+            );
+        }
+    } else {
+        emit_log(app, "发布目录无 compose 副本,沿用服务器现有 compose 文件");
+    }
+
+    // ---- compose up -d(镜像标签已恢复,up 按引用重建容器)----
+    ensure_not_cancelled(app)?;
+    // override 文件名与单镜像回滚同口径:部署时 upload_compose_files 已把
+    // override 上传到远端根目录,回滚按文件名直接引用,保证 -f 文件链与
+    // 部署时 pull/up 一致(override-only 服务不逃逸)
+    let override_names = compose_override_names(&project.compose_file);
+    let up_cmd = compose_up_cmd(&server.remote_dir, &remote_compose, &override_names);
+    emit_log(app, &format!("启动服务: {}", up_cmd));
+    exec_forwarded(app, &mut client, &up_cmd, STACK_COMPOSE_TIMEOUT_SECS).await?;
+
+    emit_log(app, "整栈回滚完成");
+    record.success = true;
+    record.message = format!("回滚到 {}", release_ts);
+    record.duration_secs = started.elapsed().as_secs();
+    Ok(record)
+}
+
+/// 单镜像一键回滚:把服务器的 `repository:date_tag`(历史标签)重新指到
+/// `target_ref`(compose 引用的标签,如 myapp:latest),再 `compose up -d`。
+/// 复用 deploy-log / deploy-done 事件体系,`deploy-done` 恰好 emit 一次;
+/// 成功后落一条 `mode = "rollback"` 的部署历史。
+#[tauri::command]
+pub async fn rollback_execute_single(
+    app: AppHandle,
+    server_id: String,
+    password_plain: Option<String>,
+    project_id: String,
+    repository: String,
+    date_tag: String,
+    target_ref: String,
+) -> Result<(), String> {
+    finish_rollback(
+        &app,
+        rollback_execute_single_inner(
+            &app,
+            &server_id,
+            password_plain.as_deref(),
+            &project_id,
+            &repository,
+            &date_tag,
+            &target_ref,
+        ),
+    )
+    .await
+}
+
+/// [`rollback_execute_single`] 的管线主体:成功返回组装好的部署历史记录,
+/// 失败返回中文错误。
+async fn rollback_execute_single_inner(
+    app: &AppHandle,
+    server_id: &str,
+    password_plain: Option<&str>,
+    project_id: &str,
+    repository: &str,
+    date_tag: &str,
+    target_ref: &str,
+) -> Result<DeployRecord, String> {
+    let started = std::time::Instant::now();
+    reset_cancelled(app);
+
+    let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    let server = find_server(&cfg, server_id)?.clone();
+    let project = find_project(&cfg, project_id)?.clone();
+    let password = resolve_password(
+        &server.auth.auth_type,
+        password_plain,
+        server.auth.password_enc.as_deref(),
+    )?;
+    let mut record = DeployRecord::new_skeleton(
+        MODE_ROLLBACK,
+        &server.name,
+        &project.name,
+        vec![target_ref.to_string()],
+    );
+
+    let source = format!("{}:{}", repository, date_tag);
+    emit_log(
+        app,
+        &format!(
+            "开始镜像回滚:服务器「{}」/ 项目「{}」:{} -> {}",
+            server.name, project.name, source, target_ref
+        ),
+    );
+
+    let mut client = with_timeout(
+        SSH_CONNECT_TIMEOUT_SECS,
+        "连接超时",
+        "请检查服务器地址与网络",
+        SshClient::connect(&server, password.as_deref()),
+    )
+    .await?;
+
+    // ---- 校验历史标签存在(不存在 → 明确报错,不盲目 docker tag)----
+    ensure_not_cancelled(app)?;
+    let (code, _) = with_timeout(
+        SSH_EXEC_TIMEOUT_SECS,
+        "校验镜像超时",
+        "请检查服务器网络后重试",
+        exec_collect(&mut client, &docker_inspect_cmd(&source)),
+    )
+    .await?;
+    if code != 0 {
+        return Err(format!("服务器上不存在镜像 {},无法回滚到该标签", source));
+    }
+
+    // ---- 远端 compose 文件检查(与单镜像部署 prepare_single_compose 同口径)----
+    // 导入项目:部署时上传到远端根目录的副本;旧版手工项目:compose_file 即远端路径
+    let (compose_path, overrides) = if Path::new(&project.compose_file).is_file() {
+        (
+            remote_compose_path(&server.remote_dir),
+            compose_override_names(&project.compose_file),
+        )
+    } else if is_windows_absolute_path(&project.compose_file) {
+        return Err(format!(
+            "本地 compose 文件不存在:{};请确认路径或重新导入 compose 文件",
+            project.compose_file
+        ));
+    } else {
+        (project.compose_file.clone(), Vec::new())
+    };
+    ensure_not_cancelled(app)?;
+    let (code, _) = with_timeout(
+        SSH_EXEC_TIMEOUT_SECS,
+        "校验 compose 文件超时",
+        "请检查服务器网络后重试",
+        exec_collect(&mut client, &test_file_cmd(&compose_path)),
+    )
+    .await?;
+    if code != 0 {
+        return Err(format!(
+            "远端 compose 文件不存在:{},请先完成一次部署",
+            compose_path
+        ));
+    }
+
+    // ---- docker tag:把 compose 引用的标签重新指回历史镜像(零拷贝)----
+    ensure_not_cancelled(app)?;
+    let tag_cmd = docker_tag_cmd(&source, target_ref);
+    emit_log(app, &format!("回滚标签: {}", tag_cmd));
+    exec_forwarded(app, &mut client, &tag_cmd, SSH_EXEC_TIMEOUT_SECS).await?;
+
+    // ---- compose up -d ----
+    ensure_not_cancelled(app)?;
+    let up_cmd = compose_up_cmd(&server.remote_dir, &compose_path, &overrides);
+    emit_log(app, &format!("启动服务: {}", up_cmd));
+    exec_forwarded(app, &mut client, &up_cmd, STACK_COMPOSE_TIMEOUT_SECS).await?;
+
+    emit_log(app, "镜像回滚完成");
+    record.success = true;
+    record.message = format!("回滚到 {}", source);
+    record.duration_secs = started.elapsed().as_secs();
+    Ok(record)
+}
+
+/// 回滚命令的统一收尾:任何路径(成功/失败/panic)下 `deploy-done` 恰好
+/// emit 一次;成功后落地 `mode = "rollback"` 的部署历史记录(append 失败
+/// 仅告警,不影响回滚结果)。
+async fn finish_rollback<F>(app: &AppHandle, fut: F) -> Result<(), String>
+where
+    F: std::future::Future<Output = Result<DeployRecord, String>> + Send,
+{
+    let result = match CatchPanic::new(fut).await {
+        Ok(res) => res,
+        Err(panic_info) => {
+            log::error!("回滚管线发生 panic: {}", panic_info);
+            Err("回滚过程发生内部错误,详情见日志".to_string())
+        }
+    };
+    match result {
+        Ok(record) => {
+            let _ = app.emit(
+                "deploy-done",
+                DeployDone {
+                    success: true,
+                    message: "回滚完成".to_string(),
+                },
+            );
+            append_record(record);
+            Ok(())
+        }
+        Err(e) => {
+            emit_log(app, &format!("回滚失败: {}", e));
+            let _ = app.emit("deploy-done", DeployDone { success: false, message: e.clone() });
+            Err(e)
+        }
+    }
+}
+
+/// 拼装 `test -d '<path>'`(远端目录存在性检查,退出码 0 = 存在)。
+pub fn test_dir_cmd(path: &str) -> String {
+    format!("test -d {}", shell_single_quote(path))
+}
+
+/// 拼装 `test -f '<path>'`(远端文件存在性检查,退出码 0 = 存在)。
+pub fn test_file_cmd(path: &str) -> String {
+    format!("test -f {}", shell_single_quote(path))
+}
+
+/// 拼装 `ls -1 '<path>'`(逐行列出远端目录内容)。
+pub fn ls_dir_cmd(path: &str) -> String {
+    format!("ls -1 {}", shell_single_quote(path))
+}
+
+/// 拼装 `cat '<path>'`。
+pub fn cat_file_cmd(path: &str) -> String {
+    format!("cat {}", shell_single_quote(path))
+}
+
+/// 拼装 `docker image inspect '<ref>'`(退出码 0 = 服务器上存在该镜像引用)。
+pub fn docker_inspect_cmd(image: &str) -> String {
+    format!("docker image inspect {}", shell_single_quote(image))
+}
+
+/// 逐行解析 `ls -1` 输出为条目列表(trim + 去空行;纯函数,便于单测)。
+pub fn parse_ls_lines(out: &str) -> Vec<String> {
+    out.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// 解析发布目录的 manifest.json 内容(纯函数):损坏 / 缺字段 → `None`
+/// (调用方按"无清单"降级,不让列表与回滚功能失败)。
+pub fn parse_release_manifest(json: &str) -> Option<ReleaseManifest> {
+    serde_json::from_str(json.trim()).ok()
 }
 
 // ===== 钩子/健康检查纯逻辑(便于单测,Task 3)=====
@@ -3783,6 +4703,47 @@ mod tests {
         );
     }
 
+    // ===== 智能传输:same_image_id 完整 ID 口径 =====
+
+    #[test]
+    fn test_same_image_id_full_64_hex_equal() {
+        // 远端 --no-trunc 输出(sha256: 前缀 + 完整 64 位)vs 本地
+        // image_id_by_ref 输出(剥前缀后的完整 64 位)→ 相等(跳过判定的主口径)
+        let full = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert!(same_image_id(
+            &format!("sha256:{}", full),
+            full
+        ));
+        assert!(same_image_id(
+            &format!("sha256:{}", full),
+            &format!("sha256:{}", full)
+        ));
+    }
+
+    #[test]
+    fn test_same_image_id_case_and_prefix_mixed() {
+        // 大小写差异、sha256: 前缀有无混合,均视为相等
+        assert!(same_image_id("sha256:ABCDEF123456", "abcdef123456"));
+        assert!(same_image_id("ABCDEF123456", "sha256:abcdef123456"));
+        assert!(same_image_id("  sha256:abc123  ", "ABC123"));
+    }
+
+    #[test]
+    fn test_same_image_id_truncated_vs_full_not_equal() {
+        // 回归:12 位截断 ID(旧 REMOTE_IMAGES_CMD 口径)与完整 64 位 ID
+        // 不相等 —— 跳过判定数据源必须用 REMOTE_IMAGES_CMD_FULL
+        let full = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert!(!same_image_id("0123456789abcdef", full));
+    }
+
+    #[test]
+    fn test_same_image_id_empty_not_equal() {
+        // 任一为空视为不等(避免空串误判"未变化")
+        assert!(!same_image_id("", "abc"));
+        assert!(!same_image_id("sha256:", "abc"));
+        assert!(!same_image_id("", ""));
+    }
+
     // ===== Task 6:webhook 载荷序列化 =====
 
     #[test]
@@ -3796,6 +4757,7 @@ mod tests {
             success: true,
             message: "部署完成".into(),
             duration_secs: 42,
+            release_dir: None,
         };
         let v: serde_json::Value = serde_json::from_str(&webhook_payload(&record)).unwrap();
         assert_eq!(v["event"], "deploy");

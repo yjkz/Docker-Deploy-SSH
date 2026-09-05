@@ -2414,3 +2414,57 @@ code {
 @media (max-width: 759px) {
   .modal-card.modal-wide { width: 96vw; }
 }
+
+/* ===== 智能传输部署选项 + 一键回滚模态(deploy.js;复用 modal/deploy-checkbox 体系) ===== */
+
+/* ---- 整栈部署选项行(分类表下方):两个复选框横排 + 通栏说明小字 ---- */
+.deploy-stack-options {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0 24px;
+  margin-top: 12px;
+}
+.deploy-stack-options-hint { flex-basis: 100%; }
+/* 「跳过未变化镜像」随「打日期标签」联动禁用时整体置灰(含文字) */
+.deploy-checkbox input:disabled { cursor: not-allowed; }
+.deploy-checkbox input:disabled + span { color: var(--ark-paper-ink-65); cursor: not-allowed; }
+
+/* ---- 回滚模态(#deploy-modal):沿用 .modal-overlay/.modal-card,仅加宽 ---- */
+.deploy-modal-card { width: min(720px, 94vw); }
+
+/* 列表上方引导语 / 空态与读取失败的提示框(虚线墨框,同既有留白语言) */
+.rb-list-hint {
+  font-size: 13px;
+  color: var(--ark-ink);
+  margin-bottom: 8px;
+}
+.rb-empty {
+  padding: 14px 16px;
+  border: 1px dashed var(--ark-line);
+  background: var(--ark-paper-dim);
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--ark-paper-ink-65);
+}
+
+/* 选中发布/标签后的动作说明框(青色左条,同 .deploy-log 的强调语言) */
+.rb-plan {
+  margin: 12px 0 2px;
+  padding: 10px 12px;
+  border: 1px solid var(--ark-line-soft);
+  border-left: 4px solid var(--ark-signal);
+  background: var(--ark-paper-dim);
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--ark-ink);
+}
+.rb-plan-sub { font-size: 11.5px; color: var(--ark-paper-ink-65); }
+
+/* 模态内等宽日志区:复用 .deploy-log 常暗表面,压缩高度适配弹窗 */
+.deploy-modal-log { height: 200px; }
+.rb-status {
+  margin-top: 10px;
+  font-size: 12.5px;
+  color: var(--ark-ink);
+}

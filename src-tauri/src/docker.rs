@@ -252,6 +252,53 @@ pub fn image_size(image: &str) -> Option<u64> {
     stdout.trim().parse::<u64>().ok()
 }
 
+/// 查询本地镜像 ID(`docker image inspect <ref> --format {{.Id}}`),供部署管线
+/// 的「智能传输(跳过未变化镜像)」与远端 `docker images` 的 ID 字段对比
+/// (对比口径:剥 `sha256:` 前缀 + 忽略大小写,见 commands 层 `same_image_id`)。
+///
+/// 错误区分(与 [`image_exists`] 的退出码判定口径一致,传输层错误单独区分):
+/// - 退出码 0 → `Some(剥离 sha256: 前缀后的 ID)`;
+/// - 退出码非 0(镜像不存在等)→ `None`;
+/// - docker CLI 缺失 / 无法启动进程(未运行 Docker Desktop 等)→ `Err`
+///   (中文错误,风格与 [`run_docker`] 一致)。
+///
+/// 阻塞型子进程调用,内部放 blocking 线程池执行,可在 async 上下文直接 await。
+pub async fn image_id_by_ref(reference: &str) -> Result<Option<String>, String> {
+    let reference = reference.to_string();
+    tauri::async_runtime::spawn_blocking(move || image_id_by_ref_blocking(&reference))
+        .await
+        .map_err(|e| format!("查询镜像 ID 任务失败: {}", e))?
+}
+
+/// [`image_id_by_ref`] 的阻塞实现(调用方须放 blocking 线程池)。
+fn image_id_by_ref_blocking(reference: &str) -> Result<Option<String>, String> {
+    let output = new_command("docker")
+        .args(["image", "inspect", "--format", "{{.Id}}", reference])
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "未找到 docker 命令,请确认已安装 Docker Desktop 并加入 PATH".to_string()
+            } else {
+                format!("执行 docker 命令失败: {}", e)
+            }
+        })?;
+    if !output.status.success() {
+        // 镜像不存在(或守护进程不可用)→ 退出码非 0,按"无此镜像"处理
+        return Ok(None);
+    }
+    Ok(parse_image_id(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// 解析 `docker image inspect --format {{.Id}}` 的输出(纯函数,便于单测):
+/// trim 后剥除 `sha256:` 前缀;空输出 → `None`。
+fn parse_image_id(stdout: &str) -> Option<String> {
+    let id = stdout.trim();
+    if id.is_empty() {
+        return None;
+    }
+    Some(id.strip_prefix("sha256:").unwrap_or(id).to_string())
+}
+
 /// `docker images --format {{json .}}` 的原始 JSON 行结构
 /// (docker 输出固定为大写字段名,统一改名映射到蛇形变量)。
 #[derive(Debug, Deserialize)]
@@ -501,6 +548,53 @@ mod tests {
         assert_eq!(size_to_bytes(""), 0);
         assert_eq!(size_to_bytes("N/A"), 0);
         assert_eq!(size_to_bytes("abc"), 0);
+    }
+
+    // ===== 智能传输:image_id_by_ref =====
+
+    #[test]
+    fn test_parse_image_id() {
+        // inspect 输出形如 sha256:abc123...,剥前缀后返回
+        assert_eq!(
+            parse_image_id("sha256:abc123def\n"),
+            Some("abc123def".to_string())
+        );
+        // 无前缀(异常环境)原样返回
+        assert_eq!(
+            parse_image_id("  abc123  "),
+            Some("abc123".to_string())
+        );
+        // 空输出 → None
+        assert_eq!(parse_image_id(""), None);
+        assert_eq!(parse_image_id("  \n"), None);
+    }
+
+    // 注:以下测试依赖本机 docker CLI 与守护进程,默认忽略
+    // 手工运行:cargo test image_id_by_ref -- --ignored
+
+    #[test]
+    #[ignore]
+    fn test_image_id_by_ref_blocking_real() {
+        // 不存在的镜像 → None(不 panic、不 Err)
+        let missing =
+            image_id_by_ref_blocking("dd-selftest-no-such-image:latest").expect("应成功返回");
+        assert_eq!(missing, None);
+    }
+
+    #[test]
+    #[ignore]
+    fn test_image_id_by_ref_async_real() {
+        let images = list_images().expect("list_images 应成功");
+        let Some(first) = images.first() else {
+            println!("本机无镜像,跳过");
+            return;
+        };
+        let reference = format!("{}:{}", first.repository, first.tag);
+        let id = tauri::async_runtime::block_on(image_id_by_ref(&reference))
+            .expect("应成功返回")
+            .expect("存在的镜像应有 ID");
+        assert!(!id.is_empty());
+        assert!(!id.starts_with("sha256:"), "应剥离 sha256: 前缀: {}", id);
     }
 
     // ===== 以下测试依赖本机 Docker 守护进程,默认忽略 =====

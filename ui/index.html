@@ -234,6 +234,14 @@
               </label>
               <div class="form-hint">为镜像追加「仓库名:日期时间」标签,并在服务器同步 compose 引用的原标签,更新生效且可按日期回滚</div>
             </div>
+            <div class="form-row mode-single-only">
+              <span class="form-label">传输选项</span>
+              <label class="deploy-checkbox">
+                <input type="checkbox" id="deploy-skip-unchanged" checked>
+                <span>跳过未变化镜像(较快)</span>
+              </label>
+              <div class="form-hint">智能传输:远端同标签镜像 ID 一致时跳过导出/上传/装载(勾选「打日期标签」时自动禁用,日期标签每次均为全新标签)</div>
+            </div>
           </div>
 
           <!-- 整栈模式:服务分类表(parse_compose 结果;hidden 由 deploy.js 切换) -->
@@ -260,6 +268,19 @@
                   <tr><td class="empty-cell" colspan="4">选择项目后自动解析</td></tr>
                 </tbody>
               </table>
+            </div>
+
+            <!-- 智能传输选项(整栈):跳过未变化镜像 / 强制留档(供一键回滚),随分类表面板显隐 -->
+            <div class="deploy-stack-options">
+              <label class="deploy-checkbox">
+                <input type="checkbox" id="deploy-stack-skip" checked>
+                <span>跳过未变化镜像(较快)</span>
+              </label>
+              <label class="deploy-checkbox">
+                <input type="checkbox" id="deploy-stack-archive">
+                <span>强制留档(便于回滚,较慢)</span>
+              </label>
+              <div class="form-hint deploy-stack-options-hint">未变化的服务跳过打包/上传/装载;强制留档时未变化镜像仍打包进发布目录(供回滚 docker load),仅跳过装载,可与上一项同开</div>
             </div>
 
             <!-- 部署预览结果(点击「部署预览」后由 deploy.js 渲染;hidden 由 deploy.js 切换) -->
@@ -310,10 +331,11 @@
                     <th scope="col">镜像 IMAGES</th>
                     <th scope="col">结果 RESULT</th>
                     <th scope="col">耗时 DURATION</th>
+                    <th scope="col" class="col-action">操作 ACTION</th>
                   </tr>
                 </thead>
                 <tbody id="deploy-history-tbody">
-                  <tr><td class="empty-cell" colspan="6">尚未加载</td></tr>
+                  <tr><td class="empty-cell" colspan="7">尚未加载</td></tr>
                 </tbody>
               </table>
             </div>
@@ -609,6 +631,17 @@
         <button id="manage-modal-close" class="modal-close" type="button" title="关闭">关闭</button>
       </div>
       <div id="manage-modal-body" class="modal-body"></div>
+    </div>
+  </div>
+
+  <!-- 部署一键回滚模态框(内容由 deploy.js 构建;执行中禁止关闭) -->
+  <div id="deploy-modal" class="modal-overlay hidden">
+    <div class="modal-card deploy-modal-card" role="dialog" aria-modal="true" aria-labelledby="deploy-modal-title">
+      <div class="modal-head">
+        <div id="deploy-modal-title" class="modal-title"></div>
+        <button id="deploy-modal-close" class="modal-close" type="button" title="关闭">关闭</button>
+      </div>
+      <div id="deploy-modal-body" class="modal-body"></div>
     </div>
   </div>
 
