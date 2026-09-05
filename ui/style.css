@@ -1553,7 +1553,10 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
 /* ===== 容器行与详情面板 ===== */
 .container-row { cursor: default; }
 .container-name-cell { font-weight: 500; }
-.container-name-cell:hover { color: var(--ark-ink); } /* 青 1.7:1 不可读,hover 语义由整行反白表达(审计 P1-2) */
+/* 可点击 affordance 用下划线表达;颜色继承行 hover 反白(墨底纸字)——
+   强制 ink 会在反白行上隐形成墨底墨字(pass 1 P1-2 回归,审计 P1-2 修正) */
+.container-name-cell { cursor: pointer; }
+.container-row:hover .container-name-cell { text-decoration: underline; text-underline-offset: 2px; }
 
 .container-detail-row td {
   padding: 0;
