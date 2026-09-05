@@ -2157,6 +2157,7 @@
       '<div class="log-tail-bar">' +
       '<label>Shell:' +
       '<select id="term-shell-select" class="form-input form-input-sm">' +
+      '<option value="">自动(推荐)</option>' +
       '<option value="bash">bash</option>' +
       '<option value="sh">sh</option>' +
       '</select></label>' +
@@ -2195,7 +2196,7 @@
       out.addEventListener('scroll', function () { /* 渲染时按位置判断,无需额外状态 */ });
     }
 
-    startExec(containerId, name, shellSel ? shellSel.value : 'bash');
+    startExec(containerId, name, shellSel ? shellSel.value : '');
   }
 
   function startExec(containerId, name, shell) {
@@ -2224,7 +2225,8 @@
     AppBus.invoke('manage_exec_start', {
       serverId: state.serverId,
       containerId: containerId,
-      shell: shell || 'bash'
+      // 空/未选 → null,由后端自动探测容器内可用 shell(bash 优先,退回 sh)
+      shell: shell || null
     }).then(function (res) {
       // 模态框可能在等待期间被关闭
       if (!$('term-output')) {
@@ -2237,7 +2239,9 @@
       cState.exec.containerId = containerId;
       cState.exec.name = name || containerId;
       resetTermBuffer();
-      termAppendLine('已连接到容器「' + cState.exec.name + '」(shell: ' + (shell || 'bash') + ')');
+      // 回显后端返回的实际 shell(选「自动」时为探测结果,可能与所选不同)
+      termAppendLine('已连接到容器「' + cState.exec.name + '」(shell: ' +
+        (res.shell || shell || 'bash') + ')');
       renderTerm();
       buffering = false;
       // 订阅已就绪:挂载正式 unlisten 并重放缓冲中的早期事件(含快速 eof);
