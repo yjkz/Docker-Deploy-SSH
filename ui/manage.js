@@ -210,10 +210,80 @@
     resetTimer();
   }
 
+  // ===== 滚动位置保持 =====
+  // 05 页唯一滚动容器是 main.stage(body overflow:hidden,.layout 100vh)。
+  // 切 Tab 时新旧面板高度不同:目标面板更矮(或首次进入还是「选择服务器后加载」
+  // 占位行)时,.stage.scrollHeight 变小,浏览器会在下次布局时把 scrollTop 钳到
+  // 新上限——面板为空时上限为 0,即用户看到的「切换列表后跳回顶部」。且该钳制
+  // 是持久的:异步数据随后到达把列表填高,滚动位置也不会自己回来。
+  var stageEl = null;
+  function getStage() {
+    if (stageEl && stageEl.isConnected) return stageEl;
+    stageEl = document.querySelector('main.stage') || document.querySelector('.stage');
+    return stageEl;
+  }
+
+  // 把滚动位置钳到 min(y, 当前内容可滚上限)并返回实际生效值
+  function clampStageScroll(y) {
+    var st = getStage();
+    if (!st) return y;
+    var max = st.scrollHeight - st.clientHeight;
+    if (max < 0) max = 0;
+    var target = Math.min(y, max);
+    if (st.scrollTop !== target) st.scrollTop = target;
+    return target;
+  }
+
+  // 切 Tab 的一次性滚动记忆:{ tab, y, applied, ts }
+  // y=切换前位置;applied=面板切换后立即恢复到的位置;ts 用于过期丢弃
+  var pendingTabScroll = null;
+  var PENDING_SCROLL_TTL = 10000;
+
+  // 切 Tab 面板切换后立即恢复:目标面板足够高则保持原位置;不够高则落在
+  // min(原位置, 新内容高度-视口),不产生比钳制更差的跳顶
+  function applyPendingTabScrollNow() {
+    var p = pendingTabScroll;
+    if (!p) return;
+    p.applied = clampStageScroll(p.y);
+  }
+
+  // 各渲染函数收尾调用:仅当本次渲染正好是「切 Tab 目标面板」的首次渲染、
+  // 且用户在数据返回前没有手动滚动过时,才把位置恢复到 min(原位置, 新上限)
+  function consumePendingTabScroll(tab) {
+    var p = pendingTabScroll;
+    if (!p || p.tab !== tab || state.tab !== tab) return;
+    pendingTabScroll = null;
+    if (Date.now() - p.ts > PENDING_SCROLL_TTL) return;
+    var st = getStage();
+    if (!st) return;
+    // applied 可能是 0(合法值),必须用 != null 判断
+    if (p.applied != null && Math.abs(st.scrollTop - p.applied) > 1) return;
+    clampStageScroll(p.y);
+  }
+
+  // 渲染期防钳制兜底:渲染前后记录/恢复 .stage 滚动位置。
+  // 仅当内容真的变矮(原位置超出新上限)时才恢复到 min(原位置, 新上限);
+  // 其余情况(含浏览器滚动锚定的自主调整)一律不干预,不会与原生行为冲突。
+  function withStageScrollGuard(mutate) {
+    var st = getStage();
+    var saved = st ? st.scrollTop : 0;
+    mutate();
+    if (!st) return;
+    var max = st.scrollHeight - st.clientHeight;
+    if (max < 0) max = 0;
+    if (saved > max && st.scrollTop !== max) st.scrollTop = max;
+  }
+
   // ===== Tab 切换 =====
   function switchTab(tab) {
     if (state.tab === tab) return;
     state.tab = tab;
+    // 记录切换前滚动位置:面板切换会把 .stage 钳回顶部,先记住,切换后立即
+    // 恢复;目标列表若尚未加载,数据到达渲染完成后再恢复一次(consume*)
+    var stBefore = getStage();
+    pendingTabScroll = stBefore
+      ? { tab: tab, y: stBefore.scrollTop, applied: null, ts: Date.now() }
+      : null;
     var tabs = document.querySelectorAll('.manage-tab');
     for (var i = 0; i < tabs.length; i++) {
       tabs[i].classList.toggle('active', tabs[i].getAttribute('data-tab') === tab);
@@ -229,6 +299,8 @@
     var mp = $('manage-monitor-panel');  // C 阶段追加
     if (mp) mp.classList.toggle('hidden', tab !== 'monitor');
     if (tab !== 'monitor') monitorStop(true); // C 阶段追加:离开监控 Tab 自动停止
+    // 面板高度已切换:立即恢复滚动位置(缓解钳制跳顶)
+    applyPendingTabScrollNow();
     // 切到对应 Tab 时若尚未加载过则加载
     if (state.serverId) {
       if (tab === 'containers') refreshContainers();
@@ -236,6 +308,8 @@
       else if (tab === 'volumes') refreshVolumes();
       else if (tab === 'networks') refreshNetworks();
       else if (tab === 'stacks') refreshStacks(); // C 阶段追加
+    } else {
+      pendingTabScroll = null; // 无服务器不会触发渲染,丢弃记忆
     }
     resetTimer();
   }
@@ -332,7 +406,12 @@
   function renderContainers(list) {
     var tbody = $('manage-containers-tbody');
     if (!tbody) return;
+    // 渲染期滚动保护 + 切 Tab 后首渲染恢复位置(见 withStageScrollGuard)
+    withStageScrollGuard(function () { renderContainersInto(tbody, list); });
+    consumePendingTabScroll('containers');
+  }
 
+  function renderContainersInto(tbody, list) {
     // 移除空占位行
     var emptyCell = tbody.querySelector('.empty-cell');
     if (emptyCell) {
@@ -721,7 +800,12 @@
   function renderImages(list) {
     var tbody = $('manage-images-tbody');
     if (!tbody) return;
+    // 渲染期滚动保护 + 切 Tab 后首渲染恢复位置(见 withStageScrollGuard)
+    withStageScrollGuard(function () { renderImagesInto(tbody, list); });
+    consumePendingTabScroll('images');
+  }
 
+  function renderImagesInto(tbody, list) {
     if (list.length === 0) {
       tbody.innerHTML = '<tr><td class="empty-cell" colspan="6">暂无镜像</td></tr>';
       state.images = [];
@@ -983,7 +1067,12 @@
   function renderVolumes(list) {
     var tbody = $('manage-volumes-tbody');
     if (!tbody) return;
+    // 渲染期滚动保护 + 切 Tab 后首渲染恢复位置(见 withStageScrollGuard)
+    withStageScrollGuard(function () { renderVolumesInto(tbody, list); });
+    consumePendingTabScroll('volumes');
+  }
 
+  function renderVolumesInto(tbody, list) {
     if (list.length === 0) {
       tbody.innerHTML = '<tr><td class="empty-cell" colspan="5">暂无卷</td></tr>';
       state.volumes = [];
@@ -1183,7 +1272,12 @@
   function renderNetworks(list) {
     var tbody = $('manage-networks-tbody');
     if (!tbody) return;
+    // 渲染期滚动保护 + 切 Tab 后首渲染恢复位置(见 withStageScrollGuard)
+    withStageScrollGuard(function () { renderNetworksInto(tbody, list); });
+    consumePendingTabScroll('networks');
+  }
 
+  function renderNetworksInto(tbody, list) {
     if (list.length === 0) {
       tbody.innerHTML = '<tr><td class="empty-cell" colspan="5">暂无网络</td></tr>';
       state.networks = [];
@@ -1642,7 +1736,12 @@
   function renderStacks(list) {
     var tbody = $('manage-stacks-tbody');
     if (!tbody) return;
+    // 渲染期滚动保护 + 切 Tab 后首渲染恢复位置(见 withStageScrollGuard)
+    withStageScrollGuard(function () { renderStacksInto(tbody, list); });
+    consumePendingTabScroll('stacks');
+  }
 
+  function renderStacksInto(tbody, list) {
     if (list.length === 0) {
       tbody.innerHTML = '<tr><td class="empty-cell" colspan="3">未在服务器目录中发现 compose 项目</td></tr>';
       cState.stacks = [];
@@ -1948,24 +2047,65 @@
   function renderStats(list) {
     var tbody = $('monitor-tbody');
     if (!tbody) return;
+    // 渲染期滚动保护 + 切监控 Tab 后首帧恢复位置(见 withStageScrollGuard)
+    withStageScrollGuard(function () { renderStatsInto(tbody, list); });
+    consumePendingTabScroll('monitor');
+  }
+
+  function renderStatsInto(tbody, list) {
     if (list.length === 0) {
       tbody.innerHTML = '<tr><td class="empty-cell" colspan="7">暂无数据</td></tr>';
       return;
     }
-    // 行数少,每次事件直接重建 tbody
-    tbody.innerHTML = '';
-    for (var i = 0; i < list.length; i++) {
-      var s = list[i];
-      var tr = document.createElement('tr');
-      tr.appendChild(mkStatTd(s.name || s.container_id || '—', true));
-      tr.appendChild(mkCpuTd(s.cpu_percent));
-      tr.appendChild(mkStatTd(s.mem_usage || '—', true));
-      tr.appendChild(mkStatTd(s.mem_percent != null ? String(s.mem_percent) : '—', false));
-      tr.appendChild(mkStatTd(s.net_io || '—', true));
-      tr.appendChild(mkStatTd(s.block_io || '—', true));
-      tr.appendChild(mkStatTd(s.pids != null ? String(s.pids) : '—', false));
-      tbody.appendChild(tr);
+    // 移除空占位行(与其它列表一致,否则占位行残留在数据行上方)
+    var emptyCell = tbody.querySelector('.empty-cell');
+    if (emptyCell) {
+      var emptyRow = emptyCell.closest('tr');
+      if (emptyRow) emptyRow.remove();
     }
+    // 按容器 ID/名称做行差异更新。原实现每次事件整表 innerHTML 重建:同步重建
+    // 本身不丢滚动位置,但容器数变化(监控期间启停容器)时内容高度突变,会把
+    // 正在浏览中下部的 .stage 钳上去;差异更新保持未变行不动,消除该路径。
+    var rowMap = {};
+    var rows = tbody.querySelectorAll('tr[data-stat-key]');
+    for (var i = 0; i < rows.length; i++) {
+      rowMap[rows[i].getAttribute('data-stat-key')] = rows[i];
+    }
+
+    var seen = {};
+    var frag = document.createDocumentFragment();
+    for (var j = 0; j < list.length; j++) {
+      var s = list[j];
+      // docker stats 恒有 container_id;缺失时退化为名称,重名再加序号保唯一
+      var base = s.container_id || s.name || 'row';
+      var key = base;
+      var dup = 1;
+      while (seen[key]) { key = base + '~' + (dup++); }
+      seen[key] = true;
+      var tr = rowMap[key];
+      if (!tr) {
+        tr = document.createElement('tr');
+        tr.setAttribute('data-stat-key', key);
+      }
+      updateStatRow(tr, s);
+      frag.appendChild(tr);
+    }
+
+    for (var k in rowMap) {
+      if (!seen[k]) rowMap[k].remove();
+    }
+    tbody.appendChild(frag);
+  }
+
+  function updateStatRow(tr, s) {
+    tr.innerHTML = '';
+    tr.appendChild(mkStatTd(s.name || s.container_id || '—', true));
+    tr.appendChild(mkCpuTd(s.cpu_percent));
+    tr.appendChild(mkStatTd(s.mem_usage || '—', true));
+    tr.appendChild(mkStatTd(s.mem_percent != null ? String(s.mem_percent) : '—', false));
+    tr.appendChild(mkStatTd(s.net_io || '—', true));
+    tr.appendChild(mkStatTd(s.block_io || '—', true));
+    tr.appendChild(mkStatTd(s.pids != null ? String(s.pids) : '—', false));
   }
 
   function mkStatTd(text, mono) {
