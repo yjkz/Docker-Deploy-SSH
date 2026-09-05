@@ -7,6 +7,75 @@
    禁圆角(radius 0,输入框最多 2px)、禁 emoji 图标、禁氛围动效。
    ============================================================ */
 
+/* ============================================================
+   本地字体捆绑(全部 OFL 许可,许可文本见 ui/fonts/OFL-*.txt)
+   - Space Grotesk latin 500/700:页面编号/技术标签(--font-cond)
+   - JetBrains Mono latin 400/500:等宽(--font-mono)
+   - Noto Sans SC chinese-simplified 400/500/600/700:正文(--font-cjk)
+   静态字重一对一声明;font-display:swap;CJK 不写 unicode-range
+   (整包子集自带覆盖,拆 range 反而破坏回退),latin 子集写标准 range。
+   ============================================================ */
+@font-face {
+  font-family: "Space Grotesk";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("./fonts/space-grotesk-latin-500.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "Space Grotesk";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("./fonts/space-grotesk-latin-700.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("./fonts/jetbrains-mono-latin-400.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("./fonts/jetbrains-mono-latin-500.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "Noto Sans SC";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("./fonts/noto-sans-sc-chinese-simplified-400.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Noto Sans SC";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("./fonts/noto-sans-sc-chinese-simplified-500.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Noto Sans SC";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("./fonts/noto-sans-sc-chinese-simplified-600.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Noto Sans SC";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("./fonts/noto-sans-sc-chinese-simplified-700.woff2") format("woff2");
+}
+
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root[data-ark-theme="ark"] {
@@ -25,11 +94,14 @@
   --ark-fail: var(--ark-ink); /* 失败:墨底白字(双色纪律,不用红;暗色随墨纸翻转) */
   --ark-line: rgba(8, 10, 11, .85);
   --ark-line-soft: rgba(8, 10, 11, .18);
-  --ark-paper-dim-ink: rgba(8, 10, 11, .5);   /* 微标签墨 */
+  --ark-paper-dim-ink: rgba(8, 10, 11, .62);  /* 微标签墨(alpha .62:亮色纸面上对比过 AA,审计 P1-1;暗色保持 .5) */
   --ark-paper-ink-65: rgba(8, 10, 11, .65);   /* 次级文字墨 */
   --ark-ink-35: rgba(8, 10, 11, .35);         /* 占位符 / 弱化 mono 文字 */
   --ark-on-signal: #080a0b;            /* 青色实心底上的文字(青恒亮,两主题固定墨色) */
   --ark-on-warn: #080a0b;              /* 琥珀底上的文字(琥珀恒亮,两主题固定墨色) */
+  --ark-stat-warm: #7a5f00;            /* 预警状态文字(亮):纸面上的暗琥珀,过 AA */
+  --ark-stat-hot: #9c3400;             /* 过热状态文字(亮):纸面上的暗红,过 AA */
+  --ark-warn-text: #7a5f00;            /* 琥珀系警示文字(亮):纸面上替代裸琥珀(#ffd23f 在纸面 ≈1.4:1 不可读) */
   --ark-on-signal-dim: var(--ark-ink); /* 青淡底上的文字(暗色翻为青字) */
   --ark-on-ink-55: rgba(244, 246, 246, .55); /* 墨底(含反转行)上的弱化文字,随墨纸翻转(暗色 .6 以过 AA) */
   --ark-dock-text-strong: #ffffff;     /* dock 激活/悬停文字(dock 常暗,两主题固定纯白) */
@@ -44,9 +116,9 @@
   --ink-on-paper-40: rgba(244, 246, 246, .40);
   --ink-on-paper-55: rgba(244, 246, 246, .55);
   --ink-on-paper-72: rgba(244, 246, 246, .72);
-  --font-cjk: "Noto Sans SC", "Source Han Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
-  --font-cond: "Arial Narrow", "Roboto Condensed", "DIN Condensed", sans-serif;
-  --font-mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  --font-cjk: "Noto Sans SC", "Source Han Sans SC", "MiSans", "HarmonyOS Sans SC", "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+  --font-cond: "Space Grotesk", "Saira Condensed", "Arial Narrow", "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Mono", "SFMono-Regular", Consolas, "Courier New", monospace;
   --radius: 0;
 }
 
@@ -72,6 +144,9 @@
   --ark-on-ink-55: rgba(8, 10, 11, .6); /* alpha .6:反白行(纸白底)上对比度过 WCAG AA */
   --ark-overlay: rgba(0, 0, 0, .62);
   --ark-shadow: rgba(0, 0, 0, .5);
+  --ark-stat-warm: #ffd23f;           /* 预警状态文字(暗):= --ark-warn 值(琥珀恒亮,黑壳上可读) */
+  --ark-stat-hot: #ff8a94;            /* 过热状态文字(暗):柔和红,近黑表面上过 AA */
+  --ark-warn-text: #ffd23f;           /* 琥珀系警示文字(暗):= --ark-warn 值 */
 }
 
 html, body { height: 100%; }
@@ -79,6 +154,7 @@ html, body { height: 100%; }
 body {
   font-family: var(--font-cjk);
   font-size: 14px;
+  line-height: 1.6;
   color: var(--ark-ink);
   background: var(--ark-paper);
   overflow: hidden;
@@ -115,7 +191,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   color: var(--ink-on-paper-40);
   font-family: var(--font-mono);
   font-size: 9px;
-  letter-spacing: .2em;
+  letter-spacing: .18em;
   line-height: 1.8;
   word-break: break-all;
 }
@@ -250,7 +326,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   font-size: 84px;
   font-weight: 700;
   line-height: .82;
-  letter-spacing: -.01em;
+  letter-spacing: -.02em;
   color: var(--ark-ink);
 }
 .page-titles { padding-bottom: 4px; }
@@ -1158,7 +1234,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   font-weight: 600;
   color: var(--ark-ink);
 }
-.deploy-step.current .deploy-step-name { color: var(--ark-signal); }
+.deploy-step.current .deploy-step-name { color: var(--ark-ink); } /* 青 1.7:1 不可读,状态由节点青描边+脉冲表达(审计 P1-2) */
 .deploy-step-en {
   margin-top: 2px;
   font-family: var(--font-mono);
@@ -1460,7 +1536,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
 /* ===== 容器行与详情面板 ===== */
 .container-row { cursor: default; }
 .container-name-cell { font-weight: 500; }
-.container-name-cell:hover { color: var(--ark-signal); }
+.container-name-cell:hover { color: var(--ark-ink); } /* 青 1.7:1 不可读,hover 语义由整行反白表达(审计 P1-2) */
 
 .container-detail-row td {
   padding: 0;
@@ -1617,14 +1693,14 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   transform: translate(2px, 2px);
 }
 
-/* 删除按钮:琥珀文字+琥珀楔形,暗示危险(不搞黑底反白) */
+/* 删除按钮:琥珀文字+琥珀楔形,暗示危险(不搞黑底反白;文字走 --ark-warn-text,审计 P1-4) */
 .action-btn-group .btn-sm.btn-danger {
   background: transparent;
   border-color: var(--ark-line-soft);
-  color: #7a5f00;
+  color: var(--ark-warn-text);
 }
 .action-btn-group .btn-sm.btn-danger::before {
-  background: rgba(255, 210, 63, .6);
+  background: color-mix(in srgb, var(--ark-warn) 60%, transparent);
 }
 
 /* 删除按钮 hover:琥珀底+墨字 */
@@ -1637,44 +1713,8 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   background: var(--ark-on-warn);
 }
 
-/* ===== 行 hover:覆盖默认的按钮反白,保持幽灵风格 ===== */
-.data-table tbody tr:hover .action-btn-group .btn-sm {
-  background: transparent;
-  border-color: rgba(244, 246, 246, .28);
-  color: rgba(244, 246, 246, .85);
-}
-.data-table tbody tr:hover .action-btn-group .btn-sm::before {
-  background: rgba(244, 246, 246, .28);
-}
-
-/* 行 hover + 普通按钮 hover:纸底反白+青楔形 */
-.data-table tbody tr:hover .action-btn-group .btn-sm:hover {
-  background: var(--ark-paper);
-  border-color: var(--ark-paper);
-  color: var(--ark-ink);
-}
-.data-table tbody tr:hover .action-btn-group .btn-sm:hover::before {
-  background: var(--ark-signal);
-}
-
-/* 行 hover + 删除按钮:琥珀文字+浅琥珀边 */
-.data-table tbody tr:hover .action-btn-group .btn-sm.btn-danger {
-  color: var(--ark-warn);
-  border-color: rgba(255, 210, 63, .45);
-}
-.data-table tbody tr:hover .action-btn-group .btn-sm.btn-danger::before {
-  background: rgba(255, 210, 63, .5);
-}
-
-/* 行 hover + 删除按钮 hover:琥珀底墨字 */
-.data-table tbody tr:hover .action-btn-group .btn-sm.btn-danger:hover {
-  background: var(--ark-warn);
-  border-color: var(--ark-warn);
-  color: var(--ark-on-warn);
-}
-.data-table tbody tr:hover .action-btn-group .btn-sm.btn-danger:hover::before {
-  background: var(--ark-on-warn);
-}
+/* (审计 P2-10:此处原有一段 rgba 字面量行 hover 规则,已被下方「按钮美化修正」
+   的 token 版逐属性完全覆盖,已删除,避免双份维护。) */
 
 /* 详情展开行不参与整行反白 hover */
 .data-table tbody tr.container-detail-row:hover {
@@ -1800,16 +1840,16 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
 
 /* ============================================================
  * C 阶段追加:Compose 栈 / 实时监控 / 容器 Exec 终端
- * 遵循 ark-ui:墨 #080a0b / 纸 #f4f6f6 / 信号青 #18d1ff / 状态黄 #c8eb21
+ * 遵循 ark-ui:墨 #080a0b / 纸 #f4f6f6 / 信号青 #18d1ff / 状态黄 --ark-warn:#ffd23f（#c8eb21 为 --ark-ok 酸绿，预留）
  * ============================================================ */
 
-/* 监控面板 CPU% 阈值着色 */
+/* 监控面板 CPU% 阈值着色(scheme 感知状态文字 token,审计 P1-3) */
 .stat-warm {
-  color: var(--ark-warn, #c8eb21);
+  color: var(--ark-stat-warm);
   font-weight: 700;
 }
 .stat-hot {
-  color: var(--ark-danger, #ff4d5e);
+  color: var(--ark-stat-hot);
   font-weight: 700;
 }
 
@@ -1845,7 +1885,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   color: #d7e0e2;
   border: 1px solid #1a2124;
   border-radius: 4px;
-  font-family: 'IBM Plex Mono', Consolas, 'Courier New', monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.5;
   white-space: pre-wrap;
@@ -1865,7 +1905,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   color: #18d1ff;
   border: 1px solid #1a2124;
   border-radius: 4px;
-  font-family: 'IBM Plex Mono', Consolas, 'Courier New', monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
   outline: none;
 }
@@ -2260,4 +2300,40 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
 /* 窄窗口退化(overlay 另有 16px 内边距 + .modal-card 的 max-width:100% 兜底) */
 @media (max-width: 759px) {
   .modal-card.modal-terminal { width: 96vw; }
+}
+
+/* ============================================================
+   审计修复追加块(P1-5 命中区 + 排版修复)
+   ============================================================ */
+
+/* ---- P1-5:小按钮不可见命中区扩展(视觉零位移) ----
+   ::before 已被楔形占用,故用 ::after;无背景,纯命中扩展。
+   - position:relative 由 .btn 基类提供,此处显式声明兜底,防止按钮脱离 .btn 使用时
+     ::after 相对错误祖先定位。
+   - .manage-table .action-btn-group 列间隙 4px,横向 -2px 两侧扩展恰在中点相接,
+     不遮相邻按钮;竖向 -9px:.btn-sm 高 24px → 命中 42px ≈ 表格行高 44px。
+   - 已知取舍:操作组在极窄窗口折行为两行时,下一行按钮的竖向扩展会盖住上一行按钮
+     底部 5px 边带(点击落到下一行)。权衡后保留 -9px:主场景(单行)零歧义且达到
+     ≈40px 目标;折行仅发生于 <~950px 窗口、4 按钮超列宽时。 */
+.manage-table .action-btn-group .btn-sm,
+.btn-mini {
+  position: relative;
+}
+.manage-table .action-btn-group .btn-sm::after,
+.btn-mini::after {
+  content: "";
+  position: absolute;
+  inset: -9px -2px;
+}
+
+/* ---- 连字控制:日志/终端/代码关闭连字 ----
+   JetBrains Mono 默认开启连字,日志中 =>、!= 是真实字符,
+   连字替换会让逐字符解析/复制失真,故在这些区域强制关闭。 */
+.manage-terminal,
+.manage-terminal-input,
+.deploy-log,
+.manage-log-body,
+pre,
+code {
+  font-variant-ligatures: none;
 }
