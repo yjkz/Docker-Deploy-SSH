@@ -2222,3 +2222,42 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   }
   .help-content { padding: 14px 16px 22px; }
 }
+
+/* ===== 终端弹窗放大(仅 #manage-modal 的终端会话态) =====
+   manage.js 的 openModal 依据终端 body 上的 .manage-terminal-modal 标记,
+   给共用 .modal-card 动态加/移除 .modal-terminal(同 .help-modal-card 的
+   修饰类先例);日志/确认/打标签等其他共用弹窗不带该类,尺寸不受影响。 */
+.modal-card.modal-terminal {
+  width: min(1000px, 94vw);
+}
+/* 终端输出区:固定 320px 提升为约 60vh(小屏不低于 320px),
+   黑底/等宽字体与 renderTerm 的贴底自动滚逻辑不变 */
+.manage-terminal-modal .manage-terminal {
+  height: 60vh;
+  min-height: 320px;
+}
+/* 命令输入行:shell 下拉与命令输入框同一行,撑满卡片宽度 */
+.manage-terminal-modal .manage-terminal-input-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.manage-terminal-modal .manage-terminal-shell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  white-space: nowrap;
+  font-size: 13px;
+}
+/* 防止 .form-input 的 width:100% 把下拉撑满整行 */
+.manage-terminal-modal .manage-terminal-shell select { width: auto; }
+.manage-terminal-modal .manage-terminal-input {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+}
+/* 窄窗口退化(overlay 另有 16px 内边距 + .modal-card 的 max-width:100% 兜底) */
+@media (max-width: 759px) {
+  .modal-card.modal-terminal { width: 96vw; }
+}

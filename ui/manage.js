@@ -1638,6 +1638,15 @@
     if (titleEl) titleEl.textContent = title;
     body.innerHTML = '';
     if (bodyEl) body.appendChild(bodyEl);
+    // 终端会话专用放大:仅当本次打开的是终端弹窗(body 带 .manage-terminal-modal
+    // 标记)时给共用 modal-card 加修饰类;其余弹窗(日志/确认/打标签等)显式移除,
+    // 保证共用模态的尺寸互不影响
+    var card = modal.querySelector('.modal-card');
+    if (card) {
+      var isTerm = !!(bodyEl && bodyEl.classList && bodyEl.classList.contains('manage-terminal-modal'));
+      if (isTerm) card.classList.add('modal-terminal');
+      else card.classList.remove('modal-terminal');
+    }
     modal.classList.remove('hidden');
   }
 
@@ -2153,19 +2162,23 @@
     }
 
     var body = document.createElement('div');
+    // 终端弹窗专属标记:openModal 据此给共用 modal-card 加 .modal-terminal 放大
+    body.className = 'manage-terminal-modal';
     body.innerHTML =
       '<div class="log-tail-bar">' +
-      '<label>Shell:' +
+      '<button id="term-close-btn" class="btn btn-sm btn-danger" type="button">关闭终端</button>' +
+      '</div>' +
+      '<pre id="term-output" class="manage-terminal">正在连接…</pre>' +
+      '<div class="manage-terminal-input-row">' +
+      '<label class="manage-terminal-shell">Shell:' +
       '<select id="term-shell-select" class="form-input form-input-sm">' +
       '<option value="">自动(推荐)</option>' +
       '<option value="bash">bash</option>' +
       '<option value="sh">sh</option>' +
       '</select></label>' +
-      '<button id="term-close-btn" class="btn btn-sm btn-danger" type="button">关闭终端</button>' +
-      '</div>' +
-      '<pre id="term-output" class="manage-terminal">正在连接…</pre>' +
       '<input id="term-input" class="manage-terminal-input" type="text" autocomplete="off" ' +
-      'spellcheck="false" placeholder="输入命令,Enter 发送;↑/↓ 切换历史">';
+      'spellcheck="false" placeholder="输入命令,Enter 发送;↑/↓ 切换历史">' +
+      '</div>';
 
     openModal('终端 — ' + name, body);
 
@@ -2409,6 +2422,13 @@
 
   // closeModal 钩子:模态框被关闭(含遮罩点击/关闭按钮)时清理终端会话
   function execOnModalClose() {
+    // 还原共用模态尺寸:任何关闭路径(关闭按钮/遮罩点击/关闭终端)都经
+    // closeModal 走到这里,移除终端态修饰类
+    var modal = $('manage-modal');
+    if (modal) {
+      var card = modal.querySelector('.modal-card');
+      if (card) card.classList.remove('modal-terminal');
+    }
     var ex = cState.exec;
     if (ex.sessionId || ex.unlisten) {
       stopExecSession(true);
