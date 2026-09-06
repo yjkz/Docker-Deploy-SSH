@@ -17,6 +17,10 @@ pub struct AuthConfig {
     pub auth_type: AuthType,
     pub key_path: Option<String>,
     pub password_enc: Option<String>,
+    /// DPAPI 加密后的私钥口令(base64 密文;仅加密私钥需要;旧版配置无此字段,
+    /// serde default 兼容)。导出/导入时按明文随加密 blob 携带(见 config_io)。
+    #[serde(default)]
+    pub key_pass_enc: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +32,12 @@ pub struct ServerConfig {
     pub username: String,
     pub auth: AuthConfig,
     pub remote_dir: String,
+    /// 首次连接(TOFU)时记录的服务器主机密钥 OpenSSH 风格指纹
+    /// (`SHA256:` + base64(nopad)(SHA-256(公钥 SSH blob)));None = 尚未信任。
+    /// 后续连接指纹不一致即拒绝(防中间人;重装/换 IP 后可在管理页重新信任)。
+    /// 旧版配置无此字段,serde default 兼容。
+    #[serde(default)]
+    pub host_key_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,13 +97,13 @@ pub struct DesktopNotify {
     pub enabled: bool,
 }
 
-/// SMTP 端口默认值:465(SSL 隐式 TLS)。
-fn default_smtp_port() -> u16 {
+/// SMTP 端口默认值:465(SSL 隐式 TLS)。pub(crate):config_io 导出镜像结构复用。
+pub(crate) fn default_smtp_port() -> u16 {
     465
 }
 
-/// SMTP 加密方式默认值:ssl。
-fn default_security() -> String {
+/// SMTP 加密方式默认值:ssl。pub(crate):config_io 导出镜像结构复用。
+pub(crate) fn default_security() -> String {
     "ssl".to_string()
 }
 
@@ -391,8 +401,9 @@ mod tests {
         cfg.servers.push(ServerConfig {
             id: "s1".into(), name: "生产".into(), host: "1.2.3.4".into(), port: 22,
             username: "root".into(),
-            auth: AuthConfig { auth_type: AuthType::Key, key_path: Some("C:/k".into()), password_enc: None },
+            auth: AuthConfig { auth_type: AuthType::Key, key_path: Some("C:/k".into()), password_enc: None, key_pass_enc: None },
             remote_dir: "/opt/app".into(),
+            host_key_sha256: None,
         });
         cfg.projects.push(ProjectConfig {
             id: "p1".into(), name: "栈项目".into(), image_filter: String::new(),
@@ -571,5 +582,27 @@ mod tests {
         assert_eq!(normalize_security(""), "ssl");
         assert_eq!(normalize_security("tls"), "ssl");
         assert_eq!(normalize_security("垃圾值"), "ssl");
+    }
+
+    #[test]
+    fn test_auth_config_and_host_key_serde_defaults() {
+        // 阶段三:旧版配置文件无 key_pass_enc / host_key_sha256 字段
+        // → serde default 补齐为 None,旧行为不变
+        let json = r#"{
+            "id":"s1","name":"n","host":"1.2.3.4","port":22,"username":"root",
+            "auth":{"auth_type":"Password","key_path":null,"password_enc":null},
+            "remote_dir":"/opt/app"
+        }"#;
+        let s: ServerConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(s.auth.key_pass_enc, None);
+        assert_eq!(s.host_key_sha256, None);
+
+        // 新字段完整 roundtrip
+        let mut s = s;
+        s.auth.key_pass_enc = Some("enc-pass".into());
+        s.host_key_sha256 = Some("SHA256:abcdef".into());
+        let text = serde_json::to_string(&s).unwrap();
+        let back: ServerConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, s);
     }
 }

@@ -2,7 +2,8 @@
 //!
 //! 通过现有 SSH 通道在远程服务器执行 docker 命令,实现容器 / 镜像的查看与操作。
 //! 低耦合:自实现连接辅助,仅通过公开 API 组合:
-//! `config::load_config` → `commands::resolve_password`(pub) →
+//! `config::load_config` → `commands::resolve_password` / `resolve_key_passphrase` /
+//! `persist_host_key_if_needed`(pub(crate)) →
 //! `ssh::SshClient::connect` → `ssh::exec_collect`(pub(crate))。
 //!
 //! Docker 输出约定:
@@ -12,9 +13,12 @@
 //! - `docker inspect <id>` 输出 JSON 数组(即使只查一个,前端取 `[0]`)。
 
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use crate::commands::resolve_password;
+use crate::commands::{
+    persist_host_key_if_needed, resolve_key_passphrase, resolve_password,
+};
 use crate::config::{load_config, AppConfig, ServerConfig};
 use crate::ssh::{exec_collect, SshClient};
 
@@ -59,13 +63,17 @@ pub(crate) async fn connect_server(
         password_plain,
         server.auth.password_enc.as_deref(),
     )?;
+    // 阶段三:私钥口令(DPAPI 解密 key_pass_enc)+ 主机密钥 TOFU(观察值落盘)
+    let key_pass = resolve_key_passphrase(&server)?;
+    let observed = Arc::new(OnceLock::new());
     let client = with_timeout(
         CONNECT_TIMEOUT_SECS,
         "连接超时",
         "请检查服务器地址与网络",
-        SshClient::connect(&server, password.as_deref()),
+        SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::clone(&observed)),
     )
     .await?;
+    persist_host_key_if_needed(&server, &observed.get().cloned());
     Ok((server, client))
 }
 

@@ -45,6 +45,13 @@ ureq = "2"
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "rustls-tls", "builder"] }
 # 通知中心:本地系统桌面通知(Rust 侧直接调用,无需前端 IPC)
 tauri-plugin-notification = "2"
+# 阶段三「连接与数据安全」:配置导出/导入的加密容器
+# - argon2:Argon2id 由导出口令派生 AES-256 密钥(password-hash 提供 SaltString 等原语)
+argon2 = { version = "0.5", features = ["std", "password-hash"] }
+# - aes-gcm:AES-256-GCM 认证加密(口令错误/文件损坏时解密失败,可明确报错)
+aes-gcm = "0.10"
+# - rand:生成导出容器的随机盐(16B)与 GCM nonce(12B)
+rand = "0.8"
 
 # Task 4: Windows DPAPI 密码加密(CurrentUser 作用域),仅 Windows 构建
 [target.'cfg(windows)'.dependencies]

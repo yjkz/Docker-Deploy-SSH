@@ -46,7 +46,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -59,7 +59,7 @@ use crate::config::{
     load_config, save_config, AppConfig, AuthType, ProjectConfig, ServerConfig, ServiceOverride,
     TransferMode,
 };
-use crate::crypto::dpapi_unprotect;
+use crate::crypto::{dpapi_protect, dpapi_unprotect};
 use crate::docker::{
     check_host, image_exists, image_id_by_ref, image_size, make_deploy_tag, save_gzip,
     start_daemon, tag_image, HostCheckReport, ImageInfo,
@@ -376,12 +376,23 @@ pub async fn list_images() -> Result<Vec<ImageInfo>, String> {
 // ===== 服务器命令 =====
 
 /// 连接服务器并检查远端环境(docker/compose/gzip/远端目录/磁盘空间)。
+///
+/// `key_passphrase` 为本次测试一次性输入的私钥口令(优先于已存储的
+/// `key_pass_enc`);`remember_key_pass` 为 true 且口令非空时,连接成功后
+/// DPAPI 加密存入 `AuthConfig.key_pass_enc`(下次免输入)。
 #[tauri::command]
 pub async fn test_server(
     server_id: String,
     password_plain: Option<String>,
+    key_passphrase: Option<String>,
+    remember_key_pass: Option<bool>,
 ) -> Result<ServerCheckReport, String> {
-    connect_and_check(&server_id, password_plain).await
+    let report = connect_and_check(&server_id, password_plain, key_passphrase.clone()).await?;
+    // 连接成功后才保存口令:口令错误时建连必失败,保存坏口令没有意义
+    if remember_key_pass.unwrap_or(false) {
+        remember_key_passphrase(&server_id, key_passphrase)?;
+    }
+    Ok(report)
 }
 
 /// 与 `test_server` 等价的环境检查(独立命令名,语义 = 部署前环境自检)。
@@ -389,16 +400,23 @@ pub async fn test_server(
 pub async fn server_env_check(
     server_id: String,
     password_plain: Option<String>,
+    key_passphrase: Option<String>,
 ) -> Result<ServerCheckReport, String> {
-    connect_and_check(&server_id, password_plain).await
+    connect_and_check(&server_id, password_plain, key_passphrase).await
 }
 
 /// 连接 + 远端环境检查的公共实现。
 async fn connect_and_check(
     server_id: &str,
     password_plain: Option<String>,
+    key_passphrase: Option<String>,
 ) -> Result<ServerCheckReport, String> {
-    let (server, mut client) = connect_server(server_id, password_plain.as_deref()).await?;
+    let (server, mut client) = connect_server(
+        server_id,
+        password_plain.as_deref(),
+        key_passphrase.as_deref(),
+    )
+    .await?;
     with_timeout(
         SSH_EXEC_TIMEOUT_SECS,
         "环境检查超时",
@@ -408,12 +426,19 @@ async fn connect_and_check(
     .await
 }
 
-/// 按 server_id 解析服务器配置与密码并建立 SSH 连接(带连接超时兜底)。
-/// `connect_and_check` 与 [`preview_stack_changes`] 共用的建连路径,
-/// 返回 `(服务器配置, 已连接的客户端)`。
+/// 按 server_id 解析服务器配置、密码与私钥口令并建立 SSH 连接
+/// (带连接超时兜底)。`connect_and_check` 与 [`preview_stack_changes`] 共用的
+/// 建连路径,返回 `(服务器配置, 已连接的客户端)`。
+///
+/// - `password_plain`:前端临时输入的 SSH 密码(密码认证时优先于已保存密文);
+/// - `key_passphrase_plain`:一次性输入的私钥口令(优先于已存储的
+///   `key_pass_enc`;无输入时用存储值,均为 `None` 则按无口令私钥加载)。
+/// - 主机密钥 TOFU:连接成功后首次观察到指纹时落盘到 `ServerConfig`
+///   (见 [`persist_host_key_if_needed`])。
 async fn connect_server(
     server_id: &str,
     password_plain: Option<&str>,
+    key_passphrase_plain: Option<&str>,
 ) -> Result<(ServerConfig, SshClient), String> {
     let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
     let server = find_server(&cfg, server_id)?.clone();
@@ -422,13 +447,21 @@ async fn connect_server(
         password_plain,
         server.auth.password_enc.as_deref(),
     )?;
+    let key_pass = match key_passphrase_plain.filter(|p| !p.is_empty()) {
+        // 一次性输入的口令优先于已存储密文(空串视为未输入)
+        Some(p) => Some(p.to_string()),
+        None => resolve_key_passphrase(&server)?,
+    };
+    // observed:记录本次连接观察到的主机指纹,首次连接后 TOFU 落盘
+    let observed = Arc::new(OnceLock::new());
     let client = with_timeout(
         SSH_CONNECT_TIMEOUT_SECS,
         "连接超时",
         "请检查服务器地址与网络",
-        SshClient::connect(&server, password.as_deref()),
+        SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::clone(&observed)),
     )
     .await?;
+    persist_host_key_if_needed(&server, &observed.get().cloned());
     Ok((server, client))
 }
 
@@ -462,7 +495,9 @@ pub async fn install_server_docker(
         password_plain.as_deref(),
         server.auth.password_enc.as_deref(),
     )?;
-    let mut client = SshClient::connect(&server, password.as_deref()).await?;
+    let key_pass = resolve_key_passphrase(&server)?;
+    let mut client = SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default())
+        .await?;
 
     let mut on_output = |line: &str| {
         let _ = app.emit("server-log", line.trim_end().to_string());
@@ -494,11 +529,12 @@ pub async fn create_remote_dir(
         password_plain.as_deref(),
         server.auth.password_enc.as_deref(),
     )?;
+    let key_pass = resolve_key_passphrase(&server)?;
     let mut client = with_timeout(
         SSH_CONNECT_TIMEOUT_SECS,
         "连接超时",
         "请检查服务器地址与网络",
-        SshClient::connect(&server, password.as_deref()),
+        SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default()),
     )
     .await?;
     let cmd = mkdir_p_cmd(&server.remote_dir);
@@ -541,11 +577,12 @@ pub async fn prune_server(
         password_plain.as_deref(),
         server.auth.password_enc.as_deref(),
     )?;
+    let key_pass = resolve_key_passphrase(&server)?;
     let mut client = with_timeout(
         SSH_CONNECT_TIMEOUT_SECS,
         "连接超时",
         "请检查服务器地址与网络",
-        SshClient::connect(&server, password.as_deref()),
+        SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default()),
     )
     .await?;
 
@@ -913,6 +950,7 @@ async fn run_deploy_steps(
         req.password_plain.as_deref(),
         server.auth.password_enc.as_deref(),
     )?;
+    let key_pass = resolve_key_passphrase(&server)?;
     emit_log(
         app,
         &format!(
@@ -950,7 +988,9 @@ async fn run_deploy_steps(
         } else {
             ensure_not_cancelled(app)?;
             emit_log(app, "智能传输:正在对比本地与远端镜像 ID…");
-            let mut probe_client = SshClient::connect(&server, password.as_deref()).await?;
+            let mut probe_client =
+                SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default())
+                    .await?;
             let remote_ids = query_remote_image_id_map(&mut probe_client).await?;
             let (repo, tag) = split_image_ref(&image_ref);
             let full_ref = format!("{}:{}", repo, tag);
@@ -1007,7 +1047,9 @@ async fn run_deploy_steps(
         let (tar_name, out_path, _, image_bytes) = packed
             .as_ref()
             .expect("未跳过传输时导出产物必然存在");
-        let mut client = SshClient::connect(&server, password.as_deref()).await?;
+        let mut client =
+            SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default())
+                .await?;
         // 远端磁盘预检:上传前确认 Docker 根目录所在盘剩余空间 ≥ 镜像大小 × 1.5
         // (镜像大小未知 → 告警跳过;不足 → 中文报错中止)
         let need_bytes = image_bytes.map(|size| (size as f64 * 1.5) as u64);
@@ -1793,6 +1835,7 @@ async fn run_deploy_stack_steps(
         req.password_plain.as_deref(),
         server.auth.password_enc.as_deref(),
     )?;
+    let key_pass = resolve_key_passphrase(&server)?;
 
     // ---- 步骤 1:分类确认 ----
     emit_progress(app, 1, 6, "分类确认");
@@ -1832,7 +1875,7 @@ async fn run_deploy_stack_steps(
         // 专用建连完成对比(用后即断,不占用打包阶段;与 deploy 的建连口径一致)
         emit_log(app, "智能传输:正在对比本地与远端镜像 ID…");
         let (_server, mut probe) =
-            connect_server(&req.server_id, req.password_plain.as_deref()).await?;
+            connect_server(&req.server_id, req.password_plain.as_deref(), None).await?;
         let remote_ids = query_remote_image_id_map(&mut probe).await?;
         for (i, svc) in local_choices.iter().enumerate() {
             let (repo, tag) = split_image_ref(&svc.image);
@@ -1903,7 +1946,7 @@ async fn run_deploy_stack_steps(
         SSH_CONNECT_TIMEOUT_SECS,
         "连接超时",
         "请检查服务器地址与网络",
-        SshClient::connect(&server, password.as_deref()),
+        SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default()),
     )
     .await?;
 
@@ -2524,7 +2567,7 @@ pub async fn preview_stack_changes(
         });
     }
 
-    let (server, mut client) = connect_server(&server_id, password_plain.as_deref()).await?;
+    let (server, mut client) = connect_server(&server_id, password_plain.as_deref(), None).await?;
 
     // 本地镜像列表(docker images,含 ID):一次取回,既供 compose 三级匹配,
     // 也供镜像 ID 与远端对比
@@ -2917,11 +2960,12 @@ pub async fn rollback_list_releases(
         password_plain.as_deref(),
         server.auth.password_enc.as_deref(),
     )?;
+    let key_pass = resolve_key_passphrase(&server)?;
     let mut client = with_timeout(
         SSH_CONNECT_TIMEOUT_SECS,
         "连接超时",
         "请检查服务器地址与网络",
-        SshClient::connect(&server, password.as_deref()),
+        SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default()),
     )
     .await?;
 
@@ -2997,7 +3041,7 @@ pub async fn rollback_list_tags(
 ) -> Result<Vec<TagBrief>, String> {
     let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
     find_project(&cfg, &project_id)?;
-    let (_server, mut client) = connect_server(&server_id, password_plain.as_deref()).await?;
+    let (_server, mut client) = connect_server(&server_id, password_plain.as_deref(), None).await?;
     let cmd = format!(
         "docker images {} --format '{{{{json .}}}}'",
         shell_single_quote(&repository)
@@ -3074,6 +3118,7 @@ async fn rollback_execute_stack_inner(
         password_plain,
         server.auth.password_enc.as_deref(),
     )?;
+    let key_pass = resolve_key_passphrase(&server)?;
     let mut record = DeployRecord::new_skeleton(MODE_ROLLBACK, &server.name, &project.name, Vec::new());
 
     emit_log(
@@ -3088,7 +3133,7 @@ async fn rollback_execute_stack_inner(
         SSH_CONNECT_TIMEOUT_SECS,
         "连接超时",
         "请检查服务器地址与网络",
-        SshClient::connect(&server, password.as_deref()),
+        SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default()),
     )
     .await?;
 
@@ -3283,6 +3328,7 @@ async fn rollback_execute_single_inner(
         password_plain,
         server.auth.password_enc.as_deref(),
     )?;
+    let key_pass = resolve_key_passphrase(&server)?;
     let mut record = DeployRecord::new_skeleton(
         MODE_ROLLBACK,
         &server.name,
@@ -3303,7 +3349,7 @@ async fn rollback_execute_single_inner(
         SSH_CONNECT_TIMEOUT_SECS,
         "连接超时",
         "请检查服务器地址与网络",
-        SshClient::connect(&server, password.as_deref()),
+        SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default()),
     )
     .await?;
 
@@ -3786,6 +3832,83 @@ pub fn resolve_password(
     }
 }
 
+/// 解析 SSH 认证所需的明文私钥口令(纯函数,便于测试;阶段三「加密私钥口令」)。
+///
+/// `AuthConfig.key_pass_enc` 有值 → DPAPI 解密返回 `Some(明文)`;
+/// 未配置(旧版配置 / 未加密私钥)→ `Ok(None)`,由 ssh 层按无口令私钥加载
+/// (加载加密私钥时会得到「私钥已加密,请输入私钥口令」的明确报错)。
+pub(crate) fn resolve_key_passphrase(cfg: &ServerConfig) -> Result<Option<String>, String> {
+    match cfg.auth.key_pass_enc.as_deref().filter(|e| !e.is_empty()) {
+        Some(enc) => Ok(Some(dpapi_unprotect(enc)?)),
+        None => Ok(None),
+    }
+}
+
+/// 保存「本次测试连接」输入的私钥口令(test_server 的 remember_key_pass)。
+///
+/// 口令为空/空白 → 直接返回(等价于不保存);否则重新 load → 改
+/// `AuthConfig.key_pass_enc`(DPAPI 加密)→ save,避免覆盖内存之外的并发修改。
+fn remember_key_passphrase(server_id: &str, key_passphrase: Option<String>) -> Result<(), String> {
+    let Some(pass) = key_passphrase.filter(|p| !p.trim().is_empty()) else {
+        return Ok(());
+    };
+    let mut cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    let server = cfg
+        .servers
+        .iter_mut()
+        .find(|s| s.id == server_id)
+        .ok_or_else(|| format!("未找到 ID 为「{}」的服务器配置", server_id))?;
+    server.auth.key_pass_enc = Some(dpapi_protect(&pass)?);
+    save_config(&cfg).map_err(|e| format!("保存私钥口令失败: {}", e))
+}
+
+/// 主机密钥 TOFU 首次落盘(commands.rs 与 manage.rs 的 connect_server 共用)。
+///
+/// 连接成功且本次观察到服务器指纹、而该服务器配置**尚未**记录指纹
+/// (`host_key_sha256` 为 None)时,按 load → 改 → save 把指纹写入
+/// `ServerConfig.host_key_sha256`。已有记录(或观察不到指纹)→ 不动配置。
+/// 落盘失败仅告警不报错:连接已成功,持久化失败不应让本次操作整体失败。
+pub(crate) fn persist_host_key_if_needed(server: &ServerConfig, observed: &Option<String>) {
+    let Some(fingerprint) = observed.as_deref() else {
+        return;
+    };
+    if server.host_key_sha256.is_some() {
+        return; // 已有信任记录(TOFU 已完成;变更拒绝由 ssh 层负责)
+    }
+    let mut cfg = match load_config() {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("保存主机密钥指纹前读取配置失败: {}", e);
+            return;
+        }
+    };
+    match cfg.servers.iter_mut().find(|s| s.id == server.id) {
+        Some(s) if s.host_key_sha256.is_none() => {
+            s.host_key_sha256 = Some(fingerprint.to_string());
+            if let Err(e) = save_config(&cfg) {
+                log::warn!("保存主机密钥指纹失败 (服务器 {}): {}", server.name, e);
+            } else {
+                log::info!("已记录服务器「{}」的主机密钥指纹 (TOFU)", server.name);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 重新信任服务器主机密钥(TOFU 重置):清空 `host_key_sha256`,
+/// 下次连接将重新接受并记录当前指纹(服务器重装/换 IP 后由用户显式调用)。
+#[tauri::command]
+pub fn retrust_host_key(server_id: String) -> Result<(), String> {
+    let mut cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    let server = cfg
+        .servers
+        .iter_mut()
+        .find(|s| s.id == server_id)
+        .ok_or_else(|| format!("未找到 ID 为「{}」的服务器配置", server_id))?;
+    server.host_key_sha256 = None;
+    save_config(&cfg).map_err(|e| format!("保存配置失败: {}", e))
+}
+
 /// 拼接远端路径:`base` 去尾部 `/` 后接 `/` + `rel`。
 ///
 /// `rel` 以 `/` 开头时去掉开头 `/` 仍视为相对 `base` 拼接
@@ -3823,7 +3946,7 @@ fn shell_single_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::TransferMode;
+    use crate::config::{AuthConfig, TransferMode};
 
     // ===== deploy_notify_text(通知中心挂点文案)=====
 
@@ -4074,6 +4197,52 @@ mod tests {
     fn test_resolve_password_bad_enc() {
         // 密文无效(base64 非法)→ 报错
         assert!(resolve_password(&AuthType::Password, None, Some("不是base64!!")).is_err());
+    }
+
+    // ===== resolve_key_passphrase(阶段三:加密私钥口令)=====
+
+    /// 构造仅含 auth 的最小 ServerConfig(供 resolve_key_passphrase 测试)。
+    #[allow(dead_code)]
+    fn key_pass_cfg(key_pass_enc: Option<String>) -> ServerConfig {
+        ServerConfig {
+            id: "s1".into(),
+            name: "n".into(),
+            host: "1.2.3.4".into(),
+            port: 22,
+            username: "root".into(),
+            auth: AuthConfig {
+                auth_type: AuthType::Key,
+                key_path: Some("C:/k".into()),
+                password_enc: None,
+                key_pass_enc,
+            },
+            remote_dir: "/opt/app".into(),
+            host_key_sha256: None,
+        }
+    }
+
+    #[test]
+    fn test_resolve_key_passphrase_none_when_absent() {
+        // 未配置 key_pass_enc(旧版配置/未加密私钥)→ None,不报错
+        assert_eq!(resolve_key_passphrase(&key_pass_cfg(None)).unwrap(), None);
+        // 空串按未配置处理
+        assert_eq!(resolve_key_passphrase(&key_pass_cfg(Some(String::new()))).unwrap(), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_resolve_key_passphrase_dpapi_roundtrip() {
+        let enc = dpapi_protect("key-pass-123").unwrap();
+        assert_eq!(
+            resolve_key_passphrase(&key_pass_cfg(Some(enc))).unwrap(),
+            Some("key-pass-123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_key_passphrase_bad_enc() {
+        // 密文无效(base64 非法)→ 报错
+        assert!(resolve_key_passphrase(&key_pass_cfg(Some("不是base64!!".into()))).is_err());
     }
 
     // ===== import_compose =====

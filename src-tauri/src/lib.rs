@@ -1,5 +1,6 @@
 pub mod commands;
 pub mod config;
+pub mod config_io;
 pub mod crypto;
 pub mod docker;
 pub mod history;
@@ -27,6 +28,10 @@ pub fn run() {
     .invoke_handler(tauri::generate_handler![
       commands::get_config,
       commands::save_config_cmd,
+      commands::retrust_host_key,
+      config_io::config_export_file,
+      config_io::config_import_file,
+      config_io::config_wipe,
       notify::notify_get_config,
       notify::notify_save_config,
       notify::notify_test_desktop,

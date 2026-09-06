@@ -4,17 +4,25 @@
  * 后端命令(对象字段为 Rust snake_case 原样序列化,JS 参数名 camelCase):
  * - get_config() -> AppConfig { servers: Server[], projects: Project[] }
  *   Server  = { id, name, host, port, username, remote_dir,
- *               auth: { auth_type: "Key"|"Password", key_path, password_enc } }
+ *               host_key_sha256,          // 主机密钥 TOFU 指纹(阶段三,null=未记录)
+ *               auth: { auth_type: "Key"|"Password", key_path, password_enc,
+ *                       key_pass_enc } }  // key_pass_enc=DPAPI 加密的私钥口令(阶段三)
  *   Project = { id, name, image_filter, compose_file,
  *               file_mappings: [{ local, remote, is_dir }], service_overrides,
  *               health_wait_secs, pre_deploy_cmd, post_deploy_cmd, notify_webhook }
  * - save_config_cmd({ cfg })                全量保存配置
  * - encrypt_password({ plain }) -> string   base64 密文,存 auth.password_enc
- * - test_server / server_env_check({ serverId, passwordPlain? })
+ * - test_server({ serverId, passwordPlain?, keyPassphrase?, rememberKeyPass? })
+ *     keyPassphrase = 一次性私钥口令(优先于已存 auth.key_pass_enc);
+ *     rememberKeyPass = 勾选「记住口令」时透传 true,后端在连接成功且口令
+ *     非空时才加密保存(是否满足持久化条件由后端判定,前端仅透传)
+ * - server_env_check({ serverId, passwordPlain?, keyPassphrase? })
  *     -> ServerCheckReport { docker, compose, gzip, remote_dir_exists,
  *                            disk_free_gb, errors: string[] }
  *     (两者等价:连接 + 远端环境检测;passwordPlain 一般不传,后端用 DPAPI
  *      解密已存密文;auth_type=Key 时后端忽略 passwordPlain)
+ * - retrust_host_key({ serverId })          重置主机密钥 TOFU 指纹(清空
+ *     host_key_sha256,下次连接重新接受并记录;服务器重装/换 IP 后调用)
  * - install_server_docker({ serverId })     过程输出经 'server-log' 事件逐行推送
  * - create_remote_dir({ serverId })
  * - prune_server({ serverId, passwordPlain? }) -> null
@@ -511,16 +519,26 @@
    * 连接 + 环境检测。
    * @param {Object} server 服务器对象(仅使用其 id)
    * @param {string} mode 'test' = test_server;'env' = server_env_check(两者等价)
+   * @param {Object} [extras] 可选透传参数(服务器表单保存后的自动测试使用):
+   *   { keyPassphrase: string, rememberKeyPass: boolean }
+   *   keyPassphrase = 一次性私钥口令(仅非空时携带);
+   *   rememberKeyPass = 「记住口令」勾选状态(仅 test_server 支持,后端在
+   *   连接成功且口令非空时才持久化,前端不判空直接透传)
    */
-  function runEnvCheck(server, mode) {
+  function runEnvCheck(server, mode, extras) {
     var id = server.id;
     if (st.checking[id] || st.installing[id] || st.pruning[id]) return;
     st.checking[id] = true;
     renderServers();
 
     var cmd = mode === 'test' ? 'test_server' : 'server_env_check';
+    var args = { serverId: id };
     // passwordPlain 不传:后端用 DPAPI 解密已存密码;Key 认证时后端忽略该参数
-    window.AppBus.invoke(cmd, { serverId: id })
+    if (extras && extras.keyPassphrase) args.keyPassphrase = extras.keyPassphrase;
+    if (cmd === 'test_server' && extras && extras.rememberKeyPass) {
+      args.rememberKeyPass = true;
+    }
+    window.AppBus.invoke(cmd, args)
       .then(function (report) {
         st.checks[id] = report || {};
         var errors = report && Array.isArray(report.errors) ? report.errors : [];
@@ -598,6 +616,29 @@
       .then(function () {
         st.creating[id] = false;
         renderServers();
+      });
+  }
+
+  /**
+   * 重新信任主机密钥(retrust_host_key):清空 host_key_sha256,下次连接
+   * 重新接受并记录当前指纹(服务器重装/换 IP 后由用户显式调用)。
+   * 成功后表单内原地刷新为「无指纹」态,并重载配置刷新列表卡片。
+   */
+  function retrustHostKey(serverId, fpInput, btn) {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    btn.textContent = '处理中…';
+    window.AppBus.invoke('retrust_host_key', { serverId: serverId })
+      .then(function () {
+        window.toast('已重置主机密钥信任,下次连接将重新记录指纹', 'ok');
+        if (fpInput) fpInput.value = '';
+        btn.classList.add('hidden'); // 指纹已清空:隐藏「重新信任」,灰字提示由 placeholder 呈现
+        return loadConfig();
+      })
+      .catch(function (err) {
+        window.toast('重新信任失败:' + (errText(err) || '未知错误'), 'fail');
+        btn.disabled = false;
+        btn.textContent = '重新信任';
       });
   }
 
@@ -1150,6 +1191,40 @@
       keyBlock.appendChild(el('div', 'form-hint', '本机私钥文件的绝对路径'));
       body.appendChild(keyBlock);
 
+      // 私钥口令(Key,阶段三):一次性输入,优先于已存 key_pass_enc;
+      // placeholder 依已存口令(key_pass_enc)有无切换(不回显明文/密文)
+      var hasSavedKeyPass = !!(prevAuth.key_pass_enc || (prev && prev.key_pass_enc));
+      var keyPassBlock = el('div', 'form-row');
+      keyPassBlock.id = 'srvf-key-pass-block';
+      var keyPassLabel = el('label', 'form-label', '私钥口令');
+      keyPassLabel.setAttribute('for', 'srvf-key-pass');
+      keyPassBlock.appendChild(keyPassLabel);
+      var keyPassInput = document.createElement('input');
+      keyPassInput.className = 'form-input';
+      keyPassInput.id = 'srvf-key-pass';
+      keyPassInput.type = 'password';
+      keyPassInput.autocomplete = 'new-password';
+      keyPassInput.placeholder = hasSavedKeyPass ? '已保存(留空保持不变)' : '无';
+      keyPassBlock.appendChild(keyPassInput);
+      keyPassBlock.appendChild(el('div', 'form-hint',
+        '仅加密私钥需要;留空则使用已保存口令(无则按无口令私钥加载)'));
+      body.appendChild(keyPassBlock);
+
+      // 记住口令复选框(Key,阶段三):保存后自动测试连接时透传,后端在
+      // 连接成功且本次口令非空时才 DPAPI 加密保存(部署时免输入)
+      var rememberBlock = el('div', 'form-row');
+      rememberBlock.id = 'srvf-remember-block';
+      var rememberLabel = el('label', 'deploy-checkbox');
+      var rememberInput = document.createElement('input');
+      rememberInput.type = 'checkbox';
+      rememberInput.id = 'srvf-remember-key-pass';
+      rememberLabel.appendChild(rememberInput);
+      rememberLabel.appendChild(el('span', '', '记住口令(用于部署)'));
+      rememberBlock.appendChild(rememberLabel);
+      rememberBlock.appendChild(el('div', 'form-hint',
+        '勾选且本次输入了口令时,测试连接成功后口令将被加密保存,部署时免输入'));
+      body.appendChild(rememberBlock);
+
       // 密码(Password)
       var passBlock = el('div', 'form-row');
       passBlock.id = 'srvf-pass-block';
@@ -1171,6 +1246,8 @@
       function syncAuthBlocks() {
         var isPass = radioPass.checked;
         keyBlock.classList.toggle('hidden', isPass);
+        keyPassBlock.classList.toggle('hidden', isPass);
+        rememberBlock.classList.toggle('hidden', isPass);
         passBlock.classList.toggle('hidden', !isPass);
       }
       radioKey.addEventListener('change', syncAuthBlocks);
@@ -1179,6 +1256,39 @@
 
       appendField(body, '远程部署目录', 'srvf-remote-dir', 'text',
         prev ? prev.remote_dir : '', '如:/opt/myapp');
+
+      // 主机密钥指纹(阶段三,TOFU):等宽只读展示 + 「重新信任」;
+      // 无指纹(首次连接/已重置)时以灰字 placeholder 提示
+      var fingerprint = (prev && prev.host_key_sha256) ? String(prev.host_key_sha256) : '';
+      var fpRow = el('div', 'form-row');
+      fpRow.id = 'srvf-fp-block';
+      fpRow.appendChild(el('label', 'form-label', '主机密钥指纹'));
+      var fpLine = el('div', 'input-btn-row');
+      var fpInput = document.createElement('input');
+      fpInput.className = 'form-input mono';
+      fpInput.id = 'srvf-fp-value';
+      fpInput.type = 'text';
+      fpInput.readOnly = true;
+      fpInput.autocomplete = 'off';
+      if (fingerprint) {
+        fpInput.value = fingerprint;
+      } else {
+        fpInput.placeholder = '首次连接时自动记录';
+      }
+      fpLine.appendChild(fpInput);
+      if (fingerprint) {
+        var retrustBtn = el('button', 'btn', '重新信任');
+        retrustBtn.type = 'button';
+        retrustBtn.title = '服务器重装或换 IP 后使用:重置指纹,下次连接重新记录';
+        retrustBtn.addEventListener('click', function () {
+          retrustHostKey(prev.id, fpInput, retrustBtn);
+        });
+        fpLine.appendChild(retrustBtn);
+      }
+      fpRow.appendChild(fpLine);
+      fpRow.appendChild(el('div', 'form-hint',
+        '首次连接记录的服务器指纹,之后指纹不一致将被拒绝连接(防中间人)'));
+      body.appendChild(fpRow);
 
       var saveBtn = appendActions(body, 'srvf-error', closeModal, function () {
         saveServer(prev, saveBtn);
@@ -1219,6 +1329,11 @@
     var keyPath = fieldVal('srvf-key-path');
     var passNode = document.getElementById('srvf-password');
     var newPass = passNode ? passNode.value : '';
+    // 阶段三:私钥口令按原样读取(不 trim,口令可能含首尾空格),仅 Key 分支生效
+    var keyPassNode = document.getElementById('srvf-key-pass');
+    var newKeyPass = (authType === 'Key' && keyPassNode) ? keyPassNode.value : '';
+    var rememberNode = document.getElementById('srvf-remember-key-pass');
+    var rememberKeyPass = !!(authType === 'Key' && rememberNode && rememberNode.checked);
 
     // 缺项聚合提示:一次告知所有未填的必填项
     var missing = [];
@@ -1239,12 +1354,15 @@
     }
     setSaving(true);
 
-    // Key → 只存 key_path(password_enc 原样保留,便于切回密码认证);
-    // Password → 输入了新密码时先加密,否则沿用已存密文
+    // Key → 只存 key_path(password_enc / key_pass_enc 原样保留,便于切回
+    // 密码认证与继续使用已存口令);Password → 输入了新密码时先加密,否则沿用已存密文
     var auth = {
       auth_type: authType,
       key_path: authType === 'Key' ? keyPath : null,
-      password_enc: prevAuth.password_enc || null
+      password_enc: prevAuth.password_enc || null,
+      // 阶段三:已存私钥口令密文原样保留(表单不承载密文;口令更新经
+      // test_server 的 remember_key_pass 由后端落盘,不经本表单回写)
+      key_pass_enc: prevAuth.key_pass_enc || null
     };
 
     var encPromise = (authType === 'Password' && newPass)
@@ -1259,20 +1377,32 @@
       })
       .then(function (cfg) {
         cfg = normalizeCfg(cfg);
+        var pid = (prev && prev.id) ? prev.id : uuid();
+        var idx = -1;
+        for (var i = 0; i < cfg.servers.length; i++) {
+          if (cfg.servers[i].id === pid) { idx = i; break; }
+        }
+        // 字段保全(阶段三):编辑回写是「get_config 全量取 → 整对象替换」
+        // 模式,表单不承载的字段必须以配置现值为基底透传回去,否则整对象
+        // 替换会经 serde(default) 把它们清空——auth.key_pass_enc(私钥口令
+        // 密文)与 host_key_sha256(主机密钥指纹)
+        var base = idx >= 0 ? cfg.servers[idx] : prev;
+        if (base) {
+          auth.key_pass_enc = (base.auth && base.auth.key_pass_enc)
+            ? base.auth.key_pass_enc
+            : null;
+        }
         var server = {
-          id: (prev && prev.id) ? prev.id : uuid(),
+          id: pid,
           name: name,
           host: host,
           port: Number(portRaw),
           username: username,
           auth: auth,
-          remote_dir: remoteDir
+          remote_dir: remoteDir,
+          host_key_sha256: (base && base.host_key_sha256) ? base.host_key_sha256 : null
         };
-        savedId = server.id;
-        var idx = -1;
-        for (var i = 0; i < cfg.servers.length; i++) {
-          if (cfg.servers[i].id === server.id) { idx = i; break; }
-        }
+        savedId = pid;
         if (idx >= 0) cfg.servers[idx] = server;
         else cfg.servers.push(server);
         return window.AppBus.invoke('save_config_cmd', { cfg: cfg });
@@ -1283,8 +1413,15 @@
         return loadConfig();
       })
       .then(function () {
-        // 保存成功后自动发起一次「测试连接」,结果呈现在服务器卡片上
-        if (savedId) runEnvCheck({ id: savedId }, 'test');
+        // 保存成功后自动发起一次「测试连接」,结果呈现在服务器卡片上;
+        // 表单中的一次性私钥口令与「记住口令」勾选随本次测试透传
+        // (是否持久化由后端判定:remember 勾选且口令非空才加密保存)
+        if (savedId) {
+          var extras = {};
+          if (newKeyPass) extras.keyPassphrase = newKeyPass;
+          if (rememberKeyPass) extras.rememberKeyPass = true;
+          runEnvCheck({ id: savedId }, 'test', extras);
+        }
       })
       .catch(function (err) {
         fail(errText(err) || '保存失败');

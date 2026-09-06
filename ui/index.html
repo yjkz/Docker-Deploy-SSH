@@ -146,6 +146,8 @@
           <div class="page-tools">
             <button id="servers-add-btn" class="btn btn-primary" type="button">新增服务器</button>
             <button id="projects-add-btn" class="btn" type="button">新增项目</button>
+            <!-- 配置中心:导出 / 导入 / 清除数据(模态内容由 config-io.js 构建) -->
+            <button id="config-io-btn" class="btn" type="button">配置中心</button>
           </div>
         </header>
 
@@ -659,6 +661,17 @@
     </div>
   </div>
 
+  <!-- 配置中心模态框(导出 / 导入 / 清除数据,内容由 config-io.js 构建) -->
+  <div id="config-io-modal" class="modal-overlay hidden">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="config-io-modal-title">
+      <div class="modal-head">
+        <div id="config-io-modal-title" class="modal-title">配置中心<span class="help-title-en">CONFIG I/O</span></div>
+        <button id="config-io-modal-close" class="modal-close" type="button" title="关闭">关闭</button>
+      </div>
+      <div id="config-io-modal-body" class="modal-body"></div>
+    </div>
+  </div>
+
   <!-- 帮助:右下角悬浮按钮(所有页面可见)+ 章节式帮助模态框(静态内容由 help.js 渲染) -->
   <button id="help-fab" class="help-fab" type="button" aria-haspopup="dialog"
           aria-controls="help-modal" aria-label="打开使用帮助" title="使用帮助">?</button>
@@ -683,5 +696,6 @@
   <script src="manage.js"></script>
   <script src="notify.js"></script>
   <script src="help.js"></script>
+  <script src="config-io.js"></script>
 </body>
 </html>

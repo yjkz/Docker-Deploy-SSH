@@ -1,20 +1,23 @@
 //! SSH/SFTP 模块(任务 3)。
 //!
 //! 基于 `russh` 0.46 + `russh-sftp` 2.x 提供:
-//! - [`SshClient::connect`]:密钥(PEM,未加密)/ 密码两种认证
+//! - [`SshClient::connect`]:密钥(PEM,支持加密私钥 + 口令)/ 密码两种认证,
+//!   并内置主机密钥 TOFU 校验(见下)
 //! - [`SshClient::exec`]:开通道执行命令,stdout+stderr 合并按行实时回调,返回退出码
 //! - [`SshClient::sftp_upload`]:单文件上传(可选断点续传),带字节进度回调
 //! - [`SshClient::sftp_upload_dir`]:整目录上传,带字节进度回调
 //! - [`SshClient::sftp_stat_size`]:查询远端文件大小(断点续传的决策依据)
 //! - [`check_server_env`]:远端 docker / compose / gzip / 目录 / 磁盘环境探测
 //!
-//! 安全取舍(有意为之):本工具面向个人部署场景,首次连接直接接受服务器主机密钥
-//! (不校验 known_hosts),避免交互式确认;如需严格校验,可在
-//! [`ClientHandler::check_server_key`] 中接入指纹比对。
+//! 主机密钥安全(TOFU,阶段三):首次连接接受服务器主机密钥并把观察到的
+//! OpenSSH 风格指纹(`SHA256:` + base64(nopad))经 `observed_host_key` 交由
+//! 调用方落盘(`ServerConfig.host_key_sha256`);此后每次连接在
+//! [`ClientHandler::check_server_key`] 中与配置的期望指纹比对,不一致即拒绝
+//! 连接(防中间人;服务器重装/换 IP 后由用户显式重新信任)。
 
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use russh::client::{self, Handle};
@@ -33,8 +36,54 @@ pub const INSTALL_DOCKER_CMD: &str = "curl -fsSL https://get.docker.com | sh";
 /// SFTP 单次读写块大小:64KB。
 const CHUNK_SIZE: usize = 64 * 1024;
 
-/// 主机密钥处理器:无条件接受(见模块注释的安全取舍)。
-struct ClientHandler;
+/// 主机密钥处理器(携带状态):按 TOFU 策略校验服务器主机密钥。
+///
+/// - `expected`:`ServerConfig.host_key_sha256`(期望指纹);`None` = 首次连接,
+///   接受并记录(TOFU 信任-on-first-use);
+/// - `observed`:调用方传入的共享槽位,记录本次连接观察到的指纹,
+///   供调用方在连接成功后做首次落盘。
+struct ClientHandler {
+    expected: Option<String>,
+    observed: Arc<OnceLock<String>>,
+}
+
+/// 计算 OpenSSH 风格的服务器主机密钥指纹:
+/// `SHA256:` + base64(nopad)(SHA-256(公钥 SSH wire blob))。
+///
+/// russh 0.46 的 [`russh::keys::key::PublicKey::fingerprint`] 已实现
+/// blob(`public_key_bytes()`)→ SHA-256 → base64(nopad) 全流程,
+/// 仅缺 `SHA256:` 前缀,这里补齐为与 `ssh-keygen -lf` 一致的形态。
+fn host_fingerprint(key: &russh::keys::key::PublicKey) -> String {
+    format!("SHA256:{}", key.fingerprint())
+}
+
+/// 私钥加载错误的中文映射(纯函数,便于单测)。
+///
+/// - 私钥已加密但未提供口令(OpenSSH 格式)→ 提示输入口令;
+/// - 提供了口令仍解不开(PEM 解密失败:PKCS#8 → `Pkcs8`,OpenSSH →
+///   `KeyIsCorrupt`)→ 「私钥口令错误或私钥已损坏」;
+/// - 无口令且解析失败(PKCS#8 加密格式无口令时解析即失败,`Pkcs8`/`Der`)
+///   → 提示「可能已加密需口令」或文件损坏;
+/// - 其余(路径不存在、格式不支持等)→ 通用「加载私钥失败」并附原始错误。
+fn map_key_load_error(key_path: &str, had_passphrase: bool, e: russh::keys::Error) -> String {
+    match e {
+        russh::keys::Error::KeyIsEncrypted => format!(
+            "私钥已加密,请输入私钥口令或先在服务器设置中保存口令 ({})",
+            key_path
+        ),
+        russh::keys::Error::KeyIsCorrupt | russh::keys::Error::CouldNotReadKey
+        | russh::keys::Error::Pkcs8(_)
+            if had_passphrase =>
+        {
+            format!("私钥口令错误或私钥已损坏 ({})", key_path)
+        }
+        russh::keys::Error::Pkcs8(_) | russh::keys::Error::Der(_) => format!(
+            "加载私钥失败 ({}): 私钥可能已加密(需提供口令)或文件已损坏",
+            key_path
+        ),
+        e => format!("加载私钥失败 ({}): {}", key_path, e),
+    }
+}
 
 #[async_trait]
 impl client::Handler for ClientHandler {
@@ -42,10 +91,17 @@ impl client::Handler for ClientHandler {
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::key::PublicKey,
+        server_public_key: &russh::keys::key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        // 首次连接直接接受主机密钥 —— 工具类应用的有意取舍(见模块注释)。
-        Ok(true)
+        let fingerprint = host_fingerprint(server_public_key);
+        // 无论接受与否都记录观察值(拒绝路径的错误信息也可引用,调用方可读)
+        let _ = self.observed.set(fingerprint.clone());
+        match &self.expected {
+            // 首次连接:接受并记录(TOFU;落盘由调用方完成)
+            None => Ok(true),
+            // 已有期望指纹:一致才接受,否则拒绝(russh 以 UnknownKey 错误中止建连)
+            Some(expected) => Ok(expected == &fingerprint),
+        }
     }
 }
 
@@ -55,25 +111,48 @@ pub struct SshClient {
 }
 
 impl SshClient {
-    /// 建立连接并完成认证。
+    /// 建立连接并完成认证(含主机密钥 TOFU 校验)。
     ///
-    /// - `AuthType::Key`:读取 `cfg.auth.key_path` 指向的 PEM 私钥文件(支持未加密密钥;
-    ///   加密私钥的口令输入属后续任务扩展点,此处以无口令方式加载)。
+    /// - `AuthType::Key`:读取 `cfg.auth.key_path` 指向的 PEM 私钥文件;
+    ///   加密私钥经 `key_passphrase` 解密(口令由调用方经
+    ///   `commands::resolve_key_passphrase` 从 DPAPI 密文解析),口令错误映射为
+    ///   「私钥口令错误或私钥已损坏」;未加密私钥传 `None` 即可。
     /// - `AuthType::Password`:使用 `password_plain`;若为 `None` 返回 `Err("需要密码")`。
     ///   (DPAPI 解密在配置/命令层完成,不在本模块内。)
-    pub async fn connect(cfg: &ServerConfig, password_plain: Option<&str>) -> Result<Self, String> {
+    /// - 主机密钥 TOFU:`cfg.host_key_sha256` 为期望指纹(缺省 = 首次连接接受);
+    ///   服务器指纹与之不一致 → 拒绝建连并返回固定中文错误(前端引导重新信任)。
+    ///   本次观察到的指纹写入 `observed_host_key`,首次连接后由调用方落盘
+    ///   (见 `commands::persist_host_key_if_needed`);调用方不关心时可传
+    ///   `Arc::default()`。
+    pub async fn connect(
+        cfg: &ServerConfig,
+        password_plain: Option<&str>,
+        key_passphrase: Option<&str>,
+        observed_host_key: Arc<OnceLock<String>>,
+    ) -> Result<Self, String> {
         let config = Arc::new(client::Config::default());
-        let mut handle = client::connect(config, (cfg.host.as_str(), cfg.port), ClientHandler)
+        let handler = ClientHandler {
+            expected: cfg.host_key_sha256.clone(),
+            observed: observed_host_key,
+        };
+        let mut handle = client::connect(config, (cfg.host.as_str(), cfg.port), handler)
             .await
-            .map_err(|e| format!("SSH 连接失败 ({}:{}): {}", cfg.host, cfg.port, e))?;
+            .map_err(|e| match e {
+                // check_server_key 返回 false 时 russh 以 UnknownKey 中止建连
+                russh::Error::UnknownKey => {
+                    "服务器主机密钥已变更!可能为服务器重装/换 IP,也可能存在中间人风险。如确认无误,请在服务器管理中重新信任该主机。"
+                        .to_string()
+                }
+                e => format!("SSH 连接失败 ({}:{}): {}", cfg.host, cfg.port, e),
+            })?;
 
         match cfg.auth.auth_type {
             AuthType::Key => {
                 let key_path = cfg.auth.key_path.as_deref().ok_or_else(|| {
                     "SSH 密钥认证失败: 未配置私钥路径(key_path 为空)".to_string()
                 })?;
-                let key = russh::keys::load_secret_key(key_path, None)
-                    .map_err(|e| format!("加载私钥失败 ({}): {}", key_path, e))?;
+                let key = russh::keys::load_secret_key(key_path, key_passphrase)
+                    .map_err(|e| map_key_load_error(key_path, key_passphrase.is_some(), e))?;
                 let ok = handle
                     .authenticate_publickey(&cfg.username, Arc::new(key))
                     .await
@@ -611,6 +690,130 @@ mod tests {
         assert_eq!(resume_plan(Some(200), 100, true), ResumePlan::AlreadyDone);
     }
 
+    // ===== 阶段三:主机密钥指纹(TOFU)与私钥口令错误映射(离线单测)=====
+
+    /// OpenSSH 风格指纹格式:`SHA256:` + 43 字符 base64(nopad,URL 安全字母表),
+    /// 同一密钥稳定、不同密钥互异。
+    #[test]
+    fn test_host_fingerprint_format() {
+        use base64::engine::general_purpose::STANDARD_NO_PAD as B64_NOPAD;
+        use base64::Engine as _;
+
+        let key = russh::keys::key::KeyPair::generate_ed25519();
+        let pk = key.clone_public_key().expect("clone_public_key 失败");
+        let fp = host_fingerprint(&pk);
+
+        assert!(fp.starts_with("SHA256:"), "指纹应有 SHA256: 前缀: {fp}");
+        let body = &fp["SHA256:".len()..];
+        assert_eq!(body.len(), 43, "SHA-256 base64(nopad) 应为 43 字符: {body}");
+        // russh 内部用 data_encoding::BASE64_NOPAD(标准字母表 + /,无填充)
+        assert!(
+            body.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/'),
+            "应为标准字母表 base64(nopad): {body}"
+        );
+        // base64 解码后恰为 32 字节(SHA-256 摘要)
+        assert_eq!(B64_NOPAD.decode(body).unwrap().len(), 32);
+        // 同一密钥两次计算结果一致
+        assert_eq!(host_fingerprint(&pk), fp);
+
+        // 不同密钥指纹互异
+        let pk2 = russh::keys::key::KeyPair::generate_ed25519()
+            .clone_public_key()
+            .unwrap();
+        assert_ne!(host_fingerprint(&pk2), fp);
+    }
+
+    /// TOFU 判定:期望为 None → 接受并记录观察值;一致 → 接受;不一致 → 拒绝。
+    #[tokio::test]
+    async fn test_check_server_key_tofu() {
+        use russh::client::Handler as _;
+
+        let pk = russh::keys::key::KeyPair::generate_ed25519()
+            .clone_public_key()
+            .expect("clone_public_key 失败");
+        let fp = host_fingerprint(&pk);
+
+        // 首次连接(expected=None):接受,且 observed 记录指纹
+        let observed = Arc::new(OnceLock::new());
+        let mut handler = ClientHandler {
+            expected: None,
+            observed: Arc::clone(&observed),
+        };
+        assert!(handler.check_server_key(&pk).await.unwrap());
+        assert_eq!(observed.get().map(String::as_str), Some(fp.as_str()));
+
+        // 期望指纹一致 → 接受
+        let observed2 = Arc::new(OnceLock::new());
+        let mut handler = ClientHandler {
+            expected: Some(fp.clone()),
+            observed: Arc::clone(&observed2),
+        };
+        assert!(handler.check_server_key(&pk).await.unwrap());
+        assert_eq!(observed2.get().map(String::as_str), Some(fp.as_str()));
+
+        // 期望指纹不一致(服务器换 key / 中间人)→ 拒绝
+        let mut handler = ClientHandler {
+            expected: Some("SHA256:mismatched-fingerprint-value-000000000000000".into()),
+            observed: Arc::new(OnceLock::new()),
+        };
+        assert!(!handler.check_server_key(&pk).await.unwrap());
+    }
+
+    /// 私钥口令错误映射:加密私钥无口令 → KeyIsEncrypted 提示;
+    /// 有口令但解不开 → 「私钥口令错误或私钥已损坏」;无口令路径 → 通用失败。
+    #[test]
+    fn test_map_key_load_error() {
+        // Error 未实现 Copy,各断言分别构造
+        assert!(
+            map_key_load_error("/k", false, russh::keys::Error::KeyIsEncrypted)
+                .contains("私钥已加密"),
+            "加密私钥未提供口令应提示输入口令"
+        );
+        assert_eq!(
+            map_key_load_error("/k", true, russh::keys::Error::KeyIsCorrupt),
+            "私钥口令错误或私钥已损坏 (/k)"
+        );
+        assert_eq!(
+            map_key_load_error("/k", true, russh::keys::Error::CouldNotReadKey),
+            "私钥口令错误或私钥已损坏 (/k)"
+        );
+        // 未提供口令时的损坏/读失败:走通用「加载私钥失败」并附原始错误
+        assert_eq!(
+            map_key_load_error("/k", false, russh::keys::Error::KeyIsCorrupt),
+            "加载私钥失败 (/k): The key is corrupt"
+        );
+    }
+
+    /// 离线加密私钥 roundtrip:russh 生成的 ed25519 密钥加密为 PKCS#8 PEM 后,
+    /// 正确口令可解开,错误口令按 russh 实际错误被映射为「口令错误或已损坏」。
+    #[test]
+    fn test_load_encrypted_pem_key() {
+        let key = russh::keys::key::KeyPair::generate_ed25519();
+        let path = std::env::temp_dir().join(format!("dd-enc-key-{}.pem", uuid::Uuid::new_v4()));
+        let f = std::fs::File::create(&path).unwrap();
+        russh::keys::encode_pkcs8_pem_encrypted(&key, b"correct-pass", 3, f).unwrap();
+
+        // 正确口令 → 解开
+        assert!(russh::keys::load_secret_key(&path, Some("correct-pass")).is_ok());
+        // 错误口令 → 解密失败(PKCS#8 路径为 Pkcs8 错误)→ 映射为口令错误提示
+        let err = russh::keys::load_secret_key(&path, Some("wrong-pass")).unwrap_err();
+        assert!(
+            matches!(err, russh::keys::Error::Pkcs8(_)),
+            "错误口令应为 Pkcs8 解密失败,实际: {:?}",
+            err
+        );
+        assert!(map_key_load_error("x", true, err).contains("私钥口令错误或私钥已损坏"));
+        // 无口令 → 解析失败(Der 错误)→ 提示可能已加密需口令
+        let err = russh::keys::load_secret_key(&path, None).unwrap_err();
+        assert!(matches!(err, russh::keys::Error::Der(_)));
+        assert!(
+            map_key_load_error("x", false, err).contains("私钥可能已加密"),
+            "无口令加载加密私钥应提示需要口令"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
     // ===== 可选真机测试:需要可连通的 SSH 服务器,默认 #[ignore] =====
     //
     // 运行示例(密码认证):
@@ -627,11 +830,13 @@ mod tests {
                 auth_type: AuthType::Key,
                 key_path: Some(key_path),
                 password_enc: None,
+                key_pass_enc: None,
             },
             Err(_) => AuthConfig {
                 auth_type: AuthType::Password,
                 key_path: None,
                 password_enc: None,
+                key_pass_enc: None,
             },
         };
         Some(ServerConfig {
@@ -642,6 +847,7 @@ mod tests {
             username,
             auth,
             remote_dir: "/tmp/dd-ssh-test".into(),
+            host_key_sha256: None,
         })
     }
 
@@ -651,7 +857,7 @@ mod tests {
         let cfg = test_cfg_from_env()
             .expect("请设置 DD_SSH_TEST_HOST / DD_SSH_TEST_USER / (DD_SSH_TEST_PASSWORD | DD_SSH_TEST_KEY)");
         let pw = std::env::var("DD_SSH_TEST_PASSWORD").ok();
-        let mut client = SshClient::connect(&cfg, pw.as_deref())
+        let mut client = SshClient::connect(&cfg, pw.as_deref(), None, Arc::default())
             .await
             .expect("connect 失败");
 
@@ -670,7 +876,7 @@ mod tests {
         let cfg = test_cfg_from_env()
             .expect("请设置 DD_SSH_TEST_HOST / DD_SSH_TEST_USER / (DD_SSH_TEST_PASSWORD | DD_SSH_TEST_KEY)");
         let pw = std::env::var("DD_SSH_TEST_PASSWORD").ok();
-        let mut client = SshClient::connect(&cfg, pw.as_deref())
+        let mut client = SshClient::connect(&cfg, pw.as_deref(), None, Arc::default())
             .await
             .expect("connect 失败");
 

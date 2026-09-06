@@ -2506,3 +2506,59 @@ code {
 /* 底部按钮行:左侧测试按钮组(margin-right:auto 推开)+ 右侧「保存配置」主按钮 */
 .notify-actions { flex-wrap: wrap; }
 .notify-test-group { display: flex; gap: 8px; margin-right: auto; }
+
+/* ===== 配置中心(config-io.js;复用 modal/form-row/input-btn-row/btn 体系) ===== */
+
+/* 模态内分组标题(参照 .notify-group-title 先例:mono 小字大写字距) */
+.cio-group-title {
+  margin: 18px 0 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--ark-paper-dim-ink);
+}
+.cio-group-title:first-child { margin-top: 0; }
+
+/* 组内说明文字(弱化段落,说明导出加密/导入覆盖语义) */
+.cio-note {
+  margin: 0 0 10px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--ark-paper-ink-65);
+}
+
+/* 导入结果行(行内回显;失败用 --ark-stat-hot,同 .notify-test-fail 先例) */
+.cio-result {
+  min-height: 18px;
+  margin-top: 4px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  word-break: break-all;
+}
+.cio-result-ok { color: var(--ark-ink); }
+.cio-result-fail { color: var(--ark-stat-hot); }
+
+/* 危险区:琥珀警示左条(--ark-warn 仅警示的既定纪律)+ 暗红标题文字
+   (--ark-stat-hot,两主题均过 AA);不用红底,维持双色纪律 */
+.cio-danger-box {
+  margin-top: 18px;
+  padding: 12px 14px;
+  border: 1px solid var(--ark-line-soft);
+  border-left: 4px solid var(--ark-warn);
+  background: var(--ark-paper-dim);
+}
+.cio-danger-title {
+  margin-bottom: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--ark-stat-hot);
+}
+.cio-danger-text {
+  margin-bottom: 10px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--ark-paper-ink-65);
+}
