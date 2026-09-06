@@ -2,6 +2,7 @@
 //! the application folder's `config/` subdirectory (portable layout).
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -455,6 +456,122 @@ pub fn app_settings_set(settings: AppSettings) -> std::result::Result<(), String
     save_app_settings(&settings).map_err(|e| format!("保存设置失败: {}", e))
 }
 
+// ===== 部署断点续传(UPGRADE-PLAN 阶段六,独立持久化于 config/resume-deploy.json)=====
+
+/// 断点条目上限:超出后按 `ts` 从最旧开始裁剪(防止无限膨胀)。
+const MAX_CHECKPOINTS: usize = 10;
+
+/// 单条部署断点(`resume-deploy.json` 的值,键见 [`checkpoint_key`])。
+///
+/// 记录一次未完成部署的进度:每个步骤完成的收尾处落盘一次,
+/// `step_next` = 下一个待执行的步骤号(失败/取消发生在该步骤,
+/// 续传时从它开始重跑)。`artifacts` 为步骤产物(JSON,按 `mode` 结构不同,
+/// 由 commands 层构造与解析:单镜像含镜像引用/本地与远端 tar 路径,
+/// 整栈含服务分类/发布时间戳/镜像包文件名)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeCheckpoint {
+    /// 断点键(`server_id|project_id|mode`,与文件中的键一致)
+    pub key: String,
+    /// 部署模式:`single`(单镜像)/ `stack`(整栈)
+    pub mode: String,
+    /// 下一个待执行的步骤号(1 起;失败步骤号 = step_next)
+    pub step_next: u32,
+    /// 最近一次落盘时间(本地时间 `%F %T`,用于展示与最旧裁剪)
+    pub ts: String,
+    pub server_id: String,
+    pub project_id: String,
+    /// 服务器名称快照(续传列表展示用;以当前配置为准校验存在性)
+    pub server_name: String,
+    /// 项目名称快照
+    pub project_name: String,
+    /// 步骤产物(结构随 mode 不同,见 [`ResumeCheckpoint`] 文档)
+    pub artifacts: serde_json::Value,
+}
+
+/// 断点键:`server_id|project_id|mode`(同一键的新部署覆盖旧断点)。
+pub fn checkpoint_key(server_id: &str, project_id: &str, mode: &str) -> String {
+    format!("{}|{}|{}", server_id, project_id, mode)
+}
+
+/// `resume-deploy.json` 路径(config 目录下,与 servers.json 同级)。
+fn resume_path() -> PathBuf {
+    config_dir().join("resume-deploy.json")
+}
+
+/// 读取全部部署断点(键 → [`ResumeCheckpoint`])。
+///
+/// 容错口径与 history/notify 一致:文件缺失(从未有未完成部署)返回空表,
+/// 损坏/不可读时告警后返回空表 —— 断点是尽力而为的旁路数据,不应让部署页
+/// 或续传入口整体不可用;后续保存会以空表起步重建。
+pub fn load_resume_map() -> HashMap<String, ResumeCheckpoint> {
+    let path = resume_path();
+    match std::fs::read(&path) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(map) => map,
+            Err(e) => {
+                log::warn!(
+                    "部署断点文件损坏,按空断点表处理 ({}): {}",
+                    path.display(),
+                    e
+                );
+                HashMap::new()
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+        Err(e) => {
+            log::warn!("读取部署断点失败 ({}): {}", path.display(), e);
+            HashMap::new()
+        }
+    }
+}
+
+/// 保存一条断点:读 → 插入(同键覆盖 = 新部署同键覆盖旧断点)→ 超上限裁剪
+/// 最旧 → 原子写回(`.tmp` + rename,复用 [`write_json_atomic`])。
+pub fn save_checkpoint(cp: &ResumeCheckpoint) -> Result<()> {
+    let mut map = load_resume_map();
+    map.insert(cp.key.clone(), cp.clone());
+    trim_checkpoints(&mut map);
+    write_resume_map(&map)
+}
+
+/// 删除一条断点,返回被删的条目(供调用方清理其临时产物;无则 `None`)。
+pub fn remove_checkpoint(key: &str) -> Result<Option<ResumeCheckpoint>> {
+    let mut map = load_resume_map();
+    let removed = map.remove(key);
+    if removed.is_some() {
+        write_resume_map(&map)?;
+    }
+    Ok(removed)
+}
+
+/// 断点条目裁剪(纯函数,便于单测):超过 [`MAX_CHECKPOINTS`] 条时按 `ts`
+/// 从最旧开始移除(`ts` 为 `%F %T` 文本,字典序即时间序)。
+fn trim_checkpoints(map: &mut HashMap<String, ResumeCheckpoint>) {
+    if map.len() <= MAX_CHECKPOINTS {
+        return;
+    }
+    // 按 ts 升序取出最旧的若干条键,逐个移除
+    let mut oldest: Vec<(String, String)> = map
+        .iter()
+        .map(|(k, v)| (v.ts.clone(), k.clone()))
+        .collect();
+    oldest.sort_by(|a, b| a.0.cmp(&b.0));
+    let overflow = map.len() - MAX_CHECKPOINTS;
+    for (_, key) in oldest.into_iter().take(overflow) {
+        map.remove(&key);
+    }
+}
+
+/// 原子写断点表(config 目录不存在则创建)。
+fn write_resume_map(map: &HashMap<String, ResumeCheckpoint>) -> Result<()> {
+    let path = resume_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    write_json_atomic(&path, map)
+}
+
 #[cfg(test)]
 pub(crate) static TEST_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -746,5 +863,138 @@ mod tests {
         let partial: AppSettings = serde_json::from_str(r#"{"closeToTray":true}"#).unwrap();
         assert!(partial.close_to_tray);
         assert_eq!(partial.proxy, "");
+    }
+
+    // ===== 部署断点续传(阶段六):键构造 / roundtrip / 覆盖 / 删除 / 裁剪 / 容错 =====
+
+    /// 构造第 idx 条测试断点(ts 随 idx 区分,供最旧裁剪断言)。
+    fn checkpoint(idx: usize, mode: &str) -> ResumeCheckpoint {
+        ResumeCheckpoint {
+            key: checkpoint_key("s1", "p1", mode),
+            mode: mode.into(),
+            step_next: 2,
+            ts: format!("2026-09-06 10:00:{:02}", idx % 60),
+            server_id: "s1".into(),
+            project_id: "p1".into(),
+            server_name: format!("服务器{}", idx),
+            project_name: "项目".into(),
+            artifacts: serde_json::json!({ "imageRef": format!("app:20260906-1000{:02}", idx % 60) }),
+        }
+    }
+
+    #[test]
+    fn test_checkpoint_key_format() {
+        assert_eq!(checkpoint_key("s1", "p1", "single"), "s1|p1|single");
+        assert_eq!(checkpoint_key("s1", "p1", "stack"), "s1|p1|stack");
+        // 不同 mode 互为不同键(同服务器同项目可同时存在两类断点)
+        assert_ne!(checkpoint_key("s1", "p1", "single"), checkpoint_key("s1", "p1", "stack"));
+    }
+
+    #[test]
+    fn test_checkpoint_save_load_roundtrip_and_overwrite() {
+        let _guard = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ddtest-resume-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
+
+        // 保存 → 读回逐字段相等
+        let cp = checkpoint(1, "single");
+        save_checkpoint(&cp).unwrap();
+        assert!(dir.join("config/resume-deploy.json").exists());
+        let map = load_resume_map();
+        assert_eq!(map.get(&cp.key), Some(&cp));
+
+        // 同键再存(新部署覆盖旧断点:step_next/ts 更新)
+        let mut newer = checkpoint(2, "single");
+        newer.step_next = 3;
+        save_checkpoint(&newer).unwrap();
+        let map = load_resume_map();
+        assert_eq!(map.len(), 1, "同键应覆盖而非新增");
+        assert_eq!(map.get(&cp.key), Some(&newer));
+
+        // 不同 mode 为不同键,可并存
+        let stack_cp = checkpoint(3, "stack");
+        save_checkpoint(&stack_cp).unwrap();
+        let map = load_resume_map();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(&stack_cp.key), Some(&stack_cp));
+
+        // 删除:返回被删条目,读回为空;再删 → None
+        let removed = remove_checkpoint(&cp.key).unwrap();
+        assert_eq!(removed, Some(newer));
+        assert!(load_resume_map().get(&cp.key).is_none());
+        assert_eq!(remove_checkpoint(&cp.key).unwrap(), None);
+        // 另一条不受影响
+        assert_eq!(load_resume_map().get(&stack_cp.key), Some(&stack_cp));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_checkpoint_missing_file_returns_empty() {
+        let _guard = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ddtest-resume-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
+        assert!(load_resume_map().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_checkpoint_corrupt_file_returns_empty_and_self_heals() {
+        let _guard = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ddtest-resume-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
+        let path = dir.join("config/resume-deploy.json");
+        std::fs::write(&path, "{oops").unwrap();
+
+        // 损坏 → 空表(不 panic、不报错)
+        assert!(load_resume_map().is_empty());
+        // 后续保存以空表起步自愈
+        let cp = checkpoint(1, "stack");
+        save_checkpoint(&cp).unwrap();
+        assert_eq!(load_resume_map().get(&cp.key), Some(&cp));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_checkpoint_trim_oldest_beyond_limit() {
+        let _guard = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ddtest-resume-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
+
+        for i in 0..(MAX_CHECKPOINTS + 3) {
+            let mut cp = checkpoint(i, "single");
+            // 每条不同键(server_id 区分),ts 递增
+            cp.key = checkpoint_key(&format!("s{}", i), "p1", "single");
+            cp.server_id = format!("s{}", i);
+            save_checkpoint(&cp).unwrap();
+        }
+        let map = load_resume_map();
+        assert_eq!(map.len(), MAX_CHECKPOINTS);
+        // 最旧的 3 条(ts 0..3,即 s0/s1/s2)被裁掉
+        assert!(!map.contains_key(&checkpoint_key("s0", "p1", "single")));
+        assert!(!map.contains_key(&checkpoint_key("s2", "p1", "single")));
+        // 最新一条仍在
+        assert!(map.contains_key(&checkpoint_key(
+            &format!("s{}", MAX_CHECKPOINTS + 2),
+            "p1",
+            "single"
+        )));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_checkpoint_serde_camel_case() {
+        let cp = checkpoint(1, "single");
+        let json = serde_json::to_string(&cp).unwrap();
+        // 文件字段为 camelCase(与前端读取约定一致)
+        assert!(json.contains("\"stepNext\":2"), "实际: {}", json);
+        assert!(json.contains("\"serverId\""), "实际: {}", json);
+        assert!(json.contains("\"serverName\""), "实际: {}", json);
+        assert!(json.contains("\"projectId\""), "实际: {}", json);
     }
 }

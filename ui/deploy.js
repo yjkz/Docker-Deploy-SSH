@@ -43,6 +43,15 @@
  * - rollback_execute_stack({ serverId, projectId, releaseTs })
  * - rollback_execute_single({ serverId, projectId, repository, dateTag, targetRef })
  *
+ * 断点续传(UPGRADE-PLAN 阶段六;事件与正常部署完全一致,前端仅多一条横幅入口):
+ * - deploy_resume_status({ serverId, projectId }) -> ResumeView | null
+ *     ResumeView = { key, mode: "single"|"stack", stepNext, stepLabel, ts,
+ *                    serverName, projectName }(同服务器+项目多条断点取 ts 最新)
+ * - deploy_resume_start({ key, passwordPlain? }) -> 同步返回 null,结果只经事件
+ *     (管线从断点 stepNext 起,deploy-progress / deploy-log / deploy-done 与
+ *      正常部署一致,进度条无需特殊处理;发起前按断点模式对齐页签节点集)
+ * - deploy_resume_discard({ key })(删断点 + 清本地临时 tar + 尽力清远端临时产物)
+ *
  * 事件(AppBus.on,模块级守卫保证只注册一次):
  * - 'deploy-progress' { step, total, message }
  *     单镜像模式 step 1..5(打标签/导出压缩/上传镜像/同步文件/服务器部署);
@@ -71,6 +80,11 @@
  *   打开 #deploy-modal(整栈选历史发布 / 单镜像选历史日期标签 + 目标引用,
  *   服务器与项目按记录名称从当前配置反查),执行期复用 st.deploying 互斥,
  *   模态内等宽日志区镜像 deploy-log,执行中禁止关闭模态(Esc/遮罩均拦截)。
+ * - 断点续传横幅:deploy-done(失败/取消)后、进入页面与切换服务器/项目时查询
+ *   deploy_resume_status,命中当前选中服务器+项目时显示「从步骤 N 继续 / 放弃断点」;
+ *   「继续」复用 st.deploying 互斥发起 deploy_resume_start(密码不传,用后端已存
+ *   密文),之后事件渲染与正常部署一致;「放弃」就地二次确认后 deploy_resume_discard。
+ *   开始新部署 / 续传发起 / 放弃成功 / 部署成功(断点已清)时隐藏横幅。
  *
  * 安全说明:所有来自后端/配置的数据一律 createElement + textContent 渲染,
  * 不使用 innerHTML 拼接;提示一律用 toast / 自绘错误框,不调用系统对话框。
@@ -128,7 +142,9 @@
     rbReleases: [],    // rollback_list_releases 结果(新 → 旧)
     rbTags: [],        // rollback_list_tags 结果(创建时间倒序)
     rbBusy: false,     // 回滚执行中(发起 invoke → deploy-done;期间模态禁止关闭)
-    rbLogs: []         // 回滚模态内日志区累积的日志行(deploy-log 镜像)
+    rbLogs: [],        // 回滚模态内日志区累积的日志行(deploy-log 镜像)
+    resume: null,      // deploy_resume_status 查询到的断点视图(ResumeView;无断点为 null)
+    resumeBusy: false  // deploy_resume_discard 请求进行中(防重复提交)
   };
 
   /** 部署事件监听守卫:只注册一次,防止重复绑定 */
@@ -231,6 +247,156 @@
     banner.textContent = '';
   }
 
+  // ===== 断点续传横幅(deploy_resume_status / start / discard)=====
+
+  /** 隐藏续传横幅并清空已查询到的断点(开始新部署 / 放弃成功 / 无断点时) */
+  function hideResumeBanner() {
+    var box = document.getElementById('deploy-resume-banner');
+    if (box) {
+      box.textContent = '';
+      box.classList.add('hidden');
+    }
+    st.resume = null;
+  }
+
+  /**
+   * 渲染续传横幅(与其他渲染一致:createElement + textContent,不拼 innerHTML)。
+   * @param {object} view deploy_resume_status 返回的 ResumeView
+   * @param {boolean} confirming true = 「放弃断点」的就地二次确认态
+   */
+  function renderResumeBanner(view, confirming) {
+    var box = document.getElementById('deploy-resume-banner');
+    if (!box || !view) return;
+    st.resume = view;
+
+    var modeText = String(view.mode) === 'stack' ? '整栈' : '单镜像';
+    box.textContent = '';
+    box.appendChild(el('div', 'servers-error-text',
+      '检测到 ' + String(view.ts || '') + ' 一次未完成的' + modeText + '部署（服务器 ' +
+      String(view.serverName || '') + ' / 项目 ' + String(view.projectName || '') +
+      '），中断于步骤：' + String(view.stepLabel || '未知')));
+
+    if (confirming) {
+      box.appendChild(el('div', 'servers-error-text',
+        '放弃将删除断点,并清理该次部署保留的本地临时文件与服务器上的临时产物,确认放弃?'));
+      var sure = el('button', 'btn btn-danger', '确认放弃');
+      sure.type = 'button';
+      sure.id = 'deploy-resume-discard-btn';
+      sure.addEventListener('click', onResumeDiscard);
+      var keep = el('button', 'btn', '保留断点');
+      keep.type = 'button';
+      keep.id = 'deploy-resume-keep-btn';
+      keep.addEventListener('click', function () { renderResumeBanner(st.resume, false); });
+      box.appendChild(sure);
+      box.appendChild(keep);
+    } else {
+      var go = el('button', 'btn btn-primary',
+        '从步骤 ' + (Number(view.stepNext) || 1) + ' 继续');
+      go.type = 'button';
+      go.id = 'deploy-resume-continue-btn';
+      go.addEventListener('click', onResumeStart);
+      var drop = el('button', 'btn', '放弃断点');
+      drop.type = 'button';
+      drop.id = 'deploy-resume-discard-btn';
+      drop.addEventListener('click', function () { renderResumeBanner(st.resume, true); });
+      box.appendChild(go);
+      box.appendChild(drop);
+    }
+
+    // 渲染时即与互斥状态对齐(部署/预检/放弃请求进行中一律禁用,口径同 refreshControls)
+    var locked = st.deploying || st.checking || st.resumeBusy;
+    ['deploy-resume-continue-btn', 'deploy-resume-discard-btn', 'deploy-resume-keep-btn']
+      .forEach(function (id) {
+        var node = document.getElementById(id);
+        if (node) node.disabled = locked;
+      });
+    box.classList.remove('hidden');
+  }
+
+  /**
+   * 查询当前选中服务器/项目的部署断点并同步横幅显隐:
+   * 命中(后端按键 server|project 过滤,取 ts 最新一条)则显示,无断点则隐藏。
+   * 查询失败静默降级(console.warn),不影响部署主流程。
+   */
+  function refreshResumeStatus() {
+    var srvSel = document.getElementById('deploy-server');
+    var prjSel = document.getElementById('deploy-project');
+    var serverId = srvSel ? String(srvSel.value) : '';
+    var projectId = prjSel ? String(prjSel.value) : '';
+    if (!serverId || !projectId) {
+      hideResumeBanner();
+      return;
+    }
+
+    window.AppBus.invoke('deploy_resume_status',
+        { serverId: serverId, projectId: projectId })
+      .then(function (view) {
+        // 过期响应丢弃:期间选中项已变化,或已进入部署/预检/放弃请求(新运行
+        // 开始时已清横幅;放弃进行中不重绘,显隐由 discard 结果决定)
+        var curSrv = srvSel ? String(srvSel.value) : '';
+        var curPrj = prjSel ? String(prjSel.value) : '';
+        if (curSrv !== serverId || curPrj !== projectId) return;
+        if (st.deploying || st.checking || st.resumeBusy) return;
+        if (view && view.key) renderResumeBanner(view, false);
+        else hideResumeBanner();
+      })
+      .catch(function (err) {
+        if (window.console && console.warn) {
+          console.warn('[deploy] deploy_resume_status 查询失败:', err);
+        }
+      });
+  }
+
+  /** 「从步骤 N 继续」:复用 st.deploying 互斥,之后事件渲染与正常部署完全一致 */
+  function onResumeStart() {
+    if (st.deploying || st.checking) return; // 并发防护:部署 / 预检中不得再次发起
+    var cp = st.resume;
+    if (!cp || !cp.key) return;
+    var key = String(cp.key);
+
+    // 断点模式与当前页签不一致时先切模式(deploy-progress 步骤号按对应节点集渲染;
+    // 横幅仅按当前选中服务器+项目展示,表单里必已选中该服务器与项目)
+    var wantMode = String(cp.mode) === 'stack' ? 'stack' : 'single';
+    if (st.mode !== wantMode) setMode(wantMode);
+
+    resetRunView(); // 清横幅/错误框/预检条/日志,进度归零(续传开始即隐藏横幅)
+
+    st.deploying = true;
+    refreshControls();
+    renderProgress(0, '');
+
+    // 密码用后端已存密文,不传 passwordPlain(与预检/预览口径一致)
+    window.AppBus.invoke('deploy_resume_start', { key: key })
+      .catch(function (err) {
+        // invoke 级失败(断点已被清理/参数异常):续传未真正启动,立即还原控件
+        st.deploying = false;
+        refreshControls();
+        showErrorBox(['发起续传失败:' + (errText(err) || '未知错误')], false);
+        refreshResumeStatus(); // 断点仍在时重查恢复横幅
+      });
+  }
+
+  /** 「放弃断点」确认后的执行:deploy_resume_discard 删断点并清理临时产物 */
+  function onResumeDiscard() {
+    var cp = st.resume;
+    if (!cp || !cp.key || st.resumeBusy) return;
+    st.resumeBusy = true;
+    refreshControls(); // 确认态两按钮同步禁用,防重复提交
+
+    window.AppBus.invoke('deploy_resume_discard', { key: String(cp.key) })
+      .then(function () {
+        st.resumeBusy = false;
+        hideResumeBanner();
+        window.toast('已放弃断点,临时文件已清理', 'ok');
+      })
+      .catch(function (err) {
+        st.resumeBusy = false;
+        refreshControls();
+        renderResumeBanner(st.resume, false); // 退出确认态,保留横幅等待重试
+        window.toast('放弃断点失败:' + (errText(err) || '未知错误'), 'fail');
+      });
+  }
+
   // ===== 下拉渲染(每次进入页面重建;尽量保留原选中项)=====
 
   function fillSelect(select, placeholderText, options) {
@@ -326,6 +492,9 @@
         showErrorBox(errs, false);
       }
       applyPendingImage();
+      // 进入页面(pagechange 触发本函数)后按当前选中服务器+项目重查断点横幅;
+      // 放在 renderSelects 之后,保证查询用的是恢复后的选中项
+      refreshResumeStatus();
       // 整栈模式:已选项目与已解析结果不一致(或尚无解析结果)时自动解析
       if (st.mode === 'stack') {
         var prjSel = document.getElementById('deploy-project');
@@ -382,6 +551,14 @@
       .forEach(function (id) {
         var node = document.getElementById(id);
         if (node) node.disabled = st.deploying || st.checking;
+      });
+
+    // 续传横幅按钮与部署互斥同步(部署 / 预检 / 放弃请求进行中一律禁用;
+    // 横幅未显示或处于无按钮状态时元素不存在,静默跳过)
+    ['deploy-resume-continue-btn', 'deploy-resume-discard-btn', 'deploy-resume-keep-btn']
+      .forEach(function (id) {
+        var node = document.getElementById(id);
+        if (node) node.disabled = st.deploying || st.checking || st.resumeBusy;
       });
 
     // 「跳过未变化镜像」与「打日期标签」互斥:日期标签每次生成全新 tag,
@@ -616,6 +793,8 @@
     buildSteps(mode);
     // 切模式即重置本次运行视图:清横幅/预检条/错误框/日志,进度按新节点集归零
     resetRunView();
+    // 断点续传横幅与页签无关(后端取同服务器+项目最近断点):重查恢复显示
+    refreshResumeStatus();
 
     // 切到整栈:已选项目且尚未解析(或解析的是别的项目)时自动解析
     if (mode === 'stack') {
@@ -979,6 +1158,9 @@
   /** 每次点击「开始部署」:清空横幅 / 错误框 / 预检条 / 日志,进度重置 */
   function resetRunView() {
     hideBanner();
+    // 续传横幅一并隐藏:横幅只按当前选中服务器+项目展示,此处发起的新部署
+    // 即为同键(后端断点会被新部署逐步覆盖)
+    hideResumeBanner();
     hideErrorBox();
     hideCheck();
     st.logs = [];
@@ -1225,8 +1407,11 @@
       showBanner('fail', (isRollback ? '回滚失败:' : '部署失败:') + (message || '未知错误'));
     }
 
-    // 部署/回滚结束(成功/失败/取消均落历史)后刷新部署历史
+    // 部署/回滚结束(成功/失败/取消均落历史)后刷新部署历史;
+    // 并重查断点:失败/取消保留断点 → 横幅给出「从步骤 N 继续」,
+    // 成功则断点已被后端清除,查询为空,横幅保持隐藏
     refreshHistory();
+    refreshResumeStatus();
   }
 
   // ===== 部署历史(get_history:折叠面板,进入页面自动刷新一次)=====
@@ -2060,12 +2245,16 @@
     if (prjSel) {
       prjSel.addEventListener('change', function () {
         hidePreviewBox(); // 项目变化后旧预览快照失效
+        refreshResumeStatus(); // 项目变化后按新键重查断点横幅
         if (st.mode === 'stack') parseStack(); // 整栈模式:选中即自动解析
       });
     }
     var srvSel = document.getElementById('deploy-server');
     if (srvSel) {
-      srvSel.addEventListener('change', hidePreviewBox); // 服务器变化后旧预览失效
+      srvSel.addEventListener('change', function () {
+        hidePreviewBox(); // 服务器变化后旧预览失效
+        refreshResumeStatus(); // 服务器变化后按新键重查断点横幅
+      });
     }
 
     // 「打日期标签」变化时联动「跳过未变化镜像」禁用态(互斥说明见 refreshControls)

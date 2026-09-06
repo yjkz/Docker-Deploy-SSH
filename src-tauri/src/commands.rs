@@ -35,6 +35,15 @@
 //! 同标签镜像 ID(`same_image_id` 口径),未变化的服务跳过传输或仅打包留档;
 //! 整栈成功时向 release 目录写入 `manifest.json` 与 compose 副本存档。
 //!
+//! 部署断点续传(UPGRADE-PLAN 阶段六):两条部署管线在每个步骤完成的收尾处
+//! 把进度与产物落盘到 `config/resume-deploy.json`(键 `server_id|project_id|mode`,
+//! 见 [`crate::config::ResumeCheckpoint`]);部署失败或被取消时断点保留,可经
+//! `deploy_resume_status` / `deploy_resume_start` / `deploy_resume_discard`
+//! 查询、续传或放弃。续传按 `step_next` 跳过已完成的步骤,并对跨 attempt 的
+//! 产物做幂等化复用(本地 tar 复用、SFTP 断点续传、远端镜像 inspect 跳过装载、
+//! 发布目录复用);部署成功后清除断点并清理断点期保留的本地临时 tar。
+//! 断点不修改正常部署的事件/历史/通知语义(`deploy-done` 恰好一次等不变)。
+//!
 //! 一键回滚(`rollback_*` 命令):整栈回滚 = 逐包 `docker load` 历史 release,
 //! 恢复 compose 副本后 `compose up -d`;单镜像回滚 = `docker tag` 把目标
 //! 引用指回历史标签后 `compose up -d`。复用 deploy-log / deploy-done 事件体系,
@@ -56,7 +65,8 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::config::{
-    load_config, save_config, AppConfig, AuthType, ProjectConfig, ServerConfig, ServiceOverride,
+    checkpoint_key, load_config, load_resume_map, remove_checkpoint, save_config, save_checkpoint,
+    AppConfig, AuthType, ProjectConfig, ResumeCheckpoint, ServerConfig, ServiceOverride,
     TransferMode,
 };
 use crate::crypto::{dpapi_protect, dpapi_unprotect};
@@ -177,7 +187,7 @@ pub struct StackDeployRequest {
 }
 
 /// 整栈部署中单个 compose 服务的传输分类。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StackServiceChoice {
     /// compose 服务名(compose pull / up 按此名定位)
     pub service: String,
@@ -657,12 +667,234 @@ pub fn precheck_remote_disk(free_gb: Option<f64>, need_bytes: u64) -> Result<(),
     Ok(())
 }
 
+// ===== 部署断点续传(UPGRADE-PLAN 阶段六)=====
+
+/// 单镜像部署断点产物(serde camelCase,存入 [`ResumeCheckpoint`] 的
+/// `artifacts` 字段)。记录跨 attempt 复用的步骤产物:
+///
+/// - `origin_ref` / `repository` / `use_date_tag` / `skip_unchanged`:部署请求
+///   回传字段(续传不经过前端,由断点重建部署请求);
+/// - `image_ref`:步骤 1 产物 —— 实际部署引用(日期标签或原始引用);
+/// - `tar_local` / `tar_name`:步骤 2 产物 —— 本地 tar 绝对路径(断点期保留,
+///   成功/放弃时显式删除)与远端上传文件名(`/tmp/<tar_name>`)。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct SingleResumeArtifacts {
+    /// 原始镜像引用(部署请求的 `image`;步骤 1 重跑的打标签源、retag 目标)
+    origin_ref: String,
+    /// 打标签前缀(部署请求的 `repository`;步骤 1 重跑生成新标签时用)
+    repository: String,
+    /// 是否日期标签部署(部署请求的 `use_date_tag`)
+    use_date_tag: bool,
+    /// 步骤 1 产物:实际部署引用(`None` = 步骤 1 尚未完成)
+    image_ref: Option<String>,
+    /// 步骤 2 产物:本地 tar 绝对路径
+    tar_local: Option<String>,
+    /// 步骤 2 决定的远端 tar 文件名(步骤 3 上传到 `/tmp/<tar_name>`)
+    tar_name: Option<String>,
+    /// 回传字段:智能传输开关(部署请求的 `skip_unchanged`)
+    skip_unchanged: bool,
+}
+
+/// 整栈部署断点产物(serde camelCase,存入 [`ResumeCheckpoint`] 的
+/// `artifacts` 字段)。
+///
+/// - `services` / `skip_unchanged` / `force_archive`:部署请求回传字段
+///   (服务分类列表由前端确认,续传时以断点为准重建请求);
+/// - `unchanged`:步骤 1 智能传输判定结果(与 Local 服务顺序对齐;
+///   续传**不重跑**判定 —— 远端状态已被上次部署部分改变,重放才确定);
+/// - `files` / `locals` / `images`:步骤 2 打包产物,三个列表按打包顺序对齐
+///   (远端镜像包文件名 / 本地 tar 绝对路径 / 镜像引用);
+/// - `release_ts`:步骤 3 创建的发布时间戳(续传复用同一发布目录)。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct StackResumeArtifacts {
+    /// 部署请求的完整服务分类列表
+    services: Vec<StackServiceChoice>,
+    /// 智能传输判定结果(与 Local 服务顺序对齐;未启用时为空)
+    unchanged: Vec<bool>,
+    /// 回传字段:智能传输开关
+    skip_unchanged: bool,
+    /// 回传字段:强制留档
+    force_archive: bool,
+    /// 步骤 3 中创建的发布时间戳(`None` = 尚未创建发布目录)
+    release_ts: Option<String>,
+    /// 步骤 2 产物:镜像包远端文件名(按打包顺序)
+    files: Vec<String>,
+    /// 与 [`StackResumeArtifacts::files`] 对齐的本地 tar 绝对路径
+    locals: Vec<String>,
+    /// 与 [`StackResumeArtifacts::files`] 对齐的镜像引用(装载幂等检查用)
+    images: Vec<String>,
+}
+
+/// 断点续传上下文:由 checkpoint 反序列化而来,驱动部署管线的跳步与幂等化。
+#[derive(Debug, Clone)]
+struct ResumeContext {
+    /// 断点键(成功收尾按它清除断点)
+    key: String,
+    /// 续传起点:下一个待执行的步骤号(该步骤及之后都要执行)
+    step_next: u32,
+    /// 单镜像模式产物(mode = "single" 时有效)
+    single: SingleResumeArtifacts,
+    /// 整栈模式产物(mode = "stack" 时有效)
+    stack: StackResumeArtifacts,
+}
+
+/// 单镜像部署的总步骤数(与 emit_progress 的 total 一致)。
+const SINGLE_TOTAL_STEPS: u32 = 5;
+/// 整栈部署的总步骤数。
+const STACK_TOTAL_STEPS: u32 = 6;
+
+/// 步骤号 → 中文标签(续传状态/日志展示用,自建映射):
+/// 单镜像 1..5 = 打标签/导出压缩/上传镜像/同步文件/服务器部署;
+/// 整栈 1..6 = 分类确认/打包/上传/装载/拉取/启动;
+/// 超出范围(成功后清除断点,理论不可达)按"部署收尾"兜底。
+fn resume_step_label(mode: &str, step_next: u32) -> String {
+    let labels: &[&str] = match mode {
+        MODE_SINGLE => &["打标签", "导出压缩", "上传镜像", "同步文件", "服务器部署"],
+        MODE_STACK => &["分类确认", "打包", "上传", "装载", "拉取", "启动"],
+        _ => &[],
+    };
+    if step_next < 1 {
+        return "部署收尾".to_string();
+    }
+    labels
+        .get(step_next as usize - 1)
+        .map(|s| (*s).to_string())
+        .unwrap_or_else(|| "部署收尾".to_string())
+}
+
+/// 解析单镜像断点产物(损坏 → `None`,调用方按断点数据损坏报错)。
+fn parse_single_artifacts(v: &serde_json::Value) -> Option<SingleResumeArtifacts> {
+    serde_json::from_value(v.clone()).ok()
+}
+
+/// 解析整栈断点产物(损坏 → `None`)。
+fn parse_stack_artifacts(v: &serde_json::Value) -> Option<StackResumeArtifacts> {
+    serde_json::from_value(v.clone()).ok()
+}
+
+/// 收集断点记录的本地临时 tar 路径(`deploy_resume_discard` 清理用;
+/// 产物解析失败按空处理 —— 清理是尽力而为,不让放弃操作失败)。
+fn resume_local_tars(cp: &ResumeCheckpoint) -> Vec<PathBuf> {
+    match cp.mode.as_str() {
+        MODE_SINGLE => parse_single_artifacts(&cp.artifacts)
+            .into_iter()
+            .filter_map(|a| a.tar_local)
+            .map(PathBuf::from)
+            .collect(),
+        MODE_STACK => parse_stack_artifacts(&cp.artifacts)
+            .into_iter()
+            .flat_map(|a| a.locals.into_iter())
+            .map(PathBuf::from)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// 断点产物序列化(纯结构体,序列化不会失败;兜底为 `Null`)。
+fn artifacts_value<T: Serialize>(art: &T) -> serde_json::Value {
+    serde_json::to_value(art).unwrap_or_default()
+}
+
+/// 落盘部署断点(尽力而为:失败仅告警,不影响部署管线本身)。
+///
+/// `step_next` = 下一个待执行的步骤号(刚完成步骤号 + 1;失败/取消发生
+/// 在该步骤,续传时从它开始重跑)。每次保存都会覆盖同键旧条目并刷新 `ts`。
+fn checkpoint_save(
+    key: &str,
+    mode: &str,
+    step_next: u32,
+    server: &ServerConfig,
+    project: &ProjectConfig,
+    artifacts: serde_json::Value,
+) {
+    let cp = ResumeCheckpoint {
+        key: key.to_string(),
+        mode: mode.to_string(),
+        step_next,
+        ts: chrono::Local::now().format("%F %T").to_string(),
+        server_id: server.id.clone(),
+        project_id: project.id.clone(),
+        server_name: server.name.clone(),
+        project_name: project.name.clone(),
+        artifacts,
+    };
+    if let Err(e) = save_checkpoint(&cp) {
+        log::warn!("保存部署断点失败(不影响本次部署): {}", e);
+    }
+}
+
+/// 成功收尾:清除断点 + 删除断点期保留的本地临时 tar(尽力而为)。
+/// 取消/失败不清 —— 断点与临时 tar 都要留给续传复用。
+fn checkpoint_cleanup_on_success(key: &str, local_tars: &[PathBuf]) {
+    match remove_checkpoint(key) {
+        Ok(_) => log::info!("部署成功,已清除断点 {}", key),
+        Err(e) => log::warn!("部署成功后清除断点失败: {}", e),
+    }
+    for path in local_tars {
+        if let Err(e) = std::fs::remove_file(path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log::warn!("清理断点期保留的本地临时文件失败 ({}): {}", path.display(), e);
+            }
+        }
+    }
+}
+
+/// 校验断点并构造续传上下文(模式未知/步骤号越界/产物损坏/缺关键产物 → 报错)。
+fn resume_context_of(cp: &ResumeCheckpoint) -> Result<ResumeContext, String> {
+    let corrupt = |why: &str| {
+        format!(
+            "断点数据损坏({}),请放弃该断点后重新部署",
+            why
+        )
+    };
+    match cp.mode.as_str() {
+        MODE_SINGLE => {
+            if cp.step_next < 1 || cp.step_next > SINGLE_TOTAL_STEPS {
+                return Err(corrupt("步骤号越界"));
+            }
+            let art = parse_single_artifacts(&cp.artifacts)
+                .ok_or_else(|| corrupt("单镜像产物解析失败"))?;
+            if cp.step_next > 1 && art.image_ref.is_none() {
+                return Err(corrupt("缺少已打标签的镜像引用"));
+            }
+            if cp.step_next > 2 && (art.tar_local.is_none() || art.tar_name.is_none()) {
+                return Err(corrupt("缺少已导出的镜像包信息"));
+            }
+            Ok(ResumeContext {
+                key: cp.key.clone(),
+                step_next: cp.step_next,
+                single: art,
+                stack: StackResumeArtifacts::default(),
+            })
+        }
+        MODE_STACK => {
+            if cp.step_next < 1 || cp.step_next > STACK_TOTAL_STEPS {
+                return Err(corrupt("步骤号越界"));
+            }
+            let art = parse_stack_artifacts(&cp.artifacts)
+                .ok_or_else(|| corrupt("整栈产物解析失败"))?;
+            if cp.step_next > 2 && (art.files.len() != art.locals.len() || art.files.len() != art.images.len()) {
+                return Err(corrupt("镜像包产物列表不一致"));
+            }
+            Ok(ResumeContext {
+                key: cp.key.clone(),
+                step_next: cp.step_next,
+                single: SingleResumeArtifacts::default(),
+                stack: art,
+            })
+        }
+        other => Err(format!("断点模式未知:{},请放弃该断点后重新部署", other)),
+    }
+}
+
 // ===== 部署命令 =====
 
 /// 发起部署:立即返回 `Ok(())`,管线在后台任务执行并通过事件推送进度。
 #[tauri::command]
 pub fn deploy(req: DeployRequest, app: AppHandle) -> Result<(), String> {
-    spawn_deploy_task(app.clone(), async move { run_deploy(&app, req).await });
+    spawn_deploy_task(app.clone(), async move { run_deploy(&app, req, None).await });
     Ok(())
 }
 
@@ -670,8 +902,210 @@ pub fn deploy(req: DeployRequest, app: AppHandle) -> Result<(), String> {
 /// 执行并通过事件推送进度(1 分类确认 2 打包 3 上传 4 装载 5 拉取 6 启动)。
 #[tauri::command]
 pub fn deploy_stack(req: StackDeployRequest, app: AppHandle) -> Result<(), String> {
-    spawn_deploy_task(app.clone(), async move { run_deploy_stack(&app, req).await });
+    spawn_deploy_task(app.clone(), async move { run_deploy_stack(&app, req, None).await });
     Ok(())
+}
+
+/// 查询某个服务器/项目是否存在可续传的部署断点。
+///
+/// 同一服务器 + 项目可能同时存在单镜像与整栈两条断点(互为不同键),
+/// 取最近落盘(`ts` 最新)的一条;无断点返回 `None`。
+#[tauri::command]
+pub fn deploy_resume_status(
+    server_id: String,
+    project_id: String,
+) -> Result<Option<ResumeView>, String> {
+    Ok(load_resume_map()
+        .into_values()
+        .filter(|c| c.server_id == server_id && c.project_id == project_id)
+        .max_by(|a, b| a.ts.cmp(&b.ts))
+        .map(|cp| resume_view_of(&cp)))
+}
+
+/// `deploy_resume_status` 返回的断点视图(camelCase,前端续传入口展示用)。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeView {
+    /// 断点键(传给 `deploy_resume_start` / `deploy_resume_discard`)
+    pub key: String,
+    /// 部署模式:`single` / `stack`
+    pub mode: String,
+    /// 下一个待执行的步骤号(续传起点)
+    pub step_next: u32,
+    /// 步骤中文名(如「打标签」「上传」)
+    pub step_label: String,
+    /// 断点最近落盘时间
+    pub ts: String,
+    pub server_name: String,
+    pub project_name: String,
+}
+
+/// [`ResumeCheckpoint`] → 前端视图(纯函数,便于单测)。
+fn resume_view_of(cp: &ResumeCheckpoint) -> ResumeView {
+    ResumeView {
+        key: cp.key.clone(),
+        mode: cp.mode.clone(),
+        step_next: cp.step_next,
+        step_label: resume_step_label(&cp.mode, cp.step_next),
+        ts: cp.ts.clone(),
+        server_name: cp.server_name.clone(),
+        project_name: cp.project_name.clone(),
+    }
+}
+
+/// 从断点续传部署:校验断点与服务器/项目仍存在后,走与正常部署完全相同的
+/// 后台任务路径(`spawn_deploy_task`,事件/历史/通知语义一致,前端零特殊
+/// 处理)。管线从断点的 `step_next` 起、对已完成产物幂等化复用。
+#[tauri::command]
+pub fn deploy_resume_start(
+    key: String,
+    password_plain: Option<String>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let cp = load_resume_map()
+        .remove(&key)
+        .ok_or_else(|| format!("断点不存在或已被清理: {}", key))?;
+    // 服务器/项目仍存在(被删除的配置无法续传)
+    let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    find_server(&cfg, &cp.server_id)?;
+    find_project(&cfg, &cp.project_id)?;
+    let ctx = resume_context_of(&cp)?;
+    match cp.mode.as_str() {
+        MODE_SINGLE => {
+            let req = DeployRequest {
+                image: ctx.single.origin_ref.clone(),
+                repository: ctx.single.repository.clone(),
+                server_id: cp.server_id.clone(),
+                project_id: cp.project_id.clone(),
+                use_date_tag: ctx.single.use_date_tag,
+                password_plain,
+                skip_unchanged: Some(ctx.single.skip_unchanged),
+            };
+            spawn_deploy_task(app.clone(), async move { run_deploy(&app, req, Some(ctx)).await });
+            Ok(())
+        }
+        MODE_STACK => {
+            let req = StackDeployRequest {
+                project_id: cp.project_id.clone(),
+                server_id: cp.server_id.clone(),
+                services: ctx.stack.services.clone(),
+                password_plain,
+                skip_unchanged: Some(ctx.stack.skip_unchanged),
+                force_archive: Some(ctx.stack.force_archive),
+            };
+            spawn_deploy_task(app.clone(), async move { run_deploy_stack(&app, req, Some(ctx)).await });
+            Ok(())
+        }
+        // resume_context_of 已校验模式,防御性兜底
+        other => Err(format!("断点模式未知:{}", other)),
+    }
+}
+
+/// 放弃断点续传:删除断点 + 删除断点期保留的本地临时 tar + 尽力删除远端
+/// 临时产物(单镜像 `/tmp` 下的 tar;整栈本次的部分发布目录;连接失败等
+/// 一律忽略,不报错)。
+#[tauri::command]
+pub async fn deploy_resume_discard(key: String) -> Result<(), String> {
+    let cp = remove_checkpoint(&key)
+        .map_err(|e| format!("删除部署断点失败: {}", e))?
+        .ok_or_else(|| format!("断点不存在或已被清理: {}", key))?;
+
+    // 1) 本地临时 tar(尽力而为,失败仅告警)
+    for path in resume_local_tars(&cp) {
+        if let Err(e) = std::fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log::warn!("清理本地临时文件失败 ({}): {}", path.display(), e);
+            }
+        }
+    }
+
+    // 2) 远端临时产物(尽力而为:任何失败仅记日志,不让放弃操作失败)
+    discard_remote_artifacts(&cp).await;
+    Ok(())
+}
+
+/// 远端临时产物清理(`deploy_resume_discard` 的尽力而为子步)。
+async fn discard_remote_artifacts(cp: &ResumeCheckpoint) {
+    // 组装待删除路径:单镜像 = /tmp/<tar_name>;整栈 = releases/<ts> 整目录
+    // (目录里只有本次 attempt 的半成品镜像包与 compose 副本)
+    let targets: Vec<String> = match cp.mode.as_str() {
+        MODE_SINGLE => parse_single_artifacts(&cp.artifacts)
+            .and_then(|a| a.tar_name)
+            .map(|n| vec![remote_join("/tmp", &n)])
+            .unwrap_or_default(),
+        MODE_STACK => parse_stack_artifacts(&cp.artifacts)
+            .and_then(|a| a.release_ts)
+            .map(|ts| vec![releases_dir_of(cp, &ts)])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    if targets.is_empty() {
+        return;
+    }
+    // 建连凭据:只用已保存的密文/密钥;密码认证且未存密码 → 无法建连,跳过
+    let cfg = match load_config() {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("放弃断点:读取配置失败,跳过远端临时产物清理: {}", e);
+            return;
+        }
+    };
+    let server = match find_server(&cfg, &cp.server_id) {
+        Ok(s) => s.clone(),
+        Err(e) => {
+            log::warn!("放弃断点:{}跳过远端临时产物清理", e);
+            return;
+        }
+    };
+    let (password, key_pass) = match (
+        resolve_password(&server.auth.auth_type, None, server.auth.password_enc.as_deref()),
+        resolve_key_passphrase(&server),
+    ) {
+        (Ok(p), Ok(k)) => (p, k),
+        _ => {
+            log::warn!("放弃断点:无法解析服务器「{}」的登录凭据,跳过远端临时产物清理", server.name);
+            return;
+        }
+    };
+    let connect = SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default());
+    let mut client = match with_timeout(
+        SSH_CONNECT_TIMEOUT_SECS,
+        "连接超时",
+        "请检查服务器地址与网络",
+        connect,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("放弃断点:连接服务器「{}」失败,跳过远端临时产物清理: {}", server.name, e);
+            return;
+        }
+    };
+    let cmd = format!(
+        "rm -rf {}",
+        targets.iter().map(|t| shell_single_quote(t)).collect::<Vec<_>>().join(" ")
+    );
+    match with_timeout(
+        SSH_EXEC_TIMEOUT_SECS,
+        "清理远端临时产物超时",
+        "请检查服务器网络后重试",
+        client.exec(&cmd, &mut |_| {}),
+    )
+    .await
+    {
+        Ok(_) => log::info!("放弃断点:已清理远端临时产物 {:?}", targets),
+        Err(e) => log::warn!("放弃断点:清理远端临时产物失败(忽略): {}", e),
+    }
+}
+
+/// 整栈断点的发布目录路径(放弃清理用;服务器配置缺失时退化为 ts 路径)。
+fn releases_dir_of(cp: &ResumeCheckpoint, ts: &str) -> String {
+    let remote_dir = load_config()
+        .ok()
+        .and_then(|cfg| find_server(&cfg, &cp.server_id).ok().map(|s| s.remote_dir.clone()))
+        .unwrap_or_default();
+    releases_dir(&remote_dir, ts)
 }
 
 /// 后台部署任务的统一启动器:panic 兜底([`CatchPanic`])+ 收尾事件 + 部署历史
@@ -901,9 +1335,13 @@ pub fn get_history() -> Result<Vec<DeployRecord>, String> {
 /// 部署管线入口:组装部署历史记录骨架(含开始计时),执行管线主体,
 /// 出口填充 success/message/duration 后连同结果与 webhook 通知地址一起返回
 /// (由 spawn 层落历史、发通知)。
+///
+/// `resume` 为 `Some`(断点续传入口 [`deploy_resume_start`])时,管线从断点的
+/// `step_next` 起跳步执行并对已完成产物幂等化复用;正常部署传 `None`(行为不变)。
 async fn run_deploy(
     app: &AppHandle,
     req: DeployRequest,
+    resume: Option<ResumeContext>,
 ) -> (Result<(), String>, DeployRecord, Option<String>) {
     let started = std::time::Instant::now();
     // webhook 通知地址:项目配置了 notify_webhook 才发(前置失败的路径取不到,为 None)
@@ -915,7 +1353,7 @@ async fn run_deploy(
         &req.project_id,
         vec![req.image.clone()],
     );
-    let result = run_deploy_steps(app, req, &mut record).await;
+    let result = run_deploy_steps(app, req, &mut record, resume, true).await;
     record.success = result.is_ok();
     record.message = match &result {
         Ok(()) => "部署完成".to_string(),
@@ -931,10 +1369,18 @@ async fn run_deploy(
 /// 智能传输(`skip_unchanged`,仅 `use_date_tag = false` 生效):对比本地与
 /// 远端同标签镜像 ID,一致时跳过步骤 2/3 的导出上传与步骤 5 的装载,
 /// compose up 照常执行。
+///
+/// 断点续传(`resume`,UPGRADE-PLAN 阶段六):`resume.step_next` 之后的步骤
+/// 才执行,已完成步骤 emit「断点续传:跳过步骤 N」;`checkpoint = true` 时
+/// 每个步骤完成的收尾处落盘断点(成功后清除,失败/取消保留给续传)。
+/// `resume` 为 `None` 且 `checkpoint = true` 为正常部署:行为与旧版一致,
+/// 仅新增步骤边界落盘与成功清理。
 async fn run_deploy_steps(
     app: &AppHandle,
     req: DeployRequest,
     record: &mut DeployRecord,
+    resume: Option<ResumeContext>,
+    checkpoint: bool,
 ) -> Result<(), String> {
     // ---- 步骤 0:前置 ----
     // 每次 deploy 开始时重置取消标志;结束时保持不变(取消后为 true,下次部署重置)
@@ -959,18 +1405,67 @@ async fn run_deploy_steps(
         ),
     );
 
+    // 断点续传:落盘键与产物上下文(续传以断点产物为准,正常部署从请求构造)
+    // 键优先取断点上下文(清理与加载指向同一键);正常部署按请求现算
+    let key = match &resume {
+        Some(r) => r.key.clone(),
+        None => checkpoint_key(&req.server_id, &req.project_id, MODE_SINGLE),
+    };
+    let resume_step = resume.as_ref().map(|r| r.step_next).unwrap_or(1);
+    let mut art = match &resume {
+        Some(r) => r.single.clone(),
+        None => SingleResumeArtifacts {
+            origin_ref: req.image.clone(),
+            repository: req.repository.clone(),
+            use_date_tag: req.use_date_tag,
+            skip_unchanged: req.skip_unchanged.unwrap_or(false),
+            ..Default::default()
+        },
+    };
+    if let Some(r) = &resume {
+        emit_log(
+            app,
+            &format!(
+                "断点续传:从步骤 {}({})继续部署",
+                r.step_next,
+                resume_step_label(MODE_SINGLE, r.step_next)
+            ),
+        );
+    }
+    // 初始断点(步骤 1 前落盘,同键新部署覆盖旧断点;续传不重置起点)
+    if checkpoint && resume.is_none() {
+        checkpoint_save(&key, MODE_SINGLE, 1, &server, &project, artifacts_value(&art));
+    }
+
     // ---- 步骤 1:打标签 ----
-    emit_progress(app, 1, 5, "打标签");
-    ensure_not_cancelled(app)?;
-    let image_ref = if req.use_date_tag {
-        let new_tag = unique_deploy_tag(app, &req.repository).await?;
-        emit_log(app, &format!("打标签: {} -> {}", req.image, new_tag));
-        tag_image(&req.image, &new_tag)?;
-        emit_log(app, "标签已创建");
-        new_tag
+    let image_ref = if resume_step > 1 {
+        emit_log(app, "断点续传:跳过步骤 1(打标签)");
+        match art.image_ref.clone() {
+            Some(r) => r,
+            None => {
+                return Err(
+                    "断点数据损坏:缺少已打标签的镜像引用,请放弃该断点后重新部署".to_string(),
+                )
+            }
+        }
     } else {
-        emit_log(app, "使用原始镜像标签,跳过打标签");
-        req.image.clone()
+        emit_progress(app, 1, 5, "打标签");
+        ensure_not_cancelled(app)?;
+        let image_ref = if req.use_date_tag {
+            let new_tag = unique_deploy_tag(app, &req.repository).await?;
+            emit_log(app, &format!("打标签: {} -> {}", req.image, new_tag));
+            tag_image(&req.image, &new_tag)?;
+            emit_log(app, "标签已创建");
+            new_tag
+        } else {
+            emit_log(app, "使用原始镜像标签,跳过打标签");
+            req.image.clone()
+        };
+        art.image_ref = Some(image_ref.clone());
+        if checkpoint {
+            checkpoint_save(&key, MODE_SINGLE, 2, &server, &project, artifacts_value(&art));
+        }
+        image_ref
     };
     // 历史记录登记实际部署的镜像引用(勾选日期标签时为生成的部署标签)
     record.images = vec![image_ref.clone()];
@@ -1011,29 +1506,69 @@ async fn run_deploy_steps(
 
     // ---- 步骤 2:导出压缩(镜像未变化时整步跳过)----
     // `packed` 为 `None` 表示跳过传输:不产生本地 tar,也没有装载步骤
-    let packed: Option<(String, PathBuf, TempFileGuard, Option<u64>)> = if skip_transfer {
+    let packed: Option<(String, PathBuf, Option<TempFileGuard>, Option<u64>)> = if skip_transfer {
         emit_progress(app, 2, 5, "跳过导出(镜像未变化)");
         emit_log(app, "镜像与远端一致,跳过导出压缩");
         None
     } else {
-        emit_progress(app, 2, 5, "导出压缩镜像");
-        ensure_not_cancelled(app)?;
-        let tar_name = format!("{}.tar.gz", uuid::Uuid::new_v4());
-        let out_path = std::env::temp_dir().join(&tar_name);
-        // 本地 tar 用完即删:Drop guard 覆盖成功/失败全部路径
-        let guard = TempFileGuard(out_path.clone());
+        // 断点续传:上次已完成导出(步骤 2 边界之后失败)且本地 tar 完整
+        // (存在且 >0 字节)→ 复用跳过导出;丢失/半成品 → 重新导出。
+        // 步骤 3 已完成(> 3)时远端 tar 已就绪,本地文件是否存在无关紧要
+        // (装载用远端路径),直接复用记录的文件名、不再重新导出。
+        let reusable = resume.as_ref().filter(|r| r.step_next > 2).and_then(|r| {
+            let local = r.single.tar_local.as_ref()?;
+            let name = r.single.tar_name.as_ref()?;
+            let complete = r.step_next > 3
+                || std::fs::metadata(local)
+                    .map(|m| m.len() > 0)
+                    .unwrap_or(false);
+            complete.then(|| (name.clone(), PathBuf::from(local)))
+        });
+        match reusable {
+            Some((tar_name, out_path)) => {
+                emit_log(
+                    app,
+                    &format!(
+                        "断点续传:跳过导出压缩,复用已导出的镜像包 {}",
+                        out_path.display()
+                    ),
+                );
+                Some((tar_name, out_path, None, image_size(&image_ref)))
+            }
+            None => {
+                if resume_step > 2 {
+                    emit_log(app, "警告:断点记录的本地镜像包已丢失,重新导出");
+                }
+                emit_progress(app, 2, 5, "导出压缩镜像");
+                ensure_not_cancelled(app)?;
+                let tar_name = format!("{}.tar.gz", uuid::Uuid::new_v4());
+                let out_path = std::env::temp_dir().join(&tar_name);
+                // 断点续传开启时保留本地 tar 供失败后复用(成功/放弃时显式清理);
+                // 关闭时用完即删:Drop guard 覆盖成功/失败全部路径(旧行为)
+                let guard = if checkpoint {
+                    TempFileGuard::keep(out_path.clone())
+                } else {
+                    TempFileGuard::new(out_path.clone())
+                };
 
-        // 空间预检:导出目标盘(临时目录所在盘)剩余空间 ≥ 镜像大小 × 1.5
-        // (镜像大小暂存,供步骤 3 的远端磁盘预检复用,避免二次查询)
-        let image_bytes = image_size(&image_ref);
-        match image_bytes {
-            Some(size) => check_export_disk_space(size)?,
-            None => emit_log(app, "警告:无法获取镜像大小,跳过磁盘剩余空间检查"),
+                // 空间预检:导出目标盘(临时目录所在盘)剩余空间 ≥ 镜像大小 × 1.5
+                // (镜像大小暂存,供步骤 3 的远端磁盘预检复用,避免二次查询)
+                let image_bytes = image_size(&image_ref);
+                match image_bytes {
+                    Some(size) => check_export_disk_space(size)?,
+                    None => emit_log(app, "警告:无法获取镜像大小,跳过磁盘剩余空间检查"),
+                }
+
+                let total_bytes = export_image(app, &image_ref, &out_path).await?;
+                emit_log(app, &format!("导出完成,共 {} MB", total_bytes / 1024 / 1024));
+                art.tar_local = Some(out_path.to_string_lossy().to_string());
+                art.tar_name = Some(tar_name.clone());
+                if checkpoint {
+                    checkpoint_save(&key, MODE_SINGLE, 3, &server, &project, artifacts_value(&art));
+                }
+                Some((tar_name, out_path, Some(guard), image_bytes))
+            }
         }
-
-        let total_bytes = export_image(app, &image_ref, &out_path).await?;
-        emit_log(app, &format!("导出完成,共 {} MB", total_bytes / 1024 / 1024));
-        Some((tar_name, out_path, guard, image_bytes))
     };
 
     // ---- 步骤 3:上传镜像(镜像未变化时跳过)----
@@ -1042,7 +1577,10 @@ async fn run_deploy_steps(
         emit_log(app, "镜像与远端一致,跳过上传");
         probe.take().expect("镜像未变化路径必然持有对比阶段连接")
     } else {
-        emit_progress(app, 3, 5, "上传镜像到服务器");
+        // 断点续传:步骤 3 已完成时不再推送本步进度(事件从 step_next 起)
+        if resume_step <= 3 {
+            emit_progress(app, 3, 5, "上传镜像到服务器");
+        }
         ensure_not_cancelled(app)?;
         let (tar_name, out_path, _, image_bytes) = packed
             .as_ref()
@@ -1050,25 +1588,43 @@ async fn run_deploy_steps(
         let mut client =
             SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default())
                 .await?;
-        // 远端磁盘预检:上传前确认 Docker 根目录所在盘剩余空间 ≥ 镜像大小 × 1.5
-        // (镜像大小未知 → 告警跳过;不足 → 中文报错中止)
-        let need_bytes = image_bytes.map(|size| (size as f64 * 1.5) as u64);
-        remote_disk_precheck(app, &mut client, need_bytes).await?;
-        // 镜像包同名即同内容(uuid 命名),启用断点续传
-        upload_tar(app, &mut client, out_path, tar_name).await?;
-        emit_log(app, "镜像上传完成");
+        if resume_step > 3 {
+            // 断点续传:上次已完成上传 → 仅建连(后续步骤复用连接),不重复上传
+            // (远端 tar 仍由步骤 5.6 在装载后清理,行为不变)
+            emit_log(app, "断点续传:跳过步骤 3(上传镜像)");
+        } else {
+            // 远端磁盘预检:上传前确认 Docker 根目录所在盘剩余空间 ≥ 镜像大小 × 1.5
+            // (镜像大小未知 → 告警跳过;不足 → 中文报错中止)
+            let need_bytes = image_bytes.map(|size| (size as f64 * 1.5) as u64);
+            remote_disk_precheck(app, &mut client, need_bytes).await?;
+            // 镜像包同名即同内容(uuid 命名),启用断点续传
+            upload_tar(app, &mut client, out_path, tar_name).await?;
+            emit_log(app, "镜像上传完成");
+            if checkpoint {
+                checkpoint_save(&key, MODE_SINGLE, 4, &server, &project, artifacts_value(&art));
+            }
+        }
         client
     };
 
-    // ---- 步骤 4:同步文件 ----
-    emit_progress(app, 4, 5, "同步项目文件");
-    ensure_not_cancelled(app)?;
-    let single_compose =
-        prepare_single_compose(app, &mut client, &server, &project).await?;
-    sync_files(app, &mut client, &server, &project).await?;
-    emit_log(app, "项目文件同步完成");
-    // 部署前钩子(归入步骤 4:装载前执行,旧容器仍在运行;失败即中止部署)
-    run_hook(app, &mut client, &project, HookKind::Pre, &server.remote_dir).await?;
+    // ---- 步骤 4:同步文件(含部署前钩子;断点续传已完成则整步跳过)----
+    // 跳过时仅按项目配置推演远端 compose 路径(不再重复上传 compose 副本)
+    let single_compose = if resume_step > 4 {
+        emit_log(app, "断点续传:跳过步骤 4(同步文件)");
+        single_compose_target(&server, &project)?
+    } else {
+        emit_progress(app, 4, 5, "同步项目文件");
+        ensure_not_cancelled(app)?;
+        let target = prepare_single_compose(app, &mut client, &server, &project).await?;
+        sync_files(app, &mut client, &server, &project).await?;
+        emit_log(app, "项目文件同步完成");
+        // 部署前钩子(归入步骤 4:装载前执行,旧容器仍在运行;失败即中止部署)
+        run_hook(app, &mut client, &project, HookKind::Pre, &server.remote_dir).await?;
+        if checkpoint {
+            checkpoint_save(&key, MODE_SINGLE, 5, &server, &project, artifacts_value(&art));
+        }
+        target
+    };
 
     // ---- 步骤 5:服务器部署 ----
     emit_progress(app, 5, 5, "服务器部署");
@@ -1090,8 +1646,21 @@ async fn run_deploy_steps(
         // 智能传输判定未变化时无本地包 → 跳过 docker load(远端已是该镜像)
         packed.as_ref().map(|(tar_name, _, _, _)| tar_name.as_str()),
         retag,
+        // 断点续传:装载前先 inspect 远端镜像,已存在(上次装载已成功)则跳过
+        resume.as_ref().map(|_| image_ref.as_str()),
     )
     .await?;
+
+    // ---- 成功收尾:清除断点 + 删除断点期保留的本地临时 tar ----
+    // (失败/取消不走这里:断点与临时 tar 都保留,供续传复用)
+    if checkpoint {
+        let local_tars: Vec<PathBuf> = art
+            .tar_local
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        checkpoint_cleanup_on_success(&key, &local_tars);
+    }
 
     emit_log(app, "部署完成");
     Ok(())
@@ -1289,12 +1858,28 @@ struct SingleComposeTarget {
 
 /// 准备单镜像部署所需的 compose 文件。
 ///
-/// 导入项目的 `compose_file` 是本地副本路径,需要先上传并改用远端副本;
-/// 旧版手工项目则把它作为远端路径保存,继续直接使用。不存在的 Windows
-/// 盘符路径明确报错,避免把本机路径拼进 SSH 命令。
+/// 先按 [`single_compose_target`] 推演远端 compose 路径,导入项目(本地副本
+/// 存在)再上传副本;旧版手工项目把它作为远端路径保存,无需上传。
+/// 断点续传跳过步骤 4 时只调 [`single_compose_target`](不再重复上传)。
 async fn prepare_single_compose(
     app: &AppHandle,
     client: &mut SshClient,
+    server: &ServerConfig,
+    project: &ProjectConfig,
+) -> Result<SingleComposeTarget, String> {
+    let target = single_compose_target(server, project)?;
+    let local = PathBuf::from(&project.compose_file);
+    if local.is_file() {
+        upload_compose_files(app, client, server, project).await?;
+    }
+    Ok(target)
+}
+
+/// 推演单镜像部署使用的远端 compose 文件及 override 文件名(纯路径推演,
+/// 不上传、不建连):导入项目的 `compose_file` 是本地副本路径 → 远端使用
+/// 根目录副本;旧版手工项目则把它作为远端路径保存,继续直接使用。
+/// 不存在的 Windows 盘符路径明确报错,避免把本机路径拼进 SSH 命令。
+fn single_compose_target(
     server: &ServerConfig,
     project: &ProjectConfig,
 ) -> Result<SingleComposeTarget, String> {
@@ -1304,7 +1889,6 @@ async fn prepare_single_compose(
 
     let local = PathBuf::from(&project.compose_file);
     if local.is_file() {
-        upload_compose_files(app, client, server, project).await?;
         return Ok(SingleComposeTarget {
             remote_file: remote_compose_path(&server.remote_dir),
             override_names: compose_override_names(&project.compose_file),
@@ -1341,7 +1925,12 @@ fn is_windows_absolute_path(path: &str) -> bool {
 /// 清理 —— 远端已是同 tag 同 ID 的镜像,compose up 即可完成回退。
 /// `retag` 为 `Some((日期tag, 原引用))` 时,装载后把原引用(如 myapp:latest)也指向
 /// 新镜像,否则 compose 引用原 tag 时感知不到变化、不会重建容器。
+/// `idempotent_load_ref` 为 `Some(镜像引用)`(断点续传)时,装载前先
+/// `docker image inspect` 远端 —— 已存在(上次装载成功后失败)则跳过 load。
 /// up 之后先做健康检查(未启用则跳过),再执行部署后钩子(失败仅告警)。
+// 参数本就偏多(阶段六新增 idempotent_load_ref 后 9 个),保持平铺签名、
+// 显式关闭 clippy 提示(避免为消警重构签名扩大 diff)。
+#[allow(clippy::too_many_arguments)]
 async fn server_deploy(
     app: &AppHandle,
     client: &mut SshClient,
@@ -1351,14 +1940,31 @@ async fn server_deploy(
     override_names: &[String],
     tar_name: Option<&str>,
     retag: Option<(String, String)>,
+    idempotent_load_ref: Option<&str>,
 ) -> Result<(), String> {
     // 5.1 加载镜像(镜像未变化时跳过:ID 已在远端,无需 load)
     match tar_name {
         Some(tar_name) => {
-            let remote_tar = remote_join("/tmp", tar_name);
-            emit_log(app, &format!("加载镜像到服务器: docker load -i {}", remote_tar));
-            let load_cmd = format!("docker load -i {}", shell_single_quote(&remote_tar));
-            exec_forwarded(app, client, &load_cmd, 600).await?;
+            // 断点续传:远端已有该镜像(上次装载成功后才失败)→ 跳过,逐次幂等
+            let mut loaded = false;
+            if let Some(image_ref) = idempotent_load_ref {
+                if remote_has_image(client, image_ref).await? {
+                    emit_log(
+                        app,
+                        &format!(
+                            "断点续传:远端已存在镜像 {},跳过 docker load",
+                            image_ref
+                        ),
+                    );
+                    loaded = true;
+                }
+            }
+            if !loaded {
+                let remote_tar = remote_join("/tmp", tar_name);
+                emit_log(app, &format!("加载镜像到服务器: docker load -i {}", remote_tar));
+                let load_cmd = format!("docker load -i {}", shell_single_quote(&remote_tar));
+                exec_forwarded(app, client, &load_cmd, 600).await?;
+            }
         }
         None => emit_log(app, "镜像与远端一致,跳过 docker load(远端已是该镜像)"),
     }
@@ -1408,6 +2014,20 @@ async fn server_deploy(
         }
     }
     Ok(())
+}
+
+/// 断点续传的装载幂等检查:远端是否已存在该镜像引用
+/// (`docker image inspect <ref>` 退出码 0 = 存在,即上次装载已成功)。
+/// 传输层失败照常以 `Err` 传播(连接已坏,后续步骤必然失败)。
+async fn remote_has_image(client: &mut SshClient, image_ref: &str) -> Result<bool, String> {
+    let (code, _) = with_timeout(
+        SSH_EXEC_TIMEOUT_SECS,
+        "检查远端镜像超时",
+        "请检查服务器网络后重试",
+        exec_collect(client, &docker_inspect_cmd(image_ref)),
+    )
+    .await?;
+    Ok(code == 0)
 }
 
 // ===== 部署钩子 + 健康检查(Task 3)=====
@@ -1790,9 +2410,13 @@ async fn query_remote_image_id_map(
 /// 整栈部署管线入口:组装部署历史记录骨架(含开始计时),执行管线主体,
 /// 出口填充 success/message/duration 后连同结果与 webhook 通知地址一起返回
 /// (由 spawn 层落历史、发通知)。
+///
+/// `resume` 为 `Some`(断点续传入口 [`deploy_resume_start`])时,管线从断点的
+/// `step_next` 起跳步执行并对已完成产物幂等化复用;正常部署传 `None`(行为不变)。
 async fn run_deploy_stack(
     app: &AppHandle,
     req: StackDeployRequest,
+    resume: Option<ResumeContext>,
 ) -> (Result<(), String>, DeployRecord, Option<String>) {
     let started = std::time::Instant::now();
     // webhook 通知地址:项目配置了 notify_webhook 才发(前置失败的路径取不到,为 None)
@@ -1804,7 +2428,7 @@ async fn run_deploy_stack(
         &req.project_id,
         stack_record_images(&req.services),
     );
-    let result = run_deploy_stack_steps(app, req, &mut record).await;
+    let result = run_deploy_stack_steps(app, req, &mut record, resume, true).await;
     record.success = result.is_ok();
     record.message = match &result {
         Ok(()) => "部署完成".to_string(),
@@ -1816,10 +2440,19 @@ async fn run_deploy_stack(
 
 /// 整栈部署管线主体(六步,任一步失败即中止)。`record` 为组装中的部署历史
 /// 记录,前置解析后回填服务器/项目名称。
+///
+/// 断点续传(`resume`,UPGRADE-PLAN 阶段六):`resume.step_next` 之后的步骤
+/// 才执行;`checkpoint = true` 时每个步骤完成的收尾处落盘断点(成功后清除,
+/// 失败/取消保留)。续传时服务分类与智能传输判定结果均以断点为准(**不重跑**
+/// 判定 —— 远端状态已被上次部署部分改变,重放才确定),已上传的镜像包按
+/// 远端文件大小校验跳过、已装载的镜像按 `docker image inspect` 跳过,
+/// 发布目录复用断点记录的时间戳。
 async fn run_deploy_stack_steps(
     app: &AppHandle,
     req: StackDeployRequest,
     record: &mut DeployRecord,
+    resume: Option<ResumeContext>,
+    checkpoint: bool,
 ) -> Result<(), String> {
     // ---- 前置:找 server/project、解析密码 ----
     // 每次部署开始时重置取消标志(与单镜像 run_deploy 一致)
@@ -1837,68 +2470,121 @@ async fn run_deploy_stack_steps(
     )?;
     let key_pass = resolve_key_passphrase(&server)?;
 
-    // ---- 步骤 1:分类确认 ----
-    emit_progress(app, 1, 6, "分类确认");
-    ensure_not_cancelled(app)?;
-    validate_stack_choices(&req.services)?;
-    let (local_choices, pull_choices) = group_by_mode(&req.services);
-    // compose 本地副本必须存在:step 3 要上传到服务器,远端 `docker compose -f` 指向它
-    if project.compose_file.trim().is_empty() {
-        return Err(format!("项目「{}」未配置 compose 文件", project.name));
+    // 断点续传:落盘键与产物上下文(续传以断点产物为准,正常部署从请求构造)
+    // 键优先取断点上下文(清理与加载指向同一键);正常部署按请求现算
+    let key = match &resume {
+        Some(r) => r.key.clone(),
+        None => checkpoint_key(&req.server_id, &req.project_id, MODE_STACK),
+    };
+    let resume_step = resume.as_ref().map(|r| r.step_next).unwrap_or(1);
+    let mut art = match &resume {
+        Some(r) => r.stack.clone(),
+        None => StackResumeArtifacts {
+            services: req.services.clone(),
+            skip_unchanged: req.skip_unchanged.unwrap_or(false),
+            force_archive: req.force_archive.unwrap_or(false),
+            ..Default::default()
+        },
+    };
+    // 服务分类列表:续传时以断点为准(前端未参与续传,重放上次确认的分类)
+    let services = match &resume {
+        Some(r) => &r.stack.services,
+        None => &req.services,
+    };
+    let (local_choices, pull_choices) = group_by_mode(services);
+    if let Some(r) = &resume {
+        emit_log(
+            app,
+            &format!(
+                "断点续传:从步骤 {}({})继续整栈部署",
+                r.step_next,
+                resume_step_label(MODE_STACK, r.step_next)
+            ),
+        );
     }
-    if !Path::new(&project.compose_file).is_file() {
-        return Err(format!("compose 文件不存在:{}", project.compose_file));
+    // 初始断点(步骤 1 前落盘,同键新部署覆盖旧断点;续传不重置起点)
+    if checkpoint && resume.is_none() {
+        checkpoint_save(&key, MODE_STACK, 1, &server, &project, artifacts_value(&art));
     }
-    emit_log(
-        app,
-        &format!(
-            "开始整栈部署:服务器「{}」/ 项目「{}」,共 {} 个服务(本地传输 {} 个,服务器拉取 {} 个)",
-            server.name,
-            project.name,
-            req.services.len(),
-            local_choices.len(),
-            pull_choices.len()
-        ),
-    );
 
-    // ---- 智能传输:对比本地/远端同标签镜像 ID,标记未变化的 Local 服务 ----
-    // 行为矩阵(skip_unchanged × force_archive,均缺省 false):
-    // - 未启用:全部 Local 服务正常打包/上传/装载(与旧版本一致);
-    // - skip=true, force=false:未变化服务从打包/上传/装载全链路剔除;
-    // - skip=true, force=true:未变化服务仍打包上传留档(供回滚 load),
-    //   仅跳过装载(其镜像 ID 已在远端)。
+    // ---- 步骤 1:分类确认 ----
     let skip_unchanged = req.skip_unchanged.unwrap_or(false);
     let force_archive = req.force_archive.unwrap_or(false);
-    let smart_transfer = skip_unchanged || force_archive;
     let mut unchanged: Vec<bool> = vec![false; local_choices.len()];
-    if smart_transfer && !local_choices.is_empty() {
-        // 专用建连完成对比(用后即断,不占用打包阶段;与 deploy 的建连口径一致)
-        emit_log(app, "智能传输:正在对比本地与远端镜像 ID…");
-        let (_server, mut probe) =
-            connect_server(&req.server_id, req.password_plain.as_deref(), None).await?;
-        let remote_ids = query_remote_image_id_map(&mut probe).await?;
-        for (i, svc) in local_choices.iter().enumerate() {
-            let (repo, tag) = split_image_ref(&svc.image);
-            let full_ref = format!("{}:{}", repo, tag);
-            let (Some(remote_id), Ok(Some(local_id))) = (
-                remote_ids.get(&full_ref),
-                image_id_by_ref(&svc.image).await,
-            ) else {
-                continue;
-            };
-            if same_image_id(remote_id, &local_id) {
-                unchanged[i] = true;
-                if force_archive {
-                    emit_log(app, &format!("未变化,打包留档(跳过装载): {}", svc.image));
-                } else {
-                    emit_log(app, &format!("未变化,跳过传输: {}", svc.image));
+    if resume_step > 1 {
+        emit_log(app, "断点续传:跳过步骤 1(分类确认)");
+        // 恢复智能传输判定结果(与 Local 服务顺序对齐;不重跑判定,见函数文档)
+        unchanged = art.unchanged.clone();
+        if unchanged.len() != local_choices.len() {
+            return Err(
+                "断点数据损坏:智能传输判定结果与当前服务分类不一致,请放弃该断点后重新部署"
+                    .to_string(),
+            );
+        }
+    } else {
+        emit_progress(app, 1, 6, "分类确认");
+        ensure_not_cancelled(app)?;
+        validate_stack_choices(services)?;
+        // compose 本地副本必须存在:step 3 要上传到服务器,远端 `docker compose -f` 指向它
+        if project.compose_file.trim().is_empty() {
+            return Err(format!("项目「{}」未配置 compose 文件", project.name));
+        }
+        if !Path::new(&project.compose_file).is_file() {
+            return Err(format!("compose 文件不存在:{}", project.compose_file));
+        }
+        emit_log(
+            app,
+            &format!(
+                "开始整栈部署:服务器「{}」/ 项目「{}」,共 {} 个服务(本地传输 {} 个,服务器拉取 {} 个)",
+                server.name,
+                project.name,
+                services.len(),
+                local_choices.len(),
+                pull_choices.len()
+            ),
+        );
+
+        // ---- 智能传输:对比本地/远端同标签镜像 ID,标记未变化的 Local 服务 ----
+        // 行为矩阵(skip_unchanged × force_archive,均缺省 false):
+        // - 未启用:全部 Local 服务正常打包/上传/装载(与旧版本一致);
+        // - skip=true, force=false:未变化服务从打包/上传/装载全链路剔除;
+        // - skip=true, force=true:未变化服务仍打包上传留档(供回滚 load),
+        //   仅跳过装载(其镜像 ID 已在远端)。
+        let smart_transfer = skip_unchanged || force_archive;
+        if smart_transfer && !local_choices.is_empty() {
+            // 专用建连完成对比(用后即断,不占用打包阶段;与 deploy 的建连口径一致)
+            emit_log(app, "智能传输:正在对比本地与远端镜像 ID…");
+            let (_server, mut probe) =
+                connect_server(&req.server_id, req.password_plain.as_deref(), None).await?;
+            let remote_ids = query_remote_image_id_map(&mut probe).await?;
+            for (i, svc) in local_choices.iter().enumerate() {
+                let (repo, tag) = split_image_ref(&svc.image);
+                let full_ref = format!("{}:{}", repo, tag);
+                let (Some(remote_id), Ok(Some(local_id))) = (
+                    remote_ids.get(&full_ref),
+                    image_id_by_ref(&svc.image).await,
+                ) else {
+                    continue;
+                };
+                if same_image_id(remote_id, &local_id) {
+                    unchanged[i] = true;
+                    if force_archive {
+                        emit_log(app, &format!("未变化,打包留档(跳过装载): {}", svc.image));
+                    } else {
+                        emit_log(app, &format!("未变化,跳过传输: {}", svc.image));
+                    }
                 }
             }
+        }
+        art.unchanged = unchanged.clone();
+        if checkpoint {
+            checkpoint_save(&key, MODE_STACK, 2, &server, &project, artifacts_value(&art));
         }
     }
 
     // 打包列表:skip 且非 force 时剔除未变化服务;其余情况保持全部 Local。
     // `pack_unchanged` 与打包列表按下标对齐,供装载步骤跳过留档的未变化镜像。
+    // (断点续传时 unchanged 取自断点,过滤结果与上次打包顺序一致)
     let pack_list: Vec<&StackServiceChoice> = local_choices
         .iter()
         .enumerate()
@@ -1917,30 +2603,70 @@ async fn run_deploy_stack_steps(
         .collect();
 
     // ---- 步骤 2:打包 ----
-    emit_progress(app, 2, 6, "打包");
-    ensure_not_cancelled(app)?;
-    let tars = if pack_list.is_empty() {
-        if local_choices.is_empty() {
-            emit_log(app, "所有服务均由服务器拉取镜像,跳过本地打包");
-        } else {
-            emit_log(app, "全部本地镜像均未变化,跳过打包与传输");
+    let tars = if resume_step > 2 {
+        emit_log(app, "断点续传:跳过步骤 2(打包),复用已打包的镜像包");
+        // 断点打包产物与过滤结果一致性校验(损坏 → 明确报错,避免错位装载)
+        if art.files.len() != pack_list.len()
+            || art.locals.len() != art.files.len()
+            || art.images.len() != art.files.len()
+        {
+            return Err(
+                "断点数据损坏:镜像包产物与当前服务分类不一致,请放弃该断点后重新部署".to_string(),
+            );
         }
+        // 复用的 tar 不挂 Drop 守卫:断点期保留,成功/放弃时显式清理
         LocalTars {
-            files: Vec::new(),
+            files: art
+                .files
+                .iter()
+                .cloned()
+                .zip(art.locals.iter().map(PathBuf::from))
+                .map(|(name, path)| (path, name))
+                .collect(),
             _guards: Vec::new(),
         }
     } else {
-        pack_local_images(app, &pack_list).await?
+        emit_progress(app, 2, 6, "打包");
+        ensure_not_cancelled(app)?;
+        let tars = if pack_list.is_empty() {
+            if local_choices.is_empty() {
+                emit_log(app, "所有服务均由服务器拉取镜像,跳过本地打包");
+            } else {
+                emit_log(app, "全部本地镜像均未变化,跳过打包与传输");
+            }
+            LocalTars {
+                files: Vec::new(),
+                _guards: Vec::new(),
+            }
+        } else {
+            // 断点续传开启时保留本地 tar 供失败后复用(成功/放弃时显式清理)
+            pack_local_images(app, &pack_list, checkpoint).await?
+        };
+        art.files = tars.files.iter().map(|(_, n)| n.clone()).collect();
+        art.locals = tars
+            .files
+            .iter()
+            .map(|(p, _)| p.to_string_lossy().to_string())
+            .collect();
+        art.images = pack_list.iter().map(|s| s.image.clone()).collect();
+        if checkpoint {
+            checkpoint_save(&key, MODE_STACK, 3, &server, &project, artifacts_value(&art));
+        }
+        tars
     };
 
     // manifest 镜像条目(整栈成功收尾写入 manifest.json):逐个 Local 服务一条,
     // 被跳过传输(未留档)的服务 file = null,其余按打包顺序携带镜像包文件名
+    // (断点续传时 unchanged 来自断点,结果与首次部署一致)
     let skip_flags: Vec<bool> = unchanged.iter().map(|u| *u && !force_archive).collect();
     let packed_files: Vec<String> = tars.files.iter().map(|(_, n)| n.clone()).collect();
     let manifest_images = build_manifest_images(&local_choices, &skip_flags, &packed_files);
 
     // ---- 步骤 3:上传 ----
-    emit_progress(app, 3, 6, "上传");
+    // 断点续传:步骤 3 已完成时不再推送本步进度(事件从 step_next 起)
+    if resume_step <= 3 {
+        emit_progress(app, 3, 6, "上传");
+    }
     ensure_not_cancelled(app)?;
     let mut client = with_timeout(
         SSH_CONNECT_TIMEOUT_SECS,
@@ -1950,108 +2676,164 @@ async fn run_deploy_stack_steps(
     )
     .await?;
 
-    // 远端磁盘预检:上传前确认 Docker 根目录所在盘剩余空间 ≥ Local 镜像字节总和 × 1.5
-    // (与本地导出预检同一 sum 口径;大小未知 → 告警跳过;不足 → 中文报错中止)
-    let local_sizes: Vec<Option<u64>> = local_choices
-        .iter()
-        .map(|s| image_size(&s.image))
-        .collect();
-    let need_bytes = sum_sizes(&local_sizes).map(|total| (total as f64 * 1.5) as u64);
-    remote_disk_precheck(app, &mut client, need_bytes).await?;
-
-    // 远端建本次发布目录 <remote_dir>/releases/<时间戳>/(mkdir -p 连带创建 remote_dir)
-    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    // 发布时间戳:断点续传复用断点记录的 ts(同一发布目录,已上传镜像包才能
+    // 按名续传/按镜像幂等装载);正常部署每次新生成(旧行为)。续传且步骤 3
+    // 已完成时断点必有 ts,缺失视为断点损坏。
+    let ts = match art.release_ts.clone() {
+        Some(ts) => ts,
+        None if resume.is_some() && resume_step > 3 => {
+            return Err(
+                "断点数据损坏:缺少发布目录信息,请放弃该断点后重新部署".to_string(),
+            )
+        }
+        None => chrono::Local::now().format("%Y%m%d-%H%M%S").to_string(),
+    };
     let release_dir = releases_dir(&server.remote_dir, &ts);
-    let mkdir_cmd = mkdir_p_cmd(&release_dir);
-    let code = with_timeout(
-        SSH_EXEC_TIMEOUT_SECS,
-        "创建远端目录超时",
-        "请检查服务器网络后重试",
-        async {
-            client
-                .exec(&mkdir_cmd, &mut |_| {})
-                .await
-                .map_err(|e| format!("远端创建目录失败: {}", e))
-        },
-    )
-    .await?;
-    if code != 0 {
-        return Err(format!(
-            "远端创建目录 {} 失败(退出码 {},常见原因:无写入权限)",
-            release_dir, code
-        ));
-    }
-    emit_log(app, &format!("本次发布目录: {}", release_dir));
 
-    upload_compose_files(app, &mut client, &server, &project).await?;
-    upload_local_tars(app, &mut client, &tars, &release_dir).await?;
-    sync_files(app, &mut client, &server, &project).await?;
-    emit_log(app, "上传完成");
-    // 部署前钩子(归入步骤 3:装载/拉取前执行,旧容器仍在运行;失败即中止部署)
-    run_hook(app, &mut client, &project, HookKind::Pre, &server.remote_dir).await?;
+    if resume_step > 3 {
+        // 断点续传:上次已完成上传 → 仅建连(后续步骤复用连接)
+        emit_log(app, &format!("断点续传:跳过步骤 3(上传),复用发布目录 {}", release_dir));
+    } else {
+        // 远端磁盘预检:上传前确认 Docker 根目录所在盘剩余空间 ≥ Local 镜像字节总和 × 1.5
+        // (与本地导出预检同一 sum 口径;大小未知 → 告警跳过;不足 → 中文报错中止)
+        let local_sizes: Vec<Option<u64>> = local_choices
+            .iter()
+            .map(|s| image_size(&s.image))
+            .collect();
+        let need_bytes = sum_sizes(&local_sizes).map(|total| (total as f64 * 1.5) as u64);
+        remote_disk_precheck(app, &mut client, need_bytes).await?;
+
+        // 远端建本次发布目录 <remote_dir>/releases/<时间戳>/(mkdir -p 连带创建
+        // remote_dir;断点续传复用同目录,mkdir -p 幂等)
+        let mkdir_cmd = mkdir_p_cmd(&release_dir);
+        let code = with_timeout(
+            SSH_EXEC_TIMEOUT_SECS,
+            "创建远端目录超时",
+            "请检查服务器网络后重试",
+            async {
+                client
+                    .exec(&mkdir_cmd, &mut |_| {})
+                    .await
+                    .map_err(|e| format!("远端创建目录失败: {}", e))
+            },
+        )
+        .await?;
+        if code != 0 {
+            return Err(format!(
+                "远端创建目录 {} 失败(退出码 {},常见原因:无写入权限)",
+                release_dir, code
+            ));
+        }
+        emit_log(app, &format!("本次发布目录: {}", release_dir));
+        if art.release_ts.as_deref() != Some(ts.as_str()) {
+            // 步骤 3 内部落盘:目录创建成功即记录 ts,上传中断后可复用同一发布目录
+            art.release_ts = Some(ts.clone());
+            if checkpoint {
+                checkpoint_save(&key, MODE_STACK, 3, &server, &project, artifacts_value(&art));
+            }
+        }
+
+        upload_compose_files(app, &mut client, &server, &project).await?;
+        // 断点续传:逐包校验远端大小,已上传完成的包跳过(半成品包由
+        // sftp_upload(resume=true) 续传)
+        upload_local_tars(app, &mut client, &tars, &release_dir, resume.is_some()).await?;
+        sync_files(app, &mut client, &server, &project).await?;
+        emit_log(app, "上传完成");
+        // 部署前钩子(归入步骤 3:装载/拉取前执行,旧容器仍在运行;失败即中止部署)
+        run_hook(app, &mut client, &project, HookKind::Pre, &server.remote_dir).await?;
+        if checkpoint {
+            checkpoint_save(&key, MODE_STACK, 4, &server, &project, artifacts_value(&art));
+        }
+    }
 
     // ---- 步骤 4:装载 ----
-    emit_progress(app, 4, 6, "装载");
-    ensure_not_cancelled(app)?;
-    let tar_count = tars.files.len();
-    if tar_count == 0 {
-        emit_log(app, "无本地镜像包,跳过装载");
-    }
-    for (i, (_, name)) in tars.files.iter().enumerate() {
+    if resume_step > 4 {
+        emit_log(app, "断点续传:跳过步骤 4(装载)");
+    } else {
+        emit_progress(app, 4, 6, "装载");
         ensure_not_cancelled(app)?;
-        // force_archive 留档的未变化镜像:ID 已在远端,仅归档进 release 目录,不装载
-        if pack_unchanged[i] {
-            emit_log(app, &format!("镜像未变化,跳过装载(仅留档): {}", name));
-            continue;
+        let tar_count = tars.files.len();
+        if tar_count == 0 {
+            emit_log(app, "无本地镜像包,跳过装载");
         }
-        let remote_tar = remote_join(&release_dir, name);
-        emit_log(
-            app,
-            &format!(
-                "装载镜像包 ({}/{}): docker load -i {}",
-                i + 1,
-                tar_count,
-                remote_tar
-            ),
-        );
-        let load_cmd = format!("docker load -i {}", shell_single_quote(&remote_tar));
-        exec_forwarded(app, &mut client, &load_cmd, STACK_LOAD_TIMEOUT_SECS).await?;
+        for (i, (_, name)) in tars.files.iter().enumerate() {
+            ensure_not_cancelled(app)?;
+            // force_archive 留档的未变化镜像:ID 已在远端,仅归档进 release 目录,不装载
+            if pack_unchanged[i] {
+                emit_log(app, &format!("镜像未变化,跳过装载(仅留档): {}", name));
+                continue;
+            }
+            // 断点续传:该包上次装载已成功(远端已有该镜像)→ 跳过,逐包幂等
+            if resume.is_some() && remote_has_image(&mut client, &art.images[i]).await? {
+                emit_log(
+                    app,
+                    &format!(
+                        "断点续传:远端已存在镜像 {},跳过装载: {}",
+                        art.images[i], name
+                    ),
+                );
+                continue;
+            }
+            let remote_tar = remote_join(&release_dir, name);
+            emit_log(
+                app,
+                &format!(
+                    "装载镜像包 ({}/{}): docker load -i {}",
+                    i + 1,
+                    tar_count,
+                    remote_tar
+                ),
+            );
+            let load_cmd = format!("docker load -i {}", shell_single_quote(&remote_tar));
+            exec_forwarded(app, &mut client, &load_cmd, STACK_LOAD_TIMEOUT_SECS).await?;
+        }
+        if checkpoint {
+            checkpoint_save(&key, MODE_STACK, 5, &server, &project, artifacts_value(&art));
+        }
     }
 
     // ---- 步骤 5:拉取 ----
-    emit_progress(app, 5, 6, "拉取");
-    ensure_not_cancelled(app)?;
     // override 文件名:按 compose 副本目录检测(与 upload_compose_files 上传的
     // 一致),pull / up 均按同序 -f 传入,保证远端合并结果与本地解析一致
+    // (跳过本步时 up 仍需要,故先于分支计算)
     let override_names = compose_override_names(&project.compose_file);
-    let pull_names: Vec<String> = pull_choices.iter().map(|s| s.service.clone()).collect();
-    if pull_names.is_empty() {
-        emit_log(app, "无需要服务器拉取的服务,跳过拉取");
+    if resume_step > 5 {
+        emit_log(app, "断点续传:跳过步骤 5(拉取)");
     } else {
-        let remote_compose = remote_compose_path(&server.remote_dir);
-        let pull_cmd =
-            compose_pull_cmd(&server.remote_dir, &remote_compose, &override_names, &pull_names);
-        emit_log(app, &format!("拉取远端镜像: {}", pull_cmd));
-        // 远端输出末尾并入错误信息:私有仓库认证失败(401/Unauthorized/denied)
-        // 时由 augment_pull_error 追加 docker login 提示
-        exec_forwarded_inner(
-            app,
-            &mut client,
-            &pull_cmd,
-            STACK_COMPOSE_TIMEOUT_SECS,
-            PULL_OUTPUT_TAIL_LINES,
-        )
-        .await
-        .map_err(|e| {
-            if e == CANCELLED_MSG {
-                e
-            } else {
-                augment_pull_error(&format!(
-                    "{}(请检查服务器能否出网访问镜像仓库,或在服务分类中把这些服务改为本地传输)",
+        emit_progress(app, 5, 6, "拉取");
+        ensure_not_cancelled(app)?;
+        let pull_names: Vec<String> = pull_choices.iter().map(|s| s.service.clone()).collect();
+        if pull_names.is_empty() {
+            emit_log(app, "无需要服务器拉取的服务,跳过拉取");
+        } else {
+            let remote_compose = remote_compose_path(&server.remote_dir);
+            let pull_cmd =
+                compose_pull_cmd(&server.remote_dir, &remote_compose, &override_names, &pull_names);
+            emit_log(app, &format!("拉取远端镜像: {}", pull_cmd));
+            // 远端输出末尾并入错误信息:私有仓库认证失败(401/Unauthorized/denied)
+            // 时由 augment_pull_error 追加 docker login 提示
+            exec_forwarded_inner(
+                app,
+                &mut client,
+                &pull_cmd,
+                STACK_COMPOSE_TIMEOUT_SECS,
+                PULL_OUTPUT_TAIL_LINES,
+            )
+            .await
+            .map_err(|e| {
+                if e == CANCELLED_MSG {
                     e
-                ))
-            }
-        })?;
+                } else {
+                    augment_pull_error(&format!(
+                        "{}(请检查服务器能否出网访问镜像仓库,或在服务分类中把这些服务改为本地传输)",
+                        e
+                    ))
+                }
+            })?;
+        }
+        if checkpoint {
+            checkpoint_save(&key, MODE_STACK, 6, &server, &project, artifacts_value(&art));
+        }
     }
 
     // ---- 步骤 6:启动 ----
@@ -2091,7 +2873,13 @@ async fn run_deploy_stack_steps(
         emit_log(app, &format!("警告:清理旧 releases 目录失败: {}", e));
     }
 
-    // 本地 tar 由 tars 的 TempFileGuard 在本函数返回(成功/失败)时统一删除
+    // ---- 成功收尾:清除断点 + 删除断点期保留的本地临时 tar ----
+    // (失败/取消不走这里:断点与临时 tar 都保留,供续传复用)
+    if checkpoint {
+        let local_tars: Vec<PathBuf> = tars.files.iter().map(|(p, _)| p.clone()).collect();
+        checkpoint_cleanup_on_success(&key, &local_tars);
+    }
+
     // 整栈成功:登记本次发布目录,供前端一键回滚定位
     record.release_dir = Some(release_dir.clone());
     emit_log(app, "整栈部署完成");
@@ -2103,6 +2891,8 @@ struct LocalTars {
     /// `(本地路径, 远端文件名)`,按服务顺序排列(与串行打包时的顺序一致)
     files: Vec<(PathBuf, String)>,
     /// Drop 守卫:管线函数返回(成功或失败)时删除全部本地 tar
+    /// (断点续传开启时以 keep 模式构造 —— 不删除,成功/放弃时显式清理;
+    /// 断点续传复用的 tar 不挂守卫)
     _guards: Vec<TempFileGuard>,
 }
 
@@ -2121,10 +2911,12 @@ struct LocalTars {
 /// 检查一次取消;取消或出错后不再启动新任务,但**已启动的阻塞 `docker save`
 /// 无法中断**,只能等其在途任务自然结束后以“部署已取消”/首个错误中止。
 /// 输出路径的 [`TempFileGuard`] 预先建立,任何返回路径(成功/失败/取消)下
-/// 半成品 tar 都随管线返回统一删除。
+/// 半成品 tar 都随管线返回统一删除;`keep_guards = true`(断点续传开启)时
+/// 守卫以 keep 模式构造 —— tar 保留给失败后续传复用,成功/放弃时显式清理。
 async fn pack_local_images(
     app: &AppHandle,
     local: &[&StackServiceChoice],
+    keep_guards: bool,
 ) -> Result<LocalTars, String> {
     if local.is_empty() {
         emit_log(app, "所有服务均由服务器拉取镜像,跳过本地打包");
@@ -2142,13 +2934,23 @@ async fn pack_local_images(
 
     let n = local.len();
     // guard 先建:导出失败的半成品文件同样会在管线返回时删除
+    // (断点续传开启时保留,供失败后复用)
     let mut outputs: Vec<(PathBuf, String)> = Vec::with_capacity(n);
     for _ in 0..n {
         let tar_name = format!("{}.tar.gz", uuid::Uuid::new_v4());
         let out_path = std::env::temp_dir().join(&tar_name);
         outputs.push((out_path, tar_name));
     }
-    let guards: Vec<TempFileGuard> = outputs.iter().map(|(p, _)| TempFileGuard(p.clone())).collect();
+    let guards: Vec<TempFileGuard> = outputs
+        .iter()
+        .map(|(p, _)| {
+            if keep_guards {
+                TempFileGuard::keep(p.clone())
+            } else {
+                TempFileGuard::new(p.clone())
+            }
+        })
+        .collect();
     let images: Vec<String> = local.iter().map(|s| s.image.clone()).collect();
 
     let available = std::thread::available_parallelism()
@@ -2299,11 +3101,16 @@ async fn upload_compose_files(
 /// 均为新时间戳,attempt 之间无同名文件;同 attempt 内重试时 `sftp_upload(resume=true)`
 /// 经 stat 命中远端半成品 → Resume 分支(重试返回 AlreadyDone = 远端已传 ≥ 本地,
 /// 同样视为该包成功)。
+///
+/// `verify_remote = true`(断点续传,UPGRADE-PLAN 阶段六):逐包先经
+/// [`SshClient::sftp_stat_size`] 校验 —— 远端同名文件不小于本地(该包上次已
+/// 上传完成)→ 跳过;查询失败不跳过(交给下方上传,由其内部 stat 兜底判定)。
 async fn upload_local_tars(
     app: &AppHandle,
     client: &mut SshClient,
     tars: &LocalTars,
     release_dir: &str,
+    verify_remote: bool,
 ) -> Result<(), String> {
     let n = tars.files.len();
     if n == 0 {
@@ -2312,6 +3119,23 @@ async fn upload_local_tars(
     }
     for (i, (path, name)) in tars.files.iter().enumerate() {
         ensure_not_cancelled(app)?;
+        // 断点续传:远端同名文件与本地大小一致 → 该包上次已上传完成,跳过
+        if verify_remote {
+            let local_size = tokio::fs::metadata(path).await.map(|m| m.len()).unwrap_or(0);
+            if local_size > 0 {
+                let remote_path = remote_join(release_dir, name);
+                let uploaded = match client.sftp_stat_size(&remote_path).await {
+                    Ok(Some(remote_size)) => remote_size >= local_size,
+                    Ok(None) => false,
+                    // 查询失败不跳过:交给下方上传兜底
+                    Err(_) => false,
+                };
+                if uploaded {
+                    emit_log(app, &format!("断点续传:镜像包 {} 已上传完成,跳过", name));
+                    continue;
+                }
+            }
+        }
         emit_log(app, &format!("上传镜像包 ({}/{}): {}", i + 1, n, name));
         let app_for_cb = app.clone();
         let idx = i + 1;
@@ -3779,13 +4603,36 @@ fn emit_log(app: &AppHandle, msg: &str) {
 }
 
 /// 本地临时 tar 的 Drop 守卫:作用域结束(成功或失败)时删除文件。
-struct TempFileGuard(PathBuf);
+///
+/// [`TempFileGuard::keep`](断点续传活跃时使用)不删除 —— 临时 tar 供失败后
+/// 续传复用,由成功收尾([`checkpoint_cleanup_on_success`])或
+/// `deploy_resume_discard` 显式清理。
+struct TempFileGuard {
+    path: PathBuf,
+    /// true = 断点活跃,Drop 不删除(保留给续传)
+    keep: bool,
+}
+
+impl TempFileGuard {
+    /// 用完即删的守卫(默认;旧行为)。
+    fn new(path: PathBuf) -> Self {
+        Self { path, keep: false }
+    }
+
+    /// 断点活跃时使用的守卫:Drop 不删除。
+    fn keep(path: PathBuf) -> Self {
+        Self { path, keep: true }
+    }
+}
 
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_file(&self.0) {
+        if self.keep {
+            return;
+        }
+        if let Err(e) = std::fs::remove_file(&self.path) {
             if e.kind() != std::io::ErrorKind::NotFound {
-                log::warn!("删除本地临时文件失败 ({}): {}", self.0.display(), e);
+                log::warn!("删除本地临时文件失败 ({}): {}", self.path.display(), e);
             }
         }
     }
@@ -5215,5 +6062,278 @@ mod tests {
         let detail = webhook_error_detail(&ureq::Error::Status(404, resp));
         assert_eq!(detail, "HTTP 状态码 404");
         assert!(!detail.contains("http"), "不应包含 URL: {}", detail);
+    }
+
+    // ===== 阶段六:部署断点续传(纯函数单测)=====
+
+    /// 构造单镜像断点产物(测试便捷函数)。
+    fn single_art() -> SingleResumeArtifacts {
+        SingleResumeArtifacts {
+            origin_ref: "myapp:latest".into(),
+            repository: "myapp".into(),
+            use_date_tag: true,
+            image_ref: Some("myapp:20260906-101010".into()),
+            tar_local: Some("C:\\Temp\\abc.tar.gz".into()),
+            tar_name: Some("abc.tar.gz".into()),
+            skip_unchanged: false,
+        }
+    }
+
+    /// 构造整栈断点产物(测试便捷函数)。
+    fn stack_art() -> StackResumeArtifacts {
+        StackResumeArtifacts {
+            services: vec![
+                choice("web", "myapp:1", TransferMode::Local),
+                choice("db", "", TransferMode::Pull),
+            ],
+            unchanged: vec![false],
+            skip_unchanged: true,
+            force_archive: false,
+            release_ts: Some("20260906-101010".into()),
+            files: vec!["a.tar.gz".into()],
+            locals: vec!["C:\\Temp\\a.tar.gz".into()],
+            images: vec!["myapp:1".into()],
+        }
+    }
+
+    #[test]
+    fn test_resume_step_label_single_and_stack() {
+        // 单镜像 1..5:打标签/导出压缩/上传镜像/同步文件/服务器部署
+        assert_eq!(resume_step_label(MODE_SINGLE, 1), "打标签");
+        assert_eq!(resume_step_label(MODE_SINGLE, 2), "导出压缩");
+        assert_eq!(resume_step_label(MODE_SINGLE, 3), "上传镜像");
+        assert_eq!(resume_step_label(MODE_SINGLE, 4), "同步文件");
+        assert_eq!(resume_step_label(MODE_SINGLE, 5), "服务器部署");
+        // 整栈 1..6:分类确认/打包/上传/装载/拉取/启动
+        assert_eq!(resume_step_label(MODE_STACK, 1), "分类确认");
+        assert_eq!(resume_step_label(MODE_STACK, 2), "打包");
+        assert_eq!(resume_step_label(MODE_STACK, 3), "上传");
+        assert_eq!(resume_step_label(MODE_STACK, 4), "装载");
+        assert_eq!(resume_step_label(MODE_STACK, 5), "拉取");
+        assert_eq!(resume_step_label(MODE_STACK, 6), "启动");
+        // 越界(成功后即清除断点,理论不可达)与未知模式兜底
+        assert_eq!(resume_step_label(MODE_SINGLE, 6), "部署收尾");
+        assert_eq!(resume_step_label(MODE_SINGLE, 0), "部署收尾");
+        assert_eq!(resume_step_label("rollback", 1), "部署收尾");
+    }
+
+    #[test]
+    fn test_single_resume_artifacts_serde_roundtrip() {
+        // camelCase 序列化(存入 resume-deploy.json 的 artifacts 字段)→ 读回逐字段相等
+        let art = single_art();
+        let v = serde_json::to_value(&art).unwrap();
+        assert_eq!(v["originRef"], "myapp:latest");
+        assert_eq!(v["useDateTag"], true);
+        assert_eq!(v["tarLocal"], "C:\\Temp\\abc.tar.gz");
+        assert_eq!(v["tarName"], "abc.tar.gz");
+        let back: SingleResumeArtifacts = serde_json::from_value(v).unwrap();
+        assert_eq!(back, art);
+    }
+
+    #[test]
+    fn test_stack_resume_artifacts_serde_roundtrip() {
+        let art = stack_art();
+        let v = serde_json::to_value(&art).unwrap();
+        assert_eq!(v["releaseTs"], "20260906-101010");
+        assert_eq!(v["skipUnchanged"], true);
+        assert_eq!(v["forceArchive"], false);
+        assert_eq!(v["files"][0], "a.tar.gz");
+        assert_eq!(v["images"][0], "myapp:1");
+        // services 内嵌 StackServiceChoice(snake_case 契约不变)
+        assert_eq!(v["services"][0]["service"], "web");
+        assert_eq!(v["services"][0]["mode"], "Local");
+        let back: StackResumeArtifacts = serde_json::from_value(v).unwrap();
+        assert_eq!(back, art);
+    }
+
+    #[test]
+    fn test_parse_resume_artifacts_corrupt_is_none() {
+        // 非 JSON 对象(数组/字符串)→ None,调用方按断点数据损坏报错
+        assert!(parse_single_artifacts(&serde_json::json!([1, 2, 3])).is_none());
+        assert!(parse_stack_artifacts(&serde_json::json!("垃圾")).is_none());
+        // JSON 对象但字段全缺 → serde default 宽松解析为默认值;关键产物缺失
+        // 由 resume_context_of 的字段级校验拦截(步骤号 > 产物完成度 → 报错)
+        let lenient = parse_single_artifacts(&serde_json::json!({"nope": 1}));
+        assert!(lenient.is_some());
+        let cp = ResumeCheckpoint {
+            key: checkpoint_key("s1", "p1", MODE_SINGLE),
+            mode: MODE_SINGLE.into(),
+            step_next: 2,
+            ts: String::new(),
+            server_id: "s1".into(),
+            project_id: "p1".into(),
+            server_name: "s".into(),
+            project_name: "p".into(),
+            artifacts: serde_json::json!({"nope": 1}),
+        };
+        assert!(resume_context_of(&cp).is_err(), "步骤 2 但缺镜像引用应判损坏");
+        // 合法数据 → Some
+        assert!(parse_single_artifacts(&serde_json::to_value(single_art()).unwrap()).is_some());
+        assert!(parse_stack_artifacts(&serde_json::to_value(stack_art()).unwrap()).is_some());
+    }
+
+    #[test]
+    fn test_resume_local_tars_by_mode() {
+        // 单镜像:tar_local;整栈:locals 全部;未知模式:空
+        let single_cp = ResumeCheckpoint {
+            key: checkpoint_key("s1", "p1", MODE_SINGLE),
+            mode: MODE_SINGLE.into(),
+            step_next: 3,
+            ts: "2026-09-06 10:00:00".into(),
+            server_id: "s1".into(),
+            project_id: "p1".into(),
+            server_name: "服务器".into(),
+            project_name: "项目".into(),
+            artifacts: serde_json::to_value(single_art()).unwrap(),
+        };
+        let tars = resume_local_tars(&single_cp);
+        assert_eq!(tars, vec![PathBuf::from("C:\\Temp\\abc.tar.gz")]);
+
+        let stack_cp = ResumeCheckpoint {
+            key: checkpoint_key("s1", "p1", MODE_STACK),
+            mode: MODE_STACK.into(),
+            step_next: 4,
+            artifacts: serde_json::to_value(stack_art()).unwrap(),
+            ..single_cp.clone()
+        };
+        let tars = resume_local_tars(&stack_cp);
+        assert_eq!(tars, vec![PathBuf::from("C:\\Temp\\a.tar.gz")]);
+
+        let unknown = ResumeCheckpoint { mode: "rollback".into(), ..stack_cp.clone() };
+        assert!(resume_local_tars(&unknown).is_empty());
+        // artifacts 损坏 → 空(清理尽力而为,不让放弃操作失败)
+        let corrupt = ResumeCheckpoint {
+            artifacts: serde_json::json!("垃圾"),
+            ..stack_cp
+        };
+        assert!(resume_local_tars(&corrupt).is_empty());
+    }
+
+    #[test]
+    fn test_resume_context_of_validates() {
+        let base = ResumeCheckpoint {
+            key: checkpoint_key("s1", "p1", MODE_SINGLE),
+            mode: MODE_SINGLE.into(),
+            step_next: 3,
+            ts: String::new(),
+            server_id: "s1".into(),
+            project_id: "p1".into(),
+            server_name: "s".into(),
+            project_name: "p".into(),
+            artifacts: serde_json::to_value(single_art()).unwrap(),
+        };
+        // 合法单镜像断点
+        let ctx = resume_context_of(&base).unwrap();
+        assert_eq!(ctx.step_next, 3);
+        assert_eq!(ctx.key, base.key);
+        assert_eq!(ctx.single.tar_name.as_deref(), Some("abc.tar.gz"));
+
+        // 未知模式 → 报错
+        let bad_mode = ResumeCheckpoint { mode: "x".into(), ..base.clone() };
+        assert!(resume_context_of(&bad_mode).is_err());
+
+        // 步骤号越界 → 报错
+        let bad_step = ResumeCheckpoint { step_next: 6, ..base.clone() };
+        assert!(resume_context_of(&bad_step).is_err());
+
+        // 步骤 1 未完成(image_ref 缺失)合法;步骤 3 但缺镜像引用 → 报错
+        let mut art = single_art();
+        art.image_ref = None;
+        let step1 = ResumeCheckpoint { step_next: 1, artifacts: serde_json::to_value(&art).unwrap(), ..base.clone() };
+        assert!(resume_context_of(&step1).is_ok());
+        let step3 = ResumeCheckpoint { step_next: 3, artifacts: serde_json::to_value(&art).unwrap(), ..base.clone() };
+        assert!(resume_context_of(&step3).is_err());
+
+        // 整栈:合法 + 产物列表不一致 → 报错
+        let stack_base = ResumeCheckpoint {
+            key: checkpoint_key("s1", "p1", MODE_STACK),
+            mode: MODE_STACK.into(),
+            step_next: 4,
+            artifacts: serde_json::to_value(stack_art()).unwrap(),
+            ..base
+        };
+        assert!(resume_context_of(&stack_base).is_ok());
+        let mut art = stack_art();
+        art.locals.clear();
+        let mismatch = ResumeCheckpoint { artifacts: serde_json::to_value(&art).unwrap(), ..stack_base };
+        assert!(resume_context_of(&mismatch).is_err());
+    }
+
+    #[test]
+    fn test_resume_view_of_mapping() {
+        let cp = ResumeCheckpoint {
+            key: checkpoint_key("s1", "p1", MODE_STACK),
+            mode: MODE_STACK.into(),
+            step_next: 3,
+            ts: "2026-09-06 10:00:00".into(),
+            server_id: "s1".into(),
+            project_id: "p1".into(),
+            server_name: "生产".into(),
+            project_name: "博客".into(),
+            artifacts: serde_json::json!({}),
+        };
+        let view = resume_view_of(&cp);
+        assert_eq!(view.key, "s1|p1|stack");
+        assert_eq!(view.mode, "stack");
+        assert_eq!(view.step_next, 3);
+        assert_eq!(view.step_label, "上传");
+        assert_eq!(view.ts, "2026-09-06 10:00:00");
+        assert_eq!(view.server_name, "生产");
+        assert_eq!(view.project_name, "博客");
+        // camelCase 序列化(前端契约)
+        let v = serde_json::to_value(&view).unwrap();
+        assert!(v.get("stepNext").is_some());
+        assert!(v.get("stepLabel").is_some());
+        assert!(v.get("serverName").is_some());
+    }
+
+    #[test]
+    fn test_temp_file_guard_drop_semantics() {
+        // new:Drop 删除;keep(断点活跃):Drop 保留(由成功收尾/放弃显式清理)
+        let p1 = std::env::temp_dir().join(format!("dd-guard-{}.tmp", uuid::Uuid::new_v4()));
+        std::fs::write(&p1, b"x").unwrap();
+        {
+            let _g = TempFileGuard::new(p1.clone());
+        }
+        assert!(!p1.exists(), "TempFileGuard::new 应在 Drop 时删除文件");
+
+        let p2 = std::env::temp_dir().join(format!("dd-guard-{}.tmp", uuid::Uuid::new_v4()));
+        std::fs::write(&p2, b"x").unwrap();
+        {
+            let _g = TempFileGuard::keep(p2.clone());
+        }
+        assert!(p2.exists(), "TempFileGuard::keep 不应在 Drop 时删除文件");
+        std::fs::remove_file(&p2).ok();
+    }
+
+    #[test]
+    fn test_checkpoint_cleanup_on_success_removes_tar_and_checkpoint() {
+        // 成功收尾:断点删除 + 保留的本地 tar 删除;文件已不存在时静默
+        let _guard = crate::config::TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ddtest-resume-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
+
+        let key = checkpoint_key("s9", "p9", MODE_SINGLE);
+        let cp = ResumeCheckpoint {
+            key: key.clone(),
+            mode: MODE_SINGLE.into(),
+            step_next: 5,
+            ts: "2026-09-06 10:00:00".into(),
+            server_id: "s9".into(),
+            project_id: "p9".into(),
+            server_name: "s".into(),
+            project_name: "p".into(),
+            artifacts: serde_json::json!({}),
+        };
+        crate::config::save_checkpoint(&cp).unwrap();
+        let tar = dir.join("left.tar.gz");
+        std::fs::write(&tar, b"x").unwrap();
+
+        checkpoint_cleanup_on_success(&key, &[tar.clone(), dir.join("already-gone.tar.gz")]);
+        assert!(crate::config::load_resume_map().get(&key).is_none(), "断点应被清除");
+        assert!(!tar.exists(), "保留的本地 tar 应被删除");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
