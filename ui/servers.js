@@ -473,44 +473,217 @@
   }
 
   /** 清理优化自绘确认条:插入卡片内嵌确认条(检测区上方),取消即移除 */
+  /** 「清理优化」:打开清理分析模态(预览 → 勾选 → 定向执行) */
   function showPruneConfirm(card, server) {
-    var old = card.querySelector('.server-prune-actions');
-    if (old) old.remove();
-    var bar = el('div', 'server-check-actions server-prune-actions');
-    bar.appendChild(el('span', 'confirm-text', '将清理悬空镜像与已退出容器,确认?'));
-    var ok = el('button', 'btn btn-danger btn-sm', '确认清理');
-    ok.type = 'button';
-    ok.addEventListener('click', function () { startPrune(server); });
-    bar.appendChild(ok);
-    var cancel = el('button', 'btn btn-sm', '取消');
-    cancel.type = 'button';
-    cancel.addEventListener('click', function () { bar.remove(); });
-    bar.appendChild(cancel);
-    var check = card.querySelector('.server-check');
-    if (check) card.insertBefore(bar, check);
-    else card.appendChild(bar);
+    openCleanupModal(server);
   }
 
-  /** 清理服务器(prune_server):输出经 server-log 事件写入底部运行日志 */
-  function startPrune(server) {
-    var id = server.id;
-    if (st.pruning[id] || st.checking[id] || st.installing[id]) return;
-    st.pruning[id] = true;
-    setLogOpen(true); // 自动展开 server-log 终端,便于观察清理输出
-    window.toast('开始清理服务器,输出见底部「运行日志」', 'info');
-    renderServers(); // 重渲染:按钮变「清理中…」禁用,确认条随卡片重建消失
+  function cleanupModal() { return document.getElementById('cleanup-modal'); }
+  function cleanupBody() { return document.getElementById('cleanup-modal-body'); }
 
-    window.AppBus.invoke('prune_server', { serverId: id })
-      .then(function () {
-        window.toast('清理完成', 'ok');
+  function closeCleanupModal() {
+    var m = cleanupModal();
+    if (m) m.classList.add('hidden');
+    // 模态关闭即解除卡片 busy(执行标志由关闭时统一复位)
+    st.pruning[st.cleanupServerId || ''] = false;
+    st.cleanupServerId = null;
+    if (!document.querySelector('.page.active[data-page="servers"]')) return;
+    renderServers();
+  }
+
+  /** 打开清理分析:先 cleanup_preview,加载中显示占位 */
+  function openCleanupModal(server) {
+    var modal = cleanupModal();
+    if (!modal) return;
+    st.cleanupServerId = server.id;
+    modal.classList.remove('hidden');
+    var body = cleanupBody();
+    body.innerHTML = '';
+    var title = document.getElementById('cleanup-modal-title');
+    if (title) title.textContent = '清理分析 — ' + (server.name || server.host);
+    body.appendChild(el('div', 'cleanup-hint', '正在扫描可清理项…'));
+    window.AppBus.invoke('cleanup_preview', { serverId: server.id })
+      .then(function (report) {
+        if (st.cleanupServerId !== server.id) return; // 模态已被关闭/切换
+        renderCleanupSections(server, report || { errors: ['预览失败'] });
       })
       .catch(function (err) {
-        saveToastFail(err, '服务器清理失败');
-      })
-      .then(function () {
-        st.pruning[id] = false;
-        renderServers();
+        if (st.cleanupServerId !== server.id) return;
+        body.innerHTML = '';
+        body.appendChild(el('div', 'cleanup-hint', '扫描失败:' + (err && err.message ? err.message : err)));
       });
+  }
+
+  /** 渲染各清理节的勾选与明细 */
+  function renderCleanupSections(server, report) {
+    var body = cleanupBody();
+    if (!body) return;
+    body.innerHTML = '';
+    st.cleanupSelection = { images: false, containers: false, volumes: false, builder: false };
+
+    var errList = Array.isArray(report.errors) ? report.errors : [];
+    for (var ei = 0; ei < errList.length; ei++) {
+      body.appendChild(el('div', 'cleanup-error', errList[ei]));
+    }
+
+    var sections = [
+      {
+        key: 'images', label: '悬空镜像', checkbox: true,
+        count: report.dangling_images ? report.dangling_images.length : 0,
+        unit: '项',
+        items: (report.dangling_images || []).map(function (im) {
+          return (im.repository || '<none>') + ':' + (im.tag || '<none>') + ' (' + (im.size || '?') + ')';
+        })
+      },
+      {
+        key: 'containers', label: '已停止容器', checkbox: true,
+        count: report.stopped_containers ? report.stopped_containers.length : 0,
+        unit: '个',
+        items: (report.stopped_containers || []).map(function (c) {
+          return (c.names || c.id) + ' — ' + (c.status || '');
+        })
+      },
+      {
+        key: 'volumes', label: '未使用卷', checkbox: true,
+        count: report.unused_volumes ? report.unused_volumes.length : 0,
+        unit: '个',
+        items: (report.unused_volumes || []).map(function (v) { return v.name || ''; })
+      },
+      {
+        key: 'builder', label: '构建缓存', checkbox: true,
+        count: null, size: report.build_cache_size || '0B', unit: '', items: []
+      }
+    ];
+
+    for (var i = 0; i < sections.length; i++) {
+      var sec = sections[i];
+      var box = el('div', 'cleanup-section');
+      var head = el('div', 'cleanup-section-head');
+      var chk = el('input');
+      chk.type = 'checkbox';
+      chk.setAttribute('data-cleanup-section', sec.key);
+      if (sec.checkbox) {
+        chk.disabled = sec.count === 0;
+        chk.checked = sec.count > 0;
+      } else {
+        chk.disabled = report.build_cache_size === '0B' || report.build_cache_size === '';
+        chk.checked = !chk.disabled;
+      }
+      head.appendChild(chk);
+      var countText = sec.checkbox
+        ? sec.count + ' ' + sec.unit
+        : (sec.size || '0B');
+      head.appendChild(el('span', 'cleanup-section-label', sec.label));
+      head.appendChild(el('span', 'cleanup-section-count', countText));
+      box.appendChild(head);
+
+      if (sec.checkbox && sec.count > 0 && sec.items.length > 0) {
+        var shown = sec.items.slice(0, 5);
+        for (var k = 0; k < shown.length; k++) {
+          box.appendChild(el('div', 'cleanup-item mono', shown[k]));
+        }
+        if (sec.items.length > 5) {
+          box.appendChild(el('div', 'cleanup-item cleanup-more', '… 共 ' + sec.items.length + ' 项'));
+        }
+      }
+      if (!sec.checkbox && sec.key === 'builder') {
+        box.appendChild(el('div', 'cleanup-item mono', '构建缓存占用:' + (sec.size || '0B')));
+      }
+      body.appendChild(box);
+    }
+
+    body.appendChild(el(
+      'div', 'cleanup-hint',
+      '清理仅移除未被使用的资源(运行中容器与其挂载卷不受影响);执行过程输出见底部「运行日志」。'
+    ));
+
+    var actions = el('div', 'modal-actions');
+    var execBtn = el('button', 'btn btn-danger', '执行清理');
+    execBtn.type = 'button';
+    execBtn.addEventListener('click', function () { onCleanupExecute(server); });
+    actions.appendChild(execBtn);
+    body.appendChild(actions);
+    refreshCleanupExecState(execBtn);
+    body.querySelectorAll('input[data-cleanup-section]').forEach(function (node) {
+      node.addEventListener('change', function () { refreshCleanupExecState(execBtn); });
+    });
+    st.cleanupExecBtn = execBtn;
+  }
+
+  /** 无勾选时禁用执行按钮 */
+  function refreshCleanupExecState(execBtn) {
+    var any = false;
+    document.querySelectorAll('#cleanup-modal-body input[data-cleanup-section]').forEach(function (n) {
+      if (n.checked) any = true;
+    });
+    if (execBtn) execBtn.disabled = !any || st.pruning[st.cleanupServerId || ''] === true;
+  }
+
+  /** 执行清理:模态内二次确认 → cleanup_execute → 逐节结果 → 自动重新预览 */
+  function onCleanupExecute(server) {
+    var body = cleanupBody();
+    if (!body) return;
+    var selection = { images: false, containers: false, volumes: false, builder: false };
+    document.querySelectorAll('#cleanup-modal-body input[data-cleanup-section]').forEach(function (n) {
+      selection[n.getAttribute('data-cleanup-section')] = n.checked;
+    });
+
+    body.innerHTML = '';
+    body.appendChild(el('div', 'cleanup-hint', '确认清理勾选项?该操作不可撤销(不影响运行中的容器与被使用的资源)。'));
+    var actions = el('div', 'modal-actions');
+    var ok = el('button', 'btn btn-danger', '确认执行');
+    ok.type = 'button';
+    var cancel = el('button', 'btn', '返回');
+    cancel.type = 'button';
+    actions.appendChild(cancel);
+    actions.appendChild(ok);
+    body.appendChild(actions);
+
+    cancel.addEventListener('click', function () {
+      window.AppBus.invoke('cleanup_preview', { serverId: server.id })
+        .then(function (report) {
+          if (st.cleanupServerId !== server.id) return;
+          renderCleanupSections(server, report || { errors: [] });
+        })
+        .catch(function () { closeCleanupModal(); });
+    });
+    ok.addEventListener('click', function () {
+      st.pruning[server.id] = true;
+      body.innerHTML = '';
+      body.appendChild(el('div', 'cleanup-hint', '清理执行中,输出见底部「运行日志」…'));
+      setLogOpen(true);
+      refreshCleanupExecState(st.cleanupExecBtn);
+      window.AppBus.invoke('cleanup_execute', { serverId: server.id, sections: selection })
+        .then(function (results) {
+          if (st.cleanupServerId !== server.id) return;
+          st.pruning[server.id] = false;
+          var list = Array.isArray(results) ? results : [];
+          body.innerHTML = '';
+          body.appendChild(el('div', 'cleanup-hint', '清理完成:'));
+          for (var i = 0; i < list.length; i++) {
+            var r = list[i];
+            var line = r.label + ':' + (r.ok ? '完成' : '失败') + (r.output ? ' — ' + r.output.split('\n')[0] : '');
+            body.appendChild(el('div', r.ok ? 'cleanup-item' : 'cleanup-error', line));
+          }
+          var again = el('button', 'btn btn-sm', '重新扫描');
+          again.type = 'button';
+          again.addEventListener('click', function () {
+            window.AppBus.invoke('cleanup_preview', { serverId: server.id })
+              .then(function (report) {
+                if (st.cleanupServerId !== server.id) return;
+                renderCleanupSections(server, report || { errors: [] });
+              });
+          });
+          body.appendChild(again);
+          refreshCleanupExecState(st.cleanupExecBtn);
+        })
+        .catch(function (err) {
+          if (st.cleanupServerId !== server.id) return;
+          st.pruning[server.id] = false;
+          body.innerHTML = '';
+          body.appendChild(el('div', 'cleanup-error', '清理失败:' + (err && err.message ? err.message : err)));
+        });
+    });
   }
 
   // ===== 远端操作(test / env check / install / mkdir)=====

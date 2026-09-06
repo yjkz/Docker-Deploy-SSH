@@ -5267,6 +5267,289 @@ fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+// ===== 清理分析(阶段八:prune 预览 + 定向执行;与既有 prune_server 同通道)=====
+
+/// 清理分析单条目:悬空镜像。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupImage {
+    pub id: String,
+    pub repository: String,
+    pub tag: String,
+    pub size: String,
+}
+
+/// 清理分析单条目:停止容器。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupContainer {
+    pub id: String,
+    pub names: String,
+    pub image: String,
+    pub status: String,
+}
+
+/// 清理分析单条目:未使用卷。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupVolume {
+    pub name: String,
+}
+
+/// 清理分析报告(各节互不影响,单项查询失败记入 errors 不阻断其余)。
+#[derive(Debug, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupReport {
+    pub dangling_images: Vec<CleanupImage>,
+    pub stopped_containers: Vec<CleanupContainer>,
+    pub unused_volumes: Vec<CleanupVolume>,
+    pub build_cache_size: String,
+    pub errors: Vec<String>,
+}
+
+/// 清理执行结果(逐节)。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupSectionResult {
+    pub label: String,
+    pub ok: bool,
+    pub output: String,
+}
+
+/// 清理执行勾选项。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupSections {
+    pub images: bool,
+    pub containers: bool,
+    pub volumes: bool,
+    pub builder: bool,
+}
+
+/// 解析 NDJSON 行为 JSON 对象向量(失败返回 Err,由调用方按节兜底)。
+fn parse_cleanup_ndjson(text: &str) -> Result<Vec<serde_json::Value>, String> {
+    let mut items = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        items.push(
+            serde_json::from_str::<serde_json::Value>(t)
+                .map_err(|e| format!("解析第 {} 行失败: {}", i + 1, e))?,
+        );
+    }
+    Ok(items)
+}
+
+fn jstr(v: &serde_json::Value, key: &str) -> String {
+    v.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string()
+}
+
+/// 清理分析:悬空镜像 / 停止容器 / 未使用卷 / build cache 占用。
+/// 只读查询,不做任何清理;单项失败不影响其余(记入 errors)。
+#[tauri::command]
+pub async fn cleanup_preview(
+    app: AppHandle,
+    server_id: String,
+    password_plain: Option<String>,
+) -> Result<CleanupReport, String> {
+    let _ = app; // 与 prune_server 等命令签名风格一致(结果经返回值而非事件)
+    let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    let server = find_server(&cfg, &server_id)?.clone();
+    let password = resolve_password(
+        &server.auth.auth_type,
+        password_plain.as_deref(),
+        server.auth.password_enc.as_deref(),
+    )?;
+    let key_pass = resolve_key_passphrase(&server)?;
+    let mut client = with_timeout(
+        SSH_CONNECT_TIMEOUT_SECS,
+        "连接超时",
+        "请检查服务器地址与网络",
+        SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default()),
+    )
+    .await?;
+
+    let mut report = CleanupReport::default();
+
+    // 1. 悬空镜像
+    match exec_collect(&mut client, "docker images -f dangling=true --format '{{json .}}'").await {
+        Ok((0, out)) => match parse_cleanup_ndjson(&out) {
+            Ok(items) => {
+                report.dangling_images = items
+                    .iter()
+                    .map(|v| CleanupImage {
+                        id: jstr(v, "ID"),
+                        repository: jstr(v, "Repository"),
+                        tag: jstr(v, "Tag"),
+                        size: jstr(v, "Size"),
+                    })
+                    .collect();
+            }
+            Err(e) => report.errors.push(format!("悬空镜像解析失败: {}", e)),
+        },
+        Ok((code, out)) => {
+            report
+                .errors
+                .push(format!("悬空镜像查询失败(退出码 {}): {}", code, out.trim()))
+        }
+        Err(e) => report.errors.push(format!("悬空镜像查询失败: {}", e)),
+    }
+
+    // 2. 停止容器(exited 与 created,多 status 过滤为 OR)
+    match exec_collect(
+        &mut client,
+        "docker ps -a --filter status=exited --filter status=created --format '{{json .}}'",
+    )
+    .await
+    {
+        Ok((0, out)) => match parse_cleanup_ndjson(&out) {
+            Ok(items) => {
+                report.stopped_containers = items
+                    .iter()
+                    .map(|v| CleanupContainer {
+                        id: jstr(v, "ID"),
+                        names: jstr(v, "Names"),
+                        image: jstr(v, "Image"),
+                        status: jstr(v, "Status"),
+                    })
+                    .collect();
+            }
+            Err(e) => report.errors.push(format!("停止容器解析失败: {}", e)),
+        },
+        Ok((code, out)) => {
+            report
+                .errors
+                .push(format!("停止容器查询失败(退出码 {}): {}", code, out.trim()))
+        }
+        Err(e) => report.errors.push(format!("停止容器查询失败: {}", e)),
+    }
+
+    // 3. 未使用卷
+    match exec_collect(&mut client, "docker volume ls -f dangling=true --format '{{json .}}'").await {
+        Ok((0, out)) => match parse_cleanup_ndjson(&out) {
+            Ok(items) => {
+                report.unused_volumes = items
+                    .iter()
+                    .map(|v| CleanupVolume { name: jstr(v, "Name") })
+                    .collect();
+            }
+            Err(e) => report.errors.push(format!("未使用卷解析失败: {}", e)),
+        },
+        Ok((code, out)) => {
+            report
+                .errors
+                .push(format!("未使用卷查询失败(退出码 {}): {}", code, out.trim()))
+        }
+        Err(e) => report.errors.push(format!("未使用卷查询失败: {}", e)),
+    }
+
+    // 4. build cache 占用(docker system df 的 Build Cache 行)
+    match exec_collect(&mut client, "docker system df --format '{{json .}}'").await {
+        Ok((0, out)) => match parse_cleanup_ndjson(&out) {
+            Ok(items) => {
+                report.build_cache_size = items
+                    .iter()
+                    .find(|v| jstr(v, "Type") == "Build Cache")
+                    .map(|v| jstr(v, "Size"))
+                    .unwrap_or_else(|| "0B".to_string());
+            }
+            Err(e) => report.errors.push(format!("磁盘占用解析失败: {}", e)),
+        },
+        Ok((code, out)) => {
+            report
+                .errors
+                .push(format!("磁盘占用查询失败(退出码 {}): {}", code, out.trim()))
+        }
+        Err(e) => report.errors.push(format!("磁盘占用查询失败: {}", e)),
+    }
+
+    Ok(report)
+}
+
+/// 清理执行单节定义。
+struct CleanupSection {
+    label: &'static str,
+    cmd: &'static str,
+}
+
+/// 定向执行勾选的清理项(逐节流式输出 server-log,与既有清理同通道)。
+/// 至少勾选一项;各节独立执行,单节失败不影响其余。
+#[tauri::command]
+pub async fn cleanup_execute(
+    app: AppHandle,
+    server_id: String,
+    password_plain: Option<String>,
+    sections: CleanupSections,
+) -> Result<Vec<CleanupSectionResult>, String> {
+    if !sections.images && !sections.containers && !sections.volumes && !sections.builder {
+        return Err("请至少勾选一项要清理的内容".to_string());
+    }
+    let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    let server = find_server(&cfg, &server_id)?.clone();
+    let password = resolve_password(
+        &server.auth.auth_type,
+        password_plain.as_deref(),
+        server.auth.password_enc.as_deref(),
+    )?;
+    let key_pass = resolve_key_passphrase(&server)?;
+    let mut client = with_timeout(
+        SSH_CONNECT_TIMEOUT_SECS,
+        "连接超时",
+        "请检查服务器地址与网络",
+        SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default()),
+    )
+    .await?;
+
+    let mut plan: Vec<(&str, &str)> = Vec::new();
+    if sections.images {
+        plan.push(("悬空镜像", "docker image prune -f"));
+    }
+    if sections.containers {
+        plan.push(("停止容器", "docker container prune -f"));
+    }
+    if sections.volumes {
+        plan.push(("未使用卷", "docker volume prune -f"));
+    }
+    if sections.builder {
+        plan.push(("构建缓存", "docker builder prune -f"));
+    }
+
+    let mut results = Vec::new();
+    for (label, cmd) in plan {
+        let mut lines: Vec<String> = Vec::new();
+        {
+            let mut on_output = |line: &str| {
+                let t = line.trim_end();
+                let _ = app.emit("server-log", t.to_string());
+                lines.push(t.to_string());
+            };
+            let fut = client.exec(cmd, &mut on_output);
+            let code = with_timeout(
+                PRUNE_TIMEOUT_SECS,
+                "服务器清理超时",
+                "请检查服务器网络后重试",
+                async { fut.await.map_err(|e| format!("执行清理命令失败: {}", e)) },
+            )
+            .await?;
+            let output = lines.join("\n");
+            if code != 0 {
+                let _ = app.emit(
+                    "server-log",
+                    format!("[{}] 清理失败(退出码 {})", label, code),
+                );
+            }
+            results.push(CleanupSectionResult {
+                label: label.to_string(),
+                ok: code == 0,
+                output,
+            });
+        }
+    }
+    Ok(results)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

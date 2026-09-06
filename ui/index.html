@@ -679,6 +679,17 @@
   </div>
 
   <!-- 通知中心模态框(桌面/邮件通知与事件订阅,内容由 notify.js 构建) -->
+  <!-- 清理分析模态(预览+勾选执行,内容由 servers.js 构建) -->
+  <div id="cleanup-modal" class="modal-overlay hidden">
+    <div class="modal-card cleanup-modal-card" role="dialog" aria-modal="true" aria-labelledby="cleanup-modal-title">
+      <div class="modal-head">
+        <div id="cleanup-modal-title" class="modal-title"></div>
+        <button id="cleanup-modal-close" class="modal-close" type="button" title="关闭">关闭</button>
+      </div>
+      <div id="cleanup-modal-body" class="modal-body"></div>
+    </div>
+  </div>
+
   <!-- 批量部署模态(服务器多选,内容由 deploy.js 构建) -->
   <div id="deploy-batch-modal" class="modal-overlay hidden">
     <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="deploy-batch-modal-title">

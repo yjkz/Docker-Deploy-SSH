@@ -2727,3 +2727,47 @@ code {
 .batch-row .badge {
   flex: none;
 }
+
+/* ===== 清理分析(阶段八:预览+勾选+定向执行) ===== */
+.cleanup-modal-card {
+  width: min(680px, 94vw);
+}
+.cleanup-hint {
+  font-size: 12.5px;
+  color: var(--ark-paper-dim-ink);
+  margin-bottom: 10px;
+}
+.cleanup-error {
+  font-size: 12.5px;
+  color: var(--ark-stat-hot);
+  margin-bottom: 8px;
+}
+.cleanup-section {
+  border-top: 1px solid var(--ink-on-paper-08, rgba(128, 128, 128, 0.15));
+  padding: 8px 0;
+}
+.cleanup-section-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.cleanup-section-label {
+  font-size: 13px;
+  font-weight: 600;
+}
+.cleanup-section-count {
+  font-size: 12px;
+  color: var(--ark-paper-dim-ink);
+  font-variant-numeric: tabular-nums;
+}
+.cleanup-item {
+  font-size: 12px;
+  color: var(--ark-paper-ink-65, inherit);
+  padding-left: 24px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cleanup-more {
+  color: var(--ark-paper-dim-ink);
+}
