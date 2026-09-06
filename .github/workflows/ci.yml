@@ -1,0 +1,68 @@
+# CI 验证流水线:push / PR 到 main 时验证 Rust(clippy + test)与前端 JS 语法。
+# runner 用 windows-latest:与发版目标平台一致,避免平台差异漏检。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# 同一分支/PR 有新 push 时取消还没跑完的旧 run,节省排队与机器时
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Cargo.toml 在 src-tauri/,显式指定 workspace 路径以命中缓存
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # package-lock.json 在仓库根目录,setup-node 的 cache: npm 依赖它
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # npm ci 按 lockfile 精确安装;依赖仅 devDependencies 里的 @tauri-apps/cli
+      - name: Install npm dependencies
+        run: npm ci
+        shell: bash
+
+      # clippy 不加 -D warnings:仓库存量告警会让流水线直接红,保持默认级别、新增告警人工跟进
+      - name: Clippy
+        working-directory: src-tauri
+        run: cargo clippy
+        shell: bash
+
+      - name: Run tests
+        working-directory: src-tauri
+        run: cargo test
+        shell: bash
+
+      # 纯静态前端无构建,只做语法校验(node --check 不执行代码);逐个检查,任一失败则整体失败
+      - name: Syntax-check ui scripts
+        run: |
+          fail=0
+          for f in ui/*.js; do
+            echo "node --check $f"
+            node --check "$f" || fail=1
+          done
+          exit $fail
+        shell: bash
