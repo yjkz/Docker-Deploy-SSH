@@ -37,30 +37,24 @@
 
 ```
 仓库:D:\Github-repositories\docker-deploy-ssh(git,主分支 main)
-代码量:Rust ~13,960 行(16 文件,含 main.rs)+ 原生 JS/HTML/CSS ~13,130 行(无框架无打包器,字体 woff2 自捆绑)
+代码量:Rust ~14,260 行(16 文件,含 main.rs)+ 原生 JS/HTML/CSS ~13,130 行(无框架无打包器,字体 woff2 自捆绑)
 技术:Tauri 2 + tokio + russh/russh-sftp + flate2 + serde_yaml + windows-dpapi + tauri-plugin-dialog
       + tauri-plugin-notification + lettre(rustls)+ argon2 + aes-gcm + reqwest(rustls+socks)+ ureq
 前端调用后端:window.__TAURI__.core.invoke(67 个命令),事件 6 个,字段默认 snake_case
       (notify/config-io/settings/update/回滚列表/.env 契约为 camelCase,例外清单见 04)
 页面:5 页导航(01 检测 / 02 镜像 / 03 服务器 / 04 部署 / 05 远程管理)+ 设置中心 + 全站帮助
-构建:npm run tauri dev / npm run tauri build(产物 NSIS 安装包 ~2.9MB)
+构建:npm run tauri dev / npm run tauri build(产物 NSIS 安装包 ~8.2MB)
 配置:安装目录 config/ 下 servers.json + projects.json + notify.json + settings.json +
       deployments.json(便携式;原子写);日志 logs/app.log
-测试:cargo test(纯函数单测 198 passed;真机测试 #[ignore] 9 个)
-当前版本:v4.6.0(tauri.conf.json;UPGRADE-PLAN 五阶段 v4.7-v5.1 功能集已全部合入,版本号未 bump)
+测试:cargo test(纯函数单测 201 passed;真机测试 #[ignore] 10 个)
+当前版本:v5.1.0(tauri.conf.json / Cargo.toml;UPGRADE-PLAN 五阶段功能集已并入本版发布)
 ```
 
 ## 权威计划/完成记录(仓库根目录)
 
-- `UPGRADE-PLAN.md` — v4.7-v5.1 五阶段升级计划(智能传输/一键回滚 → 通知中心 → 连接与数据安全 → 桌面体验 → 远程管理补遗),含各阶段完成记录(合并 commit + 要点),是 v4.6.0 后全部功能的事实来源
+- `UPGRADE-PLAN.md` — v4.7-v5.1 五阶段升级计划(智能传输/一键回滚 → 通知中心 → 连接与数据安全 → 桌面体验 → 远程管理补遗),含各阶段完成记录(合并 commit + 要点),是 v4.6.0 后全部功能的事实来源(五阶段已于 v5.1.0 一次性并入发布)
 - `DOCKER-MANAGE-PLAN.md` — 远程管理模块三阶段实施计划与 A/B/C 完成记录(v4.5.0,历史事实来源)
 
-## 历史文档(docs/ 下,过程产物)
+## 历史过程文档(已清理)
 
-- `docs/superpowers/specs/2026-08-28-docker-deploy-ssh-design.md` — v1 设计 spec
-- `docs/superpowers/plans/2026-08-28-docker-deploy-ssh.md` — v1 实现计划
-- `docs/superpowers/plans/2026-08-29-compose-stack-deploy.md` — 整栈部署增量计划
-- `docs/ui-redesign-brief-ark-light.md` — UI 设计语言简报(ark-light)
-- `docs/theme-toggle-brief.md` — 亮暗主题切换简报
-
-这些文档记录"为什么这么做";本 wiki 记录"现在是什么样"。冲突时以代码与本 wiki 为准。
+v1 设计 spec、实现计划、UI 设计简报等过程产物原存放于 `docs/`,已在 v4.6.0 收尾(commit 3d6f9f3)整体删除;"为什么这么做"的记录由本 wiki 的设计决策记录(见 07)与 `UPGRADE-PLAN.md` / `DOCKER-MANAGE-PLAN.md` 的完成记录承接。冲突时以代码与本 wiki 为准。
