@@ -1743,7 +1743,8 @@
     exec: {
       sessionId: null, unlisten: null, containerId: null, name: '',
       lines: [], cur: '', curIdx: 0, eof: false, pend: '',
-      history: [], histIdx: -1
+      history: [], histIdx: -1,
+      lastCols: null, lastRows: null   // 最近一次同步给后端的终端尺寸(去重用)
     }
   };
 
@@ -1757,6 +1758,10 @@
     if (ms) ms.addEventListener('click', monitorStart);
     var mstop = $('monitor-stop-btn');
     if (mstop) mstop.addEventListener('click', function () { monitorStop(false); });
+
+    // 阶段五:终端尺寸自适应 —— window resize 防抖同步(全程仅注册一次;
+    // 回调内部对会话判空,无终端会话时直接返回,不随模态反复注册)
+    window.addEventListener('resize', scheduleTermResize);
   }
 
   // ===== Compose 栈列表 =====
@@ -1837,7 +1842,7 @@
     tdFile.textContent = st.compose_file || '—';
     if (st.compose_file) tdFile.title = st.compose_file;
     tr.appendChild(tdFile);
-    // 操作:启动 / 停止 / 服务状态 / 日志
+    // 操作:启动 / 停止 / 服务状态 / 日志 / .env
     var tdAction = document.createElement('td');
     tdAction.className = 'col-action';
     var wrap = document.createElement('div');
@@ -1870,6 +1875,14 @@
     logBtn.textContent = '日志';
     logBtn.addEventListener('click', function () { showStackLogs(st); });
     wrap.appendChild(logBtn);
+
+    // 阶段五:.env 查看/编辑(compose 文件同目录的环境变量文件)
+    var envBtn = document.createElement('button');
+    envBtn.type = 'button';
+    envBtn.className = 'btn btn-sm';
+    envBtn.textContent = '.env';
+    envBtn.addEventListener('click', function () { showStackEnv(st); });
+    wrap.appendChild(envBtn);
 
     tdAction.appendChild(wrap);
     tr.appendChild(tdAction);
@@ -2005,6 +2018,203 @@
       var msg = err && err.message ? err.message : String(err);
       content.textContent = '加载日志失败: ' + msg;
     });
+  }
+
+  // ===== 阶段五:栈 .env 查看 / 编辑 =====
+  // 读:manage_stack_env_read(serverId, composeFile) → { exists, content }
+  // 写:manage_stack_env_save(serverId, composeFile, content) → { success, message }
+  // 交互:默认只读,「编辑」切换可写并显示「保存 .env / 取消编辑」;保存前经
+  // 自定义确认弹窗二次确认(确认弹窗会替换编辑器主体,「取消」需重建编辑体
+  // 回填草稿,见 buildStackEnvSaveConfirm,不能复用 buildConfirmBody 的默认
+  // 取消=closeModal),成功后重开只读态并回读;256KB 上限前端先拦
+  // (与后端 STACK_ENV_MAX_BYTES 同口径)。busy 防重复提交;会话序号(每次打开
+  // +1)丢弃模态重开前的旧异步回写(参照 notify.js 先例)。Esc/遮罩关闭由
+  // #manage-modal 的既有处理器承担。
+  var envState = { session: 0, busy: false, loaded: '', known: false };
+  // 非 UTF-8 字节告警文案:读回内容含 U+FFFD(后端 from_utf8_lossy 替换所致)时
+  // 在提示区展示;允许继续编辑,但保存确认文案会追加同样说明,风险由用户自担
+  var ENV_FFFD_WARN = '文件包含非 UTF-8 字节(可能为 GBK 编码),显示为替换符;直接保存会把替换字符写入文件';
+
+  function showStackEnv(st) {
+    var session = ++envState.session; // 开启新会话:此前打开的旧 promise 收尾失效
+    envState.busy = false;
+    openModal('.env — ' + (st.dir || st.compose_file), buildStackEnvBody(st, session));
+    loadStackEnv(st, session);
+  }
+
+  // 构建编辑器主体:顶栏(提示 + 操作按钮)+ 等宽 textarea(样式见 .manage-env-editor)
+  function buildStackEnvBody(st, session) {
+    var body = document.createElement('div');
+    // 查看类弹窗放大标记:openModal 据此给共用 modal-card 加 .modal-wide(同 showStackLogs)
+    body.className = 'manage-wide-modal';
+    body.innerHTML =
+      '<div class="log-tail-bar manage-env-bar">' +
+      '<span id="stack-env-hint" class="manage-env-hint hidden"></span>' +
+      '<div class="manage-env-actions">' +
+      '<button id="stack-env-edit-btn" class="btn btn-sm" type="button">编辑</button>' +
+      '<button id="stack-env-save-btn" class="btn btn-sm btn-danger hidden" type="button">保存 .env</button>' +
+      '<button id="stack-env-cancel-btn" class="btn btn-sm hidden" type="button">取消编辑</button>' +
+      '</div>' +
+      '</div>' +
+      '<textarea id="stack-env-editor" class="manage-env-editor" spellcheck="false" readonly></textarea>';
+
+    var editBtn = body.querySelector('#stack-env-edit-btn');
+    if (editBtn) editBtn.addEventListener('click', function () { setStackEnvMode(true); });
+
+    var saveBtn = body.querySelector('#stack-env-save-btn');
+    if (saveBtn) saveBtn.addEventListener('click', function () { onStackEnvSave(st, session); });
+
+    var cancelBtn = body.querySelector('#stack-env-cancel-btn');
+    if (cancelBtn) {
+      cancelBtn.addEventListener('click', function () {
+        var ta = $('stack-env-editor');
+        if (!ta) return;
+        setStackEnvMode(false);
+        if (envState.known) ta.value = envState.loaded; // 回退到最近读到的服务器内容
+        else loadStackEnv(st, session); // 保存失败重开场景:服务器内容未知,回读
+      });
+    }
+    return body;
+  }
+
+  // 读取服务器 .env 并回填(只读态);exists=false 给「将创建」提示而非报错
+  function loadStackEnv(st, session) {
+    envState.loaded = '';
+    envState.known = false;
+    var ta = $('stack-env-editor');
+    if (ta) { ta.value = ''; ta.placeholder = '加载中…'; }
+    AppBus.invoke('manage_stack_env_read', { serverId: state.serverId, composeFile: st.compose_file })
+      .then(function (res) {
+        if (session !== envState.session) return; // 模态已重开:旧回写丢弃
+        var ta2 = $('stack-env-editor');
+        if (!ta2) return;
+        var exists = !!(res && res.exists);
+        envState.loaded = exists ? String(res.content || '') : '';
+        envState.known = true;
+        if (ta2.readOnly) ta2.value = envState.loaded; // 用户已进编辑态则不打断草稿
+        ta2.placeholder = '';
+        // 含 U+FFFD(如 GBK 内容):提示区警告但不阻断编辑;保存确认会再次提醒
+        if (exists && envState.loaded.indexOf('\uFFFD') !== -1) {
+          setStackEnvHint(ENV_FFFD_WARN);
+        } else {
+          setStackEnvHint(exists ? '' : '该栈目录暂无 .env 文件,保存后将创建');
+        }
+      })
+      .catch(function (err) {
+        if (session !== envState.session) return;
+        var ta2 = $('stack-env-editor');
+        if (ta2 && ta2.readOnly) { ta2.value = ''; ta2.placeholder = ''; }
+        var msg = err && err.message ? err.message : String(err);
+        setStackEnvHint('读取 .env 失败: ' + msg);
+      });
+  }
+
+  // 只读 ↔ 可写切换:可写态显示「保存 .env」「取消编辑」,隐藏「编辑」
+  function setStackEnvMode(editing) {
+    var ta = $('stack-env-editor');
+    var editBtn = $('stack-env-edit-btn');
+    var saveBtn = $('stack-env-save-btn');
+    var cancelBtn = $('stack-env-cancel-btn');
+    if (!ta || !editBtn || !saveBtn || !cancelBtn) return;
+    ta.readOnly = !editing;
+    editBtn.classList.toggle('hidden', editing);
+    saveBtn.classList.toggle('hidden', !editing);
+    cancelBtn.classList.toggle('hidden', !editing);
+    if (editing) ta.focus();
+  }
+
+  function setStackEnvHint(text) {
+    var hint = $('stack-env-hint');
+    if (!hint) return;
+    if (text) {
+      hint.textContent = text;
+      hint.classList.remove('hidden');
+    } else {
+      hint.classList.add('hidden');
+    }
+  }
+
+  // 保存入口:busy 防重 + 256KB 前端先拦(按 UTF-8 字节,与后端校验同口径)+
+  // 自定义确认弹窗二次确认(布局同 buildConfirmBody,「取消」行为不同,见下)
+  function onStackEnvSave(st, session) {
+    if (envState.busy) return;
+    var ta = $('stack-env-editor');
+    if (!ta) return;
+    var draft = ta.value;
+    var bytes = window.TextEncoder ? new TextEncoder().encode(draft).length : draft.length;
+    if (bytes > 256 * 1024) {
+      toast('.env 内容过大(上限 256KB),请精简后再保存', 'warn');
+      return;
+    }
+    // 含 U+FFFD(如 GBK 内容被替换):确认文案追加风险说明,是否保存由用户决定
+    var msg = '保存将覆盖服务器上的 .env,影响下次 compose up,确定?';
+    if (draft.indexOf('\uFFFD') !== -1) {
+      msg += '注意:' + ENV_FFFD_WARN + '。';
+    }
+    openModal('保存 .env', buildStackEnvSaveConfirm(st, session, draft, msg));
+  }
+
+  // 保存确认弹窗主体:布局同 buildConfirmBody,但「取消」不能走默认的 closeModal
+  // ——确认弹窗替换编辑器主体后 textarea 已销毁,直接关整个模态会丢草稿且无路径
+  // 返回;这里「取消」改为 reopenStackEnvEdit 重建可写编辑体并回填草稿(带会话
+  // 校验),确认按钮才 closeModal + 执行保存
+  function buildStackEnvSaveConfirm(st, session, draft, message) {
+    var div = document.createElement('div');
+    div.innerHTML =
+      '<p class="confirm-msg">' + escHtml(message) + '</p>' +
+      '<div class="modal-actions">' +
+      '<button id="confirm-cancel-btn" class="btn" type="button">取消</button>' +
+      '<button id="confirm-ok-btn" class="btn btn-danger" type="button">保存</button>' +
+      '</div>';
+    var cancelBtn = div.querySelector('#confirm-cancel-btn');
+    if (cancelBtn) {
+      cancelBtn.addEventListener('click', function () {
+        // 草稿含 U+FFFD 时提示区一并保留风险说明
+        var hint = '已取消保存,编辑内容已保留;可重试保存或取消编辑';
+        if (draft.indexOf('\uFFFD') !== -1) hint = ENV_FFFD_WARN + '; ' + hint;
+        reopenStackEnvEdit(st, draft, session, hint);
+      });
+    }
+    var okBtn = div.querySelector('#confirm-ok-btn');
+    if (okBtn) okBtn.addEventListener('click', function () { doStackEnvSave(st, session, draft); });
+    return div;
+  }
+
+  function doStackEnvSave(st, session, draft) {
+    envState.busy = true;
+    closeModal(); // 确认弹窗关闭,保存结果决定后续走向
+    AppBus.invoke('manage_stack_env_save', {
+      serverId: state.serverId,
+      composeFile: st.compose_file,
+      content: draft
+    }).then(function (res) {
+      envState.busy = false;
+      if (session !== envState.session) return; // 期间模态已重开:丢弃旧回写
+      if (res && res.success) {
+        toast('已保存 .env,下次 compose up 生效', 'ok');
+        showStackEnv(st); // 重开只读态并回读服务器内容(顺带校验落盘结果)
+      } else {
+        toast('保存 .env 失败: ' + ((res && res.message) || '未知错误'), 'fail');
+        reopenStackEnvEdit(st, draft, session); // 带回草稿,编辑内容不丢
+      }
+    }).catch(function (err) {
+      envState.busy = false;
+      if (session !== envState.session) return;
+      var msg = err && err.message ? err.message : String(err);
+      toast('保存 .env 失败: ' + msg, 'fail');
+      reopenStackEnvEdit(st, draft, session);
+    });
+  }
+
+  // 重开可写编辑体并恢复草稿(hint 可选:保存失败/取消保存等场景定制提示;
+  // 此态下「取消编辑」因服务器内容未知会回读)
+  function reopenStackEnvEdit(st, draft, session, hint) {
+    if (session !== envState.session) return;
+    openModal('.env — ' + (st.dir || st.compose_file), buildStackEnvBody(st, session));
+    var ta = $('stack-env-editor');
+    if (ta) ta.value = draft;
+    setStackEnvMode(true);
+    setStackEnvHint(hint || '保存失败,已保留你的修改;可重试保存或取消编辑');
   }
 
   // ===== 实时监控 =====
@@ -2291,6 +2501,9 @@
       termAppendLine('已连接到容器「' + cState.exec.name + '」(shell: ' +
         (res.shell || shell || 'bash') + ')');
       renderTerm();
+      // 阶段五:会话建立即按当前输出区尺寸同步一次(后续变化走 resize 监听/观察器)
+      observeTermOutput();
+      pushTermResize();
       buffering = false;
       // 订阅已就绪:挂载正式 unlisten 并重放缓冲中的早期事件(含快速 eof);
       // 订阅尚未 resolve:保持缓冲,由其 then 分支重放
@@ -2386,6 +2599,9 @@
     cState.exec.curIdx = 0;
     cState.exec.pend = '';
     cState.exec.eof = false;
+    // 新会话(含切换 shell 重开)远端从默认尺寸起步,清缓存强制重新上报
+    cState.exec.lastCols = null;
+    cState.exec.lastRows = null;
   }
 
   function renderTerm() {
@@ -2455,6 +2671,111 @@
     }
   }
 
+  // ===== 阶段五:终端尺寸自适应(接线后端 manage_exec_resize)=====
+  // 行式终端(非全屏程序)resize 主要影响远端行宽(长行按新列数折行),属体验
+  // 优化:同步失败仅 console.warn,不打扰用户。触发时机:
+  // 1) 会话建立成功(startExec 内)同步一次;
+  // 2) window resize(防抖 300ms,监听器已在 bindEventsC 注册一次);
+  // 3) 输出区自身尺寸变化(ResizeObserver,覆盖弹窗 min(1000px,94vw) 宽与
+  //    输出区 60vh 高随窗口/布局的变化;无 RO 的老内核仅靠 window resize 兜底)。
+  var TERM_RESIZE_DEBOUNCE = 300;
+  var termCharSize = null;    // 等宽字符测量缓存 { w: 字符宽(px), h: 行高(px) }
+  var termResizeTimer = null; // resize 防抖句柄
+  var termResizeObs = null;   // 输出区 ResizeObserver(懒创建)
+
+  // 量测等宽字符尺寸:临时 span 排 100 个 "M",宽/100 = 单字符宽;
+  // inline-block + line-height 使 span 高度恰为一行行高
+  // (与 .manage-terminal 的 var(--font-mono) / 12px / line-height:1.5 一致)
+  function measureTermCharSize() {
+    if (termCharSize) return termCharSize;
+    var span = document.createElement('span');
+    span.style.cssText = 'position:absolute;top:-9999px;left:0;visibility:hidden;' +
+      'display:inline-block;white-space:pre;' +
+      'font-family:var(--font-mono);font-size:12px;line-height:1.5;';
+    span.textContent = new Array(101).join('M'); // 100 个 M
+    (document.body || document.documentElement).appendChild(span);
+    var rect = span.getBoundingClientRect();
+    var w = rect.width / 100;
+    var h = rect.height;
+    if (span.parentNode) span.parentNode.removeChild(span);
+    // 量测异常兜底:12px 等宽字体常见值(字符宽≈0.6em,行高 12×1.5)
+    if (!(w > 0)) w = 7.2;
+    if (!(h > 0)) h = 18;
+    termCharSize = { w: w, h: h };
+    return termCharSize;
+  }
+
+  // 由 .manage-terminal 输出区客户区推算列/行数(扣内边距后整除字符尺寸)
+  function termGridSize() {
+    var out = $('term-output');
+    if (!out) return null;
+    var cw = out.clientWidth;
+    var chh = out.clientHeight;
+    if (cw <= 0 || chh <= 0) return null; // 模态不可见/尚未布局,量测无意义
+    var cs = window.getComputedStyle(out);
+    var contentW = cw - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);
+    var contentH = chh - (parseFloat(cs.paddingTop) || 0) - (parseFloat(cs.paddingBottom) || 0);
+    var m = measureTermCharSize();
+    // 钳制下限:≥20 列 / ≥5 行,防极端小窗算出过小值被远端拒绝
+    return {
+      cols: Math.max(20, Math.floor(contentW / m.w)),
+      rows: Math.max(5, Math.floor(contentH / m.h))
+    };
+  }
+
+  // 向后端上报当前尺寸;无会话/已 eof/尺寸未变时跳过,失败 console.warn 静默
+  function pushTermResize() {
+    var ex = cState.exec;
+    if (!ex.sessionId || ex.eof) return; // 模态关闭后 resize 回调到这里判空直接返回
+    var size = termGridSize();
+    if (!size) return;
+    if (ex.lastCols === size.cols && ex.lastRows === size.rows) return; // 尺寸未变不重发
+    var sid = ex.sessionId;
+    var prevCols = ex.lastCols;
+    var prevRows = ex.lastRows;
+    ex.lastCols = size.cols;
+    ex.lastRows = size.rows;
+    AppBus.invoke('manage_exec_resize', { sessionId: sid, cols: size.cols, rows: size.rows })
+      .catch(function (err) {
+        // 失败回滚缓存为旧值:后续同尺寸触发不被「未变」去重挡掉,可重试;
+        // 会话已重建则不回写,避免旧会话结果污染新会话(新会话缓存起点为 null)
+        if (ex.sessionId === sid) {
+          ex.lastCols = prevCols;
+          ex.lastRows = prevRows;
+        }
+        console.warn('[manage] 终端尺寸同步失败:', err && err.message ? err.message : err);
+      });
+  }
+
+  // 防抖入口:window resize 与 ResizeObserver 共用,300ms 内合并为一次上报
+  function scheduleTermResize() {
+    if (termResizeTimer) window.clearTimeout(termResizeTimer);
+    termResizeTimer = window.setTimeout(function () {
+      termResizeTimer = null;
+      pushTermResize();
+    }, TERM_RESIZE_DEBOUNCE);
+  }
+
+  // 观察输出区自身尺寸变化(observe 挂载时会先触发一次,与会话建立时的
+  // 主动同步互为兜底;回调只进防抖,最终由 pushTermResize 判空/去重)
+  function observeTermOutput() {
+    if (typeof ResizeObserver === 'undefined') return;
+    if (!termResizeObs) {
+      termResizeObs = new ResizeObserver(function () { scheduleTermResize(); });
+    }
+    var out = $('term-output');
+    if (out) termResizeObs.observe(out);
+  }
+
+  // 解除观察(execOnModalClose / onLeaveC 统一调用,顺带清掉待触发的防抖)
+  function unobserveTermOutput() {
+    if (termResizeObs) termResizeObs.disconnect();
+    if (termResizeTimer) {
+      window.clearTimeout(termResizeTimer);
+      termResizeTimer = null;
+    }
+  }
+
   // closeModal 钩子:模态框被关闭(含遮罩点击/关闭按钮/Esc)时清理终端会话
   function execOnModalClose() {
     // 还原共用模态尺寸:任何关闭路径(关闭按钮/遮罩点击/Esc/关闭终端)都经
@@ -2471,6 +2792,8 @@
     if (ex.sessionId || ex.unlisten) {
       stopExecSession(true);
     }
+    // 阶段五:解除输出区尺寸观察(所有关闭路径统一经这里收尾)
+    unobserveTermOutput();
   }
 
   // ===== C 阶段:离开 05 页清理 =====
@@ -2479,6 +2802,7 @@
     if (cState.exec.sessionId || cState.exec.unlisten) {
       stopExecSession(true);
     }
+    unobserveTermOutput(); // 阶段五:离开页面同样解除终端尺寸观察
     hideMonitorError();
   }
 

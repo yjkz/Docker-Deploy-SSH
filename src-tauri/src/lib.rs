@@ -82,6 +82,8 @@ pub fn run() {
       manage_stacks::manage_stack_action,
       manage_stacks::manage_stack_ps,
       manage_stacks::manage_stack_logs,
+      manage_stacks::manage_stack_env_read,
+      manage_stacks::manage_stack_env_save,
       manage_stats::manage_stats_start,
       manage_stats::manage_stats_stop,
       manage_exec::manage_exec_start,

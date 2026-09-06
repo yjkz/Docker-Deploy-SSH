@@ -2634,3 +2634,56 @@ code {
 /* 底部按钮行:左侧「检查更新 / 测试连接」组(margin-right:auto 推开)+ 右侧「保存设置」 */
 .settings-actions { flex-wrap: wrap; }
 .settings-test-group { display: flex; gap: 8px; margin-right: auto; }
+
+/* ============================================================
+   阶段五:栈 .env 查看 / 编辑(manage.js showStackEnv;
+   复用 #manage-modal + body.manage-wide-modal → card.modal-wide 放大)
+   ============================================================ */
+
+/* 顶栏:左侧状态提示(暂无 .env / 读取失败等),右侧操作按钮组;
+   提示文案可换行(min-width:0 允许 flex 收缩),按钮组不缩 */
+.manage-env-bar { justify-content: space-between; }
+.manage-env-hint {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--ark-paper-ink-65);
+}
+.manage-env-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
+}
+
+/* 编辑区:等宽暗底(复用 --ark-terminal-bg/fg 与 .manage-log-body 同源 token,
+   暗色 scheme 自动适配);radius 2px 同 .form-input 输入框上限;
+   tab-size 8 对齐 shell 惯例;resize:vertical 允许用户纵向拉高 */
+.manage-env-editor {
+  display: block;
+  width: 100%;
+  min-height: 320px;
+  padding: 12px;
+  background: var(--ark-terminal-bg);
+  color: var(--ark-terminal-fg);
+  border: 1px solid var(--ark-line);
+  border-radius: 2px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow: auto;
+  tab-size: 8;
+  resize: vertical;
+}
+/* 可写态焦点:信号青描边(同 .manage-terminal-input:focus 先例),
+   只读态维持常暗描边、光标用默认箭头明示不可编辑 */
+.manage-env-editor:focus {
+  outline: none;
+  border-color: var(--ark-signal);
+}
+.manage-env-editor[readonly] { cursor: default; }
+
+/* 暗底块滚动条与 .manage-terminal/.manage-log-body 同款修复
+   (暗色 scheme 下避免出现系统亮色滚动条) */
+.manage-env-editor::-webkit-scrollbar { width: 8px; }
+.manage-env-editor::-webkit-scrollbar-thumb { background: var(--ink-on-paper-30); }
