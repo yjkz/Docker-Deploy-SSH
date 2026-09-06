@@ -2687,3 +2687,43 @@ code {
    (暗色 scheme 下避免出现系统亮色滚动条) */
 .manage-env-editor::-webkit-scrollbar { width: 8px; }
 .manage-env-editor::-webkit-scrollbar-thumb { background: var(--ink-on-paper-30); }
+
+/* ===== 批量部署(阶段七:前端编排串行队列,复用 deploy 事件体系) ===== */
+/* 进度面板:与 check-error 同层级的通栏面板,状态行逐台展示 */
+#deploy-batch-panel {
+  border: 1px solid var(--ark-line);
+  background: var(--ark-surface, transparent);
+  padding: 10px 14px;
+  margin-bottom: 14px;
+}
+.batch-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.batch-head strong {
+  font-size: 13px;
+  letter-spacing: 0.02em;
+}
+.batch-stat {
+  flex: 1;
+  font-size: 12px;
+  color: var(--ark-paper-dim-ink);
+  font-variant-numeric: tabular-nums;
+}
+.batch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 0;
+  border-top: 1px solid var(--ink-on-paper-08, rgba(128, 128, 128, 0.15));
+  font-size: 12.5px;
+}
+.batch-row:first-of-type {
+  border-top: none;
+}
+.batch-row .badge {
+  flex: none;
+}

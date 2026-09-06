@@ -142,6 +142,7 @@
     rbReleases: [],    // rollback_list_releases 结果(新 → 旧)
     rbTags: [],        // rollback_list_tags 结果(创建时间倒序)
     rbBusy: false,     // 回滚执行中(发起 invoke → deploy-done;期间模态禁止关闭)
+    batch: null,       // 批量部署:{ active, queue[], idx, success, failed, skipped, aborted, deferred };前端编排串行队列,后端零改动
     rbLogs: [],        // 回滚模态内日志区累积的日志行(deploy-log 镜像)
     resume: null,      // deploy_resume_status 查询到的断点视图(ResumeView;无断点为 null)
     resumeBusy: false  // deploy_resume_discard 请求进行中(防重复提交)
@@ -531,7 +532,10 @@
     var cancel = document.getElementById('deploy-cancel-btn');
 
     if (start) {
-      if (st.deploying) {
+      if (batchActive) {
+        start.disabled = true;
+        start.textContent = '批量部署中…';
+      } else if (st.deploying) {
         start.disabled = true;
         start.textContent = '部署中…';
       } else if (st.checking) {
@@ -545,12 +549,18 @@
     // 取消按钮:仅在部署中可用(起点 = 发起 deploy,终点 = deploy-done)
     if (cancel) cancel.disabled = !st.deploying;
 
-    // 部署 / 预检期间锁定选择区,避免中途改动造成误解
+    // 批量部署入口:批量/部署/预检期间禁用
+    var batchBtn = document.getElementById('deploy-batch-btn');
+    if (batchBtn) batchBtn.disabled = batchActive || st.deploying || st.checking;
+
+    var batchActive = !!(st.batch && st.batch.active);
+
+    // 部署 / 预检 / 批量进行期间锁定选择区,避免中途改动造成误解
     ['deploy-image', 'deploy-server', 'deploy-project', 'deploy-date-tag',
       'deploy-skip-unchanged', 'deploy-stack-skip', 'deploy-stack-archive']
       .forEach(function (id) {
         var node = document.getElementById(id);
-        if (node) node.disabled = st.deploying || st.checking;
+        if (node) node.disabled = st.deploying || st.checking || batchActive;
       });
 
     // 续传横幅按钮与部署互斥同步(部署 / 预检 / 放弃请求进行中一律禁用;
@@ -567,7 +577,8 @@
     var dateTagChk = document.getElementById('deploy-date-tag');
     if (skipSingle) {
       var gated = !!(dateTagChk && dateTagChk.checked);
-      skipSingle.disabled = st.deploying || st.checking || gated;
+      var batchActive2 = !!(st.batch && st.batch.active);
+      skipSingle.disabled = st.deploying || st.checking || batchActive2 || gated;
       skipSingle.title = gated
         ? '日期标签模式每次均为全新标签,不存在「未变化」,该选项不适用'
         : '远端同标签镜像 ID 一致时跳过导出/上传/装载,部署更快';
@@ -1256,6 +1267,13 @@
         // invoke 本身失败:部署未真正启动,立即还原控件
         st.deploying = false;
         refreshControls();
+        // 批量模式:没有 deploy-done,必须就地收尾该台,否则批量循环挂起
+        if (st.batch && st.batch.active && st.batch.deferred) {
+          var deferred = st.batch.deferred;
+          st.batch.deferred = null;
+          deferred({ success: false, message: '发起部署失败:' + (errText(err) || '未知错误') });
+          return;
+        }
         showErrorBox(['发起部署失败:' + (errText(err) || '未知错误')], false);
       });
   }
@@ -1371,6 +1389,13 @@
         // invoke 本身失败:部署未真正启动,立即还原控件
         st.deploying = false;
         refreshControls();
+        // 批量模式:没有 deploy-done,必须就地收尾该台,否则批量循环挂起
+        if (st.batch && st.batch.active && st.batch.deferred) {
+          var deferred = st.batch.deferred;
+          st.batch.deferred = null;
+          deferred({ success: false, message: '发起整栈部署失败:' + (errText(err) || '未知错误') });
+          return;
+        }
         showErrorBox(['发起整栈部署失败:' + (errText(err) || '未知错误')], false);
       });
   }
@@ -1394,6 +1419,17 @@
     // 一键回滚同样经 deploy-done 收尾(模态打开期间发起),文案区分回滚/部署
     var isRollback = st.rbKind !== '';
 
+    // 批量部署:单台收尾只做记录与刷新(历史逐台落档),横幅/最终收尾交给批量循环
+    if (st.batch && st.batch.active && st.batch.deferred) {
+      var doneDeferred = st.batch.deferred;
+      st.batch.deferred = null;
+      st.deploying = false;
+      refreshControls();
+      refreshHistory();
+      doneDeferred(p);
+      return;
+    }
+
     st.deploying = false;
     refreshControls();
 
@@ -1412,6 +1448,244 @@
     // 成功则断点已被后端清除,查询为空,横幅保持隐藏
     refreshHistory();
     refreshResumeStatus();
+  }
+
+  // ===== 批量部署(前端编排:按服务器队列串行调用单发部署,后端零改动)=====
+  // - 复用全部单发能力:环境预检/智能传输/通知/历史/断点(checkpoint 按服务器+项目独立)
+  // - 逐台状态经 deploy-batch 面板展示;deploy-done 由 handleDone 批量分支转交
+  // - 取消当前台(部署已取消)或点「停止批量」→ 余台标记「已跳过」
+
+  function batchVal(id) {
+    var n = document.getElementById(id);
+    return n ? String(n.value) : '';
+  }
+
+  function openBatchModal() {
+    if (st.deploying || st.checking || (st.batch && st.batch.active)) return;
+    var projectId = batchVal('deploy-project');
+    var project = findById(st.cfg ? st.cfg.projects : [], projectId);
+    if (!project) { window.toast('请先选择项目', 'warn'); return; }
+    var img = null;
+    if (st.mode === 'single') {
+      img = findImageByRef(batchVal('deploy-image'));
+      if (!img) { window.toast('请先选择镜像', 'warn'); return; }
+    }
+    if (st.mode === 'stack' &&
+        (!Array.isArray(st.stack.services) || st.stack.services.length === 0)) {
+      window.toast('整栈批量需要先完成服务分类(解析 compose)', 'warn');
+      return;
+    }
+    if (!Array.isArray(st.cfg.servers) || st.cfg.servers.length < 2) {
+      window.toast('服务器不足两台,无需批量部署', 'warn');
+      return;
+    }
+
+    var body = document.getElementById('deploy-batch-modal-body');
+    if (!body) return;
+    body.innerHTML = '';
+    var modeText = st.mode === 'stack' ? '整栈部署' : '单镜像部署';
+    var hint = document.createElement('p');
+    hint.className = 'confirm-msg';
+    hint.textContent = '对选中的多台服务器串行执行' + modeText +
+      '(项目:「' + (project.name || projectId) + '」),每台独立写历史、可回滚;' +
+      '传输选项沿用当前页设置。';
+    body.appendChild(hint);
+
+    for (var i = 0; i < st.cfg.servers.length; i++) {
+      var srv = st.cfg.servers[i];
+      var row = document.createElement('label');
+      row.className = 'deploy-checkbox';
+      var chk = document.createElement('input');
+      chk.type = 'checkbox';
+      chk.setAttribute('data-batch-server', srv.id);
+      chk.checked = true;
+      row.appendChild(chk);
+      var span = document.createElement('span');
+      span.textContent = (srv.name || srv.id) + ' (' + (srv.host || '') + ')';
+      row.appendChild(span);
+      body.appendChild(row);
+    }
+
+    var actions = document.createElement('div');
+    actions.className = 'modal-actions';
+    var startBtn = document.createElement('button');
+    startBtn.id = 'deploy-batch-start-btn';
+    startBtn.className = 'btn btn-primary';
+    startBtn.type = 'button';
+    startBtn.textContent = '开始批量部署';
+    startBtn.addEventListener('click', onBatchStart);
+    actions.appendChild(startBtn);
+    body.appendChild(actions);
+
+    var modal = document.getElementById('deploy-batch-modal');
+    if (modal) modal.classList.remove('hidden');
+  }
+
+  function closeBatchModal() {
+    var modal = document.getElementById('deploy-batch-modal');
+    if (modal) modal.classList.add('hidden');
+  }
+
+  function onBatchStart() {
+    var nodes = document.querySelectorAll('#deploy-batch-modal-body input[data-batch-server]');
+    var ids = [];
+    for (var i = 0; i < nodes.length; i++) {
+      if (nodes[i].checked) ids.push(nodes[i].getAttribute('data-batch-server'));
+    }
+    if (ids.length === 0) { window.toast('请至少勾选一台服务器', 'warn'); return; }
+    var projectId = batchVal('deploy-project');
+    var project = findById(st.cfg ? st.cfg.projects : [], projectId);
+    if (!project) { window.toast('所选项目已变化,请重试', 'warn'); return; }
+    var img = st.mode === 'single' ? findImageByRef(batchVal('deploy-image')) : null;
+    if (st.mode === 'single' && !img) { window.toast('所选镜像已变化,请重试', 'warn'); return; }
+
+    var queue = [];
+    for (var j = 0; j < ids.length; j++) {
+      var srv = findById(st.cfg ? st.cfg.servers : [], ids[j]);
+      if (srv) queue.push({ serverId: srv.id, server: srv, project: project, img: img });
+    }
+    if (queue.length === 0) { window.toast('没有可用的服务器', 'warn'); return; }
+
+    closeBatchModal();
+    st.batch = {
+      active: true, mode: st.mode, queue: queue, idx: 0,
+      success: 0, failed: 0, skipped: 0, aborted: false,
+      deferred: null, results: []
+    };
+    renderBatchPanel();
+    runBatchNext();
+  }
+
+  /** 当前台:环境预检 → 复用单发部署;结果经 deploy-done 批量分支转交 */
+  function runBatchNext() {
+    if (!st.batch || !st.batch.active) return;
+    if (st.batch.idx >= st.batch.queue.length) { finishBatch(); return; }
+    var item = st.batch.queue[st.batch.idx];
+    renderBatchPanel();
+
+    // 每台独立环境预检(与单发一致);失败计为该台 failed,不中断批量
+    window.AppBus.invoke('server_env_check', { serverId: item.serverId })
+      .then(function (report) {
+        if (!st.batch || !st.batch.active) return;
+        var fails = collectFailures(report);
+        if (fails.length > 0) {
+          batchItemResult('failed', '环境检测未通过:' + fails.join('、'));
+          return;
+        }
+        resetRunView();
+        var deferred = {};
+        deferred.promise = new Promise(function (resolve) { deferred.resolve = resolve; });
+        st.batch.deferred = deferred;
+        if (st.batch.mode === 'stack') startStackDeploy(item.server, item.project);
+        else startDeploy(item.img, item.server, item.project);
+        deferred.promise.then(function (payload) {
+          if (!st.batch || !st.batch.active) return;
+          var p = payload || {};
+          var state;
+          if (p.success === true) state = 'success';
+          else if (p.message === '部署已取消') { state = 'skipped'; st.batch.aborted = true; }
+          else state = 'failed';
+          batchItemResult(state, p.message || '');
+        });
+      })
+      .catch(function (err) {
+        if (!st.batch || !st.batch.active) return;
+        batchItemResult('failed', '环境预检失败:' + (errText(err) || '未知错误'));
+      });
+  }
+
+  function batchItemResult(state, message) {
+    if (!st.batch) return;
+    if (state === 'success') st.batch.success++;
+    else if (state === 'skipped') st.batch.skipped++;
+    else st.batch.failed++;
+    var item = st.batch.queue[st.batch.idx];
+    st.batch.results.push({
+      serverName: item && item.server ? (item.server.name || item.server.id) : '',
+      state: state, message: message || ''
+    });
+    st.batch.idx++;
+    renderBatchPanel();
+    runBatchNext();
+  }
+
+  function finishBatch() {
+    if (!st.batch) return;
+    st.batch.active = false;
+    refreshControls();
+    refreshResumeStatus();
+    var summary = '批量部署结束:' + st.batch.success + ' 成功 / ' +
+      st.batch.failed + ' 失败 / ' + st.batch.skipped + ' 跳过';
+    showBanner(st.batch.failed > 0 ? 'warn' : 'ok', summary);
+    window.toast(summary, st.batch.failed > 0 ? 'warn' : 'ok');
+    renderBatchPanel();
+  }
+
+  function onStopBatch() {
+    if (!st.batch || !st.batch.active) return;
+    st.batch.aborted = true;
+    window.toast('当前服务器部署完成后,余下服务器将跳过', 'info');
+    renderBatchPanel();
+  }
+
+  function renderBatchPanel() {
+    var panel = document.getElementById('deploy-batch-panel');
+    if (!panel) return;
+    if (!st.batch) { panel.classList.add('hidden'); return; }
+    panel.classList.remove('hidden');
+    panel.innerHTML = '';
+
+    var head = document.createElement('div');
+    head.className = 'batch-head';
+    var total = st.batch.queue.length;
+    var title = document.createElement('strong');
+    title.textContent = '批量部署(' + (st.batch.mode === 'stack' ? '整栈' : '单镜像') + ' · ' +
+      st.batch.idx + '/' + total + ')';
+    head.appendChild(title);
+    var stat = document.createElement('span');
+    stat.className = 'batch-stat';
+    stat.textContent = st.batch.success + ' 成功 / ' + st.batch.failed + ' 失败 / ' +
+      st.batch.skipped + ' 跳过';
+    head.appendChild(stat);
+    if (st.batch.active) {
+      var stopBtn = document.createElement('button');
+      stopBtn.id = 'deploy-batch-stop-btn';
+      stopBtn.className = 'btn btn-sm';
+      stopBtn.type = 'button';
+      stopBtn.textContent = st.batch.aborted ? '停止中(当前台完成后停止)' : '停止批量';
+      stopBtn.disabled = st.batch.aborted;
+      stopBtn.addEventListener('click', onStopBatch);
+      head.appendChild(stopBtn);
+    }
+    panel.appendChild(head);
+
+    for (var i = 0; i < st.batch.queue.length; i++) {
+      var item = st.batch.queue[i];
+      var row = document.createElement('div');
+      row.className = 'batch-row';
+      var name = document.createElement('span');
+      name.textContent = (item.server.name || item.server.id) + ' (' + (item.server.host || '') + ')';
+      row.appendChild(name);
+      var badge = document.createElement('span');
+      var state, cls;
+      if (i < st.batch.idx) {
+        var res = st.batch.results[i];
+        if (res) {
+          if (res.state === 'success') { state = '成功'; cls = 'badge-running'; }
+          else if (res.state === 'skipped') { state = '已跳过'; cls = 'badge-info'; }
+          else { state = '失败'; cls = 'badge-paused'; }
+          if (res.message) row.title = res.message;
+        } else { state = '—'; cls = 'badge-info'; }
+      } else if (i === st.batch.idx && st.batch.active) {
+        state = '部署中'; cls = 'badge-running';
+      } else {
+        state = '等待'; cls = 'badge-info';
+      }
+      badge.className = 'badge ' + cls;
+      badge.textContent = state;
+      row.appendChild(badge);
+      panel.appendChild(row);
+    }
   }
 
   // ===== 部署历史(get_history:折叠面板,进入页面自动刷新一次)=====
@@ -2200,6 +2474,23 @@
       document.addEventListener('keydown', function (e) {
         if (e.key === 'Escape' && !rbOverlayNode.classList.contains('hidden')) {
           closeRollbackModal();
+        }
+      });
+    }
+
+    // 批量部署:入口按钮 + 配置模态关闭(关闭钮/遮罩/Esc,仅本模态可见时生效)
+    var batchBtn = document.getElementById('deploy-batch-btn');
+    if (batchBtn) batchBtn.addEventListener('click', openBatchModal);
+    var batchClose = document.getElementById('deploy-batch-modal-close');
+    if (batchClose) batchClose.addEventListener('click', closeBatchModalSafe);
+    var batchOverlay = document.getElementById('deploy-batch-modal');
+    if (batchOverlay) {
+      batchOverlay.addEventListener('click', function (e) {
+        if (e.target === batchOverlay) closeBatchModalSafe();
+      });
+      document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape' && !batchOverlay.classList.contains('hidden')) {
+          closeBatchModalSafe();
         }
       });
     }

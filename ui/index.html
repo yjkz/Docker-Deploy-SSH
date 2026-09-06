@@ -221,6 +221,7 @@
           </div>
           <div class="page-tools">
             <button id="notify-entry-btn" class="btn" type="button">通知<span id="notify-entry-badge" class="badge badge-info">未配置</span></button>
+            <button id="deploy-batch-btn" class="btn" type="button">批量部署</button>
           </div>
         </header>
 
@@ -229,6 +230,9 @@
 
         <!-- 断点续传横幅(检测到未完成部署的断点时显示;文案与「从步骤 N 继续 / 放弃断点」按钮由 deploy.js 构建) -->
         <div id="deploy-resume-banner" class="check-error hidden"></div>
+
+        <!-- 批量部署进度面板(逐台状态由 deploy.js 构建;批量进行中显示) -->
+        <div id="deploy-batch-panel" class="check-error hidden"></div>
 
         <div class="section-head">
           <h2 class="section-title">部署配置<span class="section-en">CONFIG</span></h2>
@@ -675,6 +679,17 @@
   </div>
 
   <!-- 通知中心模态框(桌面/邮件通知与事件订阅,内容由 notify.js 构建) -->
+  <!-- 批量部署模态(服务器多选,内容由 deploy.js 构建) -->
+  <div id="deploy-batch-modal" class="modal-overlay hidden">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="deploy-batch-modal-title">
+      <div class="modal-head">
+        <div id="deploy-batch-modal-title" class="modal-title"></div>
+        <button id="deploy-batch-modal-close" class="modal-close" type="button" title="关闭">关闭</button>
+      </div>
+      <div id="deploy-batch-modal-body" class="modal-body"></div>
+    </div>
+  </div>
+
   <div id="notify-modal" class="modal-overlay hidden">
     <div class="modal-card notify-modal-card" role="dialog" aria-modal="true" aria-labelledby="notify-modal-title">
       <div class="modal-head">
