@@ -384,6 +384,77 @@ pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<
     Ok(())
 }
 
+// ===== 应用设置(UPGRADE-PLAN 阶段四「桌面体验」,独立持久化于 config/settings.json)=====
+
+/// 应用级设置(`settings.json`,serde camelCase 对齐前端 JS 字段)。
+/// Default 直接 derive:bool 默认 false(关闭到托盘关,旧行为不变)、
+/// String 默认空串(代理为空 = 直连),与手写默认值语义一致。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AppSettings {
+    /// 关闭主窗口时隐藏到托盘(false = 关闭即退出;默认关)
+    pub close_to_tray: bool,
+    /// 检查更新使用的代理地址(http:// 或 socks5:// 前缀;空串 = 直连)
+    pub proxy: String,
+}
+
+/// 读取应用设置(独立文件 `config/settings.json`)。
+///
+/// 与 notify.json 同模式:文件缺失(首次运行)返回默认值,损坏/不可读时
+/// 告警并回退默认值 —— 设置项不含密文等不可再生数据,回退默认值无不可恢复
+/// 损失,故无需 notify 的 UNHEALTHY「禁止写回」保护机制。
+pub fn load_app_settings() -> AppSettings {
+    load_app_settings_from(&config_dir().join("settings.json"))
+}
+
+/// `load_app_settings` 的路径注入版本(单测用,生产路径经 [`config_dir`])。
+fn load_app_settings_from(path: &Path) -> AppSettings {
+    match std::fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(settings) => settings,
+            Err(e) => {
+                log::warn!(
+                    "应用设置解析失败,已回退为默认设置 ({}): {}",
+                    path.display(),
+                    e
+                );
+                AppSettings::default()
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => AppSettings::default(),
+        Err(e) => {
+            log::warn!(
+                "应用设置读取失败,已回退为默认设置 ({}): {}",
+                path.display(),
+                e
+            );
+            AppSettings::default()
+        }
+    }
+}
+
+/// 保存应用设置(`settings.json`;复用 [`write_json_atomic`] 原子写:
+/// .tmp 写入 + rename 覆盖,崩溃不留半截 JSON)。
+pub fn save_app_settings(settings: &AppSettings) -> Result<()> {
+    let dir = config_dir();
+    std::fs::create_dir_all(&dir)?;
+    write_json_atomic(&dir.join("settings.json"), settings)
+}
+
+// ===== 应用设置命令(设置中心前端契约,camelCase 序列化) =====
+
+/// 读取应用设置(关闭到托盘 / 更新代理)。
+#[tauri::command]
+pub fn app_settings_get() -> AppSettings {
+    load_app_settings()
+}
+
+/// 保存应用设置(关闭到托盘 / 更新代理;托盘拦截在关闭事件时现读文件,保存即生效)。
+#[tauri::command]
+pub fn app_settings_set(settings: AppSettings) -> std::result::Result<(), String> {
+    save_app_settings(&settings).map_err(|e| format!("保存设置失败: {}", e))
+}
+
 #[cfg(test)]
 pub(crate) static TEST_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -604,5 +675,76 @@ mod tests {
         let text = serde_json::to_string(&s).unwrap();
         let back: ServerConfig = serde_json::from_str(&text).unwrap();
         assert_eq!(back, s);
+    }
+
+    #[test]
+    fn test_app_settings_default_values() {
+        // 默认值:关闭到托盘关(旧行为不变)、代理为空串(直连)
+        let settings = AppSettings::default();
+        assert!(!settings.close_to_tray);
+        assert_eq!(settings.proxy, "");
+    }
+
+    #[test]
+    fn test_app_settings_roundtrip() {
+        // save_app_settings → load_app_settings 逐字段相等(独立 settings.json)
+        let _guard = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ddtest-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
+        let settings = AppSettings {
+            close_to_tray: true,
+            proxy: "socks5://127.0.0.1:1080".into(),
+        };
+        save_app_settings(&settings).unwrap();
+        assert!(dir.join("config/settings.json").exists());
+        let loaded = load_app_settings();
+        assert_eq!(loaded, settings);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_app_settings_default_when_file_missing() {
+        // settings.json 缺失(首次运行)→ 全默认值,不报错
+        let _guard = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ddtest-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
+        let loaded = load_app_settings();
+        assert_eq!(loaded, AppSettings::default());
+        assert!(!loaded.close_to_tray);
+        assert_eq!(loaded.proxy, "");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_app_settings_corrupt_falls_back() {
+        // settings.json 存在但损坏 → 告警并回退默认值(无 UNHEALTHY 机制,
+        // 设置项无不可再生数据,后续保存直接用新值覆盖即可)
+        let _guard = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ddtest-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
+        let settings_path = dir.join("config/settings.json");
+        std::fs::write(&settings_path, b"{oops").unwrap();
+        let loaded = load_app_settings();
+        assert_eq!(loaded, AppSettings::default());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_app_settings_camel_case_serde() {
+        // camelCase 序列化对齐前端字段;旧/部分文件缺 proxy 字段 → serde default 补齐
+        let settings = AppSettings {
+            close_to_tray: true,
+            proxy: "http://127.0.0.1:7890".into(),
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains("\"closeToTray\":true"));
+        assert!(json.contains("\"proxy\":\"http://127.0.0.1:7890\""));
+
+        let partial: AppSettings = serde_json::from_str(r#"{"closeToTray":true}"#).unwrap();
+        assert!(partial.close_to_tray);
+        assert_eq!(partial.proxy, "");
     }
 }

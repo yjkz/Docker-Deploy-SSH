@@ -11,6 +11,7 @@ pub mod manage_stats;
 pub mod notify;
 pub mod ssh;
 pub mod stack;
+pub mod update;
 
 use tauri_plugin_log::{Target, TargetKind};
 
@@ -87,6 +88,10 @@ pub fn run() {
       manage_exec::manage_exec_write,
       manage_exec::manage_exec_resize,
       manage_exec::manage_exec_stop,
+      update::update_check,
+      config::app_settings_get,
+      config::app_settings_set,
+      update::open_external,
     ])
     .setup(|app| {
       // 日志(不限 debug 构建,release 同样记录,便于现场排查):
@@ -109,8 +114,98 @@ pub fn run() {
           .targets(targets)
           .build(),
       )?;
+      // 桌面端附加能力(UPGRADE-PLAN 阶段四):系统托盘 + 主窗口关闭拦截
+      #[cfg(desktop)]
+      setup_desktop(app)?;
       Ok(())
     })
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
+}
+
+/// 桌面端附加能力(UPGRADE-PLAN 阶段四「桌面体验」):
+/// 1. 常驻系统托盘:图标 + 菜单(显示主窗口/退出);左键单击显示并聚焦主窗口,
+///    菜单走右键弹出(show_menu_on_left_click 关闭左键弹菜单)。
+/// 2. 主窗口关闭拦截:按 settings.json 的 closeToTray 决定「隐藏到托盘」或
+///    「默认关闭退出」。
+///
+/// API 依据(registry tauri-2.11.5 源码):TrayIconBuilder(src/tray/mod.rs,
+/// icon/menu/show_menu_on_left_click/on_menu_event/on_tray_icon_event/build)、
+/// TrayIconEvent::Click{button,button_state}(同文件)、Menu::new /
+/// MenuItem::with_id / Menu::append_items(src/menu/menu.rs、normal.rs)、
+/// MenuEvent::id()(src/menu/mod.rs)、WindowEvent::CloseRequested{api} 与
+/// CloseRequestApi::prevent_close(src/app.rs)、AppHandle::exit(src/app.rs)、
+/// WebviewWindow::on_window_event / show / set_focus / unminimize。
+#[cfg(desktop)]
+fn setup_desktop(app: &tauri::App) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+    use tauri::Manager;
+
+    // 托盘菜单:显示主窗口 / 退出(with_id 显式指定 id 供事件分发)
+    let show_item = MenuItem::with_id(app, "show-main", "显示主窗口", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let tray_menu = Menu::new(app)?;
+    tray_menu.append_items(&[&show_item, &quit_item])?;
+
+    let mut tray_builder = TrayIconBuilder::with_id("main-tray")
+      .menu(&tray_menu)
+      // 左键单击留给「显示主窗口」,菜单改由右键弹出(默认 true 会左键弹菜单)
+      .show_menu_on_left_click(false)
+      .tooltip("DockerDeploy SSH");
+    // 图标用应用默认窗口图标(tauri.conf.json bundle.icon 编译期内嵌;
+    // 缺失时不设图标,托盘退化为系统占位图标,不 panic)
+    if let Some(icon) = app.default_window_icon().cloned() {
+      tray_builder = tray_builder.icon(icon);
+    }
+    tray_builder
+      .on_menu_event(|app, event| {
+        // 菜单事件是全局监听,按菜单项 id 分发
+        match event.id().as_ref() {
+          "show-main" => show_main_window(app),
+          "quit" => app.exit(0),
+          _ => {}
+        }
+      })
+      .on_tray_icon_event(|tray, event| {
+        // 左键单击(松开时)→ 显示并聚焦主窗口
+        if let TrayIconEvent::Click {
+          button: MouseButton::Left,
+          button_state: MouseButtonState::Up,
+          ..
+        } = event
+        {
+          show_main_window(tray.app_handle());
+        }
+      })
+      .build(app)?;
+
+    // 主窗口关闭拦截:每次关闭事件现读 settings.json(而非缓存),
+    // 保证前端改完设置无需重启即生效;closeToTray=false 不拦截(默认关闭,
+    // 最后一个窗口关闭即退出进程)
+    if let Some(window) = app.get_webview_window("main") {
+      let win = window.clone();
+      window.on_window_event(move |event| {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+          if crate::config::load_app_settings().close_to_tray {
+            // 阻止默认关闭,隐藏窗口;部署任务在后台继续运行
+            api.prevent_close();
+            let _ = win.hide();
+          }
+        }
+      });
+    }
+    Ok(())
+}
+
+/// 显示并聚焦主窗口(托盘左键单击与菜单「显示主窗口」共用):
+/// 取消最小化 + 显示 + 聚焦,覆盖「最小化到任务栏」「隐藏到托盘」两种状态。
+#[cfg(desktop)]
+fn show_main_window(app: &tauri::AppHandle) {
+  use tauri::Manager;
+  if let Some(window) = app.get_webview_window("main") {
+    let _ = window.unminimize();
+    let _ = window.show();
+    let _ = window.set_focus();
+  }
 }

@@ -22,7 +22,9 @@ serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 uuid = { version = "1", features = ["v4"] }
 log = "0.4"
-tauri = { version = "2.11.3", features = [] }
+# 阶段四「桌面体验」:启用 tauri 内置系统托盘(TrayIconBuilder/TrayIconEvent,
+# registry tauri-2.11.5 feature 定义 `tray-icon = ["dep:tray-icon"]`)
+tauri = { version = "2.11.3", features = ["tray-icon"] }
 tauri-plugin-log = "2"
 # 表单路径「浏览」按钮:系统文件/目录选择对话框(前端经全局对象 __TAURI__.dialog 调用)
 tauri-plugin-dialog = "2"
@@ -52,6 +54,13 @@ argon2 = { version = "0.5", features = ["std", "password-hash"] }
 aes-gcm = "0.10"
 # - rand:生成导出容器的随机盐(16B)与 GCM nonce(12B)
 rand = "0.8"
+# 阶段四「桌面体验」:检查更新(请求 GitHub releases/latest)。
+# - default-features = false:不引入 native-tls,统一走 rustls(ring provider,
+#   Windows 免 openssl/cmake 原生依赖);json = 响应解析,socks = socks5 代理
+#   (Proxy::all 支持 http/https/socks4/socks5/socks5h,见 reqwest 0.12 proxy.rs)
+# - 用 0.12 而非依赖树里的 0.13(仅 tauri 未启用的 normal feature 的可选依赖,
+#   实际不编译):0.13 已移除 rustls-tls feature 名,且 0.12 feature 名与需求一致
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "socks"] }
 
 # Task 4: Windows DPAPI 密码加密(CurrentUser 作用域),仅 Windows 构建
 [target.'cfg(windows)'.dependencies]

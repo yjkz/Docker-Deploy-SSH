@@ -5,11 +5,16 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>DockerDeploy SSH</title>
   <script>
-    // 防闪白:必须早于样式表执行——恢复上次选择的亮暗主题(异常/未存储时回退 light)
-    try {
-      document.documentElement.dataset.arkScheme =
-        localStorage.getItem('dd_scheme') === 'dark' ? 'dark' : 'light';
-    } catch (e) {
+    // 防闪白:必须早于样式表执行——恢复上次选择的亮暗主题(异常/未存储时回退 light)。
+    // dd_scheme = 'auto'(跟随系统,UPGRADE-PLAN 阶段四)时按系统偏好解析,
+    // 运行期实时跟随由 app.js 的 matchMedia change 监听接管。
+    var __ddScheme = null;
+    try { __ddScheme = localStorage.getItem('dd_scheme'); } catch (e) { /* 忽略 */ }
+    if (__ddScheme === 'dark' ||
+        (__ddScheme === 'auto' && window.matchMedia &&
+         window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+      document.documentElement.dataset.arkScheme = 'dark';
+    } else {
       document.documentElement.dataset.arkScheme = 'light';
     }
   </script>
@@ -55,8 +60,24 @@
           <span class="dock-num">05</span><span class="dock-label">远程管理</span>
         </button>
       </nav>
-      <!-- 亮暗主题切换:位于 dock 末端(桌面=左 dock 底部,窄屏=顶栏右端) -->
+      <!-- dock 底部工具区:设置中心入口(齿轮,模态由 settings.js 构建)+ 亮暗主题切换 -->
       <div class="dock-actions">
+        <button id="settings-entry-btn" class="dock-icon-btn" type="button" aria-haspopup="dialog"
+                aria-controls="settings-modal" aria-label="打开设置" title="设置">
+          <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+            <circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.5"/>
+            <g stroke="currentColor" stroke-width="1.5" stroke-linecap="square">
+              <line x1="8" y1="1.5" x2="8" y2="3.5"/>
+              <line x1="8" y1="12.5" x2="8" y2="14.5"/>
+              <line x1="1.5" y1="8" x2="3.5" y2="8"/>
+              <line x1="12.5" y1="8" x2="14.5" y2="8"/>
+              <line x1="3.4" y1="3.4" x2="4.8" y2="4.8"/>
+              <line x1="11.2" y1="11.2" x2="12.6" y2="12.6"/>
+              <line x1="12.6" y1="3.4" x2="11.2" y2="4.8"/>
+              <line x1="4.8" y1="11.2" x2="3.4" y2="12.6"/>
+            </g>
+          </svg>
+        </button>
         <button id="scheme-toggle" class="scheme-toggle" type="button" aria-label="切换亮暗主题" title="切换亮暗主题">
           <svg class="scheme-ico scheme-ico-moon" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
             <path d="M14 8.53A6 6 0 1 1 7.47 2 4.67 4.67 0 0 0 14 8.53z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="square"/>
@@ -672,6 +693,17 @@
     </div>
   </div>
 
+  <!-- 设置中心模态框(外观 / 通用 / 更新,内容由 settings.js 构建) -->
+  <div id="settings-modal" class="modal-overlay hidden">
+    <div class="modal-card settings-modal-card" role="dialog" aria-modal="true" aria-labelledby="settings-modal-title">
+      <div class="modal-head">
+        <div id="settings-modal-title" class="modal-title">设置<span class="help-title-en">SETTINGS</span></div>
+        <button id="settings-modal-close" class="modal-close" type="button" title="关闭">关闭</button>
+      </div>
+      <div id="settings-modal-body" class="modal-body"></div>
+    </div>
+  </div>
+
   <!-- 帮助:右下角悬浮按钮(所有页面可见)+ 章节式帮助模态框(静态内容由 help.js 渲染) -->
   <button id="help-fab" class="help-fab" type="button" aria-haspopup="dialog"
           aria-controls="help-modal" aria-label="打开使用帮助" title="使用帮助">?</button>
@@ -697,5 +729,6 @@
   <script src="notify.js"></script>
   <script src="help.js"></script>
   <script src="config-io.js"></script>
+  <script src="settings.js"></script>
 </body>
 </html>

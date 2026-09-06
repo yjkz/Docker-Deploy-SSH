@@ -283,6 +283,42 @@
     document.startViewTransition(apply);
   };
 
+  // ===== 主题跟随系统(dd_scheme = 'auto',UPGRADE-PLAN 阶段四)=====
+  // 手动切换(window.toggleScheme)恒写显式 'light'/'dark' 覆盖 auto,行为不变;
+  // 仅当持久化值为 'auto' 时,系统亮暗变化经此监听实时跟随。
+  var SCHEME_MQ = (typeof window.matchMedia === 'function')
+    ? window.matchMedia('(prefers-color-scheme: dark)')
+    : null;
+
+  /** 读取主题模式(localStorage['dd_scheme'],异常/未存按显式 light) */
+  function schemeMode() {
+    try { return localStorage.getItem(SCHEME_KEY) || 'light'; } catch (e) { return 'light'; }
+  }
+
+  /**
+   * 按模式应用主题:显式 'light'/'dark' 直接写;仅 'auto' 经
+   * matchMedia 解析系统偏好后写根节点 data-ark-scheme。
+   * 挂 window 供 settings.js「外观」单选复用(同 toggleScheme 先例)。
+   */
+  window.applyArkScheme = function (mode) {
+    var resolved = mode === 'auto'
+      ? (SCHEME_MQ && SCHEME_MQ.matches ? 'dark' : 'light')
+      : (mode === 'dark' ? 'dark' : 'light');
+    document.documentElement.dataset.arkScheme = resolved;
+  };
+
+  /** 系统亮暗变化:仅 auto 模式跟随(显式值不受系统偏好影响) */
+  function onSystemSchemeChange() {
+    if (schemeMode() === 'auto') window.applyArkScheme('auto');
+  }
+  if (SCHEME_MQ) {
+    if (typeof SCHEME_MQ.addEventListener === 'function') {
+      SCHEME_MQ.addEventListener('change', onSystemSchemeChange);
+    } else if (typeof SCHEME_MQ.addListener === 'function') {
+      SCHEME_MQ.addListener(onSystemSchemeChange); // 旧实现兜底(Safari < 14)
+    }
+  }
+
   // ===== 初始化:绑定导航点击 + 主题切换按钮 + 刷新禁用态 =====
   document.addEventListener('DOMContentLoaded', function () {
     var items = document.querySelectorAll('.dock-item');
