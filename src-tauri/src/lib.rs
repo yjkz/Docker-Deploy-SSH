@@ -49,6 +49,7 @@ pub fn run() {
       commands::deploy,
       commands::cancel_deploy,
       commands::deploy_stack,
+      commands::deploy_batch,
       commands::deploy_resume_status,
       commands::deploy_resume_start,
       commands::deploy_resume_discard,

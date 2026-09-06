@@ -82,23 +82,29 @@ jobs:
         with:
           fetch-depth: 0
 
-      # 取更新说明:附注 tag → subject + 空行 + body 写入 body 文件。
-      # 注意:轻量标签没有附注,git 的 %(contents:...) 会回退成 commit message(本地实测),
-      # 因此用 %(objecttype) 判别:轻量标签将 body 置空,交给 generate_release_notes 兜底。
+      # 取更新说明:优先经 GitHub API 读附注对象(与 actions/checkout 对 tag 对象的
+      # 处理方式无关,真机实测 checkout 后本地 git 侧 objecttype 判别不可靠)。
+      # API 对象类型为 "tag" → 取 .message;否则(轻量标签)body 置空,交给
+      # generate_release_notes 兜底。API 失败不阻断发版(回退空 body)。
       - name: Extract tag annotation into release body
         env:
           REF_NAME: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
           if [ -z "$REF_NAME" ]; then
             echo "::error::未能取得 tag 名（REF_NAME 为空）"
             exit 1
           fi
           body_file="release_body.md"
-          if [ "$(git for-each-ref "refs/tags/$REF_NAME" --format='%(objecttype)')" = "tag" ]; then
-            git tag -l "$REF_NAME" --format='%(contents:subject)%0a%0a%(contents:body)' > "$body_file"
+          : > "$body_file"
+          obj_type=$(gh api "repos/$REPO/git/refs/tags/$REF_NAME" --jq '.object.type' 2>/dev/null || echo "")
+          if [ "$obj_type" = "tag" ]; then
+            tag_sha=$(gh api "repos/$REPO/git/refs/tags/$REF_NAME" --jq '.object.sha')
+            gh api "repos/$REPO/git/tags/$tag_sha" --jq '.message' > "$body_file"
+            echo "已取得附注（$(wc -c < "$body_file") 字节）"
           else
-            : > "$body_file"
-            echo "轻量标签（无附注）：body 置空，将仅使用自动生成的 release notes"
+            echo "轻量标签或 API 不可达（obj_type=$obj_type）：body 置空，将仅使用自动生成的 release notes"
           fi
           echo "---- release body（空即无附注）----"
           cat "$body_file"
