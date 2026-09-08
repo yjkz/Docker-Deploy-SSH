@@ -400,6 +400,13 @@
 
   // ===== 下拉渲染(每次进入页面重建;尽量保留原选中项)=====
 
+  /**
+   * 填充下拉。占位项必须是「未选中时的 fallback 选项」而不能是 disabled:
+   * WebView2(Chromium)对「当前选中项为 disabled option」的 select 弹层
+   * 渲染有缺陷 —— 弹层高度塌缩且选项文字不显示,表现为「点开只下拉一点点、
+   * 无任何内容」。改为普通 option(空值)+ 未选中时置于选择态,弹层即可
+   * 正常按选项数撑开并显示文字;空值在提交校验处已被拦截(「请先选择…」)。
+   */
   function fillSelect(select, placeholderText, options) {
     if (!select) return;
     var prev = select.value; // 重建后尽量恢复
@@ -408,7 +415,6 @@
     var ph = document.createElement('option');
     ph.value = '';
     ph.textContent = placeholderText;
-    ph.disabled = true;
     select.appendChild(ph);
 
     options.forEach(function (opt) {

@@ -455,6 +455,15 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
 .form-input::placeholder,
 .mapping-input::placeholder { color: var(--ark-ink-35); }
 
+/* select 弹层选项显式配色(WebView2 原生弹层跟随系统主题,不读页面
+   background/color 之外的规则;显式声明防暗色主题下白字白底不可读) */
+select.form-input option,
+select.text-input option,
+.mapping-input option {
+  background: var(--ark-paper);
+  color: var(--ark-ink);
+}
+
 /* ===== 状态徽章(三态 + 信息空心)===== */
 .badge {
   display: inline-flex;
