@@ -14,6 +14,10 @@
 //! 调用方落盘(`ServerConfig.host_key_sha256`);此后每次连接在
 //! [`ClientHandler::check_server_key`] 中与配置的期望指纹比对,不一致即拒绝
 //! 连接(防中间人;服务器重装/换 IP 后由用户显式重新信任)。
+//!
+//! 阶段九/十追加(独立 impl 块,纯追加):[`SshClient::exec_streaming`]
+//! (可取消的流式日志,live-follow 日志数据源)与 [`SshClient::sftp_download`]
+//! (SFTP 下载,跨服务器镜像迁移数据源)。
 
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
@@ -870,6 +874,104 @@ mod tests {
         assert!(out.contains("hello"), "输出应包含 hello,实际: {out}");
     }
 
+    // ===== 阶段九:exec_streaming(流式 + 取消)真机测试 =====
+
+    #[tokio::test]
+    #[ignore = "需要真实 SSH 服务器(见函数注释的运行方式)"]
+    async fn test_exec_streaming_and_cancel_real() {
+        let cfg = test_cfg_from_env()
+            .expect("请设置 DD_SSH_TEST_HOST / DD_SSH_TEST_USER / (DD_SSH_TEST_PASSWORD | DD_SSH_TEST_KEY)");
+        let pw = std::env::var("DD_SSH_TEST_PASSWORD").ok();
+        let mut client = SshClient::connect(&cfg, pw.as_deref(), None, Arc::default())
+            .await
+            .expect("connect 失败");
+
+        // 1) 自然结束:echo 三行,输出逐行回调,退出码 0
+        let (mut cancel_tx, mut cancel_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let mut lines: Vec<String> = Vec::new();
+        let mut exit_code: i32 = -1;
+        let finished = client
+            .exec_streaming(
+                "echo a; echo b; echo c",
+                &mut cancel_rx,
+                &mut exit_code,
+                &mut |line: &str| lines.push(line.trim_end().to_string()),
+            )
+            .await
+            .expect("exec_streaming 失败");
+        assert!(finished, "echo 命令应自然结束");
+        assert_eq!(exit_code, 0);
+        assert!(lines.iter().any(|l| l.contains("a")));
+        assert!(lines.iter().any(|l| l.contains("c")));
+        // cancel_tx 保持存活直到此刻(证明「Sender drop = 取消」的约定)
+        cancel_tx.send(()).await.ok();
+
+        // 2) 取消:yes 持续输出 → 收到取消信号后应尽快返回 Ok(false)
+        let (mut cancel_tx2, mut cancel_rx2) = tokio::sync::mpsc::channel::<()>(1);
+        let mut count: usize = 0;
+        let mut exit2: i32 = -1;
+        let finished2 = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            client.exec_streaming(
+                "yes",
+                &mut cancel_rx2,
+                &mut exit2,
+                &mut |_line: &str| count += 1,
+            ),
+        )
+        .await
+        .expect("取消测试整体超时")
+        .expect("exec_streaming(yes) 失败");
+        assert!(!finished2, "被取消后应返回 false");
+        cancel_tx2.send(()).await.ok();
+        let _ = count; // 收到若干行后即被取消,行数不定
+    }
+
+    // ===== 阶段十:sftp_download(下载 roundtrip)真机测试 =====
+
+    #[tokio::test]
+    #[ignore = "需要真实 SSH 服务器(见函数注释的运行方式)"]
+    async fn test_sftp_download_real() {
+        let cfg = test_cfg_from_env()
+            .expect("请设置 DD_SSH_TEST_HOST / DD_SSH_TEST_USER / (DD_SSH_TEST_PASSWORD | DD_SSH_TEST_KEY)");
+        let pw = std::env::var("DD_SSH_TEST_PASSWORD").ok();
+        let mut client = SshClient::connect(&cfg, pw.as_deref(), None, Arc::default())
+            .await
+            .expect("connect 失败");
+
+        // 远端造一个含二进制字节的文件(覆盖 0x00-0xFF 全字节值)
+        let remote = "/tmp/dd-ssh-sftp-test-download.bin";
+        let (code, _) = crate::ssh::exec_collect(
+            &mut client,
+            "od -An -v -tu1 /dev/zero | head -c 0; printf '' > /tmp/dd-ssh-sftp-test-download.bin; for i in $(seq 0 255); do printf \"\\\\$(printf '%03o' $i)\" >> /tmp/dd-ssh-sftp-test-download.bin; done",
+        )
+        .await
+        .expect("造远端文件失败");
+        assert_eq!(code, 0);
+
+        // 下载并核对内容逐字节一致
+        let local = std::env::temp_dir().join(format!("dd-dl-{}.bin", std::process::id()));
+        let last = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let last2 = Arc::clone(&last);
+        client
+            .sftp_download(remote, &local, &move |sent, total| {
+                last2.store(sent, std::sync::atomic::Ordering::Relaxed);
+                assert!(sent <= total);
+            })
+            .await
+            .expect("sftp_download 失败");
+        let bytes = std::fs::read(&local).expect("读本地下载文件失败");
+        assert_eq!(bytes.len(), 256);
+        for (i, b) in bytes.iter().enumerate() {
+            assert_eq!(*b, i as u8, "第 {} 字节不符", i);
+        }
+        assert!(last.load(std::sync::atomic::Ordering::Relaxed) > 0, "应有进度回调");
+
+        // 清理
+        client.exec(&format!("rm -f {}", remote), &mut |_| {}).await.ok();
+        std::fs::remove_file(&local).ok();
+    }
+
     #[tokio::test]
     #[ignore = "需要真实 SSH 服务器(见函数注释的运行方式)"]
     async fn test_sftp_upload_real() {
@@ -978,6 +1080,165 @@ impl SshClient {
             .exec(true, cmd)
             .await
             .map_err(|e| format!("SSH 启动交互式命令 ({}) 失败: {}", cmd, e))?;
+        Ok(channel)
+    }
+}
+
+/// 阶段九/十追加:流式日志与 SFTP 下载(独立 impl 块,纯追加,零修改既有行)。
+impl SshClient {
+    /// 阶段九(UPGRADE-PLAN 第二批):流式执行命令,输出逐行实时回调。
+    ///
+    /// 与 [`SshClient::exec`](一次性 exec,输出收齐才返回)的区别:wait 循环
+    /// 外层包了 `tokio::select!` 监听 `cancel_rx` —— 取消信号(`()` 消息)到达时
+    /// **主动 `channel.close()` 并立即返回**(不再等远端自然结束),用于
+    /// live-follow 日志的「关闭即停流」。输出行为与 `exec` 一致:stdout+stderr
+    /// 合并、按完整行回调、不完整尾行在通道关闭时输出(被取消时丢弃尾行)。
+    ///
+    /// 取消通道:`tokio::sync::mpsc::Receiver<()>`,调用方(命令层)持有对应
+    /// Sender,`stop` 命令发送 `()` 即停流。注意 `recv()` 返回 `Err`(全部
+    /// Sender 已 drop)时按**主动取消**处理 —— 命令层在停流后 drop Sender 的
+    /// 场景下,流必然已由 stop 信号先行结束;此约定保证 select 分支恒可收敛。
+    ///
+    /// 返回值:`Ok(true)` = 命令自然结束(退出码写入 `exit_code`,未收到为 -1);
+    /// `Ok(false)` = 被取消方主动取消(通道已 close)。
+    pub async fn exec_streaming(
+        &mut self,
+        cmd: &str,
+        cancel_rx: &mut tokio::sync::mpsc::Receiver<()>,
+        exit_code: &mut i32,
+        on_output: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<bool, String> {
+        let mut channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .map_err(|e| format!("SSH 打开会话通道失败: {}", e))?;
+        channel
+            .exec(true, cmd)
+            .await
+            .map_err(|e| format!("SSH 执行命令失败 ({}): {}", cmd, e))?;
+
+        *exit_code = -1;
+        let mut buf: Vec<u8> = Vec::new();
+        let cancelled = loop {
+            tokio::select! {
+                // 取消与通道消息并发就绪时先查取消(biased 固定轮询顺序)
+                biased;
+                // Ok(()) = 收到 stop 信号;Err = Sender 全部 drop(命令层收尾),
+                // 两种情况都以「主动取消」收场:关通道、丢弃不完整尾行
+                _ = cancel_rx.recv() => {
+                    let _ = channel.close().await;
+                    break true;
+                }
+                msg = channel.wait() => {
+                    match msg {
+                        Some(ChannelMsg::Data { ref data })
+                        | Some(ChannelMsg::ExtendedData { ref data, .. }) => {
+                            buf.extend_from_slice(data);
+                            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                                let line: Vec<u8> = buf.drain(..=pos).collect();
+                                on_output(&String::from_utf8_lossy(&line));
+                            }
+                        }
+                        Some(ChannelMsg::ExitStatus { exit_status }) => {
+                            *exit_code = exit_status as i32;
+                        }
+                        Some(ChannelMsg::Eof) => {
+                            // 服务端输出结束,继续等待 Close
+                        }
+                        Some(ChannelMsg::Close) | None => break false,
+                        _ => {}
+                    }
+                }
+            }
+        };
+        if !cancelled && !buf.is_empty() {
+            on_output(&String::from_utf8_lossy(&buf));
+        }
+        Ok(!cancelled)
+    }
+
+    /// 阶段十(UPGRADE-PLAN 第二批):SFTP 下载远端文件到本地路径。
+    ///
+    /// 与上传的 [`copy_file_to_remote`] 对称:远端文件按 64KB 块读出写本地,
+    /// 回调 `(已下字节, 总字节)`;显式 shutdown 等待远端确认。
+    /// 远端路径经 sftp 子系统直读(不经 shell),无注入面。
+    pub async fn sftp_download(
+        &mut self,
+        remote_path: &str,
+        local: &Path,
+        on_progress: &(dyn Fn(u64, u64) + Send + Sync),
+    ) -> Result<(), String> {
+        let sftp = self.open_sftp().await?;
+        let mut remote_file = sftp
+            .open(remote_path.to_string())
+            .await
+            .map_err(|e| format!("SFTP 打开远端文件失败 ({}): {}", remote_path, e))?;
+        let total = remote_file
+            .metadata()
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        on_progress(0, total);
+
+        if let Some(parent) = local.parent() {
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| format!("无法创建本地目录 {}: {}", parent.display(), e))?;
+            }
+        }
+        let mut local_file = tokio::fs::File::create(local)
+            .await
+            .map_err(|e| format!("无法创建本地文件 {}: {}", local.display(), e))?;
+
+        let mut received: u64 = 0;
+        let mut buf = vec![0u8; CHUNK_SIZE];
+        loop {
+            let n = remote_file
+                .read(&mut buf)
+                .await
+                .map_err(|e| format!("SFTP 读取远端文件失败 ({}): {}", remote_path, e))?;
+            if n == 0 {
+                break;
+            }
+            local_file
+                .write_all(&buf[..n])
+                .await
+                .map_err(|e| format!("写入本地文件失败 ({}): {}", local.display(), e))?;
+            received += n as u64;
+            on_progress(received, total);
+        }
+        local_file
+            .flush()
+            .await
+            .map_err(|e| format!("刷新本地文件失败 ({}): {}", local.display(), e))?;
+        // 显式关闭远端句柄(等价 File::close)以等待远端确认
+        remote_file
+            .shutdown()
+            .await
+            .map_err(|e| format!("SFTP 关闭远端文件失败 ({}): {}", remote_path, e))?;
+        Ok(())
+    }
+
+    /// 阶段十(UPGRADE-PLAN 第二批):打开原始 exec 通道(不经行拆分)。
+    ///
+    /// 供二进制流(`docker save | gzip`)的消费方使用:返回
+    /// [`russh::Channel`],调用方自行 `wait()` 读 `Data` 块(二进制安全,
+    /// 与 [`SshClient::exec`]/[`SshClient::exec_streaming`] 的按行拆分不同)。
+    pub(crate) async fn raw_exec_channel(
+        &mut self,
+        cmd: &str,
+    ) -> Result<russh::Channel<client::Msg>, String> {
+        let channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .map_err(|e| format!("SSH 打开会话通道失败: {}", e))?;
+        channel
+            .exec(true, cmd)
+            .await
+            .map_err(|e| format!("SSH 执行命令失败 ({}): {}", cmd, e))?;
         Ok(channel)
     }
 }

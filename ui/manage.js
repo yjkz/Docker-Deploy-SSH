@@ -94,6 +94,10 @@
       if (e.key === 'Enter') onPullImage();
     });
 
+    // 阶段十:跨服务器镜像迁移
+    var migrateBtn = $('manage-migrate-btn');
+    if (migrateBtn) migrateBtn.addEventListener('click', openMigrateModal);
+
     // 模态框关闭
     var closeBtn = $('manage-modal-close');
     if (closeBtn) closeBtn.addEventListener('click', closeModal);
@@ -749,8 +753,9 @@
     var body = document.createElement('div');
     // 查看类弹窗放大标记:openModal 据此给共用 modal-card 加 .modal-wide
     body.className = 'manage-wide-modal';
-    body.innerHTML =
-      '<div class="log-tail-bar">' +
+    var bar1 = document.createElement('div');
+    bar1.className = 'log-tail-bar';
+    bar1.innerHTML =
       '<label>显示行数:' +
       '<select id="log-tail-select" class="form-input form-input-sm">' +
       '<option value="100">100</option>' +
@@ -758,9 +763,15 @@
       '<option value="1000">1000</option>' +
       '<option value="0">全部</option>' +
       '</select></label>' +
-      '<button id="log-copy-btn" class="btn btn-sm" type="button">复制日志</button>' +
-      '</div>' +
-      '<pre id="log-content" class="manage-log-body">加载中…</pre>';
+      '<button id="log-copy-btn" class="btn btn-sm" type="button">复制日志</button>';
+    // 阶段九:实时跟随开关(勾选开流,取消停流;eof 后自动复位)
+    bar1.appendChild(buildFollowToggle('container', containerId, 'log-tail-select', 'log-content'));
+    var pre1 = document.createElement('pre');
+    pre1.id = 'log-content';
+    pre1.className = 'manage-log-body';
+    pre1.textContent = '加载中…';
+    body.appendChild(bar1);
+    body.appendChild(pre1);
 
     openModal('容器日志 — ' + name, body);
 
@@ -1059,6 +1070,156 @@
       toast('打标签失败: ' + msg, 'fail');
       startTimerIfEnabled();
     });
+  }
+
+  // ===== 阶段十:跨服务器镜像迁移 =====
+  // - openMigrateModal:镜像多选 + 目标服务器下拉(排除当前服务器)
+  // - migrate_start:manage_log... 复用事件先订阅再 invoke 的纪律(migrate-log /
+  //   migrate-done);逐镜像进度与结果经事件,invoke 立即返回
+  // - migrate_status(true) 取消(镜像边界生效);模态关闭不中断迁移,
+  //   迁移中禁「迁移镜像」按钮与刷新
+  var migState = {
+    active: false,      // 是否有迁移在执行
+    id: 0,              // 最近一次 migrate_status 查询到的代号(事件归属判别)
+    listenerBound: false,
+    selected: []        // 开流时勾选的镜像快照(事件到来时高亮用)
+  };
+
+  function bindMigrateListener() {
+    if (migState.listenerBound) return;
+    migState.listenerBound = true;
+    AppBus.on('migrate-log', function (event) {
+      var p = (event && event.payload) || {};
+      appendMigrateLine(String(p.line || ''));
+    }).catch(function (err) {
+      if (window.console && console.warn) console.warn('[manage] migrate-log 注册失败:', err);
+    });
+    AppBus.on('migrate-done', function (event) {
+      var p = (event && event.payload) || {};
+      migState.active = false;
+      setMigrateBusy(false);
+      refreshImages(); // 镜像列表不因迁移而变,但刷新 overview 的容器状态无害
+      var ok = p.success === true;
+      var msg = String(p.message || (ok ? '迁移完成' : '迁移失败'));
+      appendMigrateLine('—— ' + msg + ' ——');
+      toast(ok ? '镜像迁移完成' : '镜像迁移失败: ' + msg, ok ? 'ok' : 'fail');
+    }).catch(function (err) {
+      if (window.console && console.warn) console.warn('[manage] migrate-done 注册失败:', err);
+    });
+  }
+
+  function appendMigrateLine(line) {
+    var content = $('migrate-log-content');
+    if (!content) return;
+    var nearBottom = content.scrollHeight - content.scrollTop - content.clientHeight < 40;
+    content.appendChild(document.createTextNode(line + '\n'));
+    if (nearBottom) content.scrollTop = content.scrollHeight;
+  }
+
+  function setMigrateBusy(busy) {
+    var btn = $('manage-migrate-btn');
+    if (btn) {
+      btn.disabled = busy || !state.serverId;
+      btn.textContent = busy ? '迁移中…' : '迁移镜像';
+    }
+  }
+
+  function openMigrateModal() {
+    if (migState.active) return;
+    if (!state.serverId) { toast('请先选择源服务器', 'warn'); return; }
+    var images = state.images || [];
+    if (images.length === 0) { toast('当前服务器没有可迁移的镜像', 'warn'); return; }
+    // 先取最新服务器列表(构建目标下拉用),再打开模态
+    AppBus.invoke('manage_list_servers').then(function (servers) {
+      var others = (servers || []).filter(function (s) { return s.id !== state.serverId; });
+      if (others.length === 0) { toast('没有其他服务器可作为迁移目标', 'warn'); return; }
+      openMigrateModalBody(others, images);
+    }).catch(function (err) {
+      var msg = err && err.message ? err.message : String(err);
+      toast('加载服务器列表失败: ' + msg, 'fail');
+    });
+  }
+
+  function openMigrateModalBody(servers, images) {
+    bindMigrateListener();
+
+    var body = document.createElement('div');
+    // 查看类弹窗放大标记(日志区较宽)
+    body.className = 'manage-wide-modal';
+    var bar = document.createElement('div');
+    bar.className = 'log-tail-bar';
+    var selHtml = '<option value="">选择目标服务器…</option>';
+    for (var i = 0; i < servers.length; i++) {
+      selHtml += '<option value="' + escHtml(servers[i].id) + '">' +
+        escHtml(servers[i].name || servers[i].id) + ' (' + escHtml(servers[i].host || '') + ')</option>';
+    }
+    bar.innerHTML = '<label>目标服务器:<select id="migrate-target-select" class="form-input form-input-sm">' + selHtml + '</select></label>';
+    body.appendChild(bar);
+
+    var listWrap = document.createElement('div');
+    listWrap.className = 'migrate-image-list';
+    for (var j = 0; j < images.length; j++) {
+      var img = images[j];
+      var ref = (img.repository || '') + ':' + (img.tag || 'latest');
+      var row = document.createElement('label');
+      row.className = 'deploy-checkbox migrate-image-item';
+      row.innerHTML =
+        '<input type="checkbox" data-migrate-image="' + escHtml(ref) + '">' +
+        '<span>' + escHtml(ref) + ' <span class="migrate-image-size">' + escHtml(img.size || '') + '</span></span>';
+      listWrap.appendChild(row);
+    }
+    body.appendChild(listWrap);
+
+    var log = document.createElement('pre');
+    log.id = 'migrate-log-content';
+    log.className = 'manage-log-body migrate-log-body';
+    log.textContent = '选择目标服务器与镜像后,点「开始迁移」。';
+    body.appendChild(log);
+
+    var actions = document.createElement('div');
+    actions.className = 'modal-actions';
+    actions.innerHTML =
+      '<button id="migrate-cancel-btn" class="btn" type="button">取消</button>' +
+      '<button id="migrate-start-btn" class="btn btn-primary" type="button">开始迁移</button>';
+    body.appendChild(actions);
+
+    openModal('迁移镜像 — 当前服务器', body);
+
+    var cancelBtn = $('migrate-cancel-btn');
+    if (cancelBtn) cancelBtn.addEventListener('click', closeModal);
+    var startBtn = $('migrate-start-btn');
+    if (startBtn) {
+      startBtn.addEventListener('click', function () {
+        var targetSel = $('migrate-target-select');
+        var targetId = targetSel ? String(targetSel.value) : '';
+        if (!targetId) { toast('请选择目标服务器', 'warn'); return; }
+        var nodes = document.querySelectorAll('input[data-migrate-image]');
+        var imagesToMigrate = [];
+        for (var k = 0; k < nodes.length; k++) {
+          if (nodes[k].checked) imagesToMigrate.push(nodes[k].getAttribute('data-migrate-image'));
+        }
+        if (imagesToMigrate.length === 0) { toast('请至少勾选一个镜像', 'warn'); return; }
+        var content = $('migrate-log-content');
+        if (content) content.textContent = '';
+        migState.active = true;
+        setMigrateBusy(true);
+        startBtn.disabled = true;
+        AppBus.invoke('migrate_images', {
+          sourceId: state.serverId,
+          targetId: targetId,
+          images: imagesToMigrate,
+          sourcePasswordPlain: null,
+          targetPasswordPlain: null
+        }).then(function () {
+          // 同步返回 null 不代表成功;结果只经 migrate-done 事件
+        }).catch(function (err) {
+          migState.active = false;
+          setMigrateBusy(false);
+          var msg = err && err.message ? err.message : String(err);
+          appendMigrateLine('—— 迁移发起失败: ' + msg + ' ——');
+        });
+      });
+    }
   }
 
   // ===== 卷列表(B 阶段追加) =====
@@ -1982,17 +2143,24 @@
     var body = document.createElement('div');
     // 查看类弹窗放大标记:openModal 据此给共用 modal-card 加 .modal-wide
     body.className = 'manage-wide-modal';
-    body.innerHTML =
-      '<div class="log-tail-bar">' +
+    var bar2 = document.createElement('div');
+    bar2.className = 'log-tail-bar';
+    bar2.innerHTML =
       '<label>显示行数:' +
       '<select id="stack-log-tail-select" class="form-input form-input-sm">' +
       '<option value="100">100</option>' +
       '<option value="500">500</option>' +
       '<option value="1000">1000</option>' +
       '<option value="0">全部</option>' +
-      '</select></label>' +
-      '</div>' +
-      '<pre id="stack-log-content" class="manage-log-body">加载中…</pre>';
+      '</select></label>';
+    // 阶段九:实时跟随开关(栈:compose logs -f)
+    bar2.appendChild(buildFollowToggle('stack', st.compose_file, 'stack-log-tail-select', 'stack-log-content'));
+    var pre2 = document.createElement('pre');
+    pre2.id = 'stack-log-content';
+    pre2.className = 'manage-log-body';
+    pre2.textContent = '加载中…';
+    body.appendChild(bar2);
+    body.appendChild(pre2);
 
     openModal('栈日志 — ' + (st.dir || st.compose_file), body);
 
@@ -2794,6 +2962,8 @@
     }
     // 阶段五:解除输出区尺寸观察(所有关闭路径统一经这里收尾)
     unobserveTermOutput();
+    // 阶段九:实时跟随日志流随模态关闭停止(关闭即停流,后端主动 close 通道)
+    stopLogFollow(true);
   }
 
   // ===== C 阶段:离开 05 页清理 =====
@@ -2804,6 +2974,143 @@
     }
     unobserveTermOutput(); // 阶段五:离开页面同样解除终端尺寸观察
     hideMonitorError();
+    stopLogFollow(true);   // 阶段九:离开页面停掉实时日志流
+  }
+
+  // ===== 阶段九:容器/栈日志实时跟随 =====
+  // - startLogFollow(kind, target, tail, contentId):开流 manage_log_stream_start
+  //   (manage-logs 事件逐行追加;事件先订阅再 invoke,防早到事件丢失)
+  // - stopLogFollow(silent):manage_log_stream_stop(后端 select 取消并主动
+  //   close 通道);模态关闭/离页统一调用;eof 事件(后端自然结束/出错)复位开关
+  // - 追加行上限 LOG_FOLLOW_MAX_LINES = 5000,超限丢最旧
+  // - 后端 payload.streamId 为后端代号(前端未知):过滤口径 = 仅处理
+  //   「当前活跃会话」的事件,旧流残余因 finishLogFollow 置空而不匹配
+  var logFollow = {
+    active: false,      // 是否有流在跟随
+    kind: null,         // 'container' | 'stack'
+    target: null,       // containerId 或 compose_file
+    contentId: null     // 输出区 pre 元素 id
+  };
+  var LOG_FOLLOW_MAX_LINES = 5000;
+
+  /** 订阅 manage-logs 事件(模块级一次;先于任何 start invoke) */
+  var followListenerBound = false;
+  function bindLogFollowListener() {
+    if (followListenerBound) return;
+    followListenerBound = true;
+    AppBus.on('manage-logs', function (event) {
+      var p = (event && event.payload) || {};
+      // 只处理当前活跃会话的事件(无活跃流 → 旧流残余/迟到事件一律忽略)
+      if (!logFollow.active) return;
+      var content = $(logFollow.contentId);
+      if (!content) return;
+      if (p.eof) {
+        // 流结束:被停止(data 为空)→ 静默复位;自然结束/出错 → 提示原因
+        var reason = p.data ? String(p.data) : '';
+        finishLogFollow();
+        if (reason) {
+          appendFollowLine(content, '—— ' + reason + ' ——');
+        }
+        return;
+      }
+      appendFollowLine(content, String(p.data || ''));
+    }).catch(function (err) {
+      if (window.console && console.warn) {
+        console.warn('[manage] manage-logs 事件监听注册失败:', err);
+      }
+    });
+  }
+
+  /** 追加一行到跟随输出区(上限裁剪 + 自动滚底:接近底部才跟随) */
+  function appendFollowLine(content, line) {
+    var nearBottom =
+      content.scrollHeight - content.scrollTop - content.clientHeight < 40;
+    content.appendChild(document.createTextNode(line + '\n'));
+    while (content.childNodes.length > LOG_FOLLOW_MAX_LINES) {
+      content.removeChild(content.firstChild);
+    }
+    if (nearBottom) content.scrollTop = content.scrollHeight;
+  }
+
+  /** 开启实时跟随(容器 or 栈);返回是否已发起 */
+  function startLogFollow(kind, target, tail, contentId) {
+    if (logFollow.active) stopLogFollow(false);
+    bindLogFollowListener();
+    logFollow.active = true;
+    logFollow.kind = kind;
+    logFollow.target = target;
+    logFollow.contentId = contentId;
+    var content = $(contentId);
+    if (content) {
+      content.appendChild(document.createTextNode('—— 实时跟随已开启 ——\n'));
+      content.scrollTop = content.scrollHeight;
+    }
+    AppBus.invoke('manage_log_stream_start', {
+      serverId: state.serverId,
+      passwordPlain: null,
+      tgt: {
+        target: kind,
+        containerId: kind === 'container' ? target : null,
+        composeFile: kind === 'stack' ? target : null,
+        tail: tail
+      }
+    }).then(function () {
+      // invoke 成功不代表已连上;数据只经事件(契约约定),无需处理返回值
+    }).catch(function (err) {
+      var msg = err && err.message ? err.message : String(err);
+      var wasActive = logFollow.active;
+      finishLogFollow();
+      var content2 = $(contentId);
+      if (content2 && wasActive) {
+        appendFollowLine(content2, '—— 实时跟随开启失败: ' + msg + ' ——');
+      }
+    });
+    return true;
+  }
+
+  /** 结束跟随的本地状态(不调后端;eof/出错路径用) */
+  function finishLogFollow() {
+    logFollow.active = false;
+    var btn = $('log-follow-btn');
+    if (btn) btn.checked = false;
+  }
+
+  /** 停流:调后端 stop + 本地状态复位(silent=true 不改输出区文案) */
+  function stopLogFollow(silent) {
+    if (!logFollow.active) return;
+    var contentId = logFollow.contentId;
+    finishLogFollow();
+    if (!silent) {
+      var content = $(contentId);
+      if (content) {
+        content.appendChild(document.createTextNode('—— 实时跟随已关闭 ——\n'));
+        content.scrollTop = content.scrollHeight;
+      }
+    }
+    AppBus.invoke('manage_log_stream_stop', {}).catch(function () {});
+  }
+
+  /** 构建日志模态顶栏的「实时跟随」开关(容器/栈共用) */
+  function buildFollowToggle(kind, target, tailSelId, contentId) {
+    var bar = document.createElement('label');
+    bar.className = 'log-follow-toggle';
+    bar.innerHTML =
+      '<input type="checkbox" id="log-follow-btn">' +
+      '<span>实时跟随(容器/栈日志)</span>';
+    var chk = bar.querySelector('#log-follow-btn');
+    if (chk) {
+      chk.addEventListener('change', function () {
+        if (chk.checked) {
+          var tail = 0;
+          var sel = $(tailSelId);
+          if (sel) tail = parseInt(sel.value, 10) || 0;
+          startLogFollow(kind, target, tail, contentId);
+        } else {
+          stopLogFollow(false);
+        }
+      });
+    }
+    return bar;
   }
 
 })();

@@ -1598,6 +1598,30 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   margin-bottom: 10px;
   font-size: 13px;
 }
+/* 阶段九:实时跟随开关(复用 checkbox 体系;margin-left:auto 推到栏尾) */
+.log-follow-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  cursor: pointer;
+  user-select: none;
+}
+.log-follow-toggle input { cursor: pointer; }
+/* 阶段十:迁移镜像模态 */
+.migrate-image-list {
+  max-height: 220px;
+  overflow: auto;
+  border: 1px solid var(--ark-line);
+  padding: 8px 12px;
+  margin-bottom: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.migrate-image-item span { font-size: 13px; }
+.migrate-image-size { color: var(--ark-paper-ink-65); font-size: 12px; margin-left: 6px; }
+.migrate-log-body { min-height: 180px; max-height: 260px; }
 .manage-log-body {
   background: var(--ark-terminal-bg);
   color: var(--ark-terminal-fg);

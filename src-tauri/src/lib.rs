@@ -6,6 +6,7 @@ pub mod docker;
 pub mod history;
 pub mod manage;
 pub mod manage_exec;
+pub mod manage_logs;
 pub mod manage_stacks;
 pub mod manage_stats;
 pub mod notify;
@@ -26,6 +27,8 @@ pub fn run() {
     .manage(commands::DeployState::default())
     .manage(manage_stats::StatsState::default())
     .manage(manage_exec::ExecState::default())
+    .manage(manage_logs::LogsState::default())
+    .manage(commands::MigrateState::default())
     .invoke_handler(tauri::generate_handler![
       commands::get_config,
       commands::save_config_cmd,
@@ -96,6 +99,10 @@ pub fn run() {
       manage_exec::manage_exec_write,
       manage_exec::manage_exec_resize,
       manage_exec::manage_exec_stop,
+      manage_logs::manage_log_stream_start,
+      manage_logs::manage_log_stream_stop,
+      commands::migrate_images,
+      commands::migrate_status,
       update::update_check,
       config::app_settings_get,
       config::app_settings_set,
