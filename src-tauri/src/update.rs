@@ -424,9 +424,231 @@ fn compare_versions(current: &str, latest: &str) -> Option<Ordering> {
     Some(Ordering::Equal)
 }
 
+// ===== 自动更新:下载安装包 + 静默安装 =====
+
+/// 下载整体超时(秒):安装包 ~8MB,慢速网络放宽到 10 分钟
+/// (检查更新仍用 15s 的 [`HTTP_TIMEOUT`],两场景节奏不同)。
+const DOWNLOAD_TIMEOUT_SECS: u64 = 600;
+
+/// `update_download` 的返回载荷(camelCase):下载完成的安装包信息,
+/// 前端据此弹「立即安装」确认框。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadedUpdate {
+    /// 安装包完整本地路径(传给 [`update_install`])
+    pub setup_path: String,
+    /// 安装包字节数(前端展示「已下载 x.x MB」)
+    pub size_bytes: u64,
+    /// 已下载到的目标版本(与请求 version 一致,回显用)
+    pub version: String,
+}
+
+/// 拼装某版本的 NSIS 安装包下载 URL(纯函数,便于单测):
+/// `https://github.com/<repo>/releases/download/v<version>/<product>_<version>_x64-setup.exe`
+/// (空格按 URL 约定编码为 %20;与 release.yml 的 NSIS 产物命名一致)。
+fn installer_download_url(repo: &str, product: &str, version: &str) -> String {
+    let v = version.trim().trim_start_matches(['v', 'V']);
+    let file_name = format!("{product}_{v}_x64-setup.exe").replace(' ', "%20");
+    format!("https://github.com/{repo}/releases/download/v{v}/{file_name}")
+}
+
+/// 下载指定版本的 NSIS 安装包到本地临时目录(流式落盘,`update_check` 确认
+/// 有新版后由前端「立即更新」调用)。
+///
+/// - 目标目录:`%TEMP%/DockerDeploy-SSH-update/<version>/setup.exe`(已存在且
+///   大小一致则跳过下载直接复用,失败重试不必重下);
+/// - 校验:以响应 `Content-Length` 为准(缺失时仅要求 >0 字节),写入字节数
+///   必须一致,防止半成品安装包被静默执行;
+/// - 只下载不安装:前端在返回后弹确认框,用户确认才调 [`update_install`]。
+#[tauri::command]
+pub async fn update_download(
+    version: String,
+    proxy: Option<String>,
+) -> Result<DownloadedUpdate, String> {
+    let version = version.trim().trim_start_matches(['v', 'V']).to_string();
+    if version.is_empty() || parse_version(&version).is_none() {
+        return Err(format!("版本号无效: \"{version}\""));
+    }
+    let url = installer_download_url("yjkz/Docker-Deploy-SSH", "DockerDeploy SSH", &version);
+
+    // 下载专用客户端:连接/读取超时防挂死,不设整体超时(大文件慢速网络)
+    let mut builder = reqwest::Client::builder()
+        .user_agent(concat!("DockerDeploy-SSH/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(15))
+        .read_timeout(Duration::from_secs(60));
+    if let Some(proxy_url) = proxy
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+    {
+        let proxy = reqwest::Proxy::all(&proxy_url)
+            .map_err(|e| format!("代理地址无效({proxy_url}): {e}"))?;
+        builder = builder.proxy(proxy);
+    }
+    let client = builder
+        .build()
+        .map_err(|e| format!("HTTP 客户端构建失败: {e}"))?;
+
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("下载安装包失败: {}", classify_http_error(&e)))?;
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err(format!(
+            "该版本({version})的安装包不存在(Release 未附 x64-setup.exe),请到 Release 页手动下载"
+        ));
+    }
+    if !status.is_success() {
+        return Err(format!(
+            "下载安装包失败(HTTP {}): {url}",
+            status.as_u16()
+        ));
+    }
+
+    let expected = response.content_length();
+    // 目标目录:%TEMP%/DockerDeploy-SSH-update/<version>/
+    let dir = std::env::temp_dir()
+        .join("DockerDeploy-SSH-update")
+        .join(&version);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建下载目录失败: {e}"))?;
+    let setup_path = dir.join("setup.exe");
+
+    // 复用:已有同名且大小与 Content-Length 一致(>0)的包 → 跳过下载
+    if let (Some(expected_size), Ok(meta)) = (expected, std::fs::metadata(&setup_path)) {
+        if meta.len() == expected_size && expected_size > 0 {
+            return Ok(DownloadedUpdate {
+                setup_path: setup_path.to_string_lossy().into_owned(),
+                size_bytes: meta.len(),
+                version,
+            });
+        }
+    }
+
+    // 流式落盘:64KB 块循环写,防整包驻留内存
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::File::create(&setup_path)
+        .await
+        .map_err(|e| format!("创建安装包文件失败 ({}): {e}", setup_path.display()))?;
+    let mut stream = response;
+    let mut written: u64 = 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(DOWNLOAD_TIMEOUT_SECS);
+    loop {
+        if std::time::Instant::now() > deadline {
+            let _ = tokio::fs::remove_file(&setup_path).await;
+            return Err(format!(
+                "下载超时({DOWNLOAD_TIMEOUT_SECS} 秒),请检查网络或改用浏览器手动下载"
+            ));
+        }
+        match tokio::time::timeout(Duration::from_secs(60), stream.chunk()).await {
+            Err(_) => {
+                let _ = tokio::fs::remove_file(&setup_path).await;
+                return Err("下载停滞超过 60 秒,已中止(可重试或改用浏览器手动下载)".to_string());
+            }
+            Ok(Err(e)) => {
+                let _ = tokio::fs::remove_file(&setup_path).await;
+                return Err(format!("下载安装包失败: {}", classify_http_error(&e)));
+            }
+            Ok(Ok(None)) => break,
+            Ok(Ok(Some(chunk))) => {
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|e| format!("写入安装包失败: {e}"))?;
+                written += chunk.len() as u64;
+            }
+        }
+    }
+    file.flush()
+        .await
+        .map_err(|e| format!("刷新安装包文件失败: {e}"))?;
+    drop(file);
+
+    // 完整性:字节数与 Content-Length 一致(声明过就严格校验),且 >0
+    if written == 0 {
+        let _ = std::fs::remove_file(&setup_path);
+        return Err("下载内容为空,已中止(网络被拦截?)".to_string());
+    }
+    if let Some(expected_size) = expected {
+        if written != expected_size {
+            let _ = std::fs::remove_file(&setup_path);
+            return Err(format!(
+                "下载不完整(收到 {written} / 应为 {expected_size} 字节),已清理,可重试"
+            ));
+        }
+    }
+
+    Ok(DownloadedUpdate {
+        setup_path: setup_path.to_string_lossy().into_owned(),
+        size_bytes: written,
+        version,
+    })
+}
+
+/// 启动已下载安装包的静默安装(NSIS `/S`)并退出当前应用
+/// (安装器接管后续:覆盖安装到原目录,完成后用户手动启动新版)。
+///
+/// 安全:路径必须位于 `%TEMP%/DockerDeploy-SSH-update/` 下且为 `setup.exe`
+/// (只接受本命令族自己下载的产物,防被诱导执行任意路径的 exe)。
+#[tauri::command]
+pub fn update_install(
+    app: tauri::AppHandle,
+    setup_path: String,
+) -> std::result::Result<(), String> {
+    let path = std::path::PathBuf::from(setup_path.trim());
+    let expected_dir = std::env::temp_dir().join("DockerDeploy-SSH-update");
+    let parent_ok = path
+        .parent()
+        .and_then(|p| p.canonicalize().ok())
+        .map(|p| p.starts_with(expected_dir.canonicalize().unwrap_or(expected_dir.clone())))
+        .unwrap_or(false);
+    if !parent_ok || path.file_name().map(|n| n != "setup.exe").unwrap_or(true) {
+        return Err(format!("拒绝执行非本应用下载的安装包: {}", path.display()));
+    }
+    if !path.is_file() {
+        return Err(format!("安装包不存在: {}", path.display()));
+    }
+
+    // NSIS 静默安装:/S(大写);经 cmd start 分离启动,安装器独立于本进程存活
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        let path_str = path.to_string_lossy().into_owned();
+        std::process::Command::new("cmd")
+            .args(["/c", "start", "", &path_str, "/S"])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW,防闪黑框
+            .spawn()
+            .map_err(|e| format!("启动安装程序失败: {e}"))?;
+        // 给安装器 500ms 拉起时间再退出本应用(避免安装器校验到旧进程文件占用)
+        let handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            handle.exit(0);
+        });
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        Err("当前平台未支持自动安装".to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_installer_download_url() {
+        // 与 release.yml 的 NSIS 产物命名一致;空格编码 %20;v 前缀容错剥离
+        assert_eq!(
+            installer_download_url("yjkz/Docker-Deploy-SSH", "DockerDeploy SSH", "5.3.0"),
+            "https://github.com/yjkz/Docker-Deploy-SSH/releases/download/v5.3.0/DockerDeploy%20SSH_5.3.0_x64-setup.exe"
+        );
+        assert_eq!(
+            installer_download_url("yjkz/Docker-Deploy-SSH", "DockerDeploy SSH", "v5.3.0"),
+            installer_download_url("yjkz/Docker-Deploy-SSH", "DockerDeploy SSH", "5.3.0")
+        );
+    }
 
     #[test]
     fn test_compare_versions_equal() {

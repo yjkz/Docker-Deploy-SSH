@@ -332,5 +332,19 @@
       schemeBtn.addEventListener('click', window.toggleScheme);
     }
     window.refreshNav();
+
+    // dock 左下角版本号:从 tauri.conf 的 package version 读取(core:default 含
+    // app:get-version 权限),替代曾硬编码的 v0.1.0;读取失败保留「v…」占位
+    var verEl = document.getElementById('dock-version');
+    if (verEl) {
+      try {
+        var appApi = (window.__TAURI__ || {}).app;
+        if (appApi && typeof appApi.getVersion === 'function') {
+          appApi.getVersion().then(function (v) {
+            if (v) verEl.textContent = 'v' + String(v);
+          }).catch(function () { /* 保留占位 */ });
+        }
+      } catch (e) { /* 保留占位 */ }
+    }
   });
 })();

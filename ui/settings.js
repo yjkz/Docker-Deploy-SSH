@@ -300,7 +300,15 @@
     if (notes.length > NOTES_SHOW_MAX) notes = notes.slice(0, NOTES_SHOW_MAX) + '…';
     if (notes) area.appendChild(el('div', 'set-notes', notes));
 
-    var btn = el('button', 'btn btn-primary', '前往下载');
+    // 「立即更新」:下载 NSIS 安装包(自动更新),完成后二次确认启动静默安装
+    var autoBtn = el('button', 'btn btn-primary', '立即更新(自动下载并安装)');
+    autoBtn.type = 'button';
+    autoBtn.id = 'settings-autoupdate-btn';
+    autoBtn.addEventListener('click', function () { onAutoUpdate(info); });
+    area.appendChild(autoBtn);
+
+    // 「前往下载」保留:手动浏览器下载兜底(自动下载失败/想看 Release 页)
+    var btn = el('button', 'btn', '前往下载');
     btn.type = 'button';
     btn.id = 'settings-download-btn';
     btn.addEventListener('click', function () {
@@ -308,6 +316,71 @@
       window.AppBus.invoke('open_external', { url: info.url }).catch(function (e) { toast('打开浏览器失败: ' + (e && e.message ? e.message : e), 'fail'); });
     });
     area.appendChild(btn);
+  }
+
+  // ===== 自动更新:下载安装包 → 确认 → 静默安装并退出 =====
+
+  var updating = false;
+
+  /** 第一步:下载(按钮转圈 + 行内进度文案);完成后进入确认态 */
+  function onAutoUpdate(info) {
+    if (updating) return;
+    updating = true;
+    var btn = document.getElementById('settings-autoupdate-btn');
+    if (btn) { btn.disabled = true; btn.textContent = '正在下载 v' + info.latest + '…'; }
+    showUpdateMessage('info', '正在下载 v' + info.latest + ' 安装包(约 8MB,慢速网络可能需要几分钟)…');
+
+    window.AppBus.invoke('update_download', { version: String(info.latest || ''), proxy: proxyArg() })
+      .then(function (dl) {
+        if (!isModalVisible()) { updating = false; return; }
+        updating = false;
+        var d = dl || {};
+        var mb = (Number(d.sizeBytes) || 0) / 1024 / 1024;
+        showUpdateMessage('ok', '下载完成(' + mb.toFixed(1) + ' MB),确认后将退出应用并自动安装 v' + (d.version || info.latest));
+        renderInstallConfirm(info, d);
+      })
+      .catch(function (err) {
+        updating = false;
+        if (!isModalVisible()) return;
+        if (btn) { btn.disabled = false; btn.textContent = '立即更新(自动下载并安装)'; }
+        showUpdateMessage('fail', '下载失败:' + (errText(err) || '未知错误'));
+        // 下载失败兜底:提供「前往下载」入口(整包下载交给浏览器)
+      });
+  }
+
+  /** 第二步:下载完成后,行内二次确认 → 启动静默安装并退出应用 */
+  function renderInstallConfirm(info, downloaded) {
+    var area = updateArea();
+    if (!area) return;
+    // 保留「发现新版本」行与 notes,替换按钮区为确认/取消
+    var oldBtns = area.querySelectorAll('button');
+    Array.prototype.forEach.call(oldBtns, function (b) { b.remove(); });
+
+    var confirm = el('button', 'btn btn-primary', '立即安装并重启应用');
+    confirm.type = 'button';
+    confirm.id = 'settings-install-btn';
+    confirm.addEventListener('click', function () {
+      confirm.disabled = true;
+      showUpdateMessage('info', '正在启动安装程序,应用即将退出…');
+      window.AppBus.invoke('update_install', { setupPath: String(downloaded.setupPath || '') })
+        .then(function () {
+          // 后端 500ms 后 exit(0);此处文案已展示,无需动作
+        })
+        .catch(function (err) {
+          showUpdateMessage('fail', '启动安装失败:' + (errText(err) || '未知错误') + '(可手动运行:' + (downloaded.setupPath || '') + ')');
+          if (confirm) confirm.disabled = false;
+        });
+    });
+    area.appendChild(confirm);
+
+    var cancel = el('button', 'btn', '暂不安装(保留安装包)');
+    cancel.type = 'button';
+    cancel.id = 'settings-install-cancel-btn';
+    cancel.addEventListener('click', function () {
+      showUpdateMessage('info', '已保留安装包:' + (downloaded.setupPath || '') + ',可随时手动运行');
+      renderUpdateAvailable(info); // 恢复按钮区(重新点「立即更新」会命中复用逻辑,秒回确认态)
+    });
+    area.appendChild(cancel);
   }
 
   // ===== 动作:保存 / 检查更新 / 测试连接 =====
@@ -425,6 +498,7 @@
     // 会话收尾:复位进行中的防重标志,重开后的新模态可立即操作
     st.saving = false;
     st.checking = false;
+    updating = false; // 自动更新下载中断态复位(后端下载任务完成后回调因模态隐藏被丢弃)
   }
 
   // ===== 初始化(入口按钮 / 模态三通道关闭)=====

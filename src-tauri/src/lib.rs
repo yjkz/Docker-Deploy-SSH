@@ -104,6 +104,8 @@ pub fn run() {
       commands::migrate_images,
       commands::migrate_status,
       update::update_check,
+      update::update_download,
+      update::update_install,
       config::app_settings_get,
       config::app_settings_set,
       update::open_external,
