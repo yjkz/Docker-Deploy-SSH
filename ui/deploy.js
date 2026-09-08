@@ -1533,6 +1533,16 @@
     if (modal) modal.classList.add('hidden');
   }
 
+  /**
+   * 关闭批量模态的统一入口(关闭钮/遮罩/Esc 三处共用):
+   * 阶段七曾引用未定义的 closeBatchModalSafe → ReferenceError 在 bindDeployEvents
+   * 内抛出并中断 init,pagechange 监听(在 bindDeployEvents 之后注册)永不建立,
+   * loadPageData 永不执行 —— 04 页三个下拉因此全空。统一收敛到本函数。
+   */
+  function closeBatchModalSafe() {
+    closeBatchModal();
+  }
+
   function onBatchStart() {
     var nodes = document.querySelectorAll('#deploy-batch-modal-body input[data-batch-server]');
     var ids = [];
