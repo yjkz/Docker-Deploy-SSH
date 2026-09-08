@@ -530,6 +530,9 @@
   function refreshControls() {
     var start = document.getElementById('deploy-start-btn');
     var cancel = document.getElementById('deploy-cancel-btn');
+    // 批量活跃标志(先于所有使用点计算;此前声明在使用点之后,依赖 var 提升
+    // 读到 undefined,批量期间「开始部署」文案与批量入口禁用全部失效)
+    var batchActive = !!(st.batch && st.batch.active);
 
     if (start) {
       if (batchActive) {
@@ -552,8 +555,6 @@
     // 批量部署入口:批量/部署/预检期间禁用
     var batchBtn = document.getElementById('deploy-batch-btn');
     if (batchBtn) batchBtn.disabled = batchActive || st.deploying || st.checking;
-
-    var batchActive = !!(st.batch && st.batch.active);
 
     // 部署 / 预检 / 批量进行期间锁定选择区,避免中途改动造成误解
     ['deploy-image', 'deploy-server', 'deploy-project', 'deploy-date-tag',
