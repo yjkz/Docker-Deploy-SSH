@@ -444,11 +444,13 @@ pub struct DownloadedUpdate {
 }
 
 /// 拼装某版本的 NSIS 安装包下载 URL(纯函数,便于单测):
-/// `https://github.com/<repo>/releases/download/v<version>/<product>_<version>_x64-setup.exe`
-/// (空格按 URL 约定编码为 %20;与 release.yml 的 NSIS 产物命名一致)。
+/// `https://github.com/<repo>/releases/download/v<version>/<product>_<version>_x64-setup.exe`。
+/// productName 里的空格在 NSIS 产物名中被替换为 `.`(Tauri 打包行为,实测
+/// 「DockerDeploy SSH」→「DockerDeploy.SSH」),而非编码为 %20——GitHub Release
+/// 资产名禁止空格,旧逻辑拼 %20 的 URL 实际 404。
 fn installer_download_url(repo: &str, product: &str, version: &str) -> String {
     let v = version.trim().trim_start_matches(['v', 'V']);
-    let file_name = format!("{product}_{v}_x64-setup.exe").replace(' ', "%20");
+    let file_name = format!("{product}_{v}_x64-setup.exe").replace(' ', ".");
     format!("https://github.com/{repo}/releases/download/v{v}/{file_name}")
 }
 
@@ -639,14 +641,20 @@ mod tests {
 
     #[test]
     fn test_installer_download_url() {
-        // 与 release.yml 的 NSIS 产物命名一致;空格编码 %20;v 前缀容错剥离
+        // 与 NSIS 实际产物命名一致:productName 空格 → `.`(GitHub 资产名禁空格);
+        // v 前缀容错剥离
         assert_eq!(
             installer_download_url("yjkz/Docker-Deploy-SSH", "DockerDeploy SSH", "5.3.0"),
-            "https://github.com/yjkz/Docker-Deploy-SSH/releases/download/v5.3.0/DockerDeploy%20SSH_5.3.0_x64-setup.exe"
+            "https://github.com/yjkz/Docker-Deploy-SSH/releases/download/v5.3.0/DockerDeploy.SSH_5.3.0_x64-setup.exe"
         );
         assert_eq!(
             installer_download_url("yjkz/Docker-Deploy-SSH", "DockerDeploy SSH", "v5.3.0"),
             installer_download_url("yjkz/Docker-Deploy-SSH", "DockerDeploy SSH", "5.3.0")
+        );
+        // 无空格的 productName 不受影响
+        assert_eq!(
+            installer_download_url("yjkz/Docker-Deploy-SSH", "MyApp", "1.2.3"),
+            "https://github.com/yjkz/Docker-Deploy-SSH/releases/download/v1.2.3/MyApp_1.2.3_x64-setup.exe"
         );
     }
 
