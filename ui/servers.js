@@ -1994,8 +1994,25 @@
         if (e.target === overlay) closeModal();
       });
     }
+
+    // 清理分析模态:关闭按钮 / 遮罩点击 / Esc(与 servers-modal 同一套)
+    var cleanupClose = document.getElementById('cleanup-modal-close');
+    if (cleanupClose) {
+      cleanupClose.addEventListener('click', closeCleanupModal);
+    }
+    var cleanupOverlay = document.getElementById('cleanup-modal');
+    if (cleanupOverlay) {
+      cleanupOverlay.addEventListener('click', function (e) {
+        if (e.target === cleanupOverlay) closeCleanupModal();
+      });
+    }
     document.addEventListener('keydown', function (e) {
-      if (e.key === 'Escape') closeModal();
+      if (e.key === 'Escape') {
+        closeModal();
+        if (cleanupModal() && !cleanupModal().classList.contains('hidden')) {
+          closeCleanupModal();
+        }
+      }
     });
   }
 
