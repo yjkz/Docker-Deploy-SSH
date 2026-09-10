@@ -346,6 +346,10 @@ pub fn import_compose(source_path: String, name: String) -> Result<ProjectConfig
         notify_webhook: None,
         source_compose_path: Some(source.to_string_lossy().to_string()),
         source_hash: source_content_hash(&source).ok(),
+        // 项目级部署目录留空 = 沿用服务器目录(保持导入后即可部署的旧行为);
+        // 需要多项目分目录时在项目表单里填一次
+        remote_dir: None,
+        default_server_id: None,
     };
     let mut cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
     cfg.projects.push(project.clone());
@@ -2189,6 +2193,8 @@ async fn run_deploy_steps(
     let project = find_project(&cfg, &req.project_id)?.clone();
     record.server_name = server.name.clone();
     record.project_name = project.name.clone();
+    record.server_id = Some(server.id.clone());
+    record.project_id = Some(project.id.clone());
     let password = resolve_password(
         &server.auth.auth_type,
         req.password_plain.as_deref(),
@@ -2417,7 +2423,7 @@ async fn run_deploy_steps(
         sync_files(app, &mut client, &server, &project).await?;
         emit_log(app, "项目文件同步完成");
         // 部署前钩子(归入步骤 4:装载前执行,旧容器仍在运行;失败即中止部署)
-        run_hook(app, &mut client, &project, HookKind::Pre, &server.remote_dir).await?;
+        run_hook(app, &mut client, &project, HookKind::Pre, &effective_remote_dir(&server, &project)).await?;
         if checkpoint {
             checkpoint_save(&key, MODE_SINGLE, 5, &server, &project, artifacts_value(&art));
         }
@@ -2643,7 +2649,7 @@ async fn sync_files(
         } else {
             mapping.remote.clone()
         };
-        let full_remote = remote_join(&server.remote_dir, &remote_rel);
+        let full_remote = remote_join(&effective_remote_dir(server, project), &remote_rel);
         if mapping.is_dir {
             emit_log(app, &format!("同步目录: {} -> {}", mapping.local, full_remote));
             client.sftp_upload_dir(&local, &full_remote, &|_, _| {}).await?;
@@ -2719,7 +2725,7 @@ fn single_compose_target(
     let local = PathBuf::from(&project.compose_file);
     if local.is_file() {
         return Ok(SingleComposeTarget {
-            remote_file: remote_compose_path(&server.remote_dir),
+            remote_file: remote_compose_path(&effective_remote_dir(server, project)),
             override_names: compose_override_names(&project.compose_file),
         });
     }
@@ -2808,14 +2814,14 @@ async fn server_deploy(
     // 5.3 启动服务:这里只使用已解析的远端 compose 路径
     let up_cmd = format!(
         "cd {} && docker compose -f {} up -d",
-        shell_single_quote(&server.remote_dir),
+        shell_single_quote(&effective_remote_dir(server, project)),
         shell_single_quote(remote_compose),
     );
     emit_log(
         app,
         &format!(
             "启动服务: cd {} && docker compose -f {} up -d",
-            server.remote_dir, remote_compose
+            effective_remote_dir(server, project), remote_compose
         ),
     );
     exec_forwarded(app, client, &up_cmd, 600).await?;
@@ -2825,14 +2831,14 @@ async fn server_deploy(
         app,
         client,
         project,
-        &server.remote_dir,
+        &effective_remote_dir(server, project),
         remote_compose,
         override_names,
     )
     .await?;
 
     // 5.5 部署后钩子(健康检查通过后执行;失败仅告警,不影响部署结果)
-    run_hook(app, client, project, HookKind::Post, &server.remote_dir).await?;
+    run_hook(app, client, project, HookKind::Post, &effective_remote_dir(server, project)).await?;
 
     // 5.6 清理远端 tar(尽力而为,失败不影响部署结果;未装载时无 tar 可清理)
     if let Some(tar_name) = tar_name {
@@ -3295,6 +3301,8 @@ async fn run_deploy_stack_steps(
     let project = find_project(&cfg, &req.project_id)?.clone();
     record.server_name = server.name.clone();
     record.project_name = project.name.clone();
+    record.server_id = Some(server.id.clone());
+    record.project_id = Some(project.id.clone());
     let password = resolve_password(
         &server.auth.auth_type,
         req.password_plain.as_deref(),
@@ -3520,7 +3528,7 @@ async fn run_deploy_stack_steps(
         }
         None => chrono::Local::now().format("%Y%m%d-%H%M%S").to_string(),
     };
-    let release_dir = releases_dir(&server.remote_dir, &ts);
+    let release_dir = releases_dir(&effective_remote_dir(&server, &project), &ts);
 
     if resume_step > 3 {
         // 断点续传:上次已完成上传 → 仅建连(后续步骤复用连接)
@@ -3572,7 +3580,7 @@ async fn run_deploy_stack_steps(
         sync_files(app, &mut client, &server, &project).await?;
         emit_log(app, "上传完成");
         // 部署前钩子(归入步骤 3:装载/拉取前执行,旧容器仍在运行;失败即中止部署)
-        run_hook(app, &mut client, &project, HookKind::Pre, &server.remote_dir).await?;
+        run_hook(app, &mut client, &project, HookKind::Pre, &effective_remote_dir(&server, &project)).await?;
         if checkpoint {
             checkpoint_save(&key, MODE_STACK, 4, &server, &project, artifacts_value(&art));
         }
@@ -3638,9 +3646,9 @@ async fn run_deploy_stack_steps(
         if pull_names.is_empty() {
             emit_log(app, "无需要服务器拉取的服务,跳过拉取");
         } else {
-            let remote_compose = remote_compose_path(&server.remote_dir);
+            let remote_compose = remote_compose_path(&effective_remote_dir(&server, &project));
             let pull_cmd =
-                compose_pull_cmd(&server.remote_dir, &remote_compose, &override_names, &pull_names);
+                compose_pull_cmd(&effective_remote_dir(&server, &project), &remote_compose, &override_names, &pull_names);
             emit_log(app, &format!("拉取远端镜像: {}", pull_cmd));
             // 远端输出末尾并入错误信息:私有仓库认证失败(401/Unauthorized/denied)
             // 时由 augment_pull_error 追加 docker login 提示
@@ -3671,8 +3679,8 @@ async fn run_deploy_stack_steps(
     // ---- 步骤 6:启动 ----
     emit_progress(app, 6, 6, "启动");
     ensure_not_cancelled(app)?;
-    let remote_compose = remote_compose_path(&server.remote_dir);
-    let up_cmd = compose_up_cmd(&server.remote_dir, &remote_compose, &override_names);
+    let remote_compose = remote_compose_path(&effective_remote_dir(&server, &project));
+    let up_cmd = compose_up_cmd(&effective_remote_dir(&server, &project), &remote_compose, &override_names);
     emit_log(app, &format!("启动服务: {}", up_cmd));
     exec_forwarded(app, &mut client, &up_cmd, STACK_COMPOSE_TIMEOUT_SECS).await?;
 
@@ -3682,14 +3690,21 @@ async fn run_deploy_stack_steps(
         app,
         &mut client,
         &project,
-        &server.remote_dir,
+        &effective_remote_dir(&server, &project),
         &remote_compose,
         &override_names,
     )
     .await?;
 
     // 部署后钩子(健康检查通过后执行;失败仅告警,不影响部署结果)
-    run_hook(app, &mut client, &project, HookKind::Post, &server.remote_dir).await?;
+    run_hook(
+        app,
+        &mut client,
+        &project,
+        HookKind::Post,
+        &effective_remote_dir(&server, &project),
+    )
+    .await?;
 
     // ---- 收尾:向发布目录写入回滚资料(manifest.json + compose 副本)----
     // 尽力而为:失败仅告警(缺 manifest/副本时回滚命令会优雅降级),不推翻
@@ -3700,7 +3715,7 @@ async fn run_deploy_stack_steps(
 
     // ---- 清理旧 releases(仅留最新 5 个,尽力而为,失败仅告警)----
     ensure_not_cancelled(app)?;
-    let cleanup_cmd = cleanup_releases_cmd(&server.remote_dir);
+    let cleanup_cmd = cleanup_releases_cmd(&effective_remote_dir(&server, &project));
     if let Err(e) = exec_forwarded(app, &mut client, &cleanup_cmd, SSH_EXEC_TIMEOUT_SECS).await {
         emit_log(app, &format!("警告:清理旧 releases 目录失败: {}", e));
     }
@@ -3892,18 +3907,18 @@ async fn upload_compose_files(
         &format!(
             "上传 compose 文件: {} -> {}",
             project.compose_file,
-            remote_join(&server.remote_dir, compose_name)
+            remote_join(&effective_remote_dir(server, project), compose_name)
         ),
     );
     // compose 副本 / .env / override 内容可变且远端同名,不做续传(全新写覆盖)
     client
-        .sftp_upload(&compose_local, &server.remote_dir, compose_name, false, &|_, _| {})
+        .sftp_upload(&compose_local, &effective_remote_dir(server, project), compose_name, false, &|_, _| {})
         .await?;
     if let Some(env_path) = compose_local.parent().map(|p| p.join(".env")) {
         if env_path.is_file() {
             emit_log(app, "上传 compose 同目录 .env 文件");
             client
-                .sftp_upload(&env_path, &server.remote_dir, ".env", false, &|_, _| {})
+                .sftp_upload(&env_path, &effective_remote_dir(server, project), ".env", false, &|_, _| {})
                 .await?;
         }
     }
@@ -3916,11 +3931,11 @@ async fn upload_compose_files(
             &format!(
                 "上传 override 文件: {} -> {}",
                 ov_path.display(),
-                remote_join(&server.remote_dir, &name)
+                remote_join(&effective_remote_dir(server, project), &name)
             ),
         );
         client
-            .sftp_upload(&ov_path, &server.remote_dir, &name, false, &|_, _| {})
+            .sftp_upload(&ov_path, &effective_remote_dir(server, project), &name, false, &|_, _| {})
             .await?;
     }
     Ok(())
@@ -4262,7 +4277,7 @@ pub async fn preview_stack_changes(
         SSH_EXEC_TIMEOUT_SECS,
         "查询远端容器超时",
         "请检查服务器网络后重试",
-        exec_collect(&mut client, &compose_containers_cmd(&server.remote_dir)),
+        exec_collect(&mut client, &compose_containers_cmd(&effective_remote_dir(&server, &project))),
     )
     .await?;
     if code != 0 {
@@ -4609,8 +4624,8 @@ pub async fn rollback_list_releases(
 ) -> Result<Vec<ReleaseBrief>, String> {
     let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
     let server = find_server(&cfg, &server_id)?.clone();
-    // 校验项目存在(前端按项目发起回滚;remote_dir 取自服务器配置)
-    find_project(&cfg, &project_id)?;
+    // 项目存在性校验 + 取其项目级部署目录(第四批;未配置则回落服务器目录)
+    let project = find_project(&cfg, &project_id)?.clone();
     let password = resolve_password(
         &server.auth.auth_type,
         password_plain.as_deref(),
@@ -4625,7 +4640,7 @@ pub async fn rollback_list_releases(
     )
     .await?;
 
-    let releases_root = remote_join(&server.remote_dir, "releases");
+    let releases_root = remote_join(&effective_remote_dir(&server, &project), "releases");
     let (code, out) = with_timeout(
         SSH_EXEC_TIMEOUT_SECS,
         "查询发布列表超时",
@@ -4776,6 +4791,8 @@ async fn rollback_execute_stack_inner(
     )?;
     let key_pass = resolve_key_passphrase(&server)?;
     let mut record = DeployRecord::new_skeleton(MODE_ROLLBACK, &server.name, &project.name, Vec::new());
+    record.server_id = Some(server.id.clone());
+    record.project_id = Some(project.id.clone());
 
     emit_log(
         app,
@@ -4793,7 +4810,7 @@ async fn rollback_execute_stack_inner(
     )
     .await?;
 
-    let release_dir = releases_dir(&server.remote_dir, release_ts);
+    let release_dir = releases_dir(&effective_remote_dir(&server, &project), release_ts);
 
     // ---- 校验发布目录存在 ----
     ensure_not_cancelled(app)?;
@@ -4893,7 +4910,7 @@ async fn rollback_execute_stack_inner(
 
     // ---- 恢复 compose 副本(发布目录归档了本次部署使用的 compose 文件)----
     ensure_not_cancelled(app)?;
-    let remote_compose = remote_compose_path(&server.remote_dir);
+    let remote_compose = remote_compose_path(&effective_remote_dir(&server, &project));
     if has_compose_copy {
         let cp_cmd = format!(
             "cp {} {}",
@@ -4922,7 +4939,7 @@ async fn rollback_execute_stack_inner(
     // override 上传到远端根目录,回滚按文件名直接引用,保证 -f 文件链与
     // 部署时 pull/up 一致(override-only 服务不逃逸)
     let override_names = compose_override_names(&project.compose_file);
-    let up_cmd = compose_up_cmd(&server.remote_dir, &remote_compose, &override_names);
+    let up_cmd = compose_up_cmd(&effective_remote_dir(&server, &project), &remote_compose, &override_names);
     emit_log(app, &format!("启动服务: {}", up_cmd));
     exec_forwarded(app, &mut client, &up_cmd, STACK_COMPOSE_TIMEOUT_SECS).await?;
 
@@ -4991,6 +5008,8 @@ async fn rollback_execute_single_inner(
         &project.name,
         vec![target_ref.to_string()],
     );
+    record.server_id = Some(server.id.clone());
+    record.project_id = Some(project.id.clone());
 
     let source = format!("{}:{}", repository, date_tag);
     emit_log(
@@ -5026,7 +5045,7 @@ async fn rollback_execute_single_inner(
     // 导入项目:部署时上传到远端根目录的副本;旧版手工项目:compose_file 即远端路径
     let (compose_path, overrides) = if Path::new(&project.compose_file).is_file() {
         (
-            remote_compose_path(&server.remote_dir),
+            remote_compose_path(&effective_remote_dir(&server, &project)),
             compose_override_names(&project.compose_file),
         )
     } else if is_windows_absolute_path(&project.compose_file) {
@@ -5060,7 +5079,7 @@ async fn rollback_execute_single_inner(
 
     // ---- compose up -d ----
     ensure_not_cancelled(app)?;
-    let up_cmd = compose_up_cmd(&server.remote_dir, &compose_path, &overrides);
+    let up_cmd = compose_up_cmd(&effective_remote_dir(&server, &project), &compose_path, &overrides);
     emit_log(app, &format!("启动服务: {}", up_cmd));
     exec_forwarded(app, &mut client, &up_cmd, STACK_COMPOSE_TIMEOUT_SECS).await?;
 
@@ -6104,6 +6123,23 @@ pub fn retrust_host_key(server_id: String) -> Result<(), String> {
         .ok_or_else(|| format!("未找到 ID 为「{}」的服务器配置", server_id))?;
     server.host_key_sha256 = None;
     save_config(&cfg).map_err(|e| format!("保存配置失败: {}", e))
+}
+
+/// 该项目实际使用的远程部署目录(第四批,纯函数便于单测)。
+///
+/// 优先级:项目级 `ProjectConfig.remote_dir`(非空)→ 服务器 `ServerConfig.remote_dir`。
+/// 项目未配置时完全沿用旧行为(服务器级目录),因此旧配置的部署路径不变。
+///
+/// 背景:`ServerConfig.remote_dir` 是服务器级单一目录,同服务器多项目会共用
+/// 同一部署目录与 `docker-compose.yml` —— 项目级目录让各项目互不干扰。
+pub fn effective_remote_dir(server: &ServerConfig, project: &ProjectConfig) -> String {
+    project
+        .remote_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| server.remote_dir.clone())
 }
 
 /// 拼接远端路径:`base` 去尾部 `/` 后接 `/` + `rel`。
@@ -7674,6 +7710,107 @@ services:
     }
 
     #[test]
+    fn test_effective_remote_dir_fallback_semantics() {
+        // 第四批:项目级目录优先;未配置(旧配置)必须完全回落到服务器目录
+        let server = ServerConfig {
+            id: "s1".into(),
+            name: "美国".into(),
+            host: "1.2.3.4".into(),
+            port: 22,
+            username: "root".into(),
+            auth: AuthConfig {
+                auth_type: crate::config::AuthType::Password,
+                key_path: None,
+                password_enc: None,
+                key_pass_enc: None,
+            },
+            remote_dir: "/home/henghao".into(),
+            host_key_sha256: None,
+        };
+        let mk_project = |dir: Option<&str>| ProjectConfig {
+            id: "p1".into(),
+            name: "官网".into(),
+            image_filter: String::new(),
+            compose_file: "c.yml".into(),
+            file_mappings: Vec::new(),
+            service_overrides: Vec::new(),
+            health_wait_secs: 0,
+            pre_deploy_cmd: None,
+            post_deploy_cmd: None,
+            notify_webhook: None,
+            source_compose_path: None,
+            source_hash: None,
+            remote_dir: dir.map(String::from),
+            default_server_id: None,
+        };
+        // 未配置 → 服务器目录(旧配置行为不变)
+        assert_eq!(effective_remote_dir(&server, &mk_project(None)), "/home/henghao");
+        // 空串/纯空白 → 同样回落(视为未配置)
+        assert_eq!(effective_remote_dir(&server, &mk_project(Some(""))), "/home/henghao");
+        assert_eq!(effective_remote_dir(&server, &mk_project(Some("   "))), "/home/henghao");
+        // 配置了 → 用项目自己的目录
+        assert_eq!(
+            effective_remote_dir(&server, &mk_project(Some("/home/henghao/site"))),
+            "/home/henghao/site"
+        );
+        // 前后空白被裁剪
+        assert_eq!(
+            effective_remote_dir(&server, &mk_project(Some("  /opt/app  "))),
+            "/opt/app"
+        );
+    }
+
+    #[test]
+    fn test_project_config_legacy_json_defaults() {
+        // 旧 projects.json(无 remote_dir / default_server_id)必须能反序列化,
+        // 且两个新字段为 None(行为与历史一致)
+        let legacy = r#"{
+            "id": "p1", "name": "官网", "image_filter": "",
+            "compose_file": "E:/cfg/stacks/u1/docker-compose.yml",
+            "file_mappings": [],
+            "service_overrides": [],
+            "health_wait_secs": 0,
+            "pre_deploy_cmd": null, "post_deploy_cmd": null, "notify_webhook": null
+        }"#;
+        let p: ProjectConfig = serde_json::from_str(legacy).unwrap();
+        assert_eq!(p.remote_dir, None);
+        assert_eq!(p.default_server_id, None);
+        assert_eq!(p.source_compose_path, None);
+        // 回落语义:旧配置取服务器目录
+        let server = ServerConfig {
+            id: "s1".into(),
+            name: "s".into(),
+            host: "h".into(),
+            port: 22,
+            username: "u".into(),
+            auth: AuthConfig {
+                auth_type: crate::config::AuthType::Password,
+                key_path: None,
+                password_enc: None,
+                key_pass_enc: None,
+            },
+            remote_dir: "/opt/legacy".into(),
+            host_key_sha256: None,
+        };
+        assert_eq!(effective_remote_dir(&server, &p), "/opt/legacy");
+    }
+
+    #[test]
+    fn test_deploy_record_legacy_json_defaults() {
+        // 旧 deployments.json(无 server_id/project_id)能反序列化,字段为 None
+        let legacy = r#"{
+            "ts": "2026-09-01 10:00:00", "mode": "stack",
+            "server_name": "美国", "project_name": "官网",
+            "images": ["a:1"], "success": true,
+            "message": "部署完成", "duration_secs": 42
+        }"#;
+        let r: DeployRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(r.server_id, None);
+        assert_eq!(r.project_id, None);
+        assert_eq!(r.release_dir, None);
+    }
+
+    #[test]
     fn test_local_basename() {
         // Windows 与 POSIX 分隔符都支持,尾部斜杠去掉
         assert_eq!(local_basename("E:\\apps\\web"), Some("web".to_string()));
@@ -7786,6 +7923,8 @@ services:
             notify_webhook: None,
             source_compose_path: path.map(String::from),
             source_hash: hash.map(String::from),
+            remote_dir: None,
+            default_server_id: None,
         };
         // 未绑定源 → unbound;手工项目(远端相对路径)与导入项目都算 unbound,
         // 但 imported 不同,前端据此决定是否提示补绑
@@ -7851,6 +7990,8 @@ services:
             message: "部署完成".into(),
             duration_secs: 42,
             release_dir: None,
+            server_id: None,
+            project_id: None,
         };
         let (title, body) = deploy_notify_text(true, "部署完成", &Some(record));
         assert_eq!(title, "部署成功");
@@ -7872,6 +8013,8 @@ services:
             message: CANCELLED_MSG.into(),
             duration_secs: 3,
             release_dir: None,
+            server_id: None,
+            project_id: None,
         };
         // 取消(固定文案)→ cancel 标题
         let (title, body) = deploy_notify_text(false, CANCELLED_MSG, &Some(record));
@@ -7925,6 +8068,8 @@ services:
             message: "回滚到 20260905120000".into(),
             duration_secs: 7,
             release_dir: None,
+            server_id: None,
+            project_id: None,
         };
         let message = record.message.clone();
         let (title, body) = rollback_notify_text(true, &message, &Some(record));
@@ -9018,6 +9163,8 @@ services:
             message: "部署完成".into(),
             duration_secs: 42,
             release_dir: None,
+            server_id: None,
+            project_id: None,
         };
         let v: serde_json::Value = serde_json::from_str(&webhook_payload(&record)).unwrap();
         assert_eq!(v["event"], "deploy");

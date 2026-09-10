@@ -33,7 +33,8 @@
  * - get_history() -> DeployRecord[](倒序 = 最新在前)
  *     DeployRecord = { ts, mode: "single"|"stack"|"rollback", server_name,
  *                      project_name, images: string[], success, message,
- *                      duration_secs }
+ *                      duration_secs, release_dir,
+ *                      server_id, project_id }  // 后两者第四批新增(旧记录为空,回滚按名回退)
  * 一键回滚(复用 deploy-log / deploy-done 事件体系;成功落 mode="rollback" 历史):
  * - rollback_list_releases({ serverId, projectId })
  *     -> ReleaseBrief[] { ts, files, services, hasManifest, hasComposeCopy }
@@ -104,6 +105,14 @@
   var HISTORY_IMAGES_MAX = 64;
   /** 日期标签形态(release ts / 打标签生成的 tag,形如 20260905-101010) */
   var DATE_TAG_RE = /^\d{8}-\d{6}$/;
+
+  /**
+   * 部署页选择记忆(第四批):记住上次选的服务器与项目,重启后恢复。
+   * 与 manage.js 的 dd_manage_autorefresh 同一套做法(模块级 key + 启动
+   * restore + 变更即 save + try/catch 静默降级)。
+   */
+  var PREF_SERVER_KEY = 'dd_deploy_server';
+  var PREF_PROJECT_KEY = 'dd_deploy_project';
 
   /**
    * 两组进度节点(与后端 deploy-progress 步骤一一对应):
@@ -407,9 +416,12 @@
    * 无任何内容」。改为普通 option(空值)+ 未选中时置于选择态,弹层即可
    * 正常按选项数撑开并显示文字;空值在提交校验处已被拦截(「请先选择…」)。
    */
-  function fillSelect(select, placeholderText, options) {
+  function fillSelect(select, placeholderText, options, restoreValue) {
     if (!select) return;
-    var prev = select.value; // 重建后尽量恢复
+    // 恢复优先级:显式传入的 restoreValue(如 localStorage 记忆)→ 当前值
+    var prev = (restoreValue !== undefined && restoreValue !== null && restoreValue !== '')
+      ? restoreValue
+      : select.value;
     select.textContent = '';
 
     var ph = document.createElement('option');
@@ -435,6 +447,45 @@
     if (!restored) select.value = '';
   }
 
+  /** 读记忆的选择(异常/不可用静默返回空串 = 不恢复) */
+  function readPref(key) {
+    try {
+      var v = window.localStorage.getItem(key);
+      return (typeof v === 'string') ? v : '';
+    } catch (e) {
+      return '';
+    }
+  }
+
+  /** 写记忆的选择(静默降级:隐私模式等场景不影响正常使用) */
+  function savePref(key, value) {
+    try {
+      if (value) window.localStorage.setItem(key, String(value));
+      else window.localStorage.removeItem(key);
+    } catch (e) { /* 忽略 */ }
+  }
+
+  /**
+   * 按「是否属于当前所选服务器」给项目排序并打标注(第四批,不过滤)。
+   *
+   * 需求背景:一台服务器常有多个项目,项目下拉此前是全局平铺、也不联动,
+   * 每次切换都得在服务器与项目两个下拉里各选一遍。这里把属于当前服务器的
+   * 项目排到最前并加「本机」标注,其余项目仍可选(保留跨服务器部署能力)。
+   */
+  function projectOptionsFor(serverId) {
+    var projects = (st.cfg && Array.isArray(st.cfg.projects)) ? st.cfg.projects : [];
+    var own = [];
+    var others = [];
+    projects.forEach(function (p) {
+      var isOwn = serverId && String(p.default_server_id || '') === String(serverId);
+      var label = String(p.name);
+      // 项目自带独立目录时标注,便于区分同服务器的多个项目
+      if (isOwn) own.push({ value: String(p.id), text: '★ ' + label + '(本机)' });
+      else others.push({ value: String(p.id), text: label });
+    });
+    return own.concat(others);
+  }
+
   function renderSelects() {
     var imgSel = document.getElementById('deploy-image');
     var srvSel = document.getElementById('deploy-server');
@@ -455,14 +506,64 @@
       hint.classList.toggle('hidden', !noImages);
     }
 
+    // 服务器 / 项目下拉:恢复上次选择(localStorage),项目按当前服务器排序
     fillSelect(srvSel, '请选择服务器',
       (st.cfg ? st.cfg.servers : []).map(function (s) {
         return { value: String(s.id), text: String(s.name) };
-      }));
+      }), readPref(PREF_SERVER_KEY));
     fillSelect(prjSel, '请选择项目',
-      (st.cfg ? st.cfg.projects : []).map(function (p) {
-        return { value: String(p.id), text: String(p.name) };
-      }));
+      projectOptionsFor(srvSel ? srvSel.value : ''), readPref(PREF_PROJECT_KEY));
+
+    // 记忆里选中的项目带有默认服务器时,若服务器尚未选择则一并带出
+    // (重启后恢复"上次那台服务器 + 那个项目"的完整上下文)
+    if (srvSel && !srvSel.value && prjSel && prjSel.value) {
+      syncServerForProject(prjSel.value);
+    }
+    updateProjectHint();
+  }
+
+  /**
+   * 按项目带出默认服务器(第四批):仅当项目配了 default_server_id 且该
+   * 服务器仍存在时自动切换;不锁定,用户仍可改。
+   */
+  function syncServerForProject(projectId) {
+    if (!st.cfg || !projectId) return false;
+    var prj = findById(st.cfg.projects, projectId);
+    if (!prj || !prj.default_server_id) return false;
+    var srv = findById(st.cfg.servers, prj.default_server_id);
+    if (!srv) return false;
+    var srvSel = document.getElementById('deploy-server');
+    if (!srvSel || srvSel.value === String(srv.id)) return false;
+    srvSel.value = String(srv.id);
+    savePref(PREF_SERVER_KEY, srv.id);
+    return true;
+  }
+
+  /**
+   * 项目下拉下方的提示:说明当前项目的部署目录来源(项目级 / 继承服务器)。
+   * 让"这个项目部署到哪"在选完就能看到,不必去服务器配置里核对。
+   */
+  function updateProjectHint() {
+    var hint = document.getElementById('deploy-project-hint');
+    if (!hint || !st.cfg) return;
+    var prjSel = document.getElementById('deploy-project');
+    var prj = (prjSel && prjSel.value) ? findById(st.cfg.projects, prjSel.value) : null;
+    if (!prj) {
+      hint.textContent = '在「服务器管理」页维护';
+      return;
+    }
+    if (prj.remote_dir) {
+      hint.textContent = '部署目录:' + String(prj.remote_dir) + '(项目独立目录)';
+      return;
+    }
+    var srvSel = document.getElementById('deploy-server');
+    var srv = (srvSel && srvSel.value) ? findById(st.cfg.servers, srvSel.value) : null;
+    if (srv) {
+      hint.textContent = '部署目录:' + String(srv.remote_dir || '?') +
+        '(继承服务器「' + String(srv.name || srv.host) + '」)';
+    } else {
+      hint.textContent = '部署目录继承所选服务器,选择服务器后显示';
+    }
   }
 
   // ===== 页面数据加载(每次进入都拉取)=====
@@ -1871,25 +1972,33 @@
   // ===== 一键回滚(部署历史 ACTION 列 → #deploy-modal;复用 deploy 事件体系)=====
 
   /**
-   * 按部署历史记录的 server/project 名称从当前配置反查 id
-   * (DeployRecord 只落名称不落 id;配置删除同名项时返回 null 由调用方提示)。
+   * 按部署历史记录解析目标 server/project 的 id(第四批改为优先用记录里的 id)。
+   *
+   * 旧记录只落名称、无 id(v5.4.x 之前),且项目/服务器**改名后按名反查即失配**
+   * (回滚按钮变灰),因此新记录写入 server_id/project_id;这里优先按 id 精确
+   * 匹配,命不中再回退按名匹配(兼容旧记录),两路都失败返回 null 由调用方提示。
    */
   function resolveRecordIds(rec) {
     var servers = (st.cfg && st.cfg.servers) || [];
     var projects = (st.cfg && st.cfg.projects) || [];
-    var server = null;
-    var project = null;
+    var server = rec.server_id ? findById(servers, String(rec.server_id)) : null;
+    var project = rec.project_id ? findById(projects, String(rec.project_id)) : null;
     var i;
-    for (i = 0; i < servers.length; i++) {
-      if (servers[i] && String(servers[i].name) === String(rec.server_name)) {
-        server = servers[i];
-        break;
+    // 回退:按名称匹配(旧记录无 id;或 id 对应项已被删除时尽量沿用旧行为)
+    if (!server) {
+      for (i = 0; i < servers.length; i++) {
+        if (servers[i] && String(servers[i].name) === String(rec.server_name)) {
+          server = servers[i];
+          break;
+        }
       }
     }
-    for (i = 0; i < projects.length; i++) {
-      if (projects[i] && String(projects[i].name) === String(rec.project_name)) {
-        project = projects[i];
-        break;
+    if (!project) {
+      for (i = 0; i < projects.length; i++) {
+        if (projects[i] && String(projects[i].name) === String(rec.project_name)) {
+          project = projects[i];
+          break;
+        }
       }
     }
     if (!server || !project) return null;
@@ -2553,6 +2662,16 @@
     if (prjSel) {
       prjSel.addEventListener('change', function () {
         hidePreviewBox(); // 项目变化后旧预览快照失效
+        // 第四批:记住选择;并带出该项目的默认服务器(仍可手动改)
+        savePref(PREF_PROJECT_KEY, prjSel.value);
+        var switched = syncServerForProject(prjSel.value);
+        // 服务器可能被带出:重建项目下拉以更新「本机」排序标注
+        if (switched) {
+          var srvSelNow = document.getElementById('deploy-server');
+          fillSelect(prjSel, '请选择项目',
+            projectOptionsFor(srvSelNow ? srvSelNow.value : ''), prjSel.value);
+        }
+        updateProjectHint();
         refreshResumeStatus(); // 项目变化后按新键重查断点横幅
         if (st.mode === 'stack') parseStack(); // 整栈模式:选中即自动解析
       });
@@ -2561,6 +2680,13 @@
     if (srvSel) {
       srvSel.addEventListener('change', function () {
         hidePreviewBox(); // 服务器变化后旧预览失效
+        savePref(PREF_SERVER_KEY, srvSel.value);
+        // 第四批:按新服务器重排项目下拉(属于它的排前并标注),保留当前选择
+        var prjSelNow = document.getElementById('deploy-project');
+        if (prjSelNow) {
+          fillSelect(prjSelNow, '请选择项目', projectOptionsFor(srvSel.value), prjSelNow.value);
+        }
+        updateProjectHint();
         refreshResumeStatus(); // 服务器变化后按新键重查断点横幅
       });
     }

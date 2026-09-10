@@ -480,6 +480,8 @@ mod tests {
             notify_webhook: None,
             source_compose_path: None,
             source_hash: None,
+            remote_dir: None,
+            default_server_id: None,
         });
         cfg.notify.email = EmailNotify {
             enabled: true,

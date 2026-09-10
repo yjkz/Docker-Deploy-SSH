@@ -93,6 +93,17 @@ pub struct ProjectConfig {
     /// 与源文件当前哈希不同即视为「源已变更」。旧配置无此字段 → None(不参与比对)
     #[serde(default)]
     pub source_hash: Option<String>,
+    /// **项目级**远程部署目录(第四批):留空/None = 沿用所属服务器的 `remote_dir`。
+    ///
+    /// 为什么需要:`ServerConfig.remote_dir` 是**服务器级**的单一目录,同一台服务器
+    /// 上的多个项目会共用同一部署目录与 `docker-compose.yml`;项目各自有部署目录
+    /// 后,切换项目不必再改服务器配置。旧配置无此字段 → None,行为与历史完全一致。
+    #[serde(default)]
+    pub remote_dir: Option<String>,
+    /// 该项目常用的服务器 id(第四批,可选):部署页选中项目时据此自动带出服务器。
+    /// 仅作便利,不做强制校验(临时跨服务器部署仍然允许)。旧配置无此字段 → None。
+    #[serde(default)]
+    pub default_server_id: Option<String>,
 }
 
 // ===== 通知中心配置(UPGRADE-PLAN 阶段二,serde default 兼容旧配置文件)=====
@@ -625,6 +636,8 @@ mod tests {
             notify_webhook: Some("https://example.com/hook".into()),
             source_compose_path: None,
             source_hash: None,
+            remote_dir: None,
+            default_server_id: None,
         });
         // config_dir 依赖环境变量以便测试注入
         std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
@@ -768,6 +781,8 @@ mod tests {
             notify_webhook: None,
             source_compose_path: None,
             source_hash: None,
+            remote_dir: None,
+            default_server_id: None,
         });
         save_config(&cfg).unwrap();
         let raw = std::fs::read(&notify_path).unwrap();

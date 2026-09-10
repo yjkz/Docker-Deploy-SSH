@@ -38,6 +38,15 @@ pub struct DeployRecord {
     /// 单镜像部署 / 失败记录为 `None`。旧记录文件缺该字段时按 `None` 反序列化。
     #[serde(default)]
     pub release_dir: Option<String>,
+    /// 目标服务器 / 项目的 id(第四批)。
+    ///
+    /// 为什么补 id:历史只存名称,回滚时前端 `resolveRecordIds` 只能按名反查
+    /// 配置里的 id —— 项目或服务器改名后即失配(回滚按钮变灰)。存 id 后优先按
+    /// id 精确匹配,按名回退仍保留(兼容旧记录)。
+    #[serde(default)]
+    pub server_id: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 impl DeployRecord {
@@ -59,6 +68,8 @@ impl DeployRecord {
             message: String::new(),
             duration_secs: 0,
             release_dir: None,
+            server_id: None,
+            project_id: None,
         }
     }
 }
@@ -150,6 +161,8 @@ mod tests {
             message: "部署完成".into(),
             duration_secs: idx as u64,
             release_dir: None,
+            server_id: None,
+            project_id: None,
         }
     }
 

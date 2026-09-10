@@ -393,6 +393,16 @@
     kv.appendChild(kvPair('用户 USER', server.username));
     kv.appendChild(kvPair('认证 AUTH', isPassword ? '密码' : '私钥'));
     kv.appendChild(kvPair('远程目录 REMOTE_DIR', server.remote_dir));
+    // 关联项目(第四批):列出把本服务器设为默认的项目,一眼看清归属
+    if (st.cfg && Array.isArray(st.cfg.projects)) {
+      var owned = st.cfg.projects.filter(function (p) {
+        return String(p.default_server_id || '') === String(server.id);
+      });
+      if (owned.length > 0) {
+        kv.appendChild(kvPair('关联项目 PROJECTS',
+          owned.map(function (p) { return String(p.name); }).join('、')));
+      }
+    }
     card.appendChild(kv);
 
     // 内嵌环境检测结果区
@@ -1136,11 +1146,11 @@
     tbody.textContent = '';
 
     if (!st.loaded) {
-      emptyRow(tbody, 5, '配置加载失败,请点击上方重试');
+      emptyRow(tbody, 7, '配置加载失败,请点击上方重试');
       return;
     }
     if (st.cfg.projects.length === 0) {
-      emptyRow(tbody, 5, '暂无部署项目,点击上方「新增项目」添加');
+      emptyRow(tbody, 7, '暂无部署项目,点击上方「新增项目」添加');
       return;
     }
     st.cfg.projects.forEach(function (project) {
@@ -1172,6 +1182,37 @@
         nameTd.appendChild(badgeUnbound);
       }
       tr.appendChild(nameTd);
+
+      // 服务器(第四批):显示默认服务器名;未指定/服务器已删除时给出明确提示。
+      // 便于一眼看出"哪个项目在哪台服务器",不必靠记忆。
+      var srvTd = document.createElement('td');
+      srvTd.className = 'nowrap';
+      var srvMatch = null;
+      if (project.default_server_id && st.cfg) {
+        srvMatch = st.cfg.servers.filter(function (s) {
+          return String(s.id) === String(project.default_server_id);
+        })[0] || null;
+      }
+      if (srvMatch) {
+        srvTd.textContent = String(srvMatch.name || srvMatch.host);
+      } else if (project.default_server_id) {
+        srvTd.appendChild(el('span', 'none-text', '(服务器已删除)'));
+      } else {
+        srvTd.appendChild(el('span', 'none-text', '(未指定)'));
+      }
+      tr.appendChild(srvTd);
+
+      // 远程目录(第四批):项目级目录优先,留空显示继承自哪台服务器的目录
+      var dirTd = document.createElement('td');
+      dirTd.className = 'mono';
+      if (project.remote_dir) {
+        dirTd.textContent = String(project.remote_dir);
+      } else if (srvMatch) {
+        dirTd.appendChild(el('span', 'none-text', '继承 ' + String(srvMatch.remote_dir || '?')));
+      } else {
+        dirTd.appendChild(el('span', 'none-text', '继承服务器'));
+      }
+      tr.appendChild(dirTd);
 
       var filterTd = document.createElement('td');
       filterTd.className = 'mono';
@@ -1484,6 +1525,45 @@
     return input;
   }
 
+  /**
+   * 「默认服务器」下拉(第四批):选中后,部署页选中该项目时会自动带出该服务器。
+   * 选项含「(不指定)」;已删除的服务器 id 会退化为不指定并在提示里说明。
+   */
+  function appendServerSelect(body, prev) {
+    var row = el('div', 'form-row');
+    var label = el('label', 'form-label', '默认服务器(可选)');
+    label.setAttribute('for', 'prjf-default-server');
+    row.appendChild(label);
+
+    var sel = document.createElement('select');
+    sel.className = 'form-input';
+    sel.id = 'prjf-default-server';
+    var noneOpt = document.createElement('option');
+    noneOpt.value = '';
+    noneOpt.textContent = '(不指定)';
+    sel.appendChild(noneOpt);
+    var servers = (st.cfg && st.cfg.servers) ? st.cfg.servers : [];
+    servers.forEach(function (s) {
+      var o = document.createElement('option');
+      o.value = String(s.id);
+      o.textContent = String(s.name || s.host);
+      sel.appendChild(o);
+    });
+    var wanted = prev && prev.default_server_id ? String(prev.default_server_id) : '';
+    if (wanted && servers.some(function (s) { return String(s.id) === wanted; })) {
+      sel.value = wanted;
+    }
+    row.appendChild(sel);
+
+    var hintText = '部署页选中本项目时自动带出该服务器(仍可临时改选);仅作便利,不做强制校验。';
+    if (wanted && !servers.some(function (s) { return String(s.id) === wanted; })) {
+      hintText = '原默认服务器已不存在,请重新选择。' + hintText;
+    }
+    row.appendChild(el('div', 'form-hint', hintText));
+    body.appendChild(row);
+    return sel;
+  }
+
   function appendActions(body, errId, onCancel, onSave, saveText) {
     var actions = el('div', 'form-actions');
     var cancel = el('button', 'btn', '取消');
@@ -1571,11 +1651,28 @@
 
     var preCmd = fieldVal('prjf-pre-cmd');
     var postCmd = fieldVal('prjf-post-cmd');
+
+    // 部署位置(第四批):项目级目录 + 默认服务器
+    var remoteDir = fieldVal('prjf-remote-dir');
+    if (remoteDir && remoteDir.indexOf('/') !== 0) {
+      formFailLoud(errId, '远程部署目录需为以 / 开头的绝对路径(如 /home/henghao/site),或留空沿用服务器目录');
+      return null;
+    }
+    var defaultServer = fieldVal('prjf-default-server');
+    // 选中的服务器必须仍存在(st.cfg 现取);空 = 不指定
+    if (defaultServer && st.cfg &&
+        !st.cfg.servers.some(function (s) { return String(s.id) === defaultServer; })) {
+      formFailLoud(errId, '所选默认服务器已不存在,请重新选择');
+      return null;
+    }
+
     return {
       health_wait_secs: healthWait,
       pre_deploy_cmd: preCmd ? preCmd : null,
       post_deploy_cmd: postCmd ? postCmd : null,
-      notify_webhook: webhook ? webhook : null
+      notify_webhook: webhook ? webhook : null,
+      remote_dir: remoteDir ? remoteDir : null,
+      default_server_id: defaultServer ? defaultServer : null
     };
   }
 
@@ -2126,6 +2223,16 @@
         composeInput.disabled = !!fieldVal('prjf-import-path');
       }
 
+      // ===== 部署位置(第四批):项目级目录 + 默认服务器 =====
+      // 背景:服务器只有一个 remote_dir,同服务器多项目共用同一部署目录与
+      // docker-compose.yml,切换项目要改服务器配置 —— 这里让项目自带目录。
+      appendField(body, '远程部署目录(可选)', 'prjf-remote-dir', 'text',
+        prev && prev.remote_dir ? String(prev.remote_dir) : '',
+        '留空 = 用服务器的部署目录',
+        '本项目独立的部署根目录(绝对路径,如 /home/henghao/site);留空则沿用所属服务器配置的远程目录。'
+        + '填了独立目录后,需在服务器上先建好该目录(可到 03 页服务器卡片点「创建远程目录」后手动补路径)。');
+      appendServerSelect(body, prev);
+
       // 文件映射编辑表格
       var mapRow = el('div', 'form-row');
       mapRow.appendChild(el('label', 'form-label', '文件映射(本地 → 服务器)'));
@@ -2360,6 +2467,8 @@
           cfg.projects[idx].pre_deploy_cmd = extras.pre_deploy_cmd;
           cfg.projects[idx].post_deploy_cmd = extras.post_deploy_cmd;
           cfg.projects[idx].notify_webhook = extras.notify_webhook;
+          cfg.projects[idx].remote_dir = extras.remote_dir;
+          cfg.projects[idx].default_server_id = extras.default_server_id;
         } else {
           cfg.projects.push({
             id: pid,
@@ -2371,7 +2480,9 @@
             health_wait_secs: extras.health_wait_secs,
             pre_deploy_cmd: extras.pre_deploy_cmd,
             post_deploy_cmd: extras.post_deploy_cmd,
-            notify_webhook: extras.notify_webhook
+            notify_webhook: extras.notify_webhook,
+            remote_dir: extras.remote_dir,
+            default_server_id: extras.default_server_id
           });
         }
         return window.AppBus.invoke('save_config_cmd', { cfg: cfg });
@@ -2424,7 +2535,9 @@
               health_wait_secs: extras.health_wait_secs,
               pre_deploy_cmd: extras.pre_deploy_cmd,
               post_deploy_cmd: extras.post_deploy_cmd,
-              notify_webhook: extras.notify_webhook
+              notify_webhook: extras.notify_webhook,
+              remote_dir: extras.remote_dir,
+              default_server_id: extras.default_server_id
             };
             return window.AppBus.invoke('get_config').then(function (cfg) {
               cfg = normalizeCfg(cfg);
