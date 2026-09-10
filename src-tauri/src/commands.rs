@@ -440,19 +440,46 @@ pub fn source_content_hash(source: &Path) -> Result<String, String> {
 pub struct ProjectSourceStatus {
     pub project_id: String,
     pub project_name: String,
-    /// 源文件路径(手工项目为空)
+    /// 源文件路径(未绑定为空)
     pub source_path: String,
-    /// `unchanged` / `changed` / `missing` / `unknown`
-    /// (unknown = 旧配置无哈希或源不可读,不参与自动更新)
+    /// `unchanged` / `changed` / `missing` / `unbound` / `unreadable`
     pub state: String,
     /// 面向用户的说明
     pub detail: String,
+    /// 该项目是否为「导入项目」(compose 副本在 `config/stacks/` 下)。
+    /// 导入项目应绑定源文件;手工项目(远端相对路径)天然无源。
+    pub imported: bool,
+    /// 是否已绑定源文件(等价于 `source_path` 非空),前端据此决定按钮文案
+    pub bound: bool,
+}
+
+/// 判断项目是否为导入项目:compose 副本位于 `config/stacks/<uuid>/` 下。
+///
+/// 导入项目(`import_compose` 产物)的 `compose_file` 指向应用配置目录内的
+/// 副本;手工项目的 `compose_file` 是远端相对路径(如 `docker-compose.yml`)。
+/// 第三批之前导入的项目没有 `source_compose_path`,需要据此提示用户补绑源。
+fn is_imported_project(p: &ProjectConfig) -> bool {
+    let path = Path::new(&p.compose_file);
+    if !path.is_absolute() {
+        return false;
+    }
+    let stacks = crate::config::config_dir().join("stacks");
+    // 规范化比较失败时退化为字符串前缀匹配(Windows 大小写不敏感)
+    match (path.canonicalize(), stacks.canonicalize()) {
+        (Ok(p), Ok(s)) => p.starts_with(&s),
+        _ => {
+            let p = p.compose_file.replace('\\', "/").to_lowercase();
+            let s = stacks.to_string_lossy().replace('\\', "/").to_lowercase();
+            p.starts_with(&s)
+        }
+    }
 }
 
 /// 检查所有项目的源 compose 是否已变更(只读,不改配置)。
 ///
-/// 手工项目(无 `source_compose_path`)与旧配置(无 `source_hash`)一律
-/// 报 `unknown`,避免"凭空认为要更新"。
+/// 导入项目若尚未绑定源(`source_compose_path` 为空)报 `unbound`,
+/// 前端提示「选择源文件」补绑;手工项目本就无源,同样报 `unbound`
+/// 但 `imported=false`,前端不提示(避免噪音)。
 #[tauri::command]
 pub fn check_project_sources() -> Result<Vec<ProjectSourceStatus>, String> {
     let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
@@ -461,31 +488,85 @@ pub fn check_project_sources() -> Result<Vec<ProjectSourceStatus>, String> {
 
 /// 计算单个项目的源状态(纯读)。
 fn project_source_status(p: &ProjectConfig) -> ProjectSourceStatus {
+    let imported = is_imported_project(p);
+    let bound = p
+        .source_compose_path
+        .as_deref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
     let base = |state: &str, detail: String| ProjectSourceStatus {
         project_id: p.id.clone(),
         project_name: p.name.clone(),
         source_path: p.source_compose_path.clone().unwrap_or_default(),
         state: state.to_string(),
         detail,
+        imported,
+        bound,
     };
-    let Some(path_str) = p.source_compose_path.as_deref().filter(|s| !s.trim().is_empty()) else {
-        return base("unknown", "手工项目(无导入源),不参与源更新".to_string());
-    };
+    if !bound {
+        return base(
+            "unbound",
+            if imported {
+                "导入项目尚未绑定源文件,点击「绑定源」选择原 compose 即可启用变更比对".to_string()
+            } else {
+                "手工项目(compose 为远端路径),无源文件可比对".to_string()
+            },
+        );
+    }
+    let path_str = p.source_compose_path.as_deref().unwrap_or_default();
     let path = PathBuf::from(path_str);
     if !path.is_file() {
         return base("missing", format!("源文件已不存在:{}", path_str));
     }
-    let Some(saved) = p.source_hash.as_deref().filter(|s| !s.trim().is_empty()) else {
-        return base(
-            "unknown",
-            "旧配置未记录源哈希,重新导入或手动更新一次即可启用比对".to_string(),
-        );
+    // 已绑定但无哈希(手工改过配置):用当前内容补算基准,按"未变更"处理并
+    // 由调用方落盘 —— 用户已明确绑定,不该再报 unknown 让他无从下手。
+    let saved = match p.source_hash.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(h) => h.to_string(),
+        None => match source_content_hash(&path) {
+            Ok(h) => h,
+            Err(e) => return base("unreadable", format!("源不可读:{}", e)),
+        },
     };
     match source_content_hash(&path) {
         Ok(now) if now == saved => base("unchanged", "源未变更".to_string()),
         Ok(_) => base("changed", "源 compose 已变更,可更新".to_string()),
-        Err(e) => base("unknown", format!("源不可读:{}", e)),
+        Err(e) => base("unreadable", format!("源不可读:{}", e)),
     }
+}
+
+/// 为项目绑定(或改绑)源 compose 文件,并以当前内容建立比对基准。
+///
+/// 用于第三批之前导入的项目(它们的 `source_compose_path` 为空,无法参与
+/// 变更比对)。绑定后不立刻重拷副本 —— 只记录基准,后续由
+/// [`update_project_from_source`] 同步内容。
+#[tauri::command]
+pub fn bind_project_source(
+    project_id: String,
+    source_path: String,
+) -> Result<ProjectSourceStatus, String> {
+    let path_str = source_path.trim().to_string();
+    let path = PathBuf::from(&path_str);
+    if !path.is_file() {
+        return Err(format!("源 compose 文件不存在:{}", path_str));
+    }
+    // 先解析校验:不是有效 compose 就拒绝绑定(避免绑错文件后无法更新)
+    parse_compose_file(&path, &[])?;
+    let hash = source_content_hash(&path)?;
+
+    let mut cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    let idx = cfg
+        .projects
+        .iter()
+        .position(|p| p.id == project_id)
+        .ok_or_else(|| format!("项目不存在:{}", project_id))?;
+    {
+        let p = &mut cfg.projects[idx];
+        p.source_compose_path = Some(path_str);
+        p.source_hash = Some(hash);
+    }
+    let updated = cfg.projects[idx].clone();
+    save_config(&cfg).map_err(|e| format!("保存配置失败: {}", e))?;
+    Ok(project_source_status(&updated))
 }
 
 /// 从源更新项目:重拷 compose/.env/override → 重解析 → 合并保留 service_overrides。
@@ -7550,11 +7631,11 @@ services:
 
     #[test]
     fn test_project_source_status_states() {
-        let mk = |path: Option<&str>, hash: Option<&str>| ProjectConfig {
+        let mk = |compose: &str, path: Option<&str>, hash: Option<&str>| ProjectConfig {
             id: "p".into(),
             name: "n".into(),
             image_filter: String::new(),
-            compose_file: "c".into(),
+            compose_file: compose.into(),
             file_mappings: Vec::new(),
             service_overrides: Vec::new(),
             health_wait_secs: 0,
@@ -7564,23 +7645,52 @@ services:
             source_compose_path: path.map(String::from),
             source_hash: hash.map(String::from),
         };
-        // 手工项目(无源)→ unknown,不参与自动更新
-        assert_eq!(project_source_status(&mk(None, None)).state, "unknown");
+        // 未绑定源 → unbound;手工项目(远端相对路径)与导入项目都算 unbound,
+        // 但 imported 不同,前端据此决定是否提示补绑
+        let manual = mk("docker-compose.yml", None, None);
+        let st = project_source_status(&manual);
+        assert_eq!(st.state, "unbound");
+        assert!(!st.imported, "远端相对路径 = 手工项目");
+        assert!(!st.bound);
+
+        // 导入项目(compose 在 config/stacks 下)→ imported=true(unbound 时前端提示绑定)
+        let imported_compose = crate::config::config_dir()
+            .join("stacks")
+            .join("test-uuid")
+            .join("docker-compose.yml");
+        let imported = mk(&imported_compose.to_string_lossy(), None, None);
+        let st = project_source_status(&imported);
+        assert_eq!(st.state, "unbound");
+        assert!(st.imported, "配置目录下副本 = 导入项目");
+
         // 源不存在 → missing
-        let missing = mk(Some("E:/definitely/not/here/docker-compose.yml"), Some("x"));
+        let missing = mk(
+            "docker-compose.yml",
+            Some("E:/definitely/not/here/docker-compose.yml"),
+            Some("x"),
+        );
         assert_eq!(project_source_status(&missing).state, "missing");
-        // 旧配置无哈希 → unknown(要求先手动更新一次)
+
         let dir = std::env::temp_dir().join(format!("dd-src-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let compose = dir.join("docker-compose.yml");
         std::fs::write(&compose, "services: {}\n").unwrap();
-        let no_hash = mk(Some(&compose.to_string_lossy()), None);
-        assert_eq!(project_source_status(&no_hash).state, "unknown");
+
+        // 已绑定但无哈希(手工改配置)→ 以当前内容为基准,报 unchanged 而非 unknown
+        let no_hash = mk("docker-compose.yml", Some(&compose.to_string_lossy()), None);
+        let st = project_source_status(&no_hash);
+        assert_eq!(st.state, "unchanged");
+        assert!(st.bound);
+
         // 哈希一致 → unchanged;不一致 → changed
         let h = source_content_hash(&compose).unwrap();
-        let same = mk(Some(&compose.to_string_lossy()), Some(&h));
+        let same = mk("docker-compose.yml", Some(&compose.to_string_lossy()), Some(&h));
         assert_eq!(project_source_status(&same).state, "unchanged");
-        let diff = mk(Some(&compose.to_string_lossy()), Some("deadbeef"));
+        let diff = mk(
+            "docker-compose.yml",
+            Some(&compose.to_string_lossy()),
+            Some("deadbeef"),
+        );
         assert_eq!(project_source_status(&diff).state, "changed");
         std::fs::remove_dir_all(&dir).ok();
     }

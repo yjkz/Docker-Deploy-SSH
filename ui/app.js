@@ -334,17 +334,45 @@
     window.refreshNav();
 
     // dock 左下角版本号:从 tauri.conf 的 package version 读取(core:default 含
-    // app:get-version 权限),替代曾硬编码的 v0.1.0;读取失败保留「v…」占位
+    // app:get-version 权限),替代曾硬编码的 v0.1.0;读取失败保留「v…」占位。
+    // 顺带消费「更新完成」标记(见下)。
     var verEl = document.getElementById('dock-version');
-    if (verEl) {
-      try {
-        var appApi = (window.__TAURI__ || {}).app;
-        if (appApi && typeof appApi.getVersion === 'function') {
-          appApi.getVersion().then(function (v) {
-            if (v) verEl.textContent = 'v' + String(v);
-          }).catch(function () { /* 保留占位 */ });
-        }
-      } catch (e) { /* 保留占位 */ }
-    }
+    var runningVersion = null;
+    var versionPromise = Promise.resolve(null);
+    try {
+      var appApi = (window.__TAURI__ || {}).app;
+      if (appApi && typeof appApi.getVersion === 'function') {
+        versionPromise = appApi.getVersion().then(function (v) {
+          if (v) {
+            if (verEl) verEl.textContent = 'v' + String(v);
+            runningVersion = String(v);
+          }
+          return runningVersion;
+        }).catch(function () { return null; });
+      }
+    } catch (e) { /* 保留占位 */ }
+
+    // 自动更新完成提示(第三批修复):静默安装前由后端写入
+    // config/update-pending.json,新版首次启动读取并**清除**该标记 →
+    // 恰好一次地提示「已更新到 vX」。旧实现装完既不重启也无提示,用户
+    // 无法判断更新是否生效。
+    // 与当前实际版本比对:安装中途失败(仍是旧版)时不误报。
+    try {
+      if (window.AppBus && typeof window.AppBus.invoke === 'function') {
+        versionPromise.then(function (current) {
+          return window.AppBus.invoke('take_update_pending').then(function (marked) {
+            if (!marked) return;
+            var m = String(marked).replace(/^v/i, '');
+            var c = String(current || '').replace(/^v/i, '');
+            // 版本一致(安装成功并重启)才提示;否则静默丢弃标记
+            if (c && m && c === m) {
+              window.toast('已更新到 v' + m, 'ok');
+            } else if (window.console && console.info) {
+              console.info('[update] 标记版本 ' + m + ' 与实际版本 ' + c + ' 不一致,不提示');
+            }
+          });
+        }).catch(function () { /* 无标记或读取失败:静默 */ });
+      }
+    } catch (e) { /* 静默 */ }
   });
 })();

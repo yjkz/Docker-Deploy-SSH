@@ -3118,3 +3118,28 @@ code {
   padding: 1px 5px;
   vertical-align: middle;
 }
+
+/* ===== 源检查汇总栏(第三批修复:更新结果常驻可见) ===== */
+.src-summary {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+  padding: 8px 12px;
+  margin-bottom: 10px;
+  border-radius: 4px;
+  border-left: 3px solid var(--ark-line);
+  background: var(--ink-on-paper-08, rgba(128, 128, 128, 0.08));
+  color: var(--ark-paper-dim-ink);
+}
+.src-summary-warn {
+  border-left-color: var(--ark-stat-warm, #d68a1e);
+}
+.src-summary-text { font-weight: 600; }
+.src-summary-list { color: var(--ark-paper-dim-ink); }
+.src-summary-last {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--ark-paper-dim-ink);
+}

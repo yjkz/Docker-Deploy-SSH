@@ -365,10 +365,13 @@
     confirm.id = 'settings-install-btn';
     confirm.addEventListener('click', function () {
       confirm.disabled = true;
-      showUpdateMessage('info', '正在启动安装程序,应用即将退出…');
-      window.AppBus.invoke('update_install', { setupPath: String(downloaded.setupPath || '') })
+      showUpdateMessage('info', '正在启动安装程序,应用即将退出,安装完成后会自动重新打开…');
+      window.AppBus.invoke('update_install', {
+        setupPath: String(downloaded.setupPath || ''),
+        version: String(downloaded.version || info.latest || '')
+      })
         .then(function () {
-          // 后端 500ms 后 exit(0);此处文案已展示,无需动作
+          // 后端 500ms 后 exit(0),安装器装完自动拉起新版;此处文案已展示,无需动作
         })
         .catch(function (err) {
           showUpdateMessage('fail', '启动安装失败:' + (errText(err) || '未知错误') + '(可手动运行:' + (downloaded.setupPath || '') + ')');

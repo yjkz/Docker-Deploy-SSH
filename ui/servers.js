@@ -1149,14 +1149,27 @@
       var nameTd = document.createElement('td');
       nameTd.className = 'nowrap';
       nameTd.textContent = String(project.name);
-      // 源已变更徽章(第三批):由 st.projectSources 缓存驱动(启动/手动检查时填充)
+      // 源状态徽章(第三批):由 st.projectSources 缓存驱动(启动/手动检查时填充)。
+      // - changed → 源已变更(可更新)
+      // - missing → 源文件丢失
+      // - unbound 且 imported → 导入项目未绑定源(点「绑定源」补上)
       var srcState = st.projectSources ? st.projectSources[project.id] : null;
-      if (srcState && (srcState.state === 'changed' || srcState.state === 'missing')) {
-        var badge = el('span', 'badge fail src-badge',
-          srcState.state === 'changed' ? '源已变更' : '源文件丢失');
+      if (srcState && srcState.state === 'changed') {
+        // fillBadge 统一 badge-ok/fail/warn 类名(手写 'badge fail' 不匹配 CSS)
+        var badge = window.fillBadge(el('span', 'src-badge'), 'fail', '源已变更');
         badge.title = srcState.detail || '';
         nameTd.appendChild(document.createTextNode(' '));
         nameTd.appendChild(badge);
+      } else if (srcState && srcState.state === 'missing') {
+        var badgeMiss = window.fillBadge(el('span', 'src-badge'), 'fail', '源文件丢失');
+        badgeMiss.title = srcState.detail || '';
+        nameTd.appendChild(document.createTextNode(' '));
+        nameTd.appendChild(badgeMiss);
+      } else if (srcState && srcState.state === 'unbound' && srcState.imported) {
+        var badgeUnbound = window.fillBadge(el('span', 'src-badge'), 'warn', '未绑定源');
+        badgeUnbound.title = srcState.detail || '尚未绑定源 compose,无法检测变更';
+        nameTd.appendChild(document.createTextNode(' '));
+        nameTd.appendChild(badgeUnbound);
       }
       tr.appendChild(nameTd);
 
@@ -1179,13 +1192,32 @@
       var actTd = document.createElement('td');
       actTd.className = 'col-action';
 
-      // 「从源更新」:仅对导入项目(有 source_compose_path)显示
-      if (project.source_compose_path) {
-        var updBtn = el('button', 'btn btn-sm', '从源更新');
-        updBtn.type = 'button';
-        updBtn.title = '重新读取源 compose(.env 与 override 一并同步)并重解析,保留已保存的服务分类';
-        updBtn.addEventListener('click', function () { updateProjectSource(project, updBtn); });
-        actTd.appendChild(updBtn);
+      // 源操作按钮(第三批修复):导入项目一律显示,不再要求已绑定源。
+      // - 已绑定 → 「从源更新」(重拷重解析)
+      // - 未绑定 → 「绑定源」(选原 compose 建立比对基准)
+      // 旧实现只在 source_compose_path 非空时显示按钮,导致 v5.4.0 之前
+      // 导入的项目**没有任何入口**绑定源、也无从触发更新。
+      if (srcState && srcState.imported) {
+        var bound = !!srcState.bound || !!project.source_compose_path;
+        var srcBtn = el('button', 'btn btn-sm', bound ? '从源更新' : '绑定源');
+        srcBtn.type = 'button';
+        srcBtn.title = bound
+          ? '重新读取源 compose(.env 与 override 一并同步)并重解析,保留已保存的服务分类'
+          : '选择一个本地 compose 文件作为该项目的更新源(用于检测变更并同步)';
+        if (!bound) srcBtn.classList.add('btn-primary');
+        srcBtn.addEventListener('click', function () {
+          if (bound) updateProjectSource(project, srcBtn);
+          else bindProjectSource(project, srcBtn);
+        });
+        actTd.appendChild(srcBtn);
+        actTd.appendChild(document.createTextNode(' '));
+      } else if (project.source_compose_path) {
+        // 兜底:源检查尚未返回(如启动竞态)但配置里已有源 → 仍显示更新按钮
+        var updBtn0 = el('button', 'btn btn-sm', '从源更新');
+        updBtn0.type = 'button';
+        updBtn0.title = '重新读取源 compose(.env 与 override 一并同步)并重解析,保留已保存的服务分类';
+        updBtn0.addEventListener('click', function () { updateProjectSource(project, updBtn0); });
+        actTd.appendChild(updBtn0);
         actTd.appendChild(document.createTextNode(' '));
       }
 
@@ -1237,6 +1269,7 @@
         for (var i = 0; i < arr.length; i++) map[arr[i].projectId] = arr[i];
         st.projectSources = map;
         renderProjects();
+        renderSourceSummary(arr);
 
         if (!auto) return arr;
 
@@ -1261,6 +1294,12 @@
             window.toast('已从源更新 ' + done + ' 个项目(' + changed.map(function (s) {
               return s.projectName;
             }).join('、') + ')', 'ok');
+            st.lastSourceResult = {
+              name: changed.map(function (s) { return s.projectName; }).join('、'),
+              state: 'unchanged',
+              detail: '启动自动更新 ' + done + ' 个项目并重解析',
+              ts: new Date().toTimeString().slice(0, 8)
+            };
             // 更新后重新加载配置并复检(徽章恢复到"源未变更")
             return loadConfig().then(function () { return checkProjectSources(false); });
           }
@@ -1283,13 +1322,77 @@
       });
   }
 
+  /**
+   * 源检查汇总栏(第三批):把比对结果常驻显示在项目表上方。
+   *
+   * 为什么需要它:更新结果此前只经 toast 一闪而过,用户反馈"没看到体现
+   * 更新结果"。这里按状态聚合计数并列出需要动作的项目,结果可复查。
+   */
+  function renderSourceSummary(list) {
+    var box = document.getElementById('projects-src-summary');
+    if (!box) return;
+    var arr = Array.isArray(list) ? list : [];
+    var changed = arr.filter(function (s) { return s.state === 'changed'; });
+    var missing = arr.filter(function (s) { return s.state === 'missing'; });
+    var unbound = arr.filter(function (s) { return s.state === 'unbound' && s.imported; });
+    var readable = arr.filter(function (s) { return s.imported; });
+
+    if (readable.length === 0) {
+      box.classList.add('hidden');
+      box.textContent = '';
+      return;
+    }
+
+    box.textContent = '';
+    box.classList.remove('hidden');
+    var parts = ['导入项目 ' + readable.length + ' 个'];
+    if (changed.length > 0) parts.push('源已变更 ' + changed.length + ' 个');
+    if (unbound.length > 0) parts.push('未绑定源 ' + unbound.length + ' 个');
+    if (missing.length > 0) parts.push('源文件丢失 ' + missing.length + ' 个');
+
+    var cls = 'src-summary';
+    if (changed.length > 0 || missing.length > 0) cls += ' src-summary-warn';
+    box.className = cls;
+
+    box.appendChild(el('span', 'src-summary-text', '源检查:' + parts.join(' · ')));
+
+    // 需要用户动作的项目列出名字(最多 5 个,避免刷屏)
+    var needAction = changed.concat(unbound).concat(missing);
+    if (needAction.length > 0) {
+      var names = needAction.slice(0, 5).map(function (s) {
+        var tag = s.state === 'changed' ? '可更新' : (s.state === 'unbound' ? '待绑定' : '源丢失');
+        return s.projectName + '(' + tag + ')';
+      });
+      if (needAction.length > 5) names.push('…共 ' + needAction.length + ' 个');
+      box.appendChild(el('span', 'src-summary-list', names.join('、')));
+    }
+
+    // 最近一次手动操作结果(持久可见,不随 toast 消失)
+    if (st.lastSourceResult) {
+      var r = st.lastSourceResult;
+      box.appendChild(el('span', 'src-summary-last',
+        '最近操作 [' + r.ts + '] ' + r.name + ':' + r.detail));
+    }
+  }
+
   /** 手动「从源更新」单个项目 */
   function updateProjectSource(project, btn) {
     if (btn) { btn.disabled = true; btn.textContent = '更新中…'; }
     window.AppBus.invoke('update_project_from_source', { projectId: project.id })
       .then(function (status) {
-        window.toast('项目「' + project.name + '」已从源更新' +
-          (status && status.state === 'unchanged' ? '(源无变化)' : ''), 'ok');
+        var detail = status && status.detail ? status.detail : '';
+        var changed = status && status.state === 'changed';
+        window.toast('项目「' + project.name + '」' +
+          (changed || detail.indexOf('已变更') >= 0
+            ? '已从源更新(检测到变更,配置已同步)'
+            : '已检查源(内容无变化,无需更新)'), 'ok');
+        // 结果落到页面上的检查汇总栏,不只依赖 toast(用户反馈"看不到更新结果")
+        st.lastSourceResult = {
+          name: project.name,
+          state: status ? status.state : 'unknown',
+          detail: detail,
+          ts: new Date().toTimeString().slice(0, 8)
+        };
         return loadConfig().then(function () { return checkProjectSources(false); });
       })
       .catch(function (err) {
@@ -1298,6 +1401,43 @@
       .then(function () {
         if (btn) { btn.disabled = false; btn.textContent = '从源更新'; }
       });
+  }
+
+  /**
+   * 为导入项目绑定源 compose:调用系统文件对话框选文件 → 后端记录路径与
+   * 当前内容基准(不立刻覆盖副本)。绑定后即可用「从源更新」。
+   */
+  function bindProjectSource(project, btn) {
+    if (btn) btn.disabled = true;
+    window.AppBus.pickPath({
+      directory: false,
+      title: '选择该项目的源 compose 文件',
+      filters: [{ name: 'Compose', extensions: ['yml', 'yaml'] }]
+    }).then(function (picked) {
+      if (picked === null) {
+        if (btn) btn.disabled = false;
+        return null;
+      }
+      if (btn) btn.textContent = '绑定中…';
+      return window.AppBus.invoke('bind_project_source', {
+        projectId: project.id,
+        sourcePath: picked
+      }).then(function (status) {
+        window.toast('项目「' + project.name + '」已绑定源:' + picked +
+          '(后续源变更会在启动时自动同步)', 'ok');
+        st.lastSourceResult = {
+          name: project.name,
+          state: status ? status.state : 'unchanged',
+          detail: '已绑定源文件并建立比对基准',
+          ts: new Date().toTimeString().slice(0, 8)
+        };
+        return loadConfig().then(function () { return checkProjectSources(false); });
+      });
+    }).catch(function (err) {
+      window.toast('绑定源失败:' + (err && err.message ? err.message : err), 'fail');
+    }).then(function () {
+      if (btn) { btn.disabled = false; btn.textContent = '从源更新'; }
+    });
   }
 
   // ===== 自绘模态框 =====
@@ -2365,6 +2505,19 @@
     var addProject = document.getElementById('projects-add-btn');
     if (addProject) {
       addProject.addEventListener('click', function () { openProjectModal(null); });
+    }
+    // 手动触发源变更检查(第三批:让"有没有更新"随时可查,不必等启动)
+    var srcCheckBtn = document.getElementById('projects-src-check-btn');
+    if (srcCheckBtn) {
+      srcCheckBtn.addEventListener('click', function () {
+        srcCheckBtn.disabled = true;
+        srcCheckBtn.textContent = '检查中…';
+        // 手动检查不自动改配置,只刷新状态(用户想改可点「从源更新」)
+        checkProjectSources(false).then(function () {
+          srcCheckBtn.disabled = false;
+          srcCheckBtn.textContent = '检查源变更';
+        });
+      });
     }
     var logToggle = document.getElementById('servers-log-toggle');
     if (logToggle) {

@@ -586,8 +586,67 @@ pub async fn update_download(
     })
 }
 
-/// 启动已下载安装包的静默安装(NSIS `/S`)并退出当前应用
-/// (安装器接管后续:覆盖安装到原目录,完成后用户手动启动新版)。
+/// 更新标记文件:`config/update-pending.json`。
+///
+/// 静默安装会覆盖安装目录下的程序文件,但不动同级的 `config/` 目录,
+/// 因此标记能跨更新存活:新版首次启动读到它 → 提示「已更新到 vX」
+/// 并删除标记(**恰好一次**语义)。
+fn update_pending_path() -> std::path::PathBuf {
+    // 测试注入用:单测经 `DD_UPDATE_PENDING_PATH` 指向临时文件,
+    // 避免改动全局 DD_CONFIG_DIR 与其他配置测试竞争(单测并行执行)
+    if let Ok(p) = std::env::var("DD_UPDATE_PENDING_PATH") {
+        if !p.trim().is_empty() {
+            return std::path::PathBuf::from(p);
+        }
+    }
+    crate::config::config_dir().join("update-pending.json")
+}
+
+/// 记录"正在安装到 version"(尽力而为,失败仅告警不影响安装)。
+fn mark_update_pending(version: &str) -> Result<(), String> {
+    let path = update_pending_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("创建配置目录失败: {e}"))?;
+    }
+    let payload = serde_json::json!({
+        "version": version.trim().trim_start_matches(['v', 'V']),
+        "ts": chrono::Local::now().format("%F %T").to_string(),
+    });
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&payload).map_err(|e| format!("序列化标记失败: {e}"))?,
+    )
+    .map_err(|e| format!("写入标记失败: {e}"))
+}
+
+/// 读取并**清除**更新标记(启动时调用一次)。
+///
+/// 返回被更新到的版本号;无标记时返回 `None`。读取后立即删除文件,
+/// 保证提示只出现一次。
+#[tauri::command]
+pub fn take_update_pending() -> Option<String> {
+    let path = update_pending_path();
+    let text = std::fs::read_to_string(&path).ok()?;
+    // 无论解析是否成功都清掉标记(避免损坏文件导致每次启动都提示)
+    if let Err(e) = std::fs::remove_file(&path) {
+        log::warn!("清除更新标记失败: {e}");
+    }
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let version = value
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if version.is_empty() {
+        None
+    } else {
+        Some(version)
+    }
+}
+
+/// 启动已下载安装包的静默安装(NSIS `/S /R`)并退出当前应用
+/// (安装器接管后续:覆盖安装到原目录,完成后自动拉起新版)。
 ///
 /// 安全:路径必须位于 `%TEMP%/DockerDeploy-SSH-update/` 下且为 `setup.exe`
 /// (只接受本命令族自己下载的产物,防被诱导执行任意路径的 exe)。
@@ -595,8 +654,13 @@ pub async fn update_download(
 pub fn update_install(
     app: tauri::AppHandle,
     setup_path: String,
+    version: Option<String>,
 ) -> std::result::Result<(), String> {
     let path = std::path::PathBuf::from(setup_path.trim());
+    let version_hint = version
+        .as_deref()
+        .map(|v| v.trim().trim_start_matches(['v', 'V']).to_string())
+        .unwrap_or_default();
     let expected_dir = std::env::temp_dir().join("DockerDeploy-SSH-update");
     let parent_ok = path
         .parent()
@@ -610,13 +674,23 @@ pub fn update_install(
         return Err(format!("安装包不存在: {}", path.display()));
     }
 
-    // NSIS 静默安装:/S(大写);经 cmd start 分离启动,安装器独立于本进程存活
+    // NSIS 静默安装 + 安装后自动重启:
+    // - `/S` 静默(不弹安装向导)
+    // - `/R` 让安装器在完成后再拉起应用。Tauri 的 installer.nsi 在
+    //   `.onInstSuccess` 里**只在静默(${Silent})或被动模式**下读取 `/R`
+    //   (GUI 模式靠完成页的复选框);旧实现只传 `/S`,装完进程退干净就
+    //   再没人启动应用,表现为"更新完成后需要手动重新打开"。
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
         let path_str = path.to_string_lossy().into_owned();
+        // 写"更新进行中"标记:新版启动后据此提示"已更新到 vX",并清理标记。
+        // 安装器会覆盖安装目录、但不动我们的 config/ 目录,标记得以保留。
+        if let Err(e) = mark_update_pending(&version_hint) {
+            log::warn!("写入更新标记失败(不影响安装): {e}");
+        }
         std::process::Command::new("cmd")
-            .args(["/c", "start", "", &path_str, "/S"])
+            .args(["/c", "start", "", &path_str, "/S", "/R"])
             .creation_flags(0x0800_0000) // CREATE_NO_WINDOW,防闪黑框
             .spawn()
             .map_err(|e| format!("启动安装程序失败: {e}"))?;
@@ -638,6 +712,33 @@ pub fn update_install(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_update_pending_marker_roundtrip() {
+        // 隔离到临时文件(经专用环境变量注入,不动全局 DD_CONFIG_DIR ——
+        // 否则会与其他配置测试竞争,单测并行执行)
+        let dir = std::env::temp_dir().join(format!("dd-upd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("update-pending.json");
+        std::env::set_var("DD_UPDATE_PENDING_PATH", marker.to_str().unwrap());
+
+        // 无标记 → None
+        assert_eq!(take_update_pending(), None);
+
+        // 写入 → 读取一次拿到版本(剥 v 前缀)
+        mark_update_pending("v5.5.0").unwrap();
+        assert_eq!(take_update_pending(), Some("5.5.0".to_string()));
+        // 恰好一次:再读为 None(标记已在首次读取时清除)
+        assert_eq!(take_update_pending(), None);
+
+        // 损坏文件 → None 且不残留(不因坏文件每次启动都提示)
+        std::fs::write(&marker, b"{ not json").unwrap();
+        assert_eq!(take_update_pending(), None);
+        assert!(!marker.exists(), "损坏标记也应被清除");
+
+        std::env::remove_var("DD_UPDATE_PENDING_PATH");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn test_installer_download_url() {

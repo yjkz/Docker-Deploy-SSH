@@ -187,7 +187,11 @@
 
         <div class="section-head">
           <h2 class="section-title">部署项目<span class="section-en">PROJECTS</span></h2>
+          <button id="projects-src-check-btn" class="btn btn-sm" type="button"
+                  title="立即比对所有导入项目的源 compose 是否变更">检查源变更</button>
         </div>
+        <!-- 源检查汇总(第三批):启动比对/手动更新后在此展示结果,不依赖 toast -->
+        <div id="projects-src-summary" class="src-summary hidden"></div>
         <div id="projects-table-wrap" class="table-wrap">
           <table class="data-table">
             <thead>
