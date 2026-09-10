@@ -47,7 +47,7 @@
 配置:安装目录 config/ 下 servers.json + projects.json + notify.json + settings.json +
       deployments.json + resume-deploy.json(便携式;原子写);日志 logs/app.log
 测试:cargo test(纯函数单测 238 passed;真机测试 #[ignore] 12 个)
-当前版本:v5.5.0(tauri.conf.json / Cargo.toml;第四批:项目级部署目录 + 默认服务器 + 部署页选择记忆)
+当前版本:v5.5.1(tauri.conf.json / Cargo.toml;第四批 + 设置「关于」栏/源检查反馈/前往下载黑框三项修复)
 ```
 
 ## 权威计划/完成记录(仓库根目录)
