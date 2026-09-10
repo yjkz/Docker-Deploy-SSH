@@ -395,3 +395,56 @@ notify: {
 - 清理执行按前端回传的显式目标,后端不做二次扫描:预览与执行之间服务器状态变化时对应条目报错,其余照常执行
 - `unknown` 状态(旧配置无 `source_hash` 或手工项目)不参与启动自动更新,需手动点一次「从源更新」写入哈希
 - 回滚中心的 `runningContainers` 以容器名包含目录名近似归属,标签缺失或 `docker ps` 不可用时可能为 0(不影响回滚)
+
+
+---
+
+# 第四批升级（v5.5.0）
+
+**目标**:解决"一台服务器多个项目时,每次切换项目都要去服务器配置里单独设置"的痛点。根因有两个,同源:① `ServerConfig.remote_dir` 是**服务器级**单一目录,同服务器的多个项目共用同一部署目录与 `docker-compose.yml`;② `ProjectConfig` 没有服务器字段,部署页两个下拉各选各的、不联动也不记忆。
+
+**进度**:阶段十五 ✅ / 阶段十六 ✅ / 阶段十七 ✅ / 阶段十八 ✅ —— 随 **v5.5.0** 发布
+
+| 阶段 | 主题 | 关键产出 |
+|---|---|---|
+| 十五 | 项目级部署目录 | `ProjectConfig.remote_dir` + `effective_remote_dir` 解析 + 28 处调用点改写 |
+| 十六 | 项目默认服务器 | `ProjectConfig.default_server_id` + 部署页自动带出 + 03 页归属展示 |
+| 十七 | 部署页选择记忆与联动 | localStorage 记忆 + 项目排序标注 + 部署目录提示行 |
+| 十八 | 部署历史配对修正 | `DeployRecord` 补 id + 回滚解析优先 id(修改名失配) |
+
+### 阶段十五:项目级部署目录 ✅
+
+- `ProjectConfig` 增 `remote_dir: Option<String>`(serde default):留空 = 沿用服务器目录(**旧配置行为完全不变**),填了则该项目的部署、compose 上传、整栈 pull/up、健康检查、钩子、回滚全走自己的目录
+- 新增纯函数 `effective_remote_dir(server, project)` 统一解析优先级;替换项目作用域内 28 处 `server.remote_dir`;环境检测 / `create_remote_dir` / 回滚中心与清理的默认扫描起点等 5 处保持服务器级(与项目无关)
+- 项目表单加「远程部署目录」(校验 `/` 开头绝对路径 + 提示需先在服务器建好目录);03 页项目表加「远程目录」列(未填显示「继承 <服务器目录>」)
+
+### 阶段十六:项目「默认服务器」✅
+
+- `ProjectConfig` 增 `default_server_id: Option<String>`(serde default)
+- 项目表单加「默认服务器」下拉(含「不指定」;服务器已删除时提示重选)
+- 部署页选中项目自动带出该服务器(**不锁定**,保留临时跨服务器部署能力);03 页项目表加「服务器」列、服务器卡片新增「关联项目」行
+
+### 阶段十七:部署页选择记忆与联动 ✅
+
+- `dd_deploy_server` / `dd_deploy_project` 两个 localStorage 键(同 `dd_manage_autorefresh` 的 restore/save 模式 + try/catch 静默降级),重启后恢复上次选择;恢复时若只记得项目,按其默认服务器补齐
+- `projectOptionsFor(serverId)`:属于当前服务器的项目排前并标「★ …(本机)」(**不过滤**,其余项目仍可选)
+- `updateProjectHint()`:项目下拉下方显示**实际部署目录**及来源(项目独立目录 / 继承服务器),选完即可确认,不必再去服务器配置核对
+
+### 阶段十八:部署历史配对修正 ✅
+
+- `DeployRecord` 增 `server_id`/`project_id`(serde default 兼容旧记录),部署与回滚四个写入点带上 id
+- `resolveRecordIds` 优先按 id 精确匹配、回退按名 —— 修掉「服务器或项目改名后回滚按钮失效」;确实无法定位的旧记录给明确提示(不静默失败)
+
+### 完成记录(2026-09-10)
+
+- 提交 `d2f1918`(单提交含四阶段)
+- 测试基线 235 → **238 passed / 0 failed / 12 ignored**(新增 `effective_remote_dir` 回落语义、旧 projects.json 反序列化、旧 deployments.json 反序列化);clippy 维持基线 7 条
+- 浏览器实测 5 项:项目表新列(继承 vs 独立目录分别显示)、选项目自动带服务器 + 排序标注 + 部署目录提示、重启(重载)后记忆恢复、改名记录仍可回滚(按 id 命中)、不可解析记录给出明确提示
+- wiki 同步:01(行数)、02(两个第四批小节 + ProjectConfig 字段)、03(servers.js 部署位置与两列、deploy.js 记忆联动)、04(ProjectConfig 新字段 + remote_dir 解析说明 + get_history/DeployRecord 补 id)、07(决策 #55-#57 + 限制 #37-#40)、README、本文件
+
+### 遗留与取舍(记录在 wiki 07 已知限制)
+
+- 项目级目录为新配置项,**已部署旧目录的项目不会自动迁移**:填了独立目录需先在服务器建好目录,原目录中的 compose/releases 留档不会自动搬运
+- 同服务器多项目若都未填项目级目录,仍共用服务器 `remote_dir` 与同一个 `docker-compose.yml`(向后兼容所致),建议逐项目分配独立目录
+- 默认服务器仅作便利(不校验归属),选错不会被拦住;部署页提示行会显示实际目录与来源供确认
+- 部署历史里的**旧记录**(无 id)在改名后仍无法回滚,重新部署一次即可写入带 id 的新记录
