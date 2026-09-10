@@ -747,9 +747,11 @@
       box.appendChild(el('div', 'cleanup-item mono', prj.composeFile));
     }
 
-    // 归档:默认保留最新 5 个(与部署收尾同一口径),只勾选更早的
+    // 归档:按该项目配置的保留数量(第五批;未配置 = 默认 5 个),只勾选更早的
     var releases = prj.releases || [];
-    var prunable = releases.slice(5);
+    var keep = (typeof prj.releaseKeep === 'number' && prj.releaseKeep >= 0)
+      ? prj.releaseKeep : 5;
+    var prunable = releases.slice(keep);
     var relRow = el('div', 'cleanup-project-row');
     var relChk = el('input');
     relChk.type = 'checkbox';
@@ -760,7 +762,8 @@
     relRow.appendChild(relChk);
     relRow.appendChild(el('span', 'cleanup-project-label',
       '旧发布归档:' + prunable.length + ' 个可清理(共 ' + releases.length +
-      ' 个,保留最新 5 个)'));
+      ' 个,保留最新 ' + keep + ' 个' +
+      (prj.appProject ? '' : ';该项目未在软件内配置,按默认 5 个') + ')'));
     box.appendChild(relRow);
     var relShow = prunable.slice(0, 3);
     for (var ri = 0; ri < relShow.length; ri++) {
@@ -861,8 +864,10 @@
       var want = byProject[key];
       var target = { dir: prj.dir || '', releaseDirs: [], imageRefs: [] };
       if (want.releases) {
-        // 与 UI 一致:保留最新 5 个
-        target.releaseDirs = (prj.releases || []).slice(5);
+        // 与 UI 一致:按项目配置的保留数量(默认 5)取更早的部分
+        var keepN = (typeof prj.releaseKeep === 'number' && prj.releaseKeep >= 0)
+          ? prj.releaseKeep : 5;
+        target.releaseDirs = (prj.releases || []).slice(keepN);
       }
       if (want.tags) {
         target.imageRefs = (prj.tagImages || [])
@@ -1728,13 +1733,25 @@
       return null;
     }
 
+    // 发布归档保留数量(第五批):留空 = 用默认 5;填了须为 0-50 整数
+    var keepRaw = fieldVal('prjf-release-keep');
+    var releaseKeep = null;
+    if (keepRaw !== '') {
+      if (!/^\d+$/.test(keepRaw) || Number(keepRaw) > 50) {
+        formFailLoud(errId, '发布归档保留数量需为 0 - 50 之间的整数,或留空使用默认 5 个');
+        return null;
+      }
+      releaseKeep = Number(keepRaw);
+    }
+
     return {
       health_wait_secs: healthWait,
       pre_deploy_cmd: preCmd ? preCmd : null,
       post_deploy_cmd: postCmd ? postCmd : null,
       notify_webhook: webhook ? webhook : null,
       remote_dir: remoteDir ? remoteDir : null,
-      default_server_id: defaultServer ? defaultServer : null
+      default_server_id: defaultServer ? defaultServer : null,
+      release_keep: releaseKeep
     };
   }
 
@@ -2295,6 +2312,15 @@
         + '填了独立目录后,需在服务器上先建好该目录(可到 03 页服务器卡片点「创建远程目录」后手动补路径)。');
       appendServerSelect(body, prev);
 
+      // 发布归档保留数量(第五批):部署成功后按此清理旧 releases 目录
+      appendField(body, '发布归档保留数量(可选)', 'prjf-release-keep', 'number',
+        prev && prev.release_keep !== null && prev.release_keep !== undefined
+          ? prev.release_keep : '',
+        '留空 = 默认 5 个',
+        '部署成功后每次清理旧发布归档(releases/),只保留最新的 N 个(0 - 50,可填 0 表示不留历史)。' +
+        '留空用默认 5 个。「服务器管理 → 清理优化」的归档清理也按此数量。',
+        { min: '0', max: '50', step: '1' });
+
       // 文件映射编辑表格
       var mapRow = el('div', 'form-row');
       mapRow.appendChild(el('label', 'form-label', '文件映射(本地 → 服务器)'));
@@ -2531,6 +2557,7 @@
           cfg.projects[idx].notify_webhook = extras.notify_webhook;
           cfg.projects[idx].remote_dir = extras.remote_dir;
           cfg.projects[idx].default_server_id = extras.default_server_id;
+          cfg.projects[idx].release_keep = extras.release_keep;
         } else {
           cfg.projects.push({
             id: pid,
@@ -2544,7 +2571,8 @@
             post_deploy_cmd: extras.post_deploy_cmd,
             notify_webhook: extras.notify_webhook,
             remote_dir: extras.remote_dir,
-            default_server_id: extras.default_server_id
+            default_server_id: extras.default_server_id,
+            release_keep: extras.release_keep
           });
         }
         return window.AppBus.invoke('save_config_cmd', { cfg: cfg });
@@ -2599,7 +2627,8 @@
               post_deploy_cmd: extras.post_deploy_cmd,
               notify_webhook: extras.notify_webhook,
               remote_dir: extras.remote_dir,
-              default_server_id: extras.default_server_id
+              default_server_id: extras.default_server_id,
+              release_keep: extras.release_keep
             };
             return window.AppBus.invoke('get_config').then(function (cfg) {
               cfg = normalizeCfg(cfg);

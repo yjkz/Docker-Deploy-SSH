@@ -315,6 +315,18 @@
           planStackRollback(detail.dir, r.ts, r.services || []);
         });
         row.appendChild(btn);
+
+        // 删除该归档(第五批):两步确认(先变「确认删除?」,3 秒内再点才执行),
+        // 与 03 页项目删除同一套交互,避免误删唯一可回滚的版本。
+        var delBtn = el('button', 'btn btn-sm rollback-del-btn', '删除');
+        delBtn.type = 'button';
+        delBtn.title = '删除服务器上的这个发布归档(不可恢复)';
+        delBtn.addEventListener('click', function () {
+          armConfirm(delBtn, function () {
+            deleteRelease(detail.dir, r.ts, delBtn);
+          });
+        });
+        row.appendChild(delBtn);
         box.appendChild(row);
       });
     }
@@ -341,11 +353,101 @@
             });
             row.appendChild(btn);
           }
+          // 删除该日期标签镜像(第五批):两步确认;仍被容器引用时后端会拒绝
+          var delTagBtn = el('button', 'btn btn-sm rollback-del-btn', '删除');
+          delTagBtn.type = 'button';
+          delTagBtn.title = '删除服务器上的这个历史镜像(不可恢复;仍被容器使用时会被拒绝)';
+          var ref = repo.repository + ':' + t.tag;
+          delTagBtn.addEventListener('click', function () {
+            armConfirm(delTagBtn, function () {
+              deleteTag(ref, delTagBtn);
+            });
+          });
+          row.appendChild(delTagBtn);
           group.appendChild(row);
         });
         box.appendChild(group);
       });
     }
+  }
+
+  // ===== 删除归档 / 历史镜像(第五批;两步确认)=====
+
+  /**
+   * 两步确认(与 03 页项目删除同一套交互):首次点击把按钮变成
+   * 「确认删除?」并加红,3 秒内再点才真正执行;超时自动还原。
+   * 用两步而非浏览器 confirm:全站约定不调用系统对话框。
+   */
+  function armConfirm(btn, onConfirm) {
+    if (btn.__rbArmed) {
+      if (btn.__rbTimer) {
+        window.clearTimeout(btn.__rbTimer);
+        btn.__rbTimer = null;
+      }
+      btn.__rbArmed = false;
+      btn.textContent = btn.__rbText || '删除';
+      btn.classList.remove('btn-danger');
+      onConfirm();
+      return;
+    }
+    btn.__rbArmed = true;
+    btn.__rbText = btn.textContent;
+    btn.textContent = '确认删除?';
+    btn.classList.add('btn-danger');
+    btn.title = '再次点击确认删除(不可恢复)';
+    btn.__rbTimer = window.setTimeout(function () {
+      btn.__rbArmed = false;
+      btn.textContent = btn.__rbText || '删除';
+      btn.classList.remove('btn-danger');
+      btn.__rbTimer = null;
+    }, 3000);
+  }
+
+  /** 删除发布归档:后端校验路径前缀与存在性 → rm -rf → 刷新明细与项目列表 */
+  function deleteRelease(dir, ts, btn) {
+    var server = currentServer();
+    if (!server) return;
+    if (btn) { btn.disabled = true; btn.textContent = '删除中…'; }
+    window.AppBus.invoke('rollback_delete_release', {
+      serverId: server.id,
+      dir: dir,
+      releaseTs: ts
+    })
+      .then(function () {
+        window.toast('已删除发布归档 ' + ts, 'ok');
+        // 刷新明细(归档数变化)与项目列表(归档计数)
+        loadDetail(dir, false);
+        loadProjects(true);
+      })
+      .catch(function (err) {
+        window.toast('删除归档失败:' + errText(err), 'fail');
+      })
+      .then(function () {
+        // 明细刷新会重建整块,此处的按钮多半已被替换;仍兜底恢复可点
+        if (btn) { btn.disabled = false; btn.textContent = '删除'; }
+      });
+  }
+
+  /** 删除历史日期标签镜像:后端 inspect 校验存在 → docker rmi → 刷新明细 */
+  function deleteTag(reference, btn) {
+    var server = currentServer();
+    if (!server) return;
+    if (btn) { btn.disabled = true; btn.textContent = '删除中…'; }
+    window.AppBus.invoke('rollback_delete_tag', {
+      serverId: server.id,
+      reference: reference
+    })
+      .then(function () {
+        window.toast('已删除历史镜像 ' + reference, 'ok');
+        if (selectedDir) loadDetail(selectedDir, true);
+      })
+      .catch(function (err) {
+        // 常见失败:镜像仍被容器引用(docker rmi 拒绝)—— 原文已足够可读
+        window.toast('删除镜像失败:' + errText(err), 'fail');
+      })
+      .then(function () {
+        if (btn) { btn.disabled = false; btn.textContent = '删除'; }
+      });
   }
 
   // ===== 回滚计划与确认 =====

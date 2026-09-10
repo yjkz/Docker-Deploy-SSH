@@ -72,6 +72,8 @@ pub fn run() {
       commands::rollback_scan_projects,
       commands::rollback_project_detail,
       commands::rollback_execute_stack_at,
+      commands::rollback_delete_release,
+      commands::rollback_delete_tag,
       commands::get_history,
       manage::manage_list_servers,
       manage::manage_overview,

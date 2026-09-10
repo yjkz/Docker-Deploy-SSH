@@ -350,6 +350,8 @@ pub fn import_compose(source_path: String, name: String) -> Result<ProjectConfig
         // 需要多项目分目录时在项目表单里填一次
         remote_dir: None,
         default_server_id: None,
+        // 归档保留数留空 = 默认 5 个(与历史行为一致)
+        release_keep: None,
     };
     let mut cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
     cfg.projects.push(project.clone());
@@ -3713,9 +3715,14 @@ async fn run_deploy_stack_steps(
     let manifest = ReleaseManifest::new(project.name.clone(), ts.clone(), manifest_images);
     write_release_artifacts(app, &mut client, &project, &release_dir, &manifest).await;
 
-    // ---- 清理旧 releases(仅留最新 5 个,尽力而为,失败仅告警)----
+    // ---- 清理旧 releases(保留该项目配置的数量,尽力而为,失败仅告警)----
     ensure_not_cancelled(app)?;
-    let cleanup_cmd = cleanup_releases_cmd(&effective_remote_dir(&server, &project));
+    let keep = crate::config::release_keep_of(&project);
+    let cleanup_cmd = cleanup_releases_cmd(&effective_remote_dir(&server, &project), keep);
+    emit_log(
+        app,
+        &format!("清理旧发布归档(保留最新 {} 个)", keep),
+    );
     if let Err(e) = exec_forwarded(app, &mut client, &cleanup_cmd, SSH_EXEC_TIMEOUT_SECS).await {
         emit_log(app, &format!("警告:清理旧 releases 目录失败: {}", e));
     }
@@ -4102,12 +4109,16 @@ fn compose_override_names(compose_file: &str) -> Vec<String> {
         .collect()
 }
 
-/// 拼装 releases 清理命令:按修改时间保留最新 5 个版本目录,其余删除
-/// (`tail -n +6` 从第 6 行起取;`xargs -r` 无输入时不执行 rm)。
-pub fn cleanup_releases_cmd(remote_dir: &str) -> String {
+/// 拼装 releases 清理命令:按修改时间保留最新 `keep` 个版本目录,其余删除
+/// (`tail -n +<keep+1>` 从第 keep+1 行起取;`xargs -r` 无输入时不执行 rm)。
+///
+/// `keep = 0` 时删除全部历史归档(`tail -n +1`,即整表)。
+/// `keep` 由项目配置经 [`crate::config::release_keep_of`] 解析(默认 5 个)。
+pub fn cleanup_releases_cmd(remote_dir: &str, keep: u32) -> String {
     format!(
-        "ls -1dt {}/*/ | tail -n +6 | xargs -r rm -rf",
-        shell_single_quote(&remote_join(remote_dir, "releases"))
+        "ls -1dt {}/*/ | tail -n +{} | xargs -r rm -rf",
+        shell_single_quote(&remote_join(remote_dir, "releases")),
+        keep.saturating_add(1)
     )
 }
 
@@ -5421,6 +5432,142 @@ pub async fn rollback_project_detail(
     })
 }
 
+/// 删除指定的发布归档目录(回滚中心「删除」按钮;二次确认由前端负责)。
+///
+/// 安全约束(防误删/防注入):
+/// - `dir` 必须是绝对路径;
+/// - `ts` 必须是纯目录名(不含 `/` 与 `..`),与 `dir` 拼成
+///   `<dir>/releases/<ts>` 后**校验路径前缀**,越出该项目 releases 目录即拒;
+/// - 只执行 `rm -rf` 这一个由后端拼装、单引号包裹的路径。
+#[tauri::command]
+pub async fn rollback_delete_release(
+    server_id: String,
+    password_plain: Option<String>,
+    dir: String,
+    release_ts: String,
+) -> Result<(), String> {
+    let dir = dir.trim().trim_end_matches('/').to_string();
+    if !dir.starts_with('/') {
+        return Err(format!("项目目录必须是绝对路径:{}", dir));
+    }
+    let ts = release_ts.trim().to_string();
+    if ts.is_empty() || ts.contains('/') || ts.contains("..") || ts.contains('\\') {
+        return Err(format!("发布标识不合法:{}", release_ts));
+    }
+    let release_dir = remote_join(&dir, &format!("releases/{}", ts));
+    // 前缀校验:必须严格位于 <dir>/releases/ 之下(防 ts 注入逃逸)
+    if !release_dir.starts_with(&format!("{}/releases/", dir)) {
+        return Err(format!("目标越出项目 releases 目录:{}", release_dir));
+    }
+
+    let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    let server = find_server(&cfg, &server_id)?.clone();
+    let password = resolve_password(
+        &server.auth.auth_type,
+        password_plain.as_deref(),
+        server.auth.password_enc.as_deref(),
+    )?;
+    let key_pass = resolve_key_passphrase(&server)?;
+    let mut client = with_timeout(
+        SSH_CONNECT_TIMEOUT_SECS,
+        "连接超时",
+        "请检查服务器地址与网络",
+        SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default()),
+    )
+    .await?;
+
+    // 存在性校验:不存在则明确报错(而非静默成功)
+    let (code, _) = with_timeout(
+        SSH_EXEC_TIMEOUT_SECS,
+        "校验归档超时",
+        "请检查服务器网络后重试",
+        exec_collect(&mut client, &test_dir_cmd(&release_dir)),
+    )
+    .await?;
+    if code != 0 {
+        return Err(format!("归档目录不存在:{}", release_dir));
+    }
+
+    let cmd = format!("rm -rf {}", shell_single_quote(&release_dir));
+    let (code, out) = with_timeout(
+        SSH_EXEC_TIMEOUT_SECS,
+        "删除归档超时",
+        "请检查服务器网络后重试",
+        exec_collect(&mut client, &cmd),
+    )
+    .await?;
+    if code != 0 {
+        return Err(format!(
+            "删除归档失败(退出码 {}): {}",
+            code,
+            out.trim()
+        ));
+    }
+    Ok(())
+}
+
+/// 删除指定的日期标签镜像(回滚中心「删除」按钮;二次确认由前端负责)。
+///
+/// 安全约束:`reference` 形如 `repo:YYYYmmdd-HHMMSS`,仅校验非空且不含
+/// shell 元字符风险字符(实际经 [`shell_single_quote`] 包裹);删除前先
+/// `docker image inspect` 校验存在,避免 `docker rmi` 的模糊匹配误删。
+#[tauri::command]
+pub async fn rollback_delete_tag(
+    server_id: String,
+    password_plain: Option<String>,
+    reference: String,
+) -> Result<(), String> {
+    let reference = reference.trim().to_string();
+    if reference.is_empty() || reference.contains(char::is_whitespace) {
+        return Err(format!("镜像引用不合法:{}", reference));
+    }
+    let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    let server = find_server(&cfg, &server_id)?.clone();
+    let password = resolve_password(
+        &server.auth.auth_type,
+        password_plain.as_deref(),
+        server.auth.password_enc.as_deref(),
+    )?;
+    let key_pass = resolve_key_passphrase(&server)?;
+    let mut client = with_timeout(
+        SSH_CONNECT_TIMEOUT_SECS,
+        "连接超时",
+        "请检查服务器地址与网络",
+        SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default()),
+    )
+    .await?;
+
+    let (code, _) = with_timeout(
+        SSH_EXEC_TIMEOUT_SECS,
+        "校验镜像超时",
+        "请检查服务器网络后重试",
+        exec_collect(&mut client, &docker_inspect_cmd(&reference)),
+    )
+    .await?;
+    if code != 0 {
+        return Err(format!("服务器上不存在镜像 {}", reference));
+    }
+
+    // 不使用 -f:若仍被容器引用则命令失败并回传原因(前端二次确认已提示),
+    // 比强制删除更安全 —— 与「清理分析」跳过在用镜像的口径一致。
+    let cmd = format!("docker rmi {}", shell_single_quote(&reference));
+    let (code, out) = with_timeout(
+        SSH_EXEC_TIMEOUT_SECS,
+        "删除镜像超时",
+        "请检查服务器网络后重试",
+        exec_collect(&mut client, &cmd),
+    )
+    .await?;
+    if code != 0 {
+        return Err(format!(
+            "删除镜像失败(退出码 {}): {}",
+            code,
+            out.trim()
+        ));
+    }
+    Ok(())
+}
+
 /// 按**服务器项目目录**执行整栈回滚(独立回滚模块入口)。
 ///
 /// 与 [`rollback_execute_stack`] 的差异:不依赖应用内项目配置 —— 释出目录
@@ -6238,6 +6385,10 @@ pub struct CleanupProject {
     pub tag_images: Vec<CleanupTagImage>,
     /// 匹配到的应用内项目名(仅标注;空串=服务器上存在但软件内未配置)
     pub app_project: String,
+    /// 该项目的发布归档保留数量(第五批):来自匹配到的应用内项目配置,
+    /// 未匹配到或未配置时为 [`crate::config::DEFAULT_RELEASE_KEEP`]。
+    /// 前端据此计算「可清理的旧归档」与部署收尾同一口径。
+    pub release_keep: u32,
 }
 
 /// 单条扫描命令的诊断信息(命令原文、退出码、输出摘要)。
@@ -6934,18 +7085,19 @@ async fn scan_cleanup_projects(
 
         // 应用内项目标注:按「项目名 == 目录名」或 compose 文件名匹配
         let dir_name = dir.rsplit('/').next().unwrap_or("");
-        let app_project = cfg
-            .projects
-            .iter()
-            .find(|p| {
-                p.name == dir_name
-                    || p.compose_file
-                        .rsplit_once('/')
-                        .map(|(d, _)| d == dir)
-                        .unwrap_or(false)
-            })
-            .map(|p| p.name.clone())
-            .unwrap_or_default();
+        // 归属匹配:按「项目名 == 目录名」或 compose 副本路径命中应用内项目;
+        // 同时取其归档保留数量(未命中/未配置 = 默认 5),与部署收尾同口径
+        let matched = cfg.projects.iter().find(|p| {
+            p.name == dir_name
+                || p.compose_file
+                    .rsplit_once('/')
+                    .map(|(d, _)| d == dir)
+                    .unwrap_or(false)
+        });
+        let app_project = matched.map(|p| p.name.clone()).unwrap_or_default();
+        let release_keep = matched
+            .map(crate::config::release_keep_of)
+            .unwrap_or(crate::config::DEFAULT_RELEASE_KEEP);
 
         projects.push(CleanupProject {
             dir: dir.clone(),
@@ -6954,6 +7106,7 @@ async fn scan_cleanup_projects(
             releases,
             tag_images,
             app_project,
+            release_keep,
         });
     }
 
@@ -7742,6 +7895,7 @@ services:
             source_hash: None,
             remote_dir: dir.map(String::from),
             default_server_id: None,
+            release_keep: None,
         };
         // 未配置 → 服务器目录(旧配置行为不变)
         assert_eq!(effective_remote_dir(&server, &mk_project(None)), "/home/henghao");
@@ -7925,6 +8079,7 @@ services:
             source_hash: hash.map(String::from),
             remote_dir: None,
             default_server_id: None,
+            release_keep: None,
         };
         // 未绑定源 → unbound;手工项目(远端相对路径)与导入项目都算 unbound,
         // 但 imported 不同,前端据此决定是否提示补绑
@@ -8647,18 +8802,63 @@ services:
 
     #[test]
     fn test_cleanup_releases_cmd() {
+        // keep = 5(历史默认):tail -n +6 起删
         assert_eq!(
-            cleanup_releases_cmd("/opt/app"),
+            cleanup_releases_cmd("/opt/app", 5),
             "ls -1dt '/opt/app/releases'/*/ | tail -n +6 | xargs -r rm -rf"
+        );
+        // 项目自定义保留数:tail 起点 = keep + 1
+        assert_eq!(
+            cleanup_releases_cmd("/opt/app", 2),
+            "ls -1dt '/opt/app/releases'/*/ | tail -n +3 | xargs -r rm -rf"
+        );
+        // keep = 0:删除全部历史归档(tail -n +1)
+        assert_eq!(
+            cleanup_releases_cmd("/opt/app", 0),
+            "ls -1dt '/opt/app/releases'/*/ | tail -n +1 | xargs -r rm -rf"
+        );
+        // 上限值不产生异常(tail 起点 = 51)
+        assert_eq!(
+            cleanup_releases_cmd("/opt/app", 50),
+            "ls -1dt '/opt/app/releases'/*/ | tail -n +51 | xargs -r rm -rf"
         );
     }
 
     #[test]
     fn test_cleanup_releases_cmd_escapes_quote() {
         assert_eq!(
-            cleanup_releases_cmd("/op't"),
+            cleanup_releases_cmd("/op't", 5),
             "ls -1dt '/op'\\''t/releases'/*/ | tail -n +6 | xargs -r rm -rf"
         );
+    }
+
+    #[test]
+    fn test_release_keep_of_fallback_and_clamp() {
+        let mk = |keep: Option<u32>| ProjectConfig {
+            id: "p".into(),
+            name: "n".into(),
+            image_filter: String::new(),
+            compose_file: "c.yml".into(),
+            file_mappings: Vec::new(),
+            service_overrides: Vec::new(),
+            health_wait_secs: 0,
+            pre_deploy_cmd: None,
+            post_deploy_cmd: None,
+            notify_webhook: None,
+            source_compose_path: None,
+            source_hash: None,
+            remote_dir: None,
+            default_server_id: None,
+            release_keep: keep,
+        };
+        // 未配置(旧配置)→ 默认 5(历史行为不变)
+        assert_eq!(crate::config::release_keep_of(&mk(None)), 5);
+        // 显式值被尊重,含边界 0
+        assert_eq!(crate::config::release_keep_of(&mk(Some(0))), 0);
+        assert_eq!(crate::config::release_keep_of(&mk(Some(1))), 1);
+        assert_eq!(crate::config::release_keep_of(&mk(Some(20))), 20);
+        // 超上限被夹到 50(防手改配置写入过大值导致 tail 参数异常)
+        assert_eq!(crate::config::release_keep_of(&mk(Some(999))), 50);
     }
 
     // ===== 单镜像步骤 5.2:docker_tag_cmd =====

@@ -104,6 +104,24 @@ pub struct ProjectConfig {
     /// 仅作便利,不做强制校验(临时跨服务器部署仍然允许)。旧配置无此字段 → None。
     #[serde(default)]
     pub default_server_id: Option<String>,
+    /// **发布归档保留数量**(第五批,可选):部署成功后按此清理旧 releases 目录,
+    /// 只保留最新的 N 个;`None` = 用 [`DEFAULT_RELEASE_KEEP`](5 个),即旧行为不变。
+    /// 取值上限见 [`RELEASE_KEEP_MAX`];0 = 部署后清空历史归档(仅留本次)。
+    #[serde(default)]
+    pub release_keep: Option<u32>,
+}
+
+/// 发布归档默认保留数量(`release_keep` 未配置时用它,等于历史行为的「最新 5 个」)。
+pub const DEFAULT_RELEASE_KEEP: u32 = 5;
+/// 发布归档保留数量上限(表单校验与后端兜底共用)。
+pub const RELEASE_KEEP_MAX: u32 = 50;
+
+/// 解析某项目实际使用的归档保留数量:配置值(夹到 `0..=MAX`)→ 默认值。
+pub fn release_keep_of(project: &ProjectConfig) -> u32 {
+    project
+        .release_keep
+        .map(|n| n.min(RELEASE_KEEP_MAX))
+        .unwrap_or(DEFAULT_RELEASE_KEEP)
 }
 
 // ===== 通知中心配置(UPGRADE-PLAN 阶段二,serde default 兼容旧配置文件)=====
@@ -638,6 +656,7 @@ mod tests {
             source_hash: None,
             remote_dir: None,
             default_server_id: None,
+            release_keep: None,
         });
         // config_dir 依赖环境变量以便测试注入
         std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
@@ -783,6 +802,7 @@ mod tests {
             source_hash: None,
             remote_dir: None,
             default_server_id: None,
+            release_keep: None,
         });
         save_config(&cfg).unwrap();
         let raw = std::fs::read(&notify_path).unwrap();

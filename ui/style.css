@@ -3217,3 +3217,13 @@ code {
   font-size: 12px;
   color: var(--ark-paper-dim-ink);
 }
+
+/* 回滚中心行内删除按钮(第五批):弱化默认态,确认态由 .btn-danger 接管 */
+.rollback-del-btn {
+  flex: none;
+  margin-left: 6px;
+  opacity: .75;
+}
+.rollback-del-btn:hover { opacity: 1; }
+.rollback-release .rollback-del-btn { margin-left: auto; flex: none; }
+.rollback-tag-row .rollback-del-btn { margin-left: 6px; }

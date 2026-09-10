@@ -482,6 +482,7 @@ mod tests {
             source_hash: None,
             remote_dir: None,
             default_server_id: None,
+            release_keep: None,
         });
         cfg.notify.email = EmailNotify {
             enabled: true,
