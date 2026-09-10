@@ -2615,8 +2615,82 @@ code {
 .dock-icon-btn:hover { color: var(--ark-dock-text-strong); background: var(--ink-on-paper-05); }
 .dock-icon-btn svg { width: 16px; height: 16px; flex: none; }
 
-/* 设置模态卡片:与通知中心同宽(容纳三组表单,同 .notify-modal-card 先例) */
-.settings-modal-card { width: min(640px, 94vw); }
+/* 设置模态卡片:容纳左设置栏 + 右「关于」栏(第四批加宽) */
+.settings-modal-card { width: min(880px, 96vw); }
+
+/* 两栏布局:左设置项(占满剩余宽度)/ 右关于栏(固定 200px);窄窗回退单列 */
+.settings-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 200px;
+  gap: 22px;
+  align-items: start;
+}
+@media (max-width: 760px) {
+  .settings-layout { grid-template-columns: 1fr; }
+}
+.settings-main { min-width: 0; }
+.settings-aside { min-width: 0; }
+
+/* ---- 关于栏:头像 → 名字 → 三行地址,竖直居中 ---- */
+.about-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 10px;
+  padding: 14px 10px;
+  border: 1px solid var(--ark-line-soft);
+  border-radius: 6px;
+  background: var(--ark-paper-dim);
+}
+.about-avatar-wrap { line-height: 0; }
+.about-avatar {
+  width: 88px;
+  height: 88px;
+  border-radius: 50%;
+  object-fit: cover;
+  border: 2px solid var(--ark-line-soft);
+  background: var(--ink-on-paper-08, rgba(128, 128, 128, 0.12));
+}
+/* 头像加载失败时的首字占位 */
+.about-avatar-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 34px;
+  font-weight: 700;
+  color: var(--ark-paper-dim-ink);
+  line-height: 1;
+}
+.about-name {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--ark-ink);
+}
+.about-links {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  margin-top: 2px;
+}
+.about-link {
+  width: 100%;
+  padding: 5px 8px;
+  font-size: 12px;
+  font-family: inherit;
+  color: var(--ark-paper-ink-65);
+  background: transparent;
+  border: 1px solid var(--ark-line-soft);
+  border-radius: 4px;
+  cursor: pointer;
+  text-align: center;
+}
+.about-link:hover {
+  color: var(--ark-ink);
+  border-color: var(--ark-ink);
+  background: var(--ink-on-paper-05);
+}
 
 /* 分组标题(mono 小字,参照 .notify-group-title/.cio-group-title 先例) */
 .set-group-title {

@@ -1364,12 +1364,61 @@
   }
 
   /**
+   * 手动「检查源变更」的结果反馈(第四批修复):toast 摘要 + 结果落汇总栏。
+   *
+   * 为什么单独做:此前手动检查只刷新徽章与汇总栏,而汇总栏在"没有导入项目"
+   * 时会整块隐藏、也不弹 toast,用户点完看不到任何变化(反馈"点了没反应")。
+   * 这里对各种情形都给出明确文案 —— 包括"没有可检查的项目"。
+   */
+  function reportSourceCheckResult(list) {
+    var imported = list.filter(function (s) { return s.imported; });
+    var changed = list.filter(function (s) { return s.state === 'changed'; });
+    var missing = list.filter(function (s) { return s.state === 'missing'; });
+    var unbound = list.filter(function (s) { return s.state === 'unbound' && s.imported; });
+
+    var summary;
+    if (list.length === 0) {
+      summary = '没有可检查的项目';
+    } else if (imported.length === 0) {
+      // 手工项目(远端 compose 路径)无源可查 —— 明确说明,不让用户以为坏了
+      summary = '没有可检查的导入项目(' + list.length + ' 个项目均为手工项目,无源文件可比对)';
+    } else {
+      var parts = [];
+      if (changed.length > 0) {
+        parts.push(changed.length + ' 个源已变更(' + changed.map(function (s) {
+          return s.projectName;
+        }).join('、') + ')');
+      }
+      if (unbound.length > 0) parts.push(unbound.length + ' 个未绑定源');
+      if (missing.length > 0) parts.push(missing.length + ' 个源文件丢失');
+      summary = parts.length > 0
+        ? '检查完成:' + parts.join(';')
+        : '检查完成:' + imported.length + ' 个导入项目的源均无变化';
+    }
+
+    var kind = (changed.length > 0 || missing.length > 0) ? 'warn' : 'ok';
+    window.toast(summary, kind);
+
+    // 结果同时落汇总栏(常驻可复查);无可检查项时也给一行,避免"看起来没反应"
+    st.lastSourceResult = {
+      name: '源检查',
+      state: changed.length > 0 ? 'changed' : 'unchanged',
+      detail: summary,
+      ts: new Date().toTimeString().slice(0, 8)
+    };
+    renderSourceSummary(list, true);
+  }
+
+  /**
    * 源检查汇总栏(第三批):把比对结果常驻显示在项目表上方。
    *
    * 为什么需要它:更新结果此前只经 toast 一闪而过,用户反馈"没看到体现
    * 更新结果"。这里按状态聚合计数并列出需要动作的项目,结果可复查。
+   *
+   * `forceShow` = true(手动点「检查源变更」)时,即使没有导入项目也显示
+   * 一行说明 —— 手动操作必须有可见反馈。
    */
-  function renderSourceSummary(list) {
+  function renderSourceSummary(list, forceShow) {
     var box = document.getElementById('projects-src-summary');
     if (!box) return;
     var arr = Array.isArray(list) ? list : [];
@@ -1378,7 +1427,7 @@
     var unbound = arr.filter(function (s) { return s.state === 'unbound' && s.imported; });
     var readable = arr.filter(function (s) { return s.imported; });
 
-    if (readable.length === 0) {
+    if (readable.length === 0 && !forceShow) {
       box.classList.add('hidden');
       box.textContent = '';
       return;
@@ -1386,6 +1435,19 @@
 
     box.textContent = '';
     box.classList.remove('hidden');
+    if (readable.length === 0) {
+      // 手动检查但没有导入项目:给出明确说明而不是隐藏整块
+      box.className = 'src-summary';
+      box.appendChild(el('span', 'src-summary-text',
+        arr.length === 0
+          ? '源检查:没有可检查的项目'
+          : '源检查:没有导入项目(' + arr.length + ' 个均为手工项目,无源文件可比对)'));
+      if (st.lastSourceResult) {
+        box.appendChild(el('span', 'src-summary-last',
+          '最近操作 [' + st.lastSourceResult.ts + '] ' + st.lastSourceResult.detail));
+      }
+      return;
+    }
     var parts = ['导入项目 ' + readable.length + ' 个'];
     if (changed.length > 0) parts.push('源已变更 ' + changed.length + ' 个');
     if (unbound.length > 0) parts.push('未绑定源 ' + unbound.length + ' 个');
@@ -2624,12 +2686,16 @@
     var srcCheckBtn = document.getElementById('projects-src-check-btn');
     if (srcCheckBtn) {
       srcCheckBtn.addEventListener('click', function () {
+        if (st.sourceChecking) return; // 进行中:不重复发起
         srcCheckBtn.disabled = true;
         srcCheckBtn.textContent = '检查中…';
         // 手动检查不自动改配置,只刷新状态(用户想改可点「从源更新」)
-        checkProjectSources(false).then(function () {
+        checkProjectSources(false).then(function (list) {
           srcCheckBtn.disabled = false;
           srcCheckBtn.textContent = '检查源变更';
+          // 手动点击必须**总是**有可见反馈:此前只在结果栏渲染(无导入项目时
+          // 整块隐藏)且不弹提示,点完看起来"什么都没发生"。
+          reportSourceCheckResult(Array.isArray(list) ? list : []);
         });
       });
     }

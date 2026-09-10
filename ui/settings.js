@@ -49,6 +49,16 @@
   var CHECK_LABEL = '检查更新';
   var TEST_LABEL = '测试连接';
 
+  // ===== 「关于」栏常量(第四批)=====
+  /** 作者展示名 */
+  var AUTHOR_NAME = '夜艺';
+  /** 头像:随应用内嵌(ui/images/avatar.png),离线也能显示;不依赖每次联网抓取 */
+  var AVATAR_SRC = 'images/avatar.png';
+  /** 项目主页 / GitHub 主页 / 个人主页(点击经 open_external 用系统浏览器打开) */
+  var LINK_PROJECT = 'https://github.com/yjkz/Docker-Deploy-SSH';
+  var LINK_GITHUB = 'https://github.com/yjkz';
+  var LINK_HOME = 'https://blog.yeyeyiyi.online';
+
   // ===== 状态 =====
 
   var st = {
@@ -200,8 +210,17 @@
   function buildBody(body) {
     body.textContent = '';
 
+    // 两栏布局(第四批):左侧设置项(外观/通用/更新),右侧「关于」栏。
+    // 窄窗口经 CSS 媒体查询回退为单列(关于栏落到下方)。
+    var layout = el('div', 'settings-layout');
+    var main = el('div', 'settings-main');
+    var aside = el('div', 'settings-aside');
+    layout.appendChild(main);
+    layout.appendChild(aside);
+    body.appendChild(layout);
+
     // ── 外观 APPEARANCE(单选,即时生效)──
-    body.appendChild(groupTitle('外观 APPEARANCE'));
+    main.appendChild(groupTitle('外观 APPEARANCE'));
     var radioRow = el('div', 'radio-row');
     var current = schemeMode();
     SCHEME_OPTIONS.forEach(function (opt) {
@@ -217,30 +236,30 @@
       label.appendChild(el('span', null, opt.label));
       radioRow.appendChild(label);
     });
-    body.appendChild(radioRow);
-    body.appendChild(hint(
+    main.appendChild(radioRow);
+    main.appendChild(hint(
       '「跟随系统」随操作系统的深色模式实时切换;点击 dock 主题按钮会写入' +
       '显式亮 / 暗并停用跟随'));
 
     // ── 通用 GENERAL ──
-    body.appendChild(groupTitle('通用 GENERAL'));
-    body.appendChild(checkboxRow('settings-close-tray', '关闭窗口时隐藏到托盘', false));
-    body.appendChild(hint('开启后点关闭仅隐藏窗口(部署继续),托盘菜单「退出」才真正退出;保存后立即生效'));
-    body.appendChild(checkboxRow('settings-auto-update-src', '启动时自动从源更新项目', true));
-    body.appendChild(hint(
+    main.appendChild(groupTitle('通用 GENERAL'));
+    main.appendChild(checkboxRow('settings-close-tray', '关闭窗口时隐藏到托盘', false));
+    main.appendChild(hint('开启后点关闭仅隐藏窗口(部署继续),托盘菜单「退出」才真正退出;保存后立即生效'));
+    main.appendChild(checkboxRow('settings-auto-update-src', '启动时自动从源更新项目', true));
+    main.appendChild(hint(
       '开启后打开软件会比对导入项目的源 compose(含 .env / override)与配置内副本,' +
       '发现变化即自动同步并重解析(保留已保存的服务分类);关闭后仍可在项目列表点「从源更新」手动执行'));
 
     // ── 更新 UPDATE ──
-    body.appendChild(groupTitle('更新 UPDATE'));
-    body.appendChild(buildField('代理地址 PROXY', 'settings-proxy-input', 'text', '',
+    main.appendChild(groupTitle('更新 UPDATE'));
+    main.appendChild(buildField('代理地址 PROXY', 'settings-proxy-input', 'text', '',
       '留空直连;支持 http:// 与 socks5://,例如 http://127.0.0.1:7890',
       '仅用于检查更新访问 GitHub;「检查更新 / 测试连接」使用上方输入框当前值,未保存也可测试'));
 
     // 更新结果区(行内回显 + notes 截断 + 前往下载,内容见 showUpdate*)
     var area = el('div', 'set-update-area');
     area.id = 'settings-update-area';
-    body.appendChild(area);
+    main.appendChild(area);
 
     // ── 底部按钮行:左侧更新组 + 右侧主保存按钮 ──
     var actions = el('div', 'modal-actions settings-actions');
@@ -265,7 +284,60 @@
 
     actions.appendChild(testGroup);
     actions.appendChild(saveBtn);
-    body.appendChild(actions);
+    main.appendChild(actions);
+
+    // ── 关于 ABOUT(右栏):头像 → 名字 → 三行地址,竖直居中排列 ──
+    buildAboutPanel(aside);
+  }
+
+  /**
+   * 「关于」栏(第四批):头像 → 名字 → 项目主页 / GitHub / 个人主页。
+   *
+   * 头像随应用内嵌(`ui/images/avatar.png`),不依赖联网抓取;三处地址经
+   * `open_external` 交给系统浏览器(WebView 内直接跳外链会被拦)。
+   */
+  function buildAboutPanel(aside) {
+    aside.appendChild(groupTitle('关于 ABOUT'));
+
+    var card = el('div', 'about-card');
+
+    // 头像(加载失败时退化为首字占位,不让空框留在界面上)
+    var avatarWrap = el('div', 'about-avatar-wrap');
+    var img = document.createElement('img');
+    img.className = 'about-avatar';
+    img.src = AVATAR_SRC;
+    img.alt = AUTHOR_NAME + ' 的头像';
+    img.addEventListener('error', function () {
+      avatarWrap.textContent = '';
+      avatarWrap.appendChild(el('div', 'about-avatar about-avatar-fallback',
+        AUTHOR_NAME.slice(0, 1)));
+    });
+    avatarWrap.appendChild(img);
+    card.appendChild(avatarWrap);
+
+    card.appendChild(el('div', 'about-name', AUTHOR_NAME));
+
+    var links = el('div', 'about-links');
+    [
+      { label: '项目主页', url: LINK_PROJECT },
+      { label: 'GitHub 主页', url: LINK_GITHUB },
+      { label: '个人主页', url: LINK_HOME }
+    ].forEach(function (item) {
+      var row = el('button', 'about-link', item.label);
+      row.type = 'button';
+      row.title = item.url;
+      row.setAttribute('data-url', item.url);
+      row.addEventListener('click', function () {
+        window.AppBus.invoke('open_external', { url: item.url })
+          .catch(function (err) {
+            window.toast('打开链接失败:' + (errText(err) || '未知错误'), 'fail');
+          });
+      });
+      links.appendChild(row);
+    });
+    card.appendChild(links);
+
+    aside.appendChild(card);
   }
 
   // ===== 更新结果区(行内回显;失败用 --ark-stat-hot 暗红)=====

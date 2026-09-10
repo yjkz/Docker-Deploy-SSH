@@ -329,7 +329,11 @@ fn build_http_client(proxy: Option<&str>, no_redirect: bool) -> Result<reqwest::
 // ===== 外部链接打开 =====
 
 /// 用系统默认浏览器打开外部链接(Tauri WebView 内 window.open 外链会被吞)。
-/// 仅允许 https:// 链接(当前唯一来源是 GitHub Release 页,防御性校验)。
+/// 仅允许 https:// 链接(GitHub Release 页 / 项目主页 / 个人主页,防御性校验)。
+///
+/// `CREATE_NO_WINDOW`(0x0800_0000)不可省:release 是 GUI 进程,经 `cmd` 拉起
+/// 子进程若不给该标志会**闪一个黑色控制台窗口**(用户可见的体验瑕疵;
+/// `update_install` 同样带了该标志)。
 #[tauri::command]
 pub fn open_external(url: String) -> std::result::Result<(), String> {
     if !url.starts_with("https://") {
@@ -337,8 +341,10 @@ pub fn open_external(url: String) -> std::result::Result<(), String> {
     }
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
         std::process::Command::new("cmd")
             .args(["/c", "start", "", &url])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW,防闪黑框
             .spawn()
             .map_err(|e| format!("打开浏览器失败: {e}"))?;
         Ok(())
