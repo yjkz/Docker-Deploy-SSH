@@ -1381,11 +1381,12 @@
     window.AppBus.invoke('update_project_from_source', { projectId: project.id })
       .then(function (status) {
         var detail = status && status.detail ? status.detail : '';
+        // state 由后端按「更新前副本 vs 源」判定:changed = 确实同步了新内容
         var changed = status && status.state === 'changed';
         window.toast('项目「' + project.name + '」' +
-          (changed || detail.indexOf('已变更') >= 0
-            ? '已从源更新(检测到变更,配置已同步)'
-            : '已检查源(内容无变化,无需更新)'), 'ok');
+          (changed
+            ? '已从源同步改动到配置副本' + (detail ? '(' + detail + ')' : '')
+            : '源与配置副本一致,无需更新'), 'ok');
         // 结果落到页面上的检查汇总栏,不只依赖 toast(用户反馈"看不到更新结果")
         st.lastSourceResult = {
           name: project.name,

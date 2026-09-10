@@ -534,6 +534,60 @@ fn project_source_status(p: &ProjectConfig) -> ProjectSourceStatus {
     }
 }
 
+/// 比对「源 compose 目录」与「配置内副本目录」的**内容**是否不同(纯内容,
+/// 忽略 compose 文件名):用于判断本次更新是否真的带来改动。
+///
+/// 为什么不能直接用 [`source_content_hash`]:该哈希把文件名也纳入计算,而
+/// 副本文件名恒为 `docker-compose.yml` —— 源文件若叫 `compose.yml` 或
+/// `docker-compose.yaml`,内容完全相同也会被判为"已变更"(假阳性)。
+///
+/// 规则:compose 本体只比字节;`.env` 与各 override 文件按同名比较
+/// (override 的增删/改名属于真实变更,需计入)。副本缺失 → `true`(需同步)。
+fn bundle_content_changed(source: &Path, dest: &Path) -> Result<bool, String> {
+    let read = |p: &Path| -> Result<Option<Vec<u8>>, String> {
+        match std::fs::read(p) {
+            Ok(b) => Ok(Some(b)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("读取文件失败 ({}): {}", p.display(), e)),
+        }
+    };
+    // compose 本体(源必存在,调用方已校验;副本可能缺失 → None)
+    let src_bytes = read(source)?.unwrap_or_default();
+    let dst_bytes = read(dest)?;
+    if dst_bytes.as_deref() != Some(src_bytes.as_slice()) {
+        return Ok(true);
+    }
+    let src_dir = source.parent();
+    let dst_dir = dest.parent();
+    let (Some(src_dir), Some(dst_dir)) = (src_dir, dst_dir) else {
+        return Ok(false);
+    };
+    // .env 同名比较(一边有一边无 = 变更)
+    let env_src = read(&src_dir.join(".env"))?;
+    let env_dst = read(&dst_dir.join(".env"))?;
+    if env_src != env_dst {
+        return Ok(true);
+    }
+    // override 文件:源侧检测到的名单与内容逐个比对
+    let src_overrides = find_override_files(src_dir);
+    for ov in &src_overrides {
+        let Some(name) = ov.file_name() else { continue };
+        let a = read(ov)?;
+        let b = read(&dst_dir.join(name))?;
+        if a != b {
+            return Ok(true);
+        }
+    }
+    // 副本侧存在而源侧已无的 override(被删除)→ 也算变更
+    for ov in find_override_files(dst_dir) {
+        let Some(name) = ov.file_name() else { continue };
+        if !src_overrides.iter().any(|s| s.file_name() == Some(name)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// 为项目绑定(或改绑)源 compose 文件,并以当前内容建立比对基准。
 ///
 /// 用于第三批之前导入的项目(它们的 `source_compose_path` 为空,无法参与
@@ -578,6 +632,12 @@ pub fn bind_project_source(
 /// 其余字段(名称/过滤词/映射/钩子/健康检查/通知)一律不动 —— 更新只同步
 /// compose 本体,不覆盖用户在应用内的配置。
 /// 更新前把旧副本另存为 `docker-compose.yml.bak`(出错可人工回退)。
+///
+/// **返回值语义**:`changed` = 本次确实同步了新内容(源与更新前的副本不同);
+/// `unchanged` = 源与更新前的副本一致(仅刷新基准,无实际改动)。
+/// 判定必须用**更新前**的副本与源比较 —— 若更新后再比配置里的哈希,基准
+/// 已被本次写入覆盖,结果恒为 unchanged(旧实现即此 bug:文件同步了却报
+/// 「无改动」,用户无法判断是否生效)。
 #[tauri::command]
 pub fn update_project_from_source(project_id: String) -> Result<ProjectSourceStatus, String> {
     let mut cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
@@ -605,6 +665,15 @@ pub fn update_project_from_source(project_id: String) -> Result<ProjectSourceSta
         .parent()
         .ok_or_else(|| format!("项目副本路径异常:{}", project.compose_file))?
         .to_path_buf();
+    if !dest_dir.is_dir() {
+        return Err(format!("项目副本目录不存在:{}", dest_dir.display()));
+    }
+
+    // ---- 更新前判定:源内容 vs 旧副本内容(副本缺失 = 视为有改动需同步)----
+    // 用内容比较(忽略 compose 文件名差异):源叫 compose.yml 而副本恒为
+    // docker-compose.yml 时不应误报"已变更"。
+    let dest_same = !bundle_content_changed(&source, &dest)?;
+
     // 旧副本另存(.bak):更新出错或结果不符时可人工回退
     if dest.is_file() {
         let bak = dest_dir.join("docker-compose.yml.bak");
@@ -638,14 +707,28 @@ pub fn update_project_from_source(project_id: String) -> Result<ProjectSourceSta
         }
     }
 
-    let new_hash = source_content_hash(&source).ok();
     let p = &mut cfg.projects[idx];
     p.compose_file = new_dest.to_string_lossy().to_string();
     p.service_overrides = merged;
-    p.source_hash = new_hash;
+    p.source_hash = source_content_hash(&source).ok();
     let updated = p.clone();
     save_config(&cfg).map_err(|e| format!("保存配置失败: {}", e))?;
-    Ok(project_source_status(&updated))
+
+    // 状态按**更新前**的比对结果给出;`source_hash` 现已是最新基准,故直接
+    // 组装状态而不复用 project_source_status(那会拿新基准复核,恒 unchanged)。
+    let status = project_source_status(&updated);
+    Ok(if dest_same {
+        status
+    } else {
+        ProjectSourceStatus {
+            state: "changed".to_string(),
+            detail: format!(
+                "已从源同步:{} 处服务(含 .env 与 override)",
+                stack.services.len()
+            ),
+            ..status
+        }
+    })
 }
 
 /// 解析项目持久化的 compose:`docker images` 一次 → parse_compose_file
@@ -7626,6 +7709,65 @@ services:
 
         // 源不存在 → Err(调用方按"无法比对"降级,不误判为已变更)
         assert!(source_content_hash(&dir.join("nope.yml")).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_bundle_content_changed_ignores_compose_filename() {
+        let dir = std::env::temp_dir().join(format!("dd-bundle-{}", uuid::Uuid::new_v4()));
+        let src = dir.join("src");
+        let dst = dir.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        let body = "services:\n  web:\n    image: a:1\n";
+
+        // 源叫 compose.yml,副本叫 docker-compose.yml —— 内容相同不应判为变更
+        // (这正是 source_content_hash 按文件名入哈希的盲区)
+        std::fs::write(src.join("compose.yml"), body).unwrap();
+        std::fs::write(dst.join("docker-compose.yml"), body).unwrap();
+        assert!(!bundle_content_changed(&src.join("compose.yml"), &dst.join("docker-compose.yml")).unwrap());
+
+        // compose 内容不同 → 变更
+        std::fs::write(dst.join("docker-compose.yml"), "services:\n  web:\n    image: a:2\n").unwrap();
+        assert!(bundle_content_changed(&src.join("compose.yml"), &dst.join("docker-compose.yml")).unwrap());
+
+        // 副本缺失 → 需同步
+        assert!(bundle_content_changed(&src.join("compose.yml"), &dst.join("nope.yml")).unwrap());
+
+        // .env 变化 → 变更(即使 compose 相同)
+        std::fs::write(dst.join("docker-compose.yml"), body).unwrap();
+        assert!(!bundle_content_changed(&src.join("compose.yml"), &dst.join("docker-compose.yml")).unwrap());
+        std::fs::write(src.join(".env"), "TAG=2\n").unwrap();
+        assert!(bundle_content_changed(&src.join("compose.yml"), &dst.join("docker-compose.yml")).unwrap());
+        std::fs::write(dst.join(".env"), "TAG=2\n").unwrap();
+        assert!(!bundle_content_changed(&src.join("compose.yml"), &dst.join("docker-compose.yml")).unwrap());
+
+        // override 增删 → 变更
+        std::fs::write(src.join("docker-compose.override.yml"), "services: {}\n").unwrap();
+        assert!(bundle_content_changed(&src.join("compose.yml"), &dst.join("docker-compose.yml")).unwrap());
+        std::fs::write(dst.join("docker-compose.override.yml"), "services: {}\n").unwrap();
+        assert!(!bundle_content_changed(&src.join("compose.yml"), &dst.join("docker-compose.yml")).unwrap());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_update_reports_changed_before_overwriting_baseline() {
+        // 回归:update_project_from_source 曾先写新哈希再复核状态,导致
+        // 无论是否真的同步了内容都报 unchanged(用户看到"无改动"但文件已更新)。
+        // 这里验证判定所用的"更新前副本 vs 源"语义:内容确有差异时必须为 changed。
+        let dir = std::env::temp_dir().join(format!("dd-upd-{}", uuid::Uuid::new_v4()));
+        let src = dir.join("src");
+        let dst = dir.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("docker-compose.yml"), "services:\n  web:\n    image: v2\n").unwrap();
+        std::fs::write(dst.join("docker-compose.yml"), "services:\n  web:\n    image: v1\n").unwrap();
+        // 更新前:内容不同 → 本次会带来改动(应报 changed)
+        assert!(bundle_content_changed(&src.join("docker-compose.yml"), &dst.join("docker-compose.yml")).unwrap());
+        // 模拟更新后(副本 == 源)→ 再比对为一致(基准已同步,后续不再报变更)
+        std::fs::copy(src.join("docker-compose.yml"), dst.join("docker-compose.yml")).unwrap();
+        assert!(!bundle_content_changed(&src.join("docker-compose.yml"), &dst.join("docker-compose.yml")).unwrap());
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -46,7 +46,7 @@
 构建:npm run tauri dev / npm run tauri build(产物 NSIS 安装包 ~8.2MB)
 配置:安装目录 config/ 下 servers.json + projects.json + notify.json + settings.json +
       deployments.json + resume-deploy.json(便携式;原子写);日志 logs/app.log
-测试:cargo test(纯函数单测 233 passed;真机测试 #[ignore] 12 个)
+测试:cargo test(纯函数单测 235 passed;真机测试 #[ignore] 12 个)
 当前版本:v5.4.1(tauri.conf.json / Cargo.toml;第三批 + 自动更新重启/项目源绑定修复)
 ```
 

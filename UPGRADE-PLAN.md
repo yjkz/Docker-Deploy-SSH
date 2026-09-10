@@ -306,7 +306,7 @@ notify: {
 
 **目标**:修掉「清理分析识别不到服务器资源」的真因,把清理从「全局 prune」升级为「按服务器实际项目分列、可逐项勾选」;新增独立的回滚中心;补上「源 compose 变更后不必重新导入」的更新机制与文件映射默认名。
 
-**进度**:阶段十一 ✅ / 阶段十二 ✅ / 阶段十三 ✅ / 阶段十四 ✅ —— 随 **v5.4.0** 发布;实测反馈的两处缺陷修复并入 **v5.4.1**
+**进度**:阶段十一 ✅ / 阶段十二 ✅ / 阶段十三 ✅ / 阶段十四 ✅ —— 随 **v5.4.0** 发布;实测反馈的缺陷修复并入 **v5.4.1 / v5.4.2**
 
 | 阶段 | 主题 | 关键产出 |
 |---|---|---|
@@ -373,6 +373,20 @@ notify: {
 - 状态机调整:`unknown` 拆为 `unbound`(未绑定)/ `unreadable`(源不可读);已绑定但缺哈希的旧配置按当前内容补算基准报 `unchanged`(用户已明确绑定,不该再无从下手)
 
 **验证**:`cargo test` 233 passed / 0 failed / 12 ignored(新增标记 round-trip 单测;修复单测污染全局 `DD_CONFIG_DIR` 导致的偶发失败 —— 改为 `DD_UPDATE_PENDING_PATH` 注入隔离,连跑 3 次稳定);浏览器实测 5 项:项目卡片按钮矩阵(未绑定→「绑定源」+ 徽章、已绑定→「从源更新」+「源已变更」徽章)、绑定源载荷与汇总栏、更新结果落汇总栏「最近操作」、更新完成提示三场景(版本一致→提示 / 不一致→静默 / 无标记→静默)、JS 语法全通过
+
+### 修复记录(v5.4.2,2026-09-10)
+
+用户实测反馈第三处缺陷:修改源 compose 后手动点「从源更新」提示「无改动」,但到部署目录核对发现副本确实已同步。
+
+**根因**:`update_project_from_source` 先把新哈希写入配置(`p.source_hash = new_hash`),然后复用 `project_source_status(&updated)` 计算返回状态 —— 该函数拿配置里的哈希与源比对,而基准刚被本次写入覆盖,于是**结果恒为 `unchanged`**。文件同步与提示文案自相矛盾。
+
+**修复**:
+- 新增 `bundle_content_changed(源, 旧副本)`:在覆盖副本**之前**比较纯内容(compose 本体 + 同名 `.env`/override),据此给出 `changed` / `unchanged`
+- 该函数**只比内容、不比文件名** —— `source_content_hash` 把文件名纳入哈希,而副本恒名 `docker-compose.yml`,源若叫 `compose.yml`/`docker-compose.yaml` 时内容相同也会假阳性
+- 前端文案区分:「已从源同步改动到配置副本(N 处服务)」vs「源与配置副本一致,无需更新」
+- 单测:`test_bundle_content_changed_ignores_compose_filename`(文件名差异 / 内容差异 / 副本缺失 / .env 变化 / override 增删各情形)、`test_update_reports_changed_before_overwriting_baseline`(回归语义)
+
+**验证**:`cargo test` 235 passed / 0 failed / 12 ignored;浏览器实测两种结果文案与汇总栏「最近操作」均按实际改动区分。
 
 ### 遗留与取舍(记录在 wiki 07 已知限制)
 
