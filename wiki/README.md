@@ -28,31 +28,31 @@
 | [01-架构总览.md](01-架构总览.md) | 技术栈、系统分层、三条数据流、目录结构 | 第一篇,建立全局图景 |
 | [02-后端模块.md](02-后端模块.md) | 14 个功能 Rust 模块职责、关键结构体/函数签名、超时常量 | 改后端前 |
 | [03-前端说明.md](03-前端说明.md) | 页面结构、JS 模块(含 manage/notify/config-io/settings/help)、全局约定(AppState/AppBus)、设计语言 | 改前端前 |
-| [04-契约参考.md](04-契约参考.md) | **77 个命令 + 9 个事件 + 配置 JSON Schema 完整速查** | 跨前后端改动的对账表 |
+| [04-契约参考.md](04-契约参考.md) | **84 个命令 + 9 个事件 + 配置 JSON Schema 完整速查** | 跨前后端改动的对账表 |
 | [05-构建与运行.md](05-构建与运行.md) | 环境要求、dev/build 命令、安装布局、日志、配置文件夹 | 跑起来之前 |
-| [06-部署流程与回滚.md](06-部署流程与回滚.md) | 两条部署管线的逐步语义、智能传输、一键回滚、环境检测闸门规则 | 理解/调试部署行为 |
+| [06-部署流程与回滚.md](06-部署流程与回滚.md) | 两条部署管线的逐步语义、智能传输、一键回滚、独立回滚中心(06 页)、环境检测闸门规则 | 理解/调试部署行为 |
 | [07-安全与已知取舍.md](07-安全与已知取舍.md) | 敏感数据数据流、导出加密格式、注入防护、设计决策记录、已知限制 | 评估改动影响时 |
 
 ## 30 秒速览
 
 ```
 仓库:E:\github\Docker-Deploy-SSH(git,主分支 main)
-代码量:Rust ~17,400 行(17 文件,含 main.rs)+ 原生 JS/HTML/CSS ~14,230 行(无框架无打包器,字体 woff2 自捆绑)
+代码量:Rust ~19,280 行(17 文件,含 main.rs)+ 原生 JS/HTML/CSS ~15,700 行(无框架无打包器,字体 woff2 自捆绑)
 技术:Tauri 2 + tokio + russh/russh-sftp + flate2 + serde_yaml + windows-dpapi + tauri-plugin-dialog
       + tauri-plugin-notification + lettre(rustls)+ argon2 + aes-gcm + reqwest(rustls+socks)+ ureq
-前端调用后端:window.__TAURI__.core.invoke(77 个命令),事件 9 个,字段默认 snake_case
-      (notify/config-io/settings/update/回滚列表/.env/批量/断点/清理/日志流/迁移契约为 camelCase,例外清单见 04)
-页面:5 页导航(01 检测 / 02 镜像 / 03 服务器 / 04 部署 / 05 远程管理)+ 设置中心 + 全站帮助
+前端调用后端:window.__TAURI__.core.invoke(84 个命令),事件 9 个,字段默认 snake_case
+      (notify/config-io/settings/update/回滚列表与回滚中心/.env/批量/断点/清理/项目源更新/日志流/迁移契约为 camelCase,例外清单见 04)
+页面:6 页导航(01 检测 / 02 镜像 / 03 服务器 / 04 部署 / 05 远程管理 / 06 回滚中心)+ 设置中心 + 全站帮助
 构建:npm run tauri dev / npm run tauri build(产物 NSIS 安装包 ~8.2MB)
 配置:安装目录 config/ 下 servers.json + projects.json + notify.json + settings.json +
       deployments.json + resume-deploy.json(便携式;原子写);日志 logs/app.log
-测试:cargo test(纯函数单测 216 passed;真机测试 #[ignore] 12 个)
-当前版本:v5.3.0(tauri.conf.json / Cargo.toml;UPGRADE-PLAN 第二批五阶段全部并入本版发布)
+测试:cargo test(纯函数单测 232 passed;真机测试 #[ignore] 12 个)
+当前版本:v5.4.0(tauri.conf.json / Cargo.toml;UPGRADE-PLAN 第三批并入本版发布)
 ```
 
 ## 权威计划/完成记录(仓库根目录)
 
-- `UPGRADE-PLAN.md` — 两批升级计划与完成记录,是 v4.6.0 后全部功能的事实来源:**第一批** v4.7-v5.1 五阶段(智能传输/一键回滚 → 通知中心 → 连接与数据安全 → 桌面体验 → 远程管理补遗,已一次性并入 v5.1.0 发布);**第二批** 阶段六至十(断点续传 ✅ / 批量部署 ✅ / 清理分析 ✅ / 实时日志 ✅ / 镜像迁移 ✅),阶段六起以 **v5.2.0** 发版,阶段九/十随 **v5.3.0** 收官
+- `UPGRADE-PLAN.md` — 三批升级计划与完成记录,是 v4.6.0 后全部功能的事实来源:**第一批** v4.7-v5.1 五阶段(智能传输/一键回滚 → 通知中心 → 连接与数据安全 → 桌面体验 → 远程管理补遗,已一次性并入 v5.1.0 发布);**第二批** 阶段六至十(断点续传 ✅ / 批量部署 ✅ / 清理分析 ✅ / 实时日志 ✅ / 镜像迁移 ✅),阶段六起以 **v5.2.0** 发版,阶段九/十随 **v5.3.0** 收官;**第三批** 阶段十一至十四(清理分析重构与分项目清理 ✅ / 项目源更新 ✅ / 独立回滚中心 ✅ / 映射默认名 ✅),随 **v5.4.0** 发布
 - `DOCKER-MANAGE-PLAN.md` — 远程管理模块三阶段实施计划与 A/B/C 完成记录(v4.5.0,历史事实来源)
 
 ## 历史过程文档(已清理)

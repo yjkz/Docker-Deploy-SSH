@@ -298,3 +298,69 @@ notify: {
 - 实时跟随行数上限 5000 由前端裁剪(后端只管推送);`manage-logs` 事件归属按「当前活跃会话唯一」过滤,后端 streamId 为后端代号,前端未知(全局单流语义下无歧义)
 - 镜像迁移逐台串行、无断点(与批量部署同取舍);取消在镜像边界生效,大镜像传输中不即时中断
 - exec_streaming 取消通道约定:全部 Sender drop(Err)同样按主动取消收场——命令层 stop 先发信号再 drop,时序保证正确
+
+
+---
+
+# 第三批升级（v5.4.0）
+
+**目标**:修掉「清理分析识别不到服务器资源」的真因,把清理从「全局 prune」升级为「按服务器实际项目分列、可逐项勾选」;新增独立的回滚中心;补上「源 compose 变更后不必重新导入」的更新机制与文件映射默认名。
+
+**进度**:阶段十一 ✅ / 阶段十二 ✅ / 阶段十三 ✅ / 阶段十四 ✅ —— 随 **v5.4.0** 发布
+
+| 阶段 | 主题 | 关键产出 |
+|---|---|---|
+| 十一 | 清理分析重构 + 分项目清理 | 修 camelCase 真因;解析容错;`<none>` 全量过滤;扫描起点可配;分项目(归档/标签)逐条删除 |
+| 十二 | 项目「从源更新」 | `source_compose_path`/`source_hash`;启动自动比对 + 手动按钮 + 徽章;保留服务分类 |
+| 十三 | 独立回滚中心(06 页) | 按服务器真实目录扫描项目;归档/标签两级回滚;路径前缀归属校验 |
+| 十四 | 文件映射默认名 | remote 留空 → 本地末段名(前端失焦自动补 + 后端兜底) |
+
+### 阶段十一:清理分析重构 + 分项目清理 ✅
+
+**真因(三个叠加)**:
+1. `CleanupReport` 标了 `#[serde(rename_all = "camelCase")]`,而 `servers.js` 一直读 snake_case(`report.dangling_images` 等)——字段恒为 `undefined`,**四项计数永远显示 0**,与服务器实际状态无关。这是「有 `<none>` 镜像却识别不到」的首因。
+2. `docker images -f dangling=true` 在 BuildKit / containerd image store 下常返回空 → 改为 `docker images --no-trunc` 全量拉取后客户端过滤 `Repository/Tag == "<none>"`。
+3. `parse_cleanup_ndjson` 对每行强制 JSON 解析,而 `exec_collect` 合并 stdout+stderr —— 服务端一句 `WARNING: No swap limit support` 就让该节整体解析失败、列表恒空 → 改为跳过非 JSON 行并收进 `warnings`。
+
+**新增能力**:
+- `CleanupReport` 增 `warnings`(非致命提示)/ `diagnostics`(逐条命令 + 退出码 + 输出摘要)/ `scanRoot` / `projects`(分项目:目录、`du -sh` 占用、releases 归档、旧日期标签镜像,按 compose 内 `image:` 仓库名归属)
+- `cleanup_preview` 增 `scanRoot` 参数(默认服务器 `remote_dir`,可填 `/home` 逐层向下;深度 ≤4,排除 `releases/`、`.git`),并与 `docker ps` 的 compose labels 合并
+- 无标签镜像与旧标签镜像用容器引用集合(`docker ps -a --no-trunc` + `docker inspect --format '{{.Image}}'`)标记在用,在用项前端禁选
+- 执行改**显式目标列表**逐条删除(`rmi` ID / `rm` ID / `volume rm` / `rm -rf` 归档目录),取代 `prune -f`(其删除范围由 docker 自判,与勾选可能不一致);逐节 catch,单节失败(含传输层错误)不中断后续
+- 前端清理模态:扫描起点输入 + 「重新扫描」、提示折叠区、**扫描诊断折叠区**、分项目区块(归档默认保留最新 5 个,与部署收尾同口径)
+- 新增纯函数单测 12 个:NDJSON 容错 / 警告条数上限 / `image_repo_of` / `is_date_tag` / `compose_image_repos` / `split_compose_dump` / `project_dir_of_release` / `parse_du_output` / `abs_path_lines` / 清理命令拼装转义 / 扫描命令形态 / `has_any` 校验
+
+### 阶段十二:项目「从源更新」 ✅
+
+- `ProjectConfig` 增 `source_compose_path`(导入来源绝对路径)与 `source_hash`(compose + `.env` + override 内容 sha256,文件名与长度一并入哈希),`#[serde(default)]` 兼容旧配置
+- `copy_compose_bundle` 统一导入与更新的复制口径(compose + `.env` + override 同名副本)
+- `check_project_sources`(只读比对,状态 `unchanged`/`changed`/`missing`/`unknown`)+ `update_project_from_source`(旧副本备份 `.bak` → 重拷重解析 → **合并保留 `service_overrides`**:仍在的服务沿用旧分类、新增取默认、消失的丢弃;其余字段不动)
+- 前端:启动加载配置后自动比对并更新(设置项 `autoUpdateFromSource` 可关,缺省开启)+ 项目卡片「从源更新」按钮 + 「源已变更 / 源文件丢失」徽章;`st.sourceChecking` 防重入(启动路径与 pagechange 并发时不重复更新 —— 实测发现并修复)
+
+### 阶段十三:独立回滚中心(06 页) ✅
+
+- 现状回滚入口埋在「04 页 → 部署历史」,释出目录固定 `server.remote_dir/releases`,非本应用部署的服务器项目无法回滚
+- 新命令 `rollback_scan_projects`(项目清单 = compose 扫描 + `com.docker.compose.project.working_dir` label 合并,按**服务器真实目录**;`appProject` 仅标注)/ `rollback_project_detail`(归档含 manifest 服务清单 + 各仓库日期标签)/ `rollback_execute_stack_at`(按目录回滚;**归属校验按路径前缀**而非项目名;compose 恢复目标为 `<dir>/docker-compose.yml`)
+- 新模块 `ui/rollback.js`(照 manage.js 骨架:IIFE + pagechange 进出 + 事件单次注册守卫 + 离页清理;纯远程操作不依赖本机 Docker,不入 `LOCKED_PAGES`);`index.html` 加 dock 第 6 项 + section + script;CSP/样式(`.rollback-*`)同步
+- 两级回滚:整栈回滚到归档(任何扫描到的项目)/ 单镜像切回日期标签(复用 `rollback_execute_single`,需软件内已配置项目)
+- 顺带修正 wiki 03 中过时的 `deploy-rollback-modal` 描述(实际一直是 `#deploy-modal`)
+
+### 阶段十四:文件映射默认名 ✅
+
+- 前端 `localBasename` + `collectMappings`:remote 留空时按本地末段名自动填充(本地格 blur 或「浏览」选择后;已填值不覆盖),保存时兜底;不再因 remote 为空报错阻断保存
+- 后端 `sync_files` 同样兜底(remote 为空 → 本地末段名),新增 `local_basename` 纯函数(兼容 `\` 与 `/`,去尾部分隔符)
+
+### 完成记录(2026-09-10)
+
+- 功能提交 `39e386e`(单提交含四阶段;紧随 `bc033f3` 自动更新下载 URL 修复与 `6a885bd` v5.3.2 版本提升)
+- 测试基线 224 → **232 passed / 0 failed / 12 ignored**(新增 12 个纯函数用例;clippy 无新增告警,存量 7 条)
+- 浏览器实测(注入 Tauri 桩)7 项:项目卡片按钮矩阵 / 清理模态四节计数(修复后非 0,在用项标注) / 清理执行载荷(仅未在用 + 仅 2 个最旧归档) / 回滚中心两级操作与执行载荷 / 从源更新载荷 / 映射名推导(文件、目录、保留手填) / 启动自动更新(防重入后恰好 1 次)
+- wiki 全量同步:01(目录 + 第四条数据流)、02(清理/源更新/回滚中心三节 + 行数)、03(页面结构 6 页 + rollback.js 章节 + servers.js 变更)、04(清理/回滚中心/源更新三节契约 + 命令计数 84 + 变更清单两条)、06(独立回滚中心章节)、07(注入防护三行 + 决策 #46-#51 + 已知限制 #27-#32)、README(命令数/页面数/测试数/版本)、本文件
+
+### 遗留与取舍(记录在 wiki 07 已知限制)
+
+- 分项目标签归属按 compose `image:` 仓库名匹配:纯 build 服务或变量插值后仓库名不符时该项目的标签不出现在分项目块(不影响通用四节清理)
+- 分项目扫描深度 ≤4 且归档目录名须匹配 `20*-*`;更深的目录或自定义命名归档不列出(可手动把扫描起点指到项目父目录)
+- 清理执行按前端回传的显式目标,后端不做二次扫描:预览与执行之间服务器状态变化时对应条目报错,其余照常执行
+- `unknown` 状态(旧配置无 `source_hash` 或手工项目)不参与启动自动更新,需手动点一次「从源更新」写入哈希
+- 回滚中心的 `runningContainers` 以容器名包含目录名近似归属,标签缺失或 `docker ps` 不可用时可能为 0(不影响回滚)
