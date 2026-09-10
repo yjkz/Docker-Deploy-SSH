@@ -86,6 +86,13 @@ pub struct ProjectConfig {
     /// 部署完成通知的 webhook URL(可选)
     #[serde(default)]
     pub notify_webhook: Option<String>,
+    /// 导入来源的 compose 绝对路径(手工项目为 None);用于「从源更新」比对
+    #[serde(default)]
+    pub source_compose_path: Option<String>,
+    /// 导入时 compose + .env + override 内容的 sha256(十六进制);
+    /// 与源文件当前哈希不同即视为「源已变更」。旧配置无此字段 → None(不参与比对)
+    #[serde(default)]
+    pub source_hash: Option<String>,
 }
 
 // ===== 通知中心配置(UPGRADE-PLAN 阶段二,serde default 兼容旧配置文件)=====
@@ -390,13 +397,27 @@ pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<
 /// 应用级设置(`settings.json`,serde camelCase 对齐前端 JS 字段)。
 /// Default 直接 derive:bool 默认 false(关闭到托盘关,旧行为不变)、
 /// String 默认空串(代理为空 = 直连),与手写默认值语义一致。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AppSettings {
     /// 关闭主窗口时隐藏到托盘(false = 关闭即退出;默认关)
     pub close_to_tray: bool,
     /// 检查更新使用的代理地址(http:// 或 socks5:// 前缀;空串 = 直连)
     pub proxy: String,
+    /// 启动时自动比对源 compose 并更新项目(第三批;缺省 true = 默认开启)
+    pub auto_update_from_source: bool,
+}
+
+/// `AppSettings::default` 的手写实现:`auto_update_from_source` 缺省为 **true**
+/// (启动自动比对是第三批的默认行为),其余字段沿用 `Default` 语义。
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            close_to_tray: false,
+            proxy: String::new(),
+            auto_update_from_source: true,
+        }
+    }
 }
 
 /// 读取应用设置(独立文件 `config/settings.json`)。
@@ -602,6 +623,8 @@ mod tests {
             pre_deploy_cmd: Some("mysqldump -uroot -p'x' db > /opt/backup.sql".into()),
             post_deploy_cmd: Some("docker image prune -f".into()),
             notify_webhook: Some("https://example.com/hook".into()),
+            source_compose_path: None,
+            source_hash: None,
         });
         // config_dir 依赖环境变量以便测试注入
         std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
@@ -743,6 +766,8 @@ mod tests {
             pre_deploy_cmd: None,
             post_deploy_cmd: None,
             notify_webhook: None,
+            source_compose_path: None,
+            source_hash: None,
         });
         save_config(&cfg).unwrap();
         let raw = std::fs::read(&notify_path).unwrap();
@@ -812,6 +837,7 @@ mod tests {
         let settings = AppSettings {
             close_to_tray: true,
             proxy: "socks5://127.0.0.1:1080".into(),
+            auto_update_from_source: false,
         };
         save_app_settings(&settings).unwrap();
         assert!(dir.join("config/settings.json").exists());
@@ -851,10 +877,11 @@ mod tests {
 
     #[test]
     fn test_app_settings_camel_case_serde() {
-        // camelCase 序列化对齐前端字段;旧/部分文件缺 proxy 字段 → serde default 补齐
+        // camelCase 序列化对齐前端字段;旧/部分文件缺字段 → serde default 补齐
         let settings = AppSettings {
             close_to_tray: true,
             proxy: "http://127.0.0.1:7890".into(),
+            auto_update_from_source: false,
         };
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains("\"closeToTray\":true"));
@@ -863,6 +890,9 @@ mod tests {
         let partial: AppSettings = serde_json::from_str(r#"{"closeToTray":true}"#).unwrap();
         assert!(partial.close_to_tray);
         assert_eq!(partial.proxy, "");
+        // 旧配置无 autoUpdateFromSource → 默认开启(第三批默认行为)
+        assert!(partial.auto_update_from_source);
+        assert!(AppSettings::default().auto_update_from_source);
     }
 
     // ===== 部署断点续传(阶段六):键构造 / roundtrip / 覆盖 / 删除 / 裁剪 / 容错 =====

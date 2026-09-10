@@ -59,6 +59,10 @@
         <button class="dock-item" type="button" data-nav="manage">
           <span class="dock-num">05</span><span class="dock-label">远程管理</span>
         </button>
+        <!-- 回滚中心:纯远程 SSH 操作(扫描服务器项目 + 归档/标签回滚),不依赖本机 Docker -->
+        <button class="dock-item" type="button" data-nav="rollback">
+          <span class="dock-num">06</span><span class="dock-label">回滚中心</span>
+        </button>
       </nav>
       <!-- dock 底部工具区:设置中心入口(齿轮,模态由 settings.js 构建)+ 亮暗主题切换 -->
       <div class="dock-actions">
@@ -640,6 +644,57 @@
           </div>
         </div>
       </section>
+
+      <!-- 06 回滚中心 ROLLBACK -->
+      <section data-page="rollback" class="page">
+        <header class="page-head">
+          <div class="page-index">06</div>
+          <div class="page-titles">
+            <h1 class="page-title">回滚中心</h1>
+            <span class="page-sub">ROLLBACK</span>
+          </div>
+          <div class="page-tools">
+            <button id="rollback-refresh-btn" class="btn" type="button">重新扫描</button>
+          </div>
+        </header>
+
+        <!-- 服务器 + 扫描起点栏 -->
+        <div class="rollback-bar">
+          <select id="rollback-server-select" class="form-input rollback-server-select"></select>
+          <label class="rollback-root-label" for="rollback-scan-root">扫描起点</label>
+          <input id="rollback-scan-root" class="form-input rollback-root-input" type="text"
+                 placeholder="留空 = 服务器部署目录" autocomplete="off">
+          <button id="rollback-rescan-btn" class="btn btn-sm" type="button">扫描项目</button>
+        </div>
+
+        <div id="rollback-error" class="check-error hidden"></div>
+
+        <div class="rollback-hint">
+          项目按服务器实际目录列出(不是软件内的项目配置)。选择项目可查看它的发布归档与旧版本标签,
+          并回滚到任意历史版本;归档可在「服务器管理 → 清理优化」中清理。
+        </div>
+
+        <!-- 两级布局:左项目列表 / 右明细 -->
+        <div class="rollback-layout">
+          <div class="rollback-list-wrap">
+            <div class="rollback-list-title">服务器项目 PROJECTS</div>
+            <div id="rollback-projects" class="rollback-projects">
+              <div class="rollback-empty">选择服务器后扫描</div>
+            </div>
+          </div>
+          <div class="rollback-detail-wrap">
+            <div id="rollback-detail" class="rollback-detail">
+              <div class="rollback-empty">从左侧选择一个项目查看可回滚版本</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 回滚执行日志 -->
+        <div class="log-shell rollback-log-shell">
+          <pre id="rollback-log" class="deploy-log"></pre>
+          <div id="rollback-log-count" class="log-count"></div>
+        </div>
+      </section>
     </main>
   </div>
 
@@ -756,6 +811,7 @@
   <script src="servers.js"></script>
   <script src="deploy.js"></script>
   <script src="manage.js"></script>
+  <script src="rollback.js"></script>
   <script src="notify.js"></script>
   <script src="help.js"></script>
   <script src="config-io.js"></script>

@@ -111,6 +111,8 @@ const STACK_LOAD_TIMEOUT_SECS: u64 = 600;
 const STACK_COMPOSE_TIMEOUT_SECS: u64 = 900;
 /// 服务器清理(`prune_server`)的执行超时(秒)。
 const PRUNE_TIMEOUT_SECS: u64 = 300;
+/// 分项目扫描的目录深度上限(起点之下);目录更深时把扫描起点指到项目父目录。
+const CLEANUP_SCAN_MAX_DEPTH: usize = 4;
 /// 部署前/后钩子命令的执行超时(秒)。
 const HOOK_TIMEOUT_SECS: u64 = 600;
 /// 健康检查:轮询间隔(秒)。
@@ -312,45 +314,8 @@ pub fn import_compose(source_path: String, name: String) -> Result<ProjectConfig
 
     let id = uuid::Uuid::new_v4().to_string();
     let dest_dir = crate::config::config_dir().join("stacks").join(&id);
-    std::fs::create_dir_all(&dest_dir)
-        .map_err(|e| format!("创建栈目录失败 ({}): {}", dest_dir.display(), e))?;
-    let dest = dest_dir.join("docker-compose.yml");
-    std::fs::copy(&source, &dest).map_err(|e| {
-        format!(
-            "复制 compose 文件失败 ({} -> {}): {}",
-            source.display(),
-            dest.display(),
-            e
-        )
-    })?;
-    // compose 同目录的 .env 一并复制(不存在则跳过),保证后续解析/部署插值一致
-    if let Some(parent) = source.parent() {
-        let source_env = parent.join(".env");
-        if source_env.is_file() {
-            let dest_env = dest_dir.join(".env");
-            std::fs::copy(&source_env, &dest_env).map_err(|e| {
-                format!("复制 .env 文件失败 ({}): {}", source_env.display(), e)
-            })?;
-        }
-    }
-    // compose 同目录的 override 文件一并复制(同名 basename):
-    // 与解析合并保持一致,远端 pull/up 的 -f 文件链才能指向同名文件
-    if let Some(parent) = source.parent() {
-        for ov_path in find_override_files(parent) {
-            let Some(name) = ov_path.file_name() else {
-                continue;
-            };
-            let dest_ov = dest_dir.join(name);
-            std::fs::copy(&ov_path, &dest_ov).map_err(|e| {
-                format!(
-                    "复制 override 文件失败 ({} -> {}): {}",
-                    ov_path.display(),
-                    dest_ov.display(),
-                    e
-                )
-            })?;
-        }
-    }
+    // 复制口径与「从源更新」共用(compose + .env + override 同名副本)
+    let dest = copy_compose_bundle(&source, &dest_dir)?;
 
     // 记录导入来源的原始 compose 父目录名(origin.json):副本父目录是 uuid,
     // 后续解析推导 compose 默认镜像名兜底候选(<原目录名>-<服务名>)需要它。
@@ -379,11 +344,227 @@ pub fn import_compose(source_path: String, name: String) -> Result<ProjectConfig
         pre_deploy_cmd: None,
         post_deploy_cmd: None,
         notify_webhook: None,
+        source_compose_path: Some(source.to_string_lossy().to_string()),
+        source_hash: source_content_hash(&source).ok(),
     };
     let mut cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
     cfg.projects.push(project.clone());
     save_config(&cfg).map_err(|e| format!("保存配置失败: {}", e))?;
     Ok(project)
+}
+
+// ===== 项目「从源更新」(第三批:源 compose 变更检测与副本同步)=====
+
+/// 把源 compose 及其同目录 `.env` / override 文件复制到项目的副本目录。
+/// 返回副本 compose 的路径(调用方据此更新 `compose_file`)。
+///
+/// 为什么把复制独立成函数:导入([`import_compose`])与「从源更新」
+/// ([`update_project_from_source`])必须用完全相同的复制口径,否则更新后
+/// 解析结果会与导入时不一致。
+fn copy_compose_bundle(source: &Path, dest_dir: &Path) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(dest_dir)
+        .map_err(|e| format!("创建栈目录失败 ({}): {}", dest_dir.display(), e))?;
+    let dest = dest_dir.join("docker-compose.yml");
+    std::fs::copy(source, &dest).map_err(|e| {
+        format!(
+            "复制 compose 文件失败 ({} -> {}): {}",
+            source.display(),
+            dest.display(),
+            e
+        )
+    })?;
+    if let Some(parent) = source.parent() {
+        let source_env = parent.join(".env");
+        if source_env.is_file() {
+            let dest_env = dest_dir.join(".env");
+            std::fs::copy(&source_env, &dest_env)
+                .map_err(|e| format!("复制 .env 文件失败 ({}): {}", source_env.display(), e))?;
+        }
+        // override 文件按同名 basename 复制,保持远端 -f 文件链与解析合并一致
+        for ov_path in find_override_files(parent) {
+            let Some(name) = ov_path.file_name() else {
+                continue;
+            };
+            let dest_ov = dest_dir.join(name);
+            std::fs::copy(&ov_path, &dest_ov).map_err(|e| {
+                format!(
+                    "复制 override 文件失败 ({} -> {}): {}",
+                    ov_path.display(),
+                    dest_ov.display(),
+                    e
+                )
+            })?;
+        }
+    }
+    Ok(dest)
+}
+
+/// 源 compose 内容哈希:对 compose 本体 + 同目录 `.env` + 各 override 文件
+/// 的**内容**（按固定顺序拼接)取 sha256 十六进制。
+///
+/// 只要其中任一份内容变化,哈希即变化 —— 用于判断「源是否已更新」。
+/// 文件不可读时返回 Err(调用方按"无法比对"降级,不误判为已变更)。
+pub fn source_content_hash(source: &Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut push_file = |path: &Path| -> Result<(), String> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| format!("读取源文件失败 ({}): {}", path.display(), e))?;
+        // 文件名 + 长度 + 内容一起入哈希,避免"交换两份文件内容"这类碰撞
+        hasher.update(path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default().as_bytes());
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(&bytes);
+        Ok(())
+    };
+    push_file(source)?;
+    if let Some(parent) = source.parent() {
+        let env = parent.join(".env");
+        if env.is_file() {
+            push_file(&env)?;
+        }
+        for ov in find_override_files(parent) {
+            push_file(&ov)?;
+        }
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        hex.push_str(&format!("{:02x}", b));
+    }
+    Ok(hex)
+}
+
+/// 单个项目的源更新比对结果(前端据此渲染徽章/提示)。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectSourceStatus {
+    pub project_id: String,
+    pub project_name: String,
+    /// 源文件路径(手工项目为空)
+    pub source_path: String,
+    /// `unchanged` / `changed` / `missing` / `unknown`
+    /// (unknown = 旧配置无哈希或源不可读,不参与自动更新)
+    pub state: String,
+    /// 面向用户的说明
+    pub detail: String,
+}
+
+/// 检查所有项目的源 compose 是否已变更(只读,不改配置)。
+///
+/// 手工项目(无 `source_compose_path`)与旧配置(无 `source_hash`)一律
+/// 报 `unknown`,避免"凭空认为要更新"。
+#[tauri::command]
+pub fn check_project_sources() -> Result<Vec<ProjectSourceStatus>, String> {
+    let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    Ok(cfg.projects.iter().map(project_source_status).collect())
+}
+
+/// 计算单个项目的源状态(纯读)。
+fn project_source_status(p: &ProjectConfig) -> ProjectSourceStatus {
+    let base = |state: &str, detail: String| ProjectSourceStatus {
+        project_id: p.id.clone(),
+        project_name: p.name.clone(),
+        source_path: p.source_compose_path.clone().unwrap_or_default(),
+        state: state.to_string(),
+        detail,
+    };
+    let Some(path_str) = p.source_compose_path.as_deref().filter(|s| !s.trim().is_empty()) else {
+        return base("unknown", "手工项目(无导入源),不参与源更新".to_string());
+    };
+    let path = PathBuf::from(path_str);
+    if !path.is_file() {
+        return base("missing", format!("源文件已不存在:{}", path_str));
+    }
+    let Some(saved) = p.source_hash.as_deref().filter(|s| !s.trim().is_empty()) else {
+        return base(
+            "unknown",
+            "旧配置未记录源哈希,重新导入或手动更新一次即可启用比对".to_string(),
+        );
+    };
+    match source_content_hash(&path) {
+        Ok(now) if now == saved => base("unchanged", "源未变更".to_string()),
+        Ok(_) => base("changed", "源 compose 已变更,可更新".to_string()),
+        Err(e) => base("unknown", format!("源不可读:{}", e)),
+    }
+}
+
+/// 从源更新项目:重拷 compose/.env/override → 重解析 → 合并保留 service_overrides。
+///
+/// 保留策略:
+/// - 仍在的服务沿用用户已保存的分类(`service_overrides`);
+/// - 新增服务取解析出的默认分类;
+/// - 源里已消失的服务丢弃其分类。
+/// 其余字段(名称/过滤词/映射/钩子/健康检查/通知)一律不动 —— 更新只同步
+/// compose 本体,不覆盖用户在应用内的配置。
+/// 更新前把旧副本另存为 `docker-compose.yml.bak`(出错可人工回退)。
+#[tauri::command]
+pub fn update_project_from_source(project_id: String) -> Result<ProjectSourceStatus, String> {
+    let mut cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    let idx = cfg
+        .projects
+        .iter()
+        .position(|p| p.id == project_id)
+        .ok_or_else(|| format!("项目不存在:{}", project_id))?;
+    let project = cfg.projects[idx].clone();
+    let source_str = project
+        .source_compose_path
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| format!("项目「{}」是手工项目,没有可更新的导入源", project.name))?;
+    let source = PathBuf::from(&source_str);
+    if !source.is_file() {
+        return Err(format!("源 compose 不存在:{}", source_str));
+    }
+
+    // 先解析校验:源有问题时不落盘、不改配置(与导入一致)
+    let stack = parse_compose_file(&source, &[])?;
+
+    let dest = PathBuf::from(&project.compose_file);
+    let dest_dir = dest
+        .parent()
+        .ok_or_else(|| format!("项目副本路径异常:{}", project.compose_file))?
+        .to_path_buf();
+    // 旧副本另存(.bak):更新出错或结果不符时可人工回退
+    if dest.is_file() {
+        let bak = dest_dir.join("docker-compose.yml.bak");
+        if let Err(e) = std::fs::copy(&dest, &bak) {
+            log::warn!("备份旧 compose 副本失败 ({}): {}", bak.display(), e);
+        }
+    }
+    let new_dest = copy_compose_bundle(&source, &dest_dir)?;
+
+    // 合并 service_overrides:仅在源中仍存在的服务沿用旧分类
+    let new_names: Vec<String> = stack.services.iter().map(|s| s.service.clone()).collect();
+    let mut merged: Vec<ServiceOverride> = project
+        .service_overrides
+        .iter()
+        .filter(|o| new_names.iter().any(|n| n == &o.service))
+        .cloned()
+        .collect();
+    for svc in &stack.services {
+        if !merged.iter().any(|o| o.service == svc.service) {
+            merged.push(ServiceOverride {
+                service: svc.service.clone(),
+                mode: svc.mode.clone(),
+            });
+        }
+    }
+
+    // origin.json 同步刷新(目录名可能已变)
+    if let Some(dir_name) = source.parent().and_then(Path::file_name) {
+        if let Err(e) = crate::stack::save_origin_file(&dest_dir, &dir_name.to_string_lossy()) {
+            log::warn!("更新栈「{}」来源目录名失败: {}", project.name, e);
+        }
+    }
+
+    let new_hash = source_content_hash(&source).ok();
+    let p = &mut cfg.projects[idx];
+    p.compose_file = new_dest.to_string_lossy().to_string();
+    p.service_overrides = merged;
+    p.source_hash = new_hash;
+    let updated = p.clone();
+    save_config(&cfg).map_err(|e| format!("保存配置失败: {}", e))?;
+    Ok(project_source_status(&updated))
 }
 
 /// 解析项目持久化的 compose:`docker images` 一次 → parse_compose_file
@@ -2291,7 +2472,14 @@ async fn sync_files(
         if !local.exists() {
             return Err(format!("同步文件失败:本地路径不存在:{}", mapping.local));
         }
-        let full_remote = remote_join(&server.remote_dir, &mapping.remote);
+        // 服务器相对路径未填时回退为本地路径的末段名(与编辑表单的默认值同一口径):
+        // 目录映射传目录名本身、文件映射传文件名,避免把内容铺进部署根目录
+        let remote_rel = if mapping.remote.trim().is_empty() {
+            local_basename(&mapping.local).unwrap_or_default()
+        } else {
+            mapping.remote.clone()
+        };
+        let full_remote = remote_join(&server.remote_dir, &remote_rel);
         if mapping.is_dir {
             emit_log(app, &format!("同步目录: {} -> {}", mapping.local, full_remote));
             client.sftp_upload_dir(&local, &full_remote, &|_, _| {}).await?;
@@ -2305,6 +2493,26 @@ async fn sync_files(
         }
     }
     Ok(())
+}
+
+/// 取本地路径的末段名(兼容 Windows `\` 与 POSIX `/`;去尾部分隔符)。
+/// 纯函数,便于单测。例:`E:\apps\web` → `web`;`/opt/data/` → `data`。
+pub fn local_basename(path: &str) -> Option<String> {
+    let trimmed = path.trim().trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return None;
+    }
+    let last = trimmed
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(trimmed)
+        .trim()
+        .to_string();
+    if last.is_empty() || last == "." || last == ".." {
+        None
+    } else {
+        Some(last)
+    }
 }
 
 /// 单镜像部署使用的远端 compose 文件及 override 文件名。
@@ -4699,8 +4907,509 @@ async fn rollback_execute_single_inner(
     Ok(record)
 }
 
-/// 组装回滚收尾通知的标题与正文(纯函数,便于单测)。
+// ===== 独立回滚模块(第三批:按服务器真实项目分列)=====
+//
+// 现状 `rollback_*` 全部以应用内 `project_id` 为入口,释出目录固定取
+// `server.remote_dir/releases`;服务器上真实存在的项目(尤其不是本应用部署的)
+// 无法被看到或回滚。本组命令按**目录**工作:先扫描服务器真实项目,
+// 再对指定目录列出发布归档/日期标签并执行回滚。
+
+/// 服务器上的一个真实项目(回滚模块列表项)。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RollbackProject {
+    /// 项目目录(绝对路径)
+    pub dir: String,
+    /// compose 文件路径(未扫到为空)
+    pub compose_file: String,
+    /// 该项目的发布归档目录(完整路径,新→旧)
+    pub releases: Vec<String>,
+    /// 归档数量
+    pub release_count: usize,
+    /// 最近的归档时间戳(无归档为空)
+    pub latest_release: String,
+    /// 运行中的容器数(按 compose project label 归属;取不到为 0)
+    pub running_containers: usize,
+    /// 匹配到的应用内项目名(仅标注;空串 = 服务器上存在但软件内未配置)
+    pub app_project: String,
+}
+
+/// 发布归档明细(回滚选择项)。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RollbackReleaseDetail {
+    pub ts: String,
+    pub dir: String,
+    /// 归档内的镜像包文件名
+    pub packages: Vec<String>,
+    /// manifest 记录的服务名(无清单为空)
+    pub services: Vec<String>,
+    pub has_manifest: bool,
+    pub has_compose_copy: bool,
+}
+
+/// 日期标签镜像明细(单镜像回滚选择项;复用 [`TagBrief`] 字段口径)。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RollbackTagDetail {
+    pub repository: String,
+    pub tags: Vec<TagBrief>,
+}
+
+/// 项目明细:发布归档 + 各仓库的日期标签(供回滚面板两级选择)。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RollbackProjectDetail {
+    pub dir: String,
+    pub compose_file: String,
+    pub releases: Vec<RollbackReleaseDetail>,
+    pub repositories: Vec<RollbackTagDetail>,
+}
+
+/// 扫描服务器上的真实项目(回滚模块入口)。
 ///
+/// 项目来源 = 文件系统扫描(含 compose 文件的目录)+ `docker ps` 的
+/// compose labels 合并去重;以服务器真实目录为准,应用内项目仅作标注。
+/// `scan_root` 缺省用服务器配置的 `remote_dir`。
+#[tauri::command]
+pub async fn rollback_scan_projects(
+    server_id: String,
+    password_plain: Option<String>,
+    scan_root: Option<String>,
+) -> Result<Vec<RollbackProject>, String> {
+    let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    let server = find_server(&cfg, &server_id)?.clone();
+    let password = resolve_password(
+        &server.auth.auth_type,
+        password_plain.as_deref(),
+        server.auth.password_enc.as_deref(),
+    )?;
+    let key_pass = resolve_key_passphrase(&server)?;
+    let mut client = with_timeout(
+        SSH_CONNECT_TIMEOUT_SECS,
+        "连接超时",
+        "请检查服务器地址与网络",
+        SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default()),
+    )
+    .await?;
+
+    let root = scan_root
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| server.remote_dir.clone());
+
+    // 1. 扫 compose 文件 → 项目目录
+    let (code, out) = with_timeout(
+        SSH_EXEC_TIMEOUT_SECS,
+        "扫描项目超时",
+        "请检查服务器网络后重试",
+        exec_collect(&mut client, &cleanup_scan_compose_cmd(&root)),
+    )
+    .await?;
+    if code != 0 {
+        return Err(format!(
+            "扫描目录「{}」失败(目录可能不存在或无权限)",
+            root
+        ));
+    }
+    let compose_paths = abs_path_lines(&out);
+    let mut dirs: Vec<String> = Vec::new();
+    for p in &compose_paths {
+        if let Some((parent, _)) = p.rsplit_once('/') {
+            if !parent.is_empty() && !dirs.iter().any(|d| d == parent) {
+                dirs.push(parent.to_string());
+            }
+        }
+    }
+
+    // 2. 合并 docker 已知的 compose 项目工作目录(label 是权威来源,可补
+    //    上"目录里 compose 文件被删但容器仍在"的情况)
+    let label_cmd = "docker ps --format '{{json .}}'";
+    if let Ok((0, ps_out)) =
+        exec_collect(&mut client, label_cmd).await
+    {
+        let (items, _) = parse_cleanup_ndjson(&ps_out);
+        let cids: Vec<String> = items
+            .iter()
+            .map(|v| jstr(v, "ID"))
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !cids.is_empty() {
+            let quoted: Vec<String> = cids.iter().map(|c| shell_single_quote(c)).collect();
+            let wd_cmd = format!(
+                "docker inspect --format '{{{{index .Config.Labels \"com.docker.compose.project.working_dir\"}}}}' {} 2>/dev/null",
+                quoted.join(" ")
+            );
+            if let Ok((_, wd_out)) = exec_collect(&mut client, &wd_cmd).await {
+                for line in abs_path_lines(&wd_out) {
+                    if !dirs.iter().any(|d| d == &line) {
+                        dirs.push(line);
+                    }
+                }
+            }
+        }
+    }
+    dirs.sort();
+
+    // 3. 归档 + 运行容器数
+    let (_, rel_out) = with_timeout(
+        SSH_EXEC_TIMEOUT_SECS,
+        "扫描归档超时",
+        "请检查服务器网络后重试",
+        exec_collect(&mut client, &cleanup_scan_releases_cmd(&root)),
+    )
+    .await?;
+    let release_paths = abs_path_lines(&rel_out);
+
+    let (_, ps_all_out) =
+        exec_collect(&mut client, "docker ps -a --format '{{json .}}'").await.unwrap_or((0, String::new()));
+    let (containers, _) = parse_cleanup_ndjson(&ps_all_out);
+
+    let mut projects = Vec::new();
+    for dir in dirs {
+        let compose_file = compose_paths
+            .iter()
+            .find(|p| p.rsplit_once('/').map(|(d, _)| d) == Some(dir.as_str()))
+            .cloned()
+            .unwrap_or_default();
+        let mut releases: Vec<String> = release_paths
+            .iter()
+            .filter(|r| project_dir_of_release(r) == dir)
+            .cloned()
+            .collect();
+        releases.sort_by(|a, b| b.cmp(a));
+        let latest = releases
+            .first()
+            .and_then(|r| r.rsplit('/').next().map(String::from))
+            .unwrap_or_default();
+        let dir_name = dir.rsplit('/').next().unwrap_or("");
+        let app_project = cfg
+            .projects
+            .iter()
+            .find(|p| {
+                p.name == dir_name
+                    || p.compose_file
+                        .rsplit_once('/')
+                        .map(|(d, _)| d == dir)
+                        .unwrap_or(false)
+            })
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        // 运行容器数:以 Names 前缀/目录名近似归属(无 labels 时的兜底)
+        let running = containers
+            .iter()
+            .filter(|c| {
+                let status = jstr(c, "Status").to_lowercase();
+                status.starts_with("up") && jstr(c, "Names").contains(dir_name)
+            })
+            .count();
+        projects.push(RollbackProject {
+            dir,
+            compose_file,
+            release_count: releases.len(),
+            releases,
+            latest_release: latest,
+            running_containers: running,
+            app_project,
+        });
+    }
+    Ok(projects)
+}
+
+/// 列出某项目目录下的发布归档与日期标签(回滚面板明细)。
+#[tauri::command]
+pub async fn rollback_project_detail(
+    server_id: String,
+    password_plain: Option<String>,
+    dir: String,
+) -> Result<RollbackProjectDetail, String> {
+    let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    let server = find_server(&cfg, &server_id)?.clone();
+    let password = resolve_password(
+        &server.auth.auth_type,
+        password_plain.as_deref(),
+        server.auth.password_enc.as_deref(),
+    )?;
+    let key_pass = resolve_key_passphrase(&server)?;
+    let mut client = with_timeout(
+        SSH_CONNECT_TIMEOUT_SECS,
+        "连接超时",
+        "请检查服务器地址与网络",
+        SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default()),
+    )
+    .await?;
+
+    let dir = dir.trim().trim_end_matches('/').to_string();
+    let releases_root = remote_join(&dir, "releases");
+    let (code, out) = with_timeout(
+        SSH_EXEC_TIMEOUT_SECS,
+        "查询归档超时",
+        "请检查服务器网络后重试",
+        exec_collect(&mut client, &ls_dir_cmd(&releases_root)),
+    )
+    .await?;
+    let mut ts_list = if code == 0 { parse_ls_lines(&out) } else { Vec::new() };
+    ts_list.sort_by(|a, b| b.cmp(a));
+
+    // 逐归档读文件清单与 manifest(与既有 rollback_list_releases 同口径)
+    let mut releases: Vec<RollbackReleaseDetail> = Vec::new();
+    for ts in ts_list.iter().take(50) {
+        let rd = remote_join(&releases_root, ts);
+        let Ok((code, files_out)) = exec_collect(&mut client, &ls_dir_cmd(&rd)).await else {
+            continue;
+        };
+        if code != 0 {
+            continue;
+        }
+        let files = parse_ls_lines(&files_out);
+        let packages: Vec<String> = files.iter().filter(|f| f.ends_with(".tar.gz")).cloned().collect();
+        let has_manifest = files.iter().any(|f| f == "manifest.json");
+        let has_compose_copy = files.iter().any(|f| f == "docker-compose.yml");
+        let mut services: Vec<String> = Vec::new();
+        if has_manifest {
+            let mp = remote_join(&rd, "manifest.json");
+            if let Ok((0, m_out)) = exec_collect(&mut client, &cat_file_cmd(&mp)).await {
+                if let Some(m) = parse_release_manifest(&m_out) {
+                    services = m.images.into_iter().map(|i| i.service).collect();
+                }
+            }
+        }
+        releases.push(RollbackReleaseDetail {
+            ts: ts.clone(),
+            dir: rd,
+            packages,
+            services,
+            has_manifest,
+            has_compose_copy,
+        });
+    }
+
+    // 日期标签:读该目录 compose 的镜像仓库名,再逐个列标签
+    let mut repositories: Vec<RollbackTagDetail> = Vec::new();
+    let compose_candidates = [
+        remote_join(&dir, "docker-compose.yml"),
+        remote_join(&dir, "compose.yml"),
+    ];
+    for cand in compose_candidates.iter() {
+        let Ok((0, text)) = exec_collect(&mut client, &cat_file_cmd(cand)).await else {
+            continue;
+        };
+        for repo in compose_image_repos(&text) {
+            if repositories.iter().any(|r| r.repository == repo) {
+                continue;
+            }
+            let repo = repo.trim().to_string();
+            if repo.is_empty() {
+                continue;
+            }
+            let cmd = format!("docker images {} --format '{{{{json .}}}}'", shell_single_quote(&repo));
+            let Ok((0, out)) = exec_collect(&mut client, &cmd).await else {
+                continue;
+            };
+            let (items, _) = parse_cleanup_ndjson(&out);
+            let mut tags: Vec<TagBrief> = items
+                .iter()
+                .filter(|v| is_date_tag(&jstr(v, "Tag")))
+                .map(|v| TagBrief {
+                    tag: jstr(v, "Tag"),
+                    id: jstr(v, "ID"),
+                    created: jstr(v, "CreatedAt"),
+                })
+                .collect();
+            tags.sort_by(|a, b| b.tag.cmp(&a.tag));
+            if !tags.is_empty() {
+                repositories.push(RollbackTagDetail { repository: repo, tags });
+            }
+        }
+        if !repositories.is_empty() {
+            break;
+        }
+    }
+
+    Ok(RollbackProjectDetail {
+        dir,
+        compose_file: compose_candidates
+            .iter()
+            .find(|c| **c != String::new())
+            .cloned()
+            .unwrap_or_default(),
+        releases,
+        repositories,
+    })
+}
+
+/// 按**服务器项目目录**执行整栈回滚(独立回滚模块入口)。
+///
+/// 与 [`rollback_execute_stack`] 的差异:不依赖应用内项目配置 —— 释出目录
+/// 直接取自传入的项目目录,compose 恢复目标为 `<dir>/docker-compose.yml`。
+/// 归属校验改为"归档目录必须位于该项目目录下"(路径前缀比对),避免跨项目误回滚。
+/// 复用 deploy-log / deploy-done 事件体系与部署历史记录。
+#[tauri::command]
+pub async fn rollback_execute_stack_at(
+    app: AppHandle,
+    server_id: String,
+    password_plain: Option<String>,
+    dir: String,
+    release_ts: String,
+) -> Result<(), String> {
+    finish_rollback(
+        &app,
+        rollback_execute_stack_at_inner(
+            &app,
+            &server_id,
+            password_plain.as_deref(),
+            &dir,
+            &release_ts,
+        ),
+    )
+    .await
+}
+
+/// [`rollback_execute_stack_at`] 的管线主体。
+async fn rollback_execute_stack_at_inner(
+    app: &AppHandle,
+    server_id: &str,
+    password_plain: Option<&str>,
+    dir: &str,
+    release_ts: &str,
+) -> Result<DeployRecord, String> {
+    let started = std::time::Instant::now();
+    reset_cancelled(app);
+
+    let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    let server = find_server(&cfg, server_id)?.clone();
+    let password = resolve_password(
+        &server.auth.auth_type,
+        password_plain,
+        server.auth.password_enc.as_deref(),
+    )?;
+    let key_pass = resolve_key_passphrase(&server)?;
+    let dir = dir.trim().trim_end_matches('/').to_string();
+    if !dir.starts_with('/') {
+        return Err(format!("项目目录必须是绝对路径:{}", dir));
+    }
+    let project_name = dir.rsplit('/').next().unwrap_or(&dir).to_string();
+    let mut record =
+        DeployRecord::new_skeleton(MODE_ROLLBACK, &server.name, &project_name, Vec::new());
+
+    emit_log(
+        app,
+        &format!(
+            "开始整栈回滚:服务器「{}」/ 项目目录 {} ,目标发布 {}",
+            server.name, dir, release_ts
+        ),
+    );
+
+    let mut client = with_timeout(
+        SSH_CONNECT_TIMEOUT_SECS,
+        "连接超时",
+        "请检查服务器地址与网络",
+        SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default()),
+    )
+    .await?;
+
+    // 归档目录 = <dir>/releases/<ts>;归属校验靠"必须位于该项目目录下"
+    let release_dir = remote_join(&dir, &format!("releases/{}", release_ts));
+    if !release_dir.starts_with(&format!("{}/releases/", dir)) {
+        return Err(format!("回滚目标越出项目目录:{}", release_dir));
+    }
+
+    ensure_not_cancelled(app)?;
+    let (code, _) = with_timeout(
+        SSH_EXEC_TIMEOUT_SECS,
+        "校验发布目录超时",
+        "请检查服务器网络后重试",
+        exec_collect(&mut client, &test_dir_cmd(&release_dir)),
+    )
+    .await?;
+    if code != 0 {
+        return Err(format!("回滚目标发布目录不存在: {}", release_dir));
+    }
+
+    ensure_not_cancelled(app)?;
+    let (code, out) = with_timeout(
+        SSH_EXEC_TIMEOUT_SECS,
+        "查询发布目录超时",
+        "请检查服务器网络后重试",
+        exec_collect(&mut client, &ls_dir_cmd(&release_dir)),
+    )
+    .await?;
+    if code != 0 {
+        return Err(format!("查询发布目录内容失败(退出码 {}): {}", code, release_dir));
+    }
+    let files = parse_ls_lines(&out);
+    let packages: Vec<String> = files.iter().filter(|f| f.ends_with(".tar.gz")).cloned().collect();
+    let has_compose_copy = files.iter().any(|f| f == "docker-compose.yml");
+
+    // manifest 只用于历史展示(归属由目录前缀保证,不以项目名卡)
+    if files.iter().any(|f| f == "manifest.json") {
+        let mp = remote_join(&release_dir, "manifest.json");
+        if let Ok((0, m_out)) = exec_collect(&mut client, &cat_file_cmd(&mp)).await {
+            if let Some(m) = parse_release_manifest(&m_out) {
+                record.images = m.images.into_iter().map(|i| i.tag).collect();
+            }
+        }
+    }
+
+    let n = packages.len();
+    if n == 0 {
+        emit_log(app, "发布目录内无镜像包,跳过 docker load");
+    }
+    for (i, name) in packages.iter().enumerate() {
+        ensure_not_cancelled(app)?;
+        let remote_tar = remote_join(&release_dir, name);
+        emit_log(
+            app,
+            &format!("回滚装载镜像包 ({}/{}): docker load -i {}", i + 1, n, remote_tar),
+        );
+        let load_cmd = format!("docker load -i {}", shell_single_quote(&remote_tar));
+        if let Err(e) = exec_forwarded(app, &mut client, &load_cmd, STACK_LOAD_TIMEOUT_SECS).await {
+            return Err(format!(
+                "装载镜像包 {}/{} 失败:{};已装载 {}/{} 个镜像包,这些包的镜像标签已恢复,容器未重建(可排除问题后重新发起回滚)",
+                i + 1, n, e, i, n
+            ));
+        }
+    }
+
+    // 恢复 compose 副本到该项目目录(而非 server.remote_dir)
+    ensure_not_cancelled(app)?;
+    let target_compose = remote_join(&dir, "docker-compose.yml");
+    if has_compose_copy {
+        let cp_cmd = format!(
+            "cp {} {}",
+            shell_single_quote(&remote_join(&release_dir, "docker-compose.yml")),
+            shell_single_quote(&target_compose)
+        );
+        emit_log(app, &format!("恢复 compose 文件: {}", cp_cmd));
+        if let Err(e) = exec_forwarded(app, &mut client, &cp_cmd, SSH_EXEC_TIMEOUT_SECS).await {
+            emit_log(
+                app,
+                &format!("警告:恢复 compose 副本失败({}),沿用现有 compose 文件继续回滚", e),
+            );
+        }
+    } else {
+        emit_log(app, "发布目录无 compose 副本,沿用现有 compose 文件");
+    }
+
+    // compose up -d:cd 到项目目录,按目录内 compose 文件启动
+    // (override 文件按远端同名约定自动生效,无需显式 -f 链)
+    ensure_not_cancelled(app)?;
+    let up_cmd = format!(
+        "cd {} && docker compose up -d",
+        shell_single_quote(&dir)
+    );
+    emit_log(app, &format!("启动服务: {}", up_cmd));
+    exec_forwarded(app, &mut client, &up_cmd, STACK_COMPOSE_TIMEOUT_SECS).await?;
+
+    emit_log(app, "整栈回滚完成");
+    record.success = true;
+    record.message = format!("回滚到 {}", release_ts);
+    record.release_dir = Some(release_dir);
+    record.duration_secs = started.elapsed().as_secs();
+    Ok(record)
+}
+
+/// 组装回滚收尾通知的标题与正文(纯函数,便于单测)。///
 /// 标题:成功=「回滚成功」;取消(错误文案为 CANCELLED_MSG)=「回滚已取消」;
 /// 其余失败=「回滚失败」。正文含项目名 + 服务器名 + 结果消息 + 耗时
 /// (成功时消息为「回滚到 <目标 release ts / 镜像标签>」,回滚目标随之入文);
@@ -5269,7 +5978,7 @@ fn shell_single_quote(s: &str) -> String {
 
 // ===== 清理分析(阶段八:prune 预览 + 定向执行;与既有 prune_server 同通道)=====
 
-/// 清理分析单条目:悬空镜像。
+/// 清理分析单条目:未使用镜像(无标签/悬空)。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CleanupImage {
@@ -5277,6 +5986,8 @@ pub struct CleanupImage {
     pub repository: String,
     pub tag: String,
     pub size: String,
+    /// 是否被任一容器(含停止/创建态)引用:true 时前端禁选(删不掉,rmi 会失败)
+    pub in_use: bool,
 }
 
 /// 清理分析单条目:停止容器。
@@ -5296,7 +6007,55 @@ pub struct CleanupVolume {
     pub name: String,
 }
 
-/// 清理分析报告(各节互不影响,单项查询失败记入 errors 不阻断其余)。
+/// 分项目视图单条目:日期标签镜像(`repo:YYYYmmdd-HHMMSS`)。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupTagImage {
+    pub reference: String,
+    pub id: String,
+    pub size: String,
+    pub created: String,
+    /// 被任一容器引用时为 true,前端禁选并跳过删除
+    pub in_use: bool,
+}
+
+/// 分项目视图:服务器上扫描到的项目目录及其可清理项。
+///
+/// 列表以**服务器真实目录**为准(扫描起点可配),应用内项目仅作标注;
+/// 归档与标签的归属靠该目录下 compose 文件里的 `image:` 仓库名匹配。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupProject {
+    /// 项目目录(绝对路径)
+    pub dir: String,
+    /// 该项目使用的 compose 文件(未扫到时为空串)
+    pub compose_file: String,
+    /// `du -sh` 输出(如 "1.2G";取不到为 "?")
+    pub size: String,
+    /// 发布归档目录(完整远端路径,新→旧)
+    pub releases: Vec<String>,
+    /// 该项目的日期标签镜像(新→旧)
+    pub tag_images: Vec<CleanupTagImage>,
+    /// 匹配到的应用内项目名(仅标注;空串=服务器上存在但软件内未配置)
+    pub app_project: String,
+}
+
+/// 单条扫描命令的诊断信息(命令原文、退出码、输出摘要)。
+///
+/// 用于「清理识别不到」类问题的自证:即使某节为空,也能看到命令实际
+/// 退出码与服务器返回,而不必猜。
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupDiag {
+    pub label: String,
+    pub cmd: String,
+    /// 传输层失败时为 None
+    pub exit_code: Option<i32>,
+    /// 输出摘要(最多 [`CLEANUP_DIAG_OUTPUT_LINES`] 行)
+    pub output: String,
+}
+
+/// 清理分析报告(各节互不影响,单项查询失败记入 errors/warnings 不阻断其余)。
 #[derive(Debug, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CleanupReport {
@@ -5304,6 +6063,15 @@ pub struct CleanupReport {
     pub stopped_containers: Vec<CleanupContainer>,
     pub unused_volumes: Vec<CleanupVolume>,
     pub build_cache_size: String,
+    /// 分项目可清理项(第三批新增)
+    pub projects: Vec<CleanupProject>,
+    /// 本次实际使用的扫描起点
+    pub scan_root: String,
+    /// 非致命提示(命令 stderr 混入、解析跳过的行等)
+    pub warnings: Vec<String>,
+    /// 逐条命令诊断
+    pub diagnostics: Vec<CleanupDiag>,
+    /// 致命错误(该节整体不可用)
     pub errors: Vec<String>,
 }
 
@@ -5316,7 +6084,25 @@ pub struct CleanupSectionResult {
     pub output: String,
 }
 
-/// 清理执行勾选项。
+/// 分项目清理目标(前端勾选后原样回传:只删用户看到并勾选的条目)。
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupProjectTarget {
+    /// 项目目录(仅用于结果标签)
+    pub dir: String,
+    /// 待删归档目录(完整远端路径)
+    #[serde(default)]
+    pub release_dirs: Vec<String>,
+    /// 待删镜像引用(`repo:tag`)
+    #[serde(default)]
+    pub image_refs: Vec<String>,
+}
+
+/// 清理执行勾选项(分节布尔 + 各节显式目标列表)。
+///
+/// 为什么带目标列表:清理只应删除用户在预览里看到并勾选的条目。
+/// 逐条显式传入既避免 `prune -f` 的"清理范围外扩"(例如 volume prune
+/// 会连未列出的未使用卷一起删),也让执行结果与预览一一对应。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CleanupSections {
@@ -5324,35 +6110,328 @@ pub struct CleanupSections {
     pub containers: bool,
     pub volumes: bool,
     pub builder: bool,
+    /// 待删无标签镜像 ID 列表
+    #[serde(default)]
+    pub image_ids: Vec<String>,
+    /// 待删停止容器 ID 列表
+    #[serde(default)]
+    pub container_ids: Vec<String>,
+    /// 待删未使用卷名列表
+    #[serde(default)]
+    pub volume_names: Vec<String>,
+    /// 分项目清理目标
+    #[serde(default)]
+    pub projects: Vec<CleanupProjectTarget>,
 }
 
-/// 解析 NDJSON 行为 JSON 对象向量(失败返回 Err,由调用方按节兜底)。
-fn parse_cleanup_ndjson(text: &str) -> Result<Vec<serde_json::Value>, String> {
+impl CleanupSections {
+    /// 是否至少勾选了一项可执行内容(供「至少勾选一项」校验)。
+    fn has_any(&self) -> bool {
+        (self.images && !self.image_ids.is_empty())
+            || (self.containers && !self.container_ids.is_empty())
+            || (self.volumes && !self.volume_names.is_empty())
+            || self.builder
+            || !self.projects.is_empty()
+    }
+}
+
+/// 宽松解析 NDJSON 行:跳过非 JSON 行(收进 warnings),不再让整节失败。
+///
+/// 服务器上 `docker` 可能把 `WARNING: No swap limit support` 之类的提示
+/// 写进 stderr,而 [`exec_collect`] 把 stdout+stderr 合并返回 —— 旧实现
+/// 只要有一行不是 JSON 就整节解析失败、列表恒为空,表现为"扫描不到"。
+fn parse_cleanup_ndjson(text: &str) -> (Vec<serde_json::Value>, Vec<String>) {
     let mut items = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
     for (i, line) in text.lines().enumerate() {
         let t = line.trim();
         if t.is_empty() {
             continue;
         }
-        items.push(
-            serde_json::from_str::<serde_json::Value>(t)
-                .map_err(|e| format!("解析第 {} 行失败: {}", i + 1, e))?,
-        );
+        // 只对 `{` 开头的行尝试 JSON;其余按提示行收集(限 3 条防刷屏)
+        if t.starts_with('{') {
+            match serde_json::from_str::<serde_json::Value>(t) {
+                Ok(v) => items.push(v),
+                Err(e) => {
+                    if warnings.len() < 3 {
+                        warnings.push(format!("第 {} 行解析失败: {}", i + 1, e));
+                    }
+                }
+            }
+        } else if warnings.len() < 3 {
+            warnings.push(t.to_string());
+        }
     }
-    Ok(items)
+    (items, warnings)
+}
+
+/// 输出摘要保留行数(诊断区展示)。
+const CLEANUP_DIAG_OUTPUT_LINES: usize = 8;
+
+/// 取文本前 n 行(诊断输出摘要;超长时追加省略标记)。
+fn head_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let mut out = lines[..lines.len().min(n)].join("\n");
+    if lines.len() > n {
+        out.push_str(&format!("\n… (共 {} 行)", lines.len()));
+    }
+    out
 }
 
 fn jstr(v: &serde_json::Value, key: &str) -> String {
     v.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string()
 }
 
-/// 清理分析:悬空镜像 / 停止容器 / 未使用卷 / build cache 占用。
-/// 只读查询,不做任何清理;单项失败不影响其余(记入 errors)。
+/// 单条扫描命令的结果:解析后的条目 + 非致命提示 + 诊断信息。
+struct CleanupQuery {
+    /// JSON 模式下的解析条目;文本模式下为空
+    items: Vec<serde_json::Value>,
+    warnings: Vec<String>,
+    diag: CleanupDiag,
+    /// 完整输出(文本模式解析用;诊断里只有截断摘要,不进前端)
+    full_output: String,
+}
+
+/// 执行一条清理扫描命令(`json_mode` 决定是否按 NDJSON 解析)。
+///
+/// 传输层错误与退出码非 0 都只记 warnings(不向上传播),使单节失败
+/// 不影响其余节的扫描结果 —— 这正是"为什么某一节是 0"可排查的前提。
+async fn run_cleanup_query(
+    client: &mut SshClient,
+    label: &str,
+    cmd: &str,
+    json_mode: bool,
+) -> CleanupQuery {
+    let mut diag = CleanupDiag {
+        label: label.to_string(),
+        cmd: cmd.to_string(),
+        exit_code: None,
+        output: String::new(),
+    };
+    match exec_collect(client, cmd).await {
+        Ok((code, out)) => {
+            diag.exit_code = Some(code);
+            diag.output = head_lines(&out, CLEANUP_DIAG_OUTPUT_LINES);
+            if code != 0 {
+                return CleanupQuery {
+                    items: Vec::new(),
+                    warnings: vec![format!(
+                        "{}查询失败(退出码 {}): {}",
+                        label,
+                        code,
+                        head_lines(&out, 1)
+                    )],
+                    diag,
+                    full_output: out,
+                };
+            }
+            let (items, warnings) = if json_mode {
+                parse_cleanup_ndjson(&out)
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            CleanupQuery {
+                items,
+                warnings,
+                diag,
+                full_output: out,
+            }
+        }
+        Err(e) => {
+            diag.output = format!("(传输层错误) {}", e);
+            CleanupQuery {
+                items: Vec::new(),
+                warnings: vec![format!("{}查询失败: {}", label, e)],
+                diag,
+                full_output: String::new(),
+            }
+        }
+    }
+}
+
+/// 从命令输出的纯文本行里取绝对路径(过滤空行与摘要省略标记;纯函数,便于单测)。
+fn abs_path_lines(out: &str) -> Vec<String> {
+    out.lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('/') && !l.starts_with("…"))
+        .map(String::from)
+        .collect()
+}
+
+/// 把镜像引用裁成仓库名(去 `:tag` / `@digest`;纯函数,便于单测)。
+/// 例:`myapp:latest` → `myapp`;`registry:5000/app` → `registry:5000/app`。
+fn image_repo_of(reference: &str) -> String {
+    let r = reference.trim();
+    if r.is_empty() {
+        return String::new();
+    }
+    // 有 @digest 时以 digest 之前为准
+    let base = r.split('@').next().unwrap_or(r);
+    // 最后一个 ':' 若在最后一个 '/' 之后才是 tag 分隔符(避免误切 registry:port)
+    match (base.rfind(':'), base.rfind('/')) {
+        (Some(c), Some(s)) if c < s => base.to_string(),
+        (Some(c), None) => base[..c].to_string(),
+        (Some(c), Some(_)) => base[..c].to_string(),
+        (None, _) => base.to_string(),
+    }
+}
+
+/// 判断字符串是否为日期标签 `YYYYmmdd-HHMMSS`(纯函数,便于单测)。
+fn is_date_tag(tag: &str) -> bool {
+    let t = tag.trim();
+    if t.len() != 15 {
+        return false;
+    }
+    let b = t.as_bytes();
+    for (i, ch) in b.iter().enumerate() {
+        if i == 8 {
+            if *ch != b'-' {
+                return false;
+            }
+        } else if !ch.is_ascii_digit() {
+            return false;
+        }
+    }
+    true
+}
+
+/// 从 compose 文本提取全部 `services.*.image` 的仓库名(纯函数,便于单测)。
+/// 解析失败或无 image 字段 → 空 Vec(调用方据此跳过该项目的标签清理,不误删)。
+fn compose_image_repos(yaml_text: &str) -> Vec<String> {
+    let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(yaml_text) else {
+        return Vec::new();
+    };
+    let Some(services) = doc.get("services").and_then(|s| s.as_mapping()) else {
+        return Vec::new();
+    };
+    let mut repos: Vec<String> = Vec::new();
+    for (_name, svc) in services {
+        if let Some(image) = svc.get("image").and_then(|i| i.as_str()) {
+            let repo = image_repo_of(image);
+            if !repo.is_empty() && !repos.contains(&repo) {
+                repos.push(repo);
+            }
+        }
+    }
+    repos
+}
+
+// ===== 分项目扫描拼命令(纯函数,便于单测)=====
+
+/// 扫描含 compose 文件的目录:深度 ≤ [`CLEANUP_SCAN_MAX_DEPTH`],排除
+/// `releases/` 归档与 `.git`(归档里的 compose 副本不是项目)。
+pub fn cleanup_scan_compose_cmd(root: &str) -> String {
+    format!(
+        "find {} -maxdepth {} -type f \\( -name 'docker-compose.yml' -o -name 'docker-compose.yaml' -o -name 'compose.yml' -o -name 'compose.yaml' \\) ! -path '*/releases/*' ! -path '*/.git/*' 2>/dev/null",
+        shell_single_quote(root),
+        CLEANUP_SCAN_MAX_DEPTH
+    )
+}
+
+/// 扫描发布归档目录(`<项目>/releases/<YYYYmmdd-HHMMSS>`)的完整路径。
+pub fn cleanup_scan_releases_cmd(root: &str) -> String {
+    format!(
+        "find {} -maxdepth {} -type d -path '*/releases/*' -name '20*-*' 2>/dev/null",
+        shell_single_quote(root),
+        CLEANUP_SCAN_MAX_DEPTH + 2
+    )
+}
+
+/// 拼 `du -sh <dir>...`(一次调用取多个目录占用;取不到的目录由 du 自行跳过)。
+pub fn cleanup_du_cmd(dirs: &[String]) -> String {
+    let quoted: Vec<String> = dirs.iter().map(|d| shell_single_quote(d)).collect();
+    format!("du -sh {} 2>/dev/null", quoted.join(" "))
+}
+
+/// 拼「逐个 cat compose(带路径标记行)」命令:一次往返取回多份 compose 内容,
+/// 标记行形如 `==COMPOSE:<path>`,便于按项目切分。
+pub fn cleanup_cat_composes_cmd(files: &[String]) -> String {
+    let mut out = String::new();
+    for f in files {
+        // 标记行与内容都经 printf/cat 输出;路径单引号包裹防注入
+        out.push_str(&format!(
+            "printf '==COMPOSE:%s\\n' {}; cat {} 2>/dev/null; printf '\\n'; ",
+            shell_single_quote(f),
+            shell_single_quote(f)
+        ));
+    }
+    out
+}
+
+/// 解析 `==COMPOSE:<path>` 标记切分的 compose 内容(纯函数,便于单测)。
+/// 返回 `(path, content)` 列表。
+fn split_compose_dump(out: &str) -> Vec<(String, String)> {
+    let mut result: Vec<(String, String)> = Vec::new();
+    let mut cur_path: Option<String> = None;
+    let mut buf = String::new();
+    for line in out.lines() {
+        if let Some(rest) = line.strip_prefix("==COMPOSE:") {
+            if let Some(p) = cur_path.take() {
+                result.push((p, buf.clone()));
+            }
+            buf.clear();
+            cur_path = Some(rest.trim().to_string());
+        } else if cur_path.is_some() {
+            buf.push_str(line);
+            buf.push('\n');
+        }
+    }
+    if let Some(p) = cur_path {
+        result.push((p, buf));
+    }
+    result
+}
+
+/// 项目目录 = 发布归档路径去末尾两级(`<dir>/releases/<ts>` → `<dir>`)。
+/// 纯函数,便于单测。
+fn project_dir_of_release(release_path: &str) -> String {
+    let p = release_path.trim_end_matches('/');
+    let without_ts = match p.rfind('/') {
+        Some(i) => &p[..i],
+        None => return String::new(),
+    };
+    match without_ts.rfind('/') {
+        Some(i) => without_ts[..i].to_string(),
+        None => String::new(),
+    }
+}
+
+/// 解析 `du -sh` 输出为 `路径 → 占用`(纯函数,便于单测)。
+/// GNU du 输出形如 `1.2G\t/home/x/proj`(大小以制表符或空格分隔路径)。
+fn parse_du_output(out: &str) -> Vec<(String, String)> {
+    let mut rows = Vec::new();
+    for line in out.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        // 以最后一个制表符切分;无制表符时退化为按首个空白切分
+        if let Some((size, path)) = t.rsplit_once('\t') {
+            rows.push((path.trim().to_string(), size.trim().to_string()));
+        } else if let Some((size, path)) = t.split_once(char::is_whitespace) {
+            rows.push((path.trim().to_string(), size.trim().to_string()));
+        }
+    }
+    rows
+}
+
+
+/// 清理分析:无标签镜像 / 停止容器 / 未使用卷 / build cache 占用 / 分项目可清理项。
+/// 只读查询,不做任何清理;单项失败不影响其余(记入 warnings,诊断逐条可查)。
+///
+/// 无标签镜像为什么不用 `docker images -f dangling=true`:该过滤在新版
+/// Docker(BuildKit / containerd image store)下常返回空,而 `docker images`
+/// 明明列得出 `<none>:<none>` 条目 —— 表现为"有悬空镜像但识别不到"。这里改为
+/// 全量拉取后在客户端过滤 `Repository == "<none>"`,并用容器引用集合标记在用项。
 #[tauri::command]
 pub async fn cleanup_preview(
     app: AppHandle,
     server_id: String,
     password_plain: Option<String>,
+    scan_root: Option<String>,
 ) -> Result<CleanupReport, String> {
     let _ = app; // 与 prune_server 等命令签名风格一致(结果经返回值而非事件)
     let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
@@ -5372,112 +6451,348 @@ pub async fn cleanup_preview(
     .await?;
 
     let mut report = CleanupReport::default();
+    // 扫描起点:显式传入优先,否则用服务器配置的部署目录
+    let scan_root = scan_root
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| server.remote_dir.clone());
+    report.scan_root = scan_root.clone();
 
-    // 1. 悬空镜像
-    match exec_collect(&mut client, "docker images -f dangling=true --format '{{json .}}'").await {
-        Ok((0, out)) => match parse_cleanup_ndjson(&out) {
-            Ok(items) => {
-                report.dangling_images = items
-                    .iter()
-                    .map(|v| CleanupImage {
-                        id: jstr(v, "ID"),
-                        repository: jstr(v, "Repository"),
-                        tag: jstr(v, "Tag"),
-                        size: jstr(v, "Size"),
-                    })
-                    .collect();
-            }
-            Err(e) => report.errors.push(format!("悬空镜像解析失败: {}", e)),
-        },
-        Ok((code, out)) => {
-            report
-                .errors
-                .push(format!("悬空镜像查询失败(退出码 {}): {}", code, out.trim()))
-        }
-        Err(e) => report.errors.push(format!("悬空镜像查询失败: {}", e)),
-    }
-
-    // 2. 停止容器(exited 与 created,多 status 过滤为 OR)
-    match exec_collect(
+    // 0. 先取容器列表与它们引用的镜像 ID(用于标记在用的无标签/旧标签镜像)
+    let containers_q = run_cleanup_query(
         &mut client,
-        "docker ps -a --filter status=exited --filter status=created --format '{{json .}}'",
+        "容器列表",
+        "docker ps -a --no-trunc --format '{{json .}}'",
+        true,
     )
-    .await
-    {
-        Ok((0, out)) => match parse_cleanup_ndjson(&out) {
-            Ok(items) => {
-                report.stopped_containers = items
-                    .iter()
-                    .map(|v| CleanupContainer {
-                        id: jstr(v, "ID"),
-                        names: jstr(v, "Names"),
-                        image: jstr(v, "Image"),
-                        status: jstr(v, "Status"),
-                    })
-                    .collect();
+    .await;
+    report.diagnostics.push(containers_q.diag.clone());
+    report.warnings.extend(containers_q.warnings.clone());
+    let container_rows = containers_q.items;
+
+    // 容器条目只有镜像名,需 inspect 才拿到镜像 ID(sha256:...)
+    let cids: Vec<String> = container_rows
+        .iter()
+        .map(|v| jstr(v, "ID"))
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut in_use_image_ids: Vec<String> = Vec::new();
+    if !cids.is_empty() {
+        let quoted: Vec<String> = cids.iter().map(|c| shell_single_quote(c)).collect();
+        let inspect_cmd = format!(
+            "docker inspect --format '{{{{.Image}}}}' {} 2>/dev/null",
+            quoted.join(" ")
+        );
+        let inspect_q = run_cleanup_query(&mut client, "容器镜像引用", &inspect_cmd, false).await;
+        // 纯文本输出:逐行取 sha256:...(不要求 JSON)
+        for line in inspect_q.full_output.lines() {
+            let t = line.trim();
+            if t.starts_with("sha256:") {
+                in_use_image_ids.push(t.to_string());
             }
-            Err(e) => report.errors.push(format!("停止容器解析失败: {}", e)),
-        },
-        Ok((code, out)) => {
-            report
-                .errors
-                .push(format!("停止容器查询失败(退出码 {}): {}", code, out.trim()))
         }
-        Err(e) => report.errors.push(format!("停止容器查询失败: {}", e)),
+        report.diagnostics.push(inspect_q.diag);
     }
+
+    // 1. 无标签镜像(<none>:<none> 及 <none> 仓库)—— 全量拉取后客户端过滤
+    let images_q = run_cleanup_query(
+        &mut client,
+        "镜像列表",
+        "docker images --no-trunc --format '{{json .}}'",
+        true,
+    )
+    .await;
+    report.diagnostics.push(images_q.diag.clone());
+    report.warnings.extend(images_q.warnings.clone());
+    for v in &images_q.items {
+        let repo = jstr(v, "Repository");
+        let tag = jstr(v, "Tag");
+        if repo != "<none>" && tag != "<none>" {
+            continue;
+        }
+        let id = jstr(v, "ID");
+        let in_use = in_use_image_ids.iter().any(|x| x == &id);
+        report.dangling_images.push(CleanupImage {
+            repository: repo,
+            tag,
+            size: jstr(v, "Size"),
+            in_use,
+            id,
+        });
+    }
+
+    // 2. 停止容器(exited 与 created;已在第 0 步取回,直接复用)
+    report.stopped_containers = container_rows
+        .iter()
+        .filter(|v| {
+            let state = jstr(v, "State").to_lowercase();
+            let status = jstr(v, "Status").to_lowercase();
+            state == "exited"
+                || state == "created"
+                || status.starts_with("exited")
+                || status.starts_with("created")
+        })
+        .map(|v| CleanupContainer {
+            id: jstr(v, "ID"),
+            names: jstr(v, "Names"),
+            image: jstr(v, "Image"),
+            status: jstr(v, "Status"),
+        })
+        .collect();
 
     // 3. 未使用卷
-    match exec_collect(&mut client, "docker volume ls -f dangling=true --format '{{json .}}'").await {
-        Ok((0, out)) => match parse_cleanup_ndjson(&out) {
-            Ok(items) => {
-                report.unused_volumes = items
-                    .iter()
-                    .map(|v| CleanupVolume { name: jstr(v, "Name") })
-                    .collect();
-            }
-            Err(e) => report.errors.push(format!("未使用卷解析失败: {}", e)),
-        },
-        Ok((code, out)) => {
-            report
-                .errors
-                .push(format!("未使用卷查询失败(退出码 {}): {}", code, out.trim()))
-        }
-        Err(e) => report.errors.push(format!("未使用卷查询失败: {}", e)),
-    }
+    let volumes_q = run_cleanup_query(
+        &mut client,
+        "卷列表",
+        "docker volume ls -f dangling=true --format '{{json .}}'",
+        true,
+    )
+    .await;
+    report.diagnostics.push(volumes_q.diag.clone());
+    report.warnings.extend(volumes_q.warnings.clone());
+    report.unused_volumes = volumes_q
+        .items
+        .iter()
+        .map(|v| CleanupVolume {
+            name: jstr(v, "Name"),
+        })
+        .collect();
 
     // 4. build cache 占用(docker system df 的 Build Cache 行)
-    match exec_collect(&mut client, "docker system df --format '{{json .}}'").await {
-        Ok((0, out)) => match parse_cleanup_ndjson(&out) {
-            Ok(items) => {
-                report.build_cache_size = items
-                    .iter()
-                    .find(|v| jstr(v, "Type") == "Build Cache")
-                    .map(|v| jstr(v, "Size"))
-                    .unwrap_or_else(|| "0B".to_string());
-            }
-            Err(e) => report.errors.push(format!("磁盘占用解析失败: {}", e)),
-        },
-        Ok((code, out)) => {
-            report
-                .errors
-                .push(format!("磁盘占用查询失败(退出码 {}): {}", code, out.trim()))
+    let df_q = run_cleanup_query(
+        &mut client,
+        "磁盘占用",
+        "docker system df --format '{{json .}}'",
+        true,
+    )
+    .await;
+    report.diagnostics.push(df_q.diag.clone());
+    report.warnings.extend(df_q.warnings.clone());
+    report.build_cache_size = df_q
+        .items
+        .iter()
+        .find(|v| jstr(v, "Type") == "Build Cache")
+        .map(|v| jstr(v, "Size"))
+        .unwrap_or_else(|| "0B".to_string());
+
+    // 5. 分项目扫描:compose 文件 → 目录 → du 占用 → releases 归档 → 日期标签镜像
+    match scan_cleanup_projects(&mut client, &scan_root, &cfg, &in_use_image_ids).await {
+        Ok((projects, mut diags, mut warnings)) => {
+            report.projects = projects;
+            report.diagnostics.append(&mut diags);
+            report.warnings.append(&mut warnings);
         }
-        Err(e) => report.errors.push(format!("磁盘占用查询失败: {}", e)),
+        Err(e) => report.errors.push(format!("分项目扫描失败: {}", e)),
     }
 
     Ok(report)
 }
 
-/// 清理执行单节定义(未使用:cleanup_execute 实际用行内 (label, cmd) 元组;
-/// 保留结构体供后续多节扩展时复用)。
-#[allow(dead_code)]
-struct CleanupSection {
-    label: &'static str,
-    cmd: &'static str,
+/// 扫描服务器上的项目目录,汇总每个项目的占用/归档/旧标签镜像(只读)。
+///
+/// 步骤:find compose(排除 releases)→ 目录去重 → du -sh 取占用 →
+/// 逐目录 cat compose 提取镜像仓库名 → 匹配 releases 归档与日期标签镜像。
+/// 注意:纯文本命令的解析必须用 `full_output`(诊断里只有截断摘要)。
+async fn scan_cleanup_projects(
+    client: &mut SshClient,
+    scan_root: &str,
+    cfg: &crate::config::AppConfig,
+    in_use_image_ids: &[String],
+) -> Result<(Vec<CleanupProject>, Vec<CleanupDiag>, Vec<String>), String> {
+    let mut diags: Vec<CleanupDiag> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    // 5.1 扫 compose 文件
+    let compose_q = run_cleanup_query(
+        client,
+        "项目扫描",
+        &cleanup_scan_compose_cmd(scan_root),
+        false,
+    )
+    .await;
+    let compose_paths = abs_path_lines(&compose_q.full_output);
+    diags.push(compose_q.diag);
+    if compose_paths.is_empty() {
+        return Ok((Vec::new(), diags, warnings));
+    }
+
+    // 项目目录去重(compose 文件所在目录)
+    let mut dirs: Vec<String> = Vec::new();
+    for p in &compose_paths {
+        if let Some((parent, _)) = p.rsplit_once('/') {
+            if !parent.is_empty() && !dirs.iter().any(|d| d == parent) {
+                dirs.push(parent.to_string());
+            }
+        }
+    }
+    dirs.sort();
+
+    // 5.2 du -sh 取占用
+    let du_q = run_cleanup_query(client, "项目占用", &cleanup_du_cmd(&dirs), false).await;
+    let du_rows = parse_du_output(&du_q.full_output);
+    diags.push(du_q.diag);
+
+    // 5.3 逐目录 cat compose(带标记行),提取镜像仓库名
+    let cat_q = run_cleanup_query(
+        client,
+        "compose 内容",
+        &cleanup_cat_composes_cmd(&compose_paths),
+        false,
+    )
+    .await;
+    let dumped = split_compose_dump(&cat_q.full_output);
+    diags.push(cat_q.diag);
+    let mut dir_repos: Vec<(String, Vec<String>)> = Vec::new();
+    for (path, content) in &dumped {
+        let Some((dir, _)) = path.rsplit_once('/') else {
+            continue;
+        };
+        let repos = compose_image_repos(content);
+        if let Some(entry) = dir_repos.iter_mut().find(|(d, _)| d == dir) {
+            for r in repos {
+                if !entry.1.contains(&r) {
+                    entry.1.push(r);
+                }
+            }
+        } else {
+            dir_repos.push((dir.to_string(), repos));
+        }
+    }
+
+    // 5.4 扫 releases 归档(一次 find 取全量,再按项目目录归组)
+    let rel_q = run_cleanup_query(
+        client,
+        "发布归档",
+        &cleanup_scan_releases_cmd(scan_root),
+        false,
+    )
+    .await;
+    let release_paths = abs_path_lines(&rel_q.full_output);
+    diags.push(rel_q.diag);
+
+    // 5.5 全量镜像列表(取日期标签镜像;含 ID/大小/创建时间)
+    let tag_q = run_cleanup_query(
+        client,
+        "镜像标签",
+        "docker images --format '{{json .}}'",
+        true,
+    )
+    .await;
+    let all_images: Vec<serde_json::Value> = tag_q.items.clone();
+    warnings.extend(tag_q.warnings.clone());
+    diags.push(tag_q.diag);
+
+    // 5.6 组项目视图
+    let mut projects: Vec<CleanupProject> = Vec::new();
+    for dir in &dirs {
+        let compose_file = compose_paths
+            .iter()
+            .find(|p| p.rsplit_once('/').map(|(d, _)| d) == Some(dir.as_str()))
+            .cloned()
+            .unwrap_or_default();
+        let repos = dir_repos
+            .iter()
+            .find(|(d, _)| d == dir)
+            .map(|(_, r)| r.clone())
+            .unwrap_or_default();
+        let size = du_rows
+            .iter()
+            .find(|(p, _)| p == dir)
+            .map(|(_, s)| s.clone())
+            .unwrap_or_else(|| "?".to_string());
+
+        // 该项目下的归档目录(新→旧,按目录名时间戳倒序)
+        let mut releases: Vec<String> = release_paths
+            .iter()
+            .filter(|r| project_dir_of_release(r) == *dir)
+            .cloned()
+            .collect();
+        releases.sort_by(|a, b| b.cmp(a));
+
+        // 该项目可清理的日期标签镜像(仓库名匹配 + 未被容器引用)
+        let tag_images: Vec<CleanupTagImage> = all_images
+            .iter()
+            .filter_map(|v| {
+                let repo = jstr(v, "Repository");
+                let tag = jstr(v, "Tag");
+                if repo == "<none>" || !is_date_tag(&tag) {
+                    return None;
+                }
+                if !repos.iter().any(|r| r == &repo) {
+                    return None;
+                }
+                let id = jstr(v, "ID");
+                Some(CleanupTagImage {
+                    reference: format!("{}:{}", repo, tag),
+                    in_use: in_use_image_ids.iter().any(|x| x == &id),
+                    id,
+                    size: jstr(v, "Size"),
+                    created: jstr(v, "CreatedAt"),
+                })
+            })
+            .collect();
+
+        // 应用内项目标注:按「项目名 == 目录名」或 compose 文件名匹配
+        let dir_name = dir.rsplit('/').next().unwrap_or("");
+        let app_project = cfg
+            .projects
+            .iter()
+            .find(|p| {
+                p.name == dir_name
+                    || p.compose_file
+                        .rsplit_once('/')
+                        .map(|(d, _)| d == dir)
+                        .unwrap_or(false)
+            })
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+
+        projects.push(CleanupProject {
+            dir: dir.clone(),
+            compose_file,
+            size,
+            releases,
+            tag_images,
+            app_project,
+        });
+    }
+
+    Ok((projects, diags, warnings))
+}
+
+
+/// 拼装删除无标签镜像的命令(逐 ID `docker rmi`,不使用 prune)。
+///
+/// 为什么不用 `docker image prune -f`:prune 删除的范围由 docker 自行判定,
+/// 与用户在预览里勾选的条目未必一致;逐 ID 删除让执行结果与勾选一一对应。
+fn rmi_ids_cmd(ids: &[String]) -> String {
+    let quoted: Vec<String> = ids.iter().map(|i| shell_single_quote(i)).collect();
+    format!("docker rmi {}", quoted.join(" "))
+}
+
+/// 拼装删除停止容器的命令(逐 ID `docker rm`)。
+fn rm_container_ids_cmd(ids: &[String]) -> String {
+    let quoted: Vec<String> = ids.iter().map(|i| shell_single_quote(i)).collect();
+    format!("docker rm {}", quoted.join(" "))
+}
+
+/// 拼装删除未使用卷的命令(逐名 `docker volume rm`;卷被占用时该条失败不影响其余)。
+fn rm_volume_names_cmd(names: &[String]) -> String {
+    let quoted: Vec<String> = names.iter().map(|n| shell_single_quote(n)).collect();
+    format!("docker volume rm {}", quoted.join(" "))
+}
+
+/// 拼装删除发布归档目录的命令(逐目录 `rm -rf`;路径由后端拼自服务器扫描结果)。
+fn rm_release_dirs_cmd(dirs: &[String]) -> String {
+    let quoted: Vec<String> = dirs.iter().map(|d| shell_single_quote(d)).collect();
+    format!("rm -rf {}", quoted.join(" "))
 }
 
 /// 定向执行勾选的清理项(逐节流式输出 server-log,与既有清理同通道)。
 /// 至少勾选一项;各节独立执行,单节失败不影响其余。
+///
+/// 每节都按前端回传的**显式目标列表**逐条删除(见 [`CleanupSections`] 注释);
+/// 分项目清理复用同一命令,避免两套实现。
 #[tauri::command]
 pub async fn cleanup_execute(
     app: AppHandle,
@@ -5485,7 +6800,7 @@ pub async fn cleanup_execute(
     password_plain: Option<String>,
     sections: CleanupSections,
 ) -> Result<Vec<CleanupSectionResult>, String> {
-    if !sections.images && !sections.containers && !sections.volumes && !sections.builder {
+    if !sections.has_any() {
         return Err("请至少勾选一项要清理的内容".to_string());
     }
     let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
@@ -5504,49 +6819,94 @@ pub async fn cleanup_execute(
     )
     .await?;
 
-    let mut plan: Vec<(&str, &str)> = Vec::new();
-    if sections.images {
-        plan.push(("悬空镜像", "docker image prune -f"));
+    let mut plan: Vec<(String, String)> = Vec::new();
+    if sections.images && !sections.image_ids.is_empty() {
+        plan.push((
+            format!("无标签镜像({} 项)", sections.image_ids.len()),
+            rmi_ids_cmd(&sections.image_ids),
+        ));
     }
-    if sections.containers {
-        plan.push(("停止容器", "docker container prune -f"));
+    if sections.containers && !sections.container_ids.is_empty() {
+        plan.push((
+            format!("停止容器({} 个)", sections.container_ids.len()),
+            rm_container_ids_cmd(&sections.container_ids),
+        ));
     }
-    if sections.volumes {
-        plan.push(("未使用卷", "docker volume prune -f"));
+    if sections.volumes && !sections.volume_names.is_empty() {
+        plan.push((
+            format!("未使用卷({} 个)", sections.volume_names.len()),
+            rm_volume_names_cmd(&sections.volume_names),
+        ));
     }
     if sections.builder {
-        plan.push(("构建缓存", "docker builder prune -f"));
+        plan.push(("构建缓存".to_string(), "docker builder prune -f".to_string()));
+    }
+    // 分项目:归档删除与标签删除各聚合成一条命令(减少往返),逐项结果由输出体现
+    let all_release_dirs: Vec<String> = sections
+        .projects
+        .iter()
+        .flat_map(|p| p.release_dirs.iter().cloned())
+        .collect();
+    if !all_release_dirs.is_empty() {
+        plan.push((
+            format!("旧发布归档({} 个)", all_release_dirs.len()),
+            rm_release_dirs_cmd(&all_release_dirs),
+        ));
+    }
+    let all_image_refs: Vec<String> = sections
+        .projects
+        .iter()
+        .flat_map(|p| p.image_refs.iter().cloned())
+        .collect();
+    if !all_image_refs.is_empty() {
+        plan.push((
+            format!("旧版本镜像({} 个)", all_image_refs.len()),
+            rmi_ids_cmd(&all_image_refs),
+        ));
     }
 
     let mut results = Vec::new();
     for (label, cmd) in plan {
         let mut lines: Vec<String> = Vec::new();
-        {
+        // 借用作用域:on_output 持有 &mut client,出块后释放,便于循环下一节继续用
+        let outcome: Result<i32, String> = {
             let mut on_output = |line: &str| {
                 let t = line.trim_end();
                 let _ = app.emit("server-log", t.to_string());
                 lines.push(t.to_string());
             };
-            let fut = client.exec(cmd, &mut on_output);
-            let code = with_timeout(
+            let fut = client.exec(&cmd, &mut on_output);
+            with_timeout(
                 PRUNE_TIMEOUT_SECS,
                 "服务器清理超时",
                 "请检查服务器网络后重试",
                 async { fut.await.map_err(|e| format!("执行清理命令失败: {}", e)) },
             )
-            .await?;
-            let output = lines.join("\n");
-            if code != 0 {
-                let _ = app.emit(
-                    "server-log",
-                    format!("[{}] 清理失败(退出码 {})", label, code),
-                );
+            .await
+        };
+        // 单节传输层失败只记为该节失败,不中断后续节(与"各节独立"语义一致)
+        match outcome {
+            Ok(code) => {
+                if code != 0 {
+                    let _ = app.emit(
+                        "server-log",
+                        format!("[{}] 清理失败(退出码 {})", label, code),
+                    );
+                }
+                results.push(CleanupSectionResult {
+                    label,
+                    ok: code == 0,
+                    output: lines.join("\n"),
+                });
             }
-            results.push(CleanupSectionResult {
-                label: label.to_string(),
-                ok: code == 0,
-                output,
-            });
+            Err(e) => {
+                let _ = app.emit("server-log", format!("[{}] {}", label, e));
+                results.push(CleanupSectionResult {
+                    label,
+                    ok: false,
+                    output: format!("{}\n{}", lines.join("\n"), e),
+                });
+            }
         }
     }
     Ok(results)
@@ -5975,6 +7335,255 @@ async fn exec_forwarded_migrate(
 mod tests {
     use super::*;
     use crate::config::{AuthConfig, TransferMode};
+
+    // ===== 清理分析纯函数(第三批)=====
+
+    #[test]
+    fn test_parse_cleanup_ndjson_skips_non_json() {
+        // stderr 混入(如 "WARNING: No swap limit support")不应让整节失败;
+        // 以 `{` 开头但结构损坏的行单独报"解析失败"
+        let out = "WARNING: No swap limit support\n{\"ID\":\"abc\",\"Repository\":\"x\"}\n\n{ broken json\n";
+        let (items, warnings) = parse_cleanup_ndjson(out);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["ID"], "abc");
+        // 提示行进 warnings;损坏的 JSON 行报解析失败
+        assert!(warnings.iter().any(|w| w.contains("No swap limit")));
+        assert!(warnings.iter().any(|w| w.contains("解析失败")));
+    }
+
+    #[test]
+    fn test_parse_cleanup_ndjson_warning_cap() {
+        // 提示行最多收集 3 条,防刷屏
+        let out = "a\nb\nc\nd\ne\n";
+        let (items, warnings) = parse_cleanup_ndjson(out);
+        assert!(items.is_empty());
+        assert_eq!(warnings.len(), 3);
+    }
+
+    #[test]
+    fn test_image_repo_of() {
+        assert_eq!(image_repo_of("myapp:latest"), "myapp");
+        assert_eq!(image_repo_of("myapp"), "myapp");
+        // registry:port/name 里的冒号不是 tag 分隔符
+        assert_eq!(image_repo_of("registry:5000/app"), "registry:5000/app");
+        assert_eq!(image_repo_of("registry:5000/app:v1"), "registry:5000/app");
+        assert_eq!(image_repo_of("app@sha256:deadbeef"), "app");
+        assert_eq!(image_repo_of(""), "");
+    }
+
+    #[test]
+    fn test_is_date_tag() {
+        assert!(is_date_tag("20260905-101010"));
+        assert!(!is_date_tag("latest"));
+        assert!(!is_date_tag("20260905"));
+        assert!(!is_date_tag("2026090-1010100"));
+        assert!(!is_date_tag("2026090x-101010"));
+    }
+
+    #[test]
+    fn test_compose_image_repos() {
+        let yaml = "\
+services:
+  web:
+    image: myapp:latest
+  db:
+    image: registry:5000/postgres:16
+  worker:
+    image: myapp:latest
+";
+        let repos = compose_image_repos(yaml);
+        assert!(repos.contains(&"myapp".to_string()));
+        assert!(repos.contains(&"registry:5000/postgres".to_string()));
+        // 去重:myapp 只出现一次
+        assert_eq!(repos.iter().filter(|r| *r == "myapp").count(), 1);
+        // 解析失败 → 空(调用方据此跳过标签清理,不误删)
+        assert!(compose_image_repos("}{ not yaml").is_empty());
+        assert!(compose_image_repos("services: {}").is_empty());
+    }
+
+    #[test]
+    fn test_split_compose_dump() {
+        let out = "==COMPOSE:/home/a/docker-compose.yml\nservices:\n  web:\n    image: x\n\n==COMPOSE:/home/b/docker-compose.yml\nservices:\n  db:\n    image: y\n\n";
+        let parts = split_compose_dump(out);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].0, "/home/a/docker-compose.yml");
+        assert!(parts[0].1.contains("image: x"));
+        assert_eq!(parts[1].0, "/home/b/docker-compose.yml");
+        assert!(parts[1].1.contains("image: y"));
+    }
+
+    #[test]
+    fn test_project_dir_of_release() {
+        assert_eq!(
+            project_dir_of_release("/home/henghao/zetok/releases/20260905-101010"),
+            "/home/henghao/zetok"
+        );
+        assert_eq!(
+            project_dir_of_release("/home/henghao/zetok/releases/20260905-101010/"),
+            "/home/henghao/zetok"
+        );
+        assert_eq!(project_dir_of_release("/tmp/x"), "");
+    }
+
+    #[test]
+    fn test_parse_du_output() {
+        // GNU du:大小与路径以制表符分隔
+        let rows = parse_du_output("1.2G\t/home/a/proj\n340M\t/home/a/other\n");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], ("/home/a/proj".to_string(), "1.2G".to_string()));
+        assert_eq!(rows[1], ("/home/a/other".to_string(), "340M".to_string()));
+        // 退化为空格分隔
+        let rows2 = parse_du_output("12K /home/a/b");
+        assert_eq!(rows2[0], ("/home/a/b".to_string(), "12K".to_string()));
+        assert!(parse_du_output("").is_empty());
+    }
+
+    #[test]
+    fn test_abs_path_lines() {
+        let out = "/home/a/docker-compose.yml\nrunning\n… (共 12 行)\n/home/b/compose.yml\n";
+        let lines = abs_path_lines(out);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "/home/a/docker-compose.yml");
+    }
+
+    #[test]
+    fn test_cleanup_cmd_builders_quote() {
+        // 含空格与单引号的路径必须被安全包裹
+        let dirs = vec!["/home/a b/releases/20260905-101010".to_string()];
+        assert_eq!(
+            rm_release_dirs_cmd(&dirs),
+            "rm -rf '/home/a b/releases/20260905-101010'"
+        );
+        let ids = vec!["sha256:abc".to_string()];
+        assert_eq!(rmi_ids_cmd(&ids), "docker rmi 'sha256:abc'");
+        assert_eq!(
+            rm_volume_names_cmd(&["vol1".to_string()]),
+            "docker volume rm 'vol1'"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_scan_compose_cmd_excludes_archives() {
+        let cmd = cleanup_scan_compose_cmd("/home/henghao");
+        assert!(cmd.contains("-maxdepth 4"));
+        assert!(cmd.contains("'*/releases/*'"));
+        assert!(cmd.contains("'*/.git/*'"));
+        assert!(cmd.contains("/home/henghao"));
+    }
+
+    #[test]
+    fn test_cleanup_sections_has_any() {
+        let empty = CleanupSections {
+            images: true,
+            containers: false,
+            volumes: false,
+            builder: false,
+            image_ids: vec![],
+            container_ids: vec![],
+            volume_names: vec![],
+            projects: vec![],
+        };
+        // 勾了节但没有任何目标 → 不可执行(防"勾了却没东西可删"的误报成功)
+        assert!(!empty.has_any());
+        let with_target = CleanupSections {
+            images: true,
+            containers: false,
+            volumes: false,
+            builder: false,
+            image_ids: vec!["sha256:x".into()],
+            container_ids: vec![],
+            volume_names: vec![],
+            projects: vec![],
+        };
+        assert!(with_target.has_any());
+        let builder_only = CleanupSections {
+            images: false,
+            containers: false,
+            volumes: false,
+            builder: true,
+            image_ids: vec![],
+            container_ids: vec![],
+            volume_names: vec![],
+            projects: vec![],
+        };
+        assert!(builder_only.has_any());
+    }
+
+    #[test]
+    fn test_local_basename() {
+        // Windows 与 POSIX 分隔符都支持,尾部斜杠去掉
+        assert_eq!(local_basename("E:\\apps\\web"), Some("web".to_string()));
+        assert_eq!(local_basename("/opt/data/"), Some("data".to_string()));
+        assert_eq!(local_basename("C:/x/y/z.txt"), Some("z.txt".to_string()));
+        assert_eq!(local_basename("web"), Some("web".to_string()));
+        // 无法取名的输入 → None(调用方据此保持原行为)
+        assert_eq!(local_basename(""), None);
+        assert_eq!(local_basename("   "), None);
+        assert_eq!(local_basename("/"), None);
+    }
+
+    #[test]
+    fn test_source_content_hash_detects_change() {
+        let dir = std::env::temp_dir().join(format!("dd-hash-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let compose = dir.join("docker-compose.yml");
+        std::fs::write(&compose, "services:\n  web:\n    image: a:1\n").unwrap();
+        let h1 = source_content_hash(&compose).unwrap();
+        // 同内容 → 同哈希(可重复比对)
+        assert_eq!(h1, source_content_hash(&compose).unwrap());
+
+        // 改 compose → 哈希变化
+        std::fs::write(&compose, "services:\n  web:\n    image: a:2\n").unwrap();
+        let h2 = source_content_hash(&compose).unwrap();
+        assert_ne!(h1, h2);
+
+        // 改 .env(compose 未动)→ 也要变化(插值结果会变)
+        std::fs::write(&compose, "services:\n  web:\n    image: a:1\n").unwrap();
+        std::fs::write(dir.join(".env"), "TAG=2\n").unwrap();
+        let h3 = source_content_hash(&compose).unwrap();
+        assert_ne!(h1, h3);
+
+        // 源不存在 → Err(调用方按"无法比对"降级,不误判为已变更)
+        assert!(source_content_hash(&dir.join("nope.yml")).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_project_source_status_states() {
+        let mk = |path: Option<&str>, hash: Option<&str>| ProjectConfig {
+            id: "p".into(),
+            name: "n".into(),
+            image_filter: String::new(),
+            compose_file: "c".into(),
+            file_mappings: Vec::new(),
+            service_overrides: Vec::new(),
+            health_wait_secs: 0,
+            pre_deploy_cmd: None,
+            post_deploy_cmd: None,
+            notify_webhook: None,
+            source_compose_path: path.map(String::from),
+            source_hash: hash.map(String::from),
+        };
+        // 手工项目(无源)→ unknown,不参与自动更新
+        assert_eq!(project_source_status(&mk(None, None)).state, "unknown");
+        // 源不存在 → missing
+        let missing = mk(Some("E:/definitely/not/here/docker-compose.yml"), Some("x"));
+        assert_eq!(project_source_status(&missing).state, "missing");
+        // 旧配置无哈希 → unknown(要求先手动更新一次)
+        let dir = std::env::temp_dir().join(format!("dd-src-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let compose = dir.join("docker-compose.yml");
+        std::fs::write(&compose, "services: {}\n").unwrap();
+        let no_hash = mk(Some(&compose.to_string_lossy()), None);
+        assert_eq!(project_source_status(&no_hash).state, "unknown");
+        // 哈希一致 → unchanged;不一致 → changed
+        let h = source_content_hash(&compose).unwrap();
+        let same = mk(Some(&compose.to_string_lossy()), Some(&h));
+        assert_eq!(project_source_status(&same).state, "unchanged");
+        let diff = mk(Some(&compose.to_string_lossy()), Some("deadbeef"));
+        assert_eq!(project_source_status(&diff).state, "changed");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     // ===== deploy_notify_text(通知中心挂点文案)=====
 

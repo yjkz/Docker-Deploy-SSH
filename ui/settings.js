@@ -226,6 +226,10 @@
     body.appendChild(groupTitle('通用 GENERAL'));
     body.appendChild(checkboxRow('settings-close-tray', '关闭窗口时隐藏到托盘', false));
     body.appendChild(hint('开启后点关闭仅隐藏窗口(部署继续),托盘菜单「退出」才真正退出;保存后立即生效'));
+    body.appendChild(checkboxRow('settings-auto-update-src', '启动时自动从源更新项目', true));
+    body.appendChild(hint(
+      '开启后打开软件会比对导入项目的源 compose(含 .env / override)与配置内副本,' +
+      '发现变化即自动同步并重解析(保留已保存的服务分类);关闭后仍可在项目列表点「从源更新」手动执行'));
 
     // ── 更新 UPDATE ──
     body.appendChild(groupTitle('更新 UPDATE'));
@@ -399,7 +403,8 @@
     window.AppBus.invoke('app_settings_set', {
       settings: {
         closeToTray: isChecked('settings-close-tray'),
-        proxy: fieldVal('settings-proxy-input').trim()
+        proxy: fieldVal('settings-proxy-input').trim(),
+        autoUpdateFromSource: isChecked('settings-auto-update-src')
       }
     }).then(function () {
       // 过期会话(保存期间模态被关闭甚至重开)→ 静默丢弃,防旧 promise 回写新模态
@@ -480,6 +485,8 @@
         if (!isModalVisible()) return; // 读取期间已被关闭
         var s = (settings && typeof settings === 'object') ? settings : {};
         setChecked('settings-close-tray', s.closeToTray === true);
+        // 缺省(旧 settings.json)视为开启 —— 与后端 serde default 同口径
+        setChecked('settings-auto-update-src', s.autoUpdateFromSource !== false);
         var proxy = document.getElementById('settings-proxy-input');
         if (proxy && proxy.value === '') proxy.value = String(s.proxy || '');
         showUpdateMessage('info', '');

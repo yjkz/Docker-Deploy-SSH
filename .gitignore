@@ -31,3 +31,6 @@ desktop.ini
 
 # (是其余电脑的文件不要删,含构建产物和本地配置)
 targe-1/
+
+# ZCode 会话本地文件(plan 等)
+.zcode/

@@ -478,6 +478,8 @@ mod tests {
             pre_deploy_cmd: None,
             post_deploy_cmd: None,
             notify_webhook: None,
+            source_compose_path: None,
+            source_hash: None,
         });
         cfg.notify.email = EmailNotify {
             enabled: true,
