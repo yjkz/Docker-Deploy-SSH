@@ -28,7 +28,7 @@
 | [01-架构总览.md](01-架构总览.md) | 技术栈、系统分层、三条数据流、目录结构 | 第一篇,建立全局图景 |
 | [02-后端模块.md](02-后端模块.md) | 14 个功能 Rust 模块职责、关键结构体/函数签名、超时常量 | 改后端前 |
 | [03-前端说明.md](03-前端说明.md) | 页面结构、JS 模块(含 manage/notify/config-io/settings/help)、全局约定(AppState/AppBus)、设计语言 | 改前端前 |
-| [04-契约参考.md](04-契约参考.md) | **86 个命令 + 9 个事件 + 配置 JSON Schema 完整速查** | 跨前后端改动的对账表 |
+| [04-契约参考.md](04-契约参考.md) | **88 个命令 + 9 个事件 + 配置 JSON Schema 完整速查** | 跨前后端改动的对账表 |
 | [05-构建与运行.md](05-构建与运行.md) | 环境要求、dev/build 命令、安装布局、日志、配置文件夹 | 跑起来之前 |
 | [06-部署流程与回滚.md](06-部署流程与回滚.md) | 两条部署管线的逐步语义、智能传输、一键回滚、独立回滚中心(06 页)、环境检测闸门规则 | 理解/调试部署行为 |
 | [07-安全与已知取舍.md](07-安全与已知取舍.md) | 敏感数据数据流、导出加密格式、注入防护、设计决策记录、已知限制 | 评估改动影响时 |
@@ -40,14 +40,14 @@
 代码量:Rust ~19,280 行(17 文件,含 main.rs)+ 原生 JS/HTML/CSS ~15,700 行(无框架无打包器,字体 woff2 自捆绑)
 技术:Tauri 2 + tokio + russh/russh-sftp + flate2 + serde_yaml + windows-dpapi + tauri-plugin-dialog
       + tauri-plugin-notification + lettre(rustls)+ argon2 + aes-gcm + reqwest(rustls+socks)+ ureq
-前端调用后端:window.__TAURI__.core.invoke(86 个命令),事件 9 个,字段默认 snake_case
+前端调用后端:window.__TAURI__.core.invoke(88 个命令),事件 9 个,字段默认 snake_case
       (notify/config-io/settings/update/回滚列表与回滚中心/.env/批量/断点/清理/项目源更新/日志流/迁移契约为 camelCase,例外清单见 04)
 页面:6 页导航(01 检测 / 02 镜像 / 03 服务器 / 04 部署 / 05 远程管理 / 06 回滚中心)+ 设置中心 + 全站帮助
 构建:npm run tauri dev / npm run tauri build(产物 NSIS 安装包 ~8.2MB)
 配置:安装目录 config/ 下 servers.json + projects.json + notify.json + settings.json +
       deployments.json + resume-deploy.json(便携式;原子写);日志 logs/app.log
-测试:cargo test(纯函数单测 238 passed;真机测试 #[ignore] 12 个)
-当前版本:v5.5.1(tauri.conf.json / Cargo.toml;第四批 + 设置「关于」栏/源检查反馈/前往下载黑框三项修复)
+测试:cargo test(纯函数单测 239 passed;真机测试 #[ignore] 12 个)
+当前版本:v5.6.0(tauri.conf.json / Cargo.toml;第五批:项目级归档保留数量 + 回滚中心逐版本删除)
 ```
 
 ## 权威计划/完成记录(仓库根目录)
