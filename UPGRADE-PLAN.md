@@ -488,3 +488,100 @@ notify: {
 - 保留数填 0 = 不留历史归档,将无法回滚到任何历史版本(表单与面板文案均已写明)
 - 镜像删除不带 `-f`:仍被容器引用时由 docker 拒绝,需先停用/删除相关容器
 - 删除归档只删该目录,不影响当前运行的服务与 compose 文件(与「回滚到此归档」的语义区分明确)
+
+---
+
+## 第六批：项目跨服务器迁移 + 镜像迁移失效修复（v5.7.0）
+
+### 背景：先修复被复用的地基
+
+实施新功能前发现**阶段十的「镜像迁移」自发布起就是坏的**,且是双重失效:
+
+1. **搬不动镜像**:取 ID 用的是 `docker_inspect_cmd`(拼 `docker image inspect '<ref>'`,**无 `--format`**),
+   而迁移路径拿它的输出做 `strip_prefix("sha256:")`。`inspect` 默认输出是 pretty-print 的 JSON 数组
+   (首字符 `[`),解析恒为 `None` ⇒ 每个镜像都判「源服务器上不存在镜像,跳过」,**一个镜像都不会传**。
+   该函数另 3 个调用点只用退出码判存在性,语义正确,故问题只压在迁移上。
+2. **点按钮就报错**:后端签名 `migrate_images(app, state, req: MigrateRequest)` 要求顶层 `req` 键,
+   前端发的是扁平 `{sourceId, targetId, ...}` ⇒ `missing required key req` 直接落进 catch。
+
+修复:新增专用 `docker_inspect_id_cmd`(`--format '{{.Id}}'`)+ `parse_inspect_id`(拒绝 `[`/`{` 开头
+的输出,防止再把 JSON 当 ID);原 `docker_inspect_cmd` 保持只用于存在性判定;前端补 `req` 包装;
+`migrate-done` 加 `CatchPanic` 兜底(否则任务 panic 时前端永久停在「迁移中…」);取消按钮接上
+`migrate_status(true)`(此前只关模态,无取消路径)。
+
+### 阶段一:stack.rs 卷解析(新增能力)
+
+`stack.rs` 此前完全不解析 compose 的 `volumes:`。新增:
+
+- `parse_compose_volumes` / `collect_volume_mounts`:短语法 `src:dst[:opts]` 与长语法
+  `type/source/target` 都支持;与 `parse_compose_file` **共用 `load_compose_document`**
+  (override 合并后的文档)—— 否则卷定义写在 override 里会被漏掉,而这种差异极难从结果察觉
+- `classify_volume_source`:绝对路径(`/` 或 `C:\`)→ `BindAbsolute`(不搬);`.` 开头 → `BindRelative`
+  (可搬);顶层 `external: true` → `External`(不搬);其余 → `Named`,实际卷名取顶层 `name:` 覆盖值
+  否则 `<项目名>_<卷名键>`
+- 短语法切分**必须跳过 Windows 盘符**:`C:\data:/app` 按「首个冒号切 source」会切成 `C`,故先跳盘符前缀
+- `dedupe_volume_specs`:跨服务去重,`key` **保留 compose 原文**而非从 `resolved_name` 反推 ——
+  卷名含下划线时反推会截错(`zetok` + `pg_data` 反推成 `data`)
+
+### 阶段二:migrate_project.rs(新模块,2 命令)
+
+以**项目**为单位搬运(镜像迁移只管镜像),`commands.rs` 已 9,900 行且这是自成一体的关注点。
+复用 commands 的连接/镜像搬运/命令拼装助手(可见性放宽为 `pub(crate)`),沿用 manage 系列
+「复用助手、不反向依赖」的既有模式。
+
+- `migrate_project_preview`(**只读**):连源读 `<源目录>/docker-compose.yml` ——
+  **以源实际部署为准,本机副本不作依据**(目标要复现的是源真正在跑的状态;手工项目由此同样可用)
+  → 解析镜像/卷/近 N 归档 → 汇总 warnings + errors
+- `migrate_project_start`:`②源 stop → ③逐卷 tar 导出 → ④源 start(无条件恢复)` →
+  ⑤镜像/卷包/归档经本机中转 → ⑥目标 load + volume create/导入 → ⑦compose 三件套与归档落盘 →
+  ⑧目标 up -d → ⑨清两端临时目录 → ⑩改绑 `default_server_id` + 写 `mode="migrate"` 历史
+- **停机窗口只覆盖卷导出**(卷必须在停服态导出,写入中打包会产生无法修复的损坏),
+  长耗时的镜像/归档传输在源恢复运行后进行;**恢复源无条件执行**,任何导出失败路径都先恢复再返回错误
+- 卷导出/导入经 `docker run --rm --entrypoint tar` 临时容器(宿主机不一定有 tar),
+  候选镜像链 busybox → alpine → ubuntu → `docker pull busybox`,全失败则明确报错给建议
+- 卷名跨机推导 `resolve_volume_names`:两机目录名不同则卷名不同,执行时**按目标侧自己的卷名**
+  create+导入(数据不关心名字,关键是目标 compose 找得到),并在 warnings 提示
+- 复用 `MigrateState` 单会话(与镜像迁移天然互斥);`CatchPanic` 兜底;`StageDirGuard` 清理本地中转目录
+
+### 阶段三:前端
+
+- 入口:`#deploy-mode-tabs` 内、整栈 tab 右侧「迁移项目…」(`.mode-tab-action` 靠右,青色文字不吃 active 填充)
+- 模态 `#migrate-project-modal`(`modal-wide`):选择区(源默认带出 `default_server_id`;目标下拉排除源
+  并在源变化时重建;迁移项 —— 镜像+compose 恒选、数据卷默认勾、归档数默认 1 上限 20;目标目录可选)
+  → 计划区(两端目录、预计总量、`errors` 红框阻断、`warnings` 清单、镜像/卷/归档三表)
+  → 日志区(恒暗面板,上限 2000 行丢最旧、近底才滚)
+- `migrateState` **声明在 `refreshControls` 之前**(var 提升陷阱,本项目批量部署曾因同类问题失效)
+- 事件订阅先于 invoke、模块级单次守卫;执行中禁关模态;done 回显 warnings 逐条;成功刷新页面数据
+
+### 完成记录（2026-09-11）
+
+- 测试基线 239 → **269 passed / 0 failed / 13 ignored**;新增用例:镜像 ID 命令形态与 JSON 输出拒绝、目录检测/创建命令拼装与防注入、
+  卷解析(短/长语法、盘符、external、顶层 name 覆盖、override 内定义)、卷名跨机推导(同/异目录、
+  name 覆盖、空声明)、迁移命令拼装与防注入(含单引号的卷名)、事件与计划 camelCase 契约、
+  `dedupe_volume_specs` 保留原文键(下划线回归)
+- **卷搬运链路已用本机真实 Docker 端到端验证**:建卷写入已知内容(含 256 字节随机二进制 + 子目录)
+  → 按代码生成形态导出 → 导入新卷 → 逐文件 sha256 比对完全一致
+- 前端:`node --check` 通过 + DOM 桩冒烟(模态构建/源切换重建目标下拉/计划渲染与阻断态/
+  有 errors 时禁用执行/日志上限 2000/事件注册齐全)+ 前后端字段契约脚本核对(无错配)
+- wiki 同步:README(命令 90/事件 11/版本 5.7.0/代码量/第六批记录)、01(架构图 + 迁移数据流)、
+  02(stack.rs 卷解析 + migrate_project 模块节 + history MODE_MIGRATE + 镜像 ID 修复说明 + 测试计数)、
+  03(入口与模态)、04(命令/事件/计划契约 + DeployRecord mode)、06(项目迁移全流程)、
+  07(决策 #60-#63 + 限制 #46-#52 + 注入防护 + 测试现状)、本文件
+
+### 阶段四:项目表单的远程部署目录检测/创建（第六批追加）
+
+**痛点**:项目级 `remote_dir`(第四批)在服务器上不存在时,过去只能靠部署失败才发现;表单提示让人「到服务器卡片点『创建远程目录』后手动补路径」,而那个按钮建的是**服务器级**目录,路径对不上。
+
+- 后端新增 2 命令(90 → 92):`check_remote_dir({serverId, dir}) -> bool`(只读 `test -d`)、`create_remote_dir_at({serverId, dir})`(`mkdir -p`);均要求 `dir` 为绝对路径(前端也拦一次);抽出共用 `create_dir_on`(服务器级 `create_remote_dir` 一并改用)
+- 前端 `appendRemoteDirField`:目录输入框同行「检测」按钮 → 结果区四态(已存在 / 不存在+创建入口 / 失败 / 留空无需创建);不存在时「创建该目录」→ **内联二次确认**(显示将执行的 `mkdir -p <dir>`,不用系统对话框)→ 创建成功后**自动重新检测**
+- 检测针对**「默认服务器」下拉选中的那台**(项目级目录只有落到具体服务器才有"存在与否");未选服务器时提示先选。因此把默认服务器下拉提到目录字段**之前**渲染
+- 目录或服务器变化即清空检测结果(`input`/`change` 监听),避免残留旧结论误导
+- 新增样式 `.dir-check-result` 四态(全部走既有 token)
+
+### 遗留与取舍（记录在 wiki 07 已知限制）
+
+- 源服务器内容保留不动 ⇒ 迁移后两台同跑,卷数据是导出时刻快照,源后续写入不回传(确认页明确提示尽快停用源)
+- 目录检测/创建不限制路径前缀(仅要求绝对路径):项目级目录本就是独立绝对路径,限定在服务器目录下反而挡掉正当用法(理由记在 wiki 07 注入防护表)
+- `external: true` 卷与宿主绝对路径挂载不搬运,只列 warnings 由用户自行准备
+- 卷搬运依赖服务器有 tar 镜像或能拉 busybox;distroless/scratch 项目镜像不含 tar,不能作回退
+- 归档搬运只处理单层目录;取消在卷/镜像边界生效(大文件传输中不即时中断)
