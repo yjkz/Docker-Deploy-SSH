@@ -1076,6 +1076,17 @@ select.text-input option,
 }
 .mode-tab.active:disabled { background: var(--ark-ink); color: var(--ark-paper); }
 
+/* 迁移项目:与模式 tab 同排但靠右(它是动作入口而非模式切换,故不吃
+   active 填充与左侧分隔线,视觉上退后一档) */
+.mode-tab-action {
+  margin-left: auto;
+  border-left: none;
+  font-size: 13px;
+  color: var(--ark-signal);
+}
+.mode-tab-action:hover { color: var(--ark-ink); }
+.mode-tab-action::after { display: none; }
+
 /* 整栈模式:隐藏单镜像专属格子,选择区收窄为两列 */
 .deploy-form.mode-stack .mode-single-only { display: none; }
 .deploy-form.mode-stack .deploy-form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -3227,3 +3238,134 @@ code {
 .rollback-del-btn:hover { opacity: 1; }
 .rollback-release .rollback-del-btn { margin-left: auto; flex: none; }
 .rollback-tag-row .rollback-del-btn { margin-left: 6px; }
+
+/* ===== 项目跨服务器迁移模态(第六批)=====
+   入口是 deploy-mode-tabs 内的靠右动作按钮(样式见该处 .mode-tab-action);
+   以下是模态内部:两列表单 / 计划清单表 / 恒暗日志面板。 */
+.migrate-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 20px;
+  margin-bottom: 4px;
+}
+.migrate-form-grid .form-row { margin-bottom: 0; }
+/* 迁移项与目录行占满整行(内容比服务器下拉长) */
+.migrate-form-grid .form-row:nth-child(3),
+.migrate-form-grid .form-row:nth-child(4) { grid-column: 1 / -1; }
+.migrate-options {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 22px;
+}
+.migrate-release-count input[type="number"] {
+  width: 62px;
+  margin-right: 6px;
+  font-family: var(--font-mono);
+}
+.migrate-plan {
+  margin-top: 16px;
+  border-top: 1px solid var(--ark-line);
+  padding-top: 14px;
+}
+.migrate-plan-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  color: var(--ark-paper-dim-ink);
+}
+.migrate-plan-label {
+  margin: 12px 0 6px;
+  font-family: var(--font-cond);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--ark-paper-ink-65);
+}
+.migrate-plan-warnings {
+  border-left: 3px solid var(--ark-stat-warm, #d68a1e);
+  padding: 8px 12px;
+  margin-bottom: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+}
+.migrate-plan-empty { font-size: 13px; color: var(--ark-paper-dim-ink); }
+.migrate-plan-note {
+  margin-top: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--ark-line);
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--ark-paper-dim-ink);
+}
+.migrate-plan-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.migrate-plan-table th {
+  text-align: left;
+  font-family: var(--font-cond);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--ark-paper-dim-ink);
+  padding: 6px 10px 6px 0;
+  border-bottom: 1px solid var(--ark-line);
+}
+.migrate-plan-table td {
+  padding: 6px 10px 6px 0;
+  border-bottom: 1px solid var(--ark-line-soft);
+  vertical-align: middle;
+}
+.migrate-log-head {
+  margin: 18px 0 6px;
+  font-family: var(--font-cond);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--ark-paper-ink-65);
+}
+/* 迁移日志复用 .manage-log-body 的恒暗面板视觉;此处只给出尺寸 */
+.migrate-log-body {
+  background: var(--ark-terminal-bg);
+  color: var(--ark-terminal-fg);
+  font-family: var(--font-mono);
+  font-variant-ligatures: none;
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 12px;
+  min-height: 160px;
+  max-height: 300px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  border: 1px solid var(--ark-line);
+}
+
+/* ===== 项目表单「远程部署目录」检测结果(第六批)=====
+   四态:ok(已存在)/ warn(需处理或路径不合规)/ fail(检测失败)/ hint(无需创建)。
+   颜色一律走既有 token;创建入口用 .btn-danger 走本页既有的内联二次确认语言。 */
+.dir-check-result {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.dir-check-result.hidden { display: none; }
+.dir-check-text { flex: 1; min-width: 200px; }
+.dir-check-ok { color: var(--ark-stat-warm); }
+.dir-check-ok .dir-check-text { color: var(--ark-ink); }
+.dir-check-warn { color: var(--ark-warn-text); }
+.dir-check-fail { color: var(--ark-warn-text); }
+.dir-check-hint { color: var(--ark-paper-ink-65); font-weight: 500; }

@@ -15,6 +15,10 @@ pub const MODE_STACK: &str = "stack";
 /// 部署模式:回滚(整栈回滚到历史 release / 单镜像回滚到历史标签)。
 pub const MODE_ROLLBACK: &str = "rollback";
 
+/// 项目跨服务器迁移记录的 mode(第五批)。不是部署也不是回滚:历史表据此
+/// 显示徽标,且不为该记录提供「回滚」按钮(源服务器资产并未删除)。
+pub const MODE_MIGRATE: &str = "migrate";
+
 /// 历史记录上限:超过后从最旧开始裁剪。
 const MAX_RECORDS: usize = 200;
 

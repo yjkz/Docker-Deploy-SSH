@@ -252,6 +252,8 @@
           <div class="deploy-mode-tabs" id="deploy-mode-tabs" role="tablist" aria-label="部署模式">
             <button id="deploy-mode-single" class="mode-tab active" type="button" role="tab" aria-selected="true">单镜像</button>
             <button id="deploy-mode-stack" class="mode-tab" type="button" role="tab" aria-selected="false">整栈部署(compose)</button>
+            <!-- 项目跨服务器迁移入口(靠右;与模式 tab 同排) -->
+            <button id="deploy-migrate-project-btn" class="mode-tab mode-tab-action" type="button">迁移项目…</button>
           </div>
           <div class="deploy-form-grid">
             <div class="form-row mode-single-only">
@@ -760,6 +762,17 @@
         <button id="deploy-batch-modal-close" class="modal-close" type="button" title="关闭">关闭</button>
       </div>
       <div id="deploy-batch-modal-body" class="modal-body"></div>
+    </div>
+  </div>
+
+  <!-- 项目跨服务器迁移模态(源/目标选择 → 预检计划 → 执行日志;内容由 deploy.js 构建) -->
+  <div id="migrate-project-modal" class="modal-overlay hidden">
+    <div class="modal-card modal-wide" role="dialog" aria-modal="true" aria-labelledby="migrate-project-modal-title">
+      <div class="modal-head">
+        <div id="migrate-project-modal-title" class="modal-title">迁移项目到其他服务器<span class="help-title-en">MIGRATE</span></div>
+        <button id="migrate-project-modal-close" class="modal-close" type="button" title="关闭">关闭</button>
+      </div>
+      <div id="migrate-project-modal-body" class="modal-body"></div>
     </div>
   </div>
 

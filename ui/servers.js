@@ -25,6 +25,14 @@
  *     host_key_sha256,下次连接重新接受并记录;服务器重装/换 IP 后调用)
  * - install_server_docker({ serverId })     过程输出经 'server-log' 事件逐行推送
  * - create_remote_dir({ serverId })
+ *     在远端创建服务器配置的 remote_dir
+ * - check_remote_dir({ serverId, dir }) -> bool
+ *     检测远端任意目录是否存在(只读;dir 须为 / 开头绝对路径)。
+ *     供项目表单「远程部署目录」的「检测」按钮使用 —— 项目级目录可与
+ *     服务器级目录不同,故必须能查任意路径
+ * - create_remote_dir_at({ serverId, dir }) -> null
+ *     在远端创建任意指定目录(mkdir -p;dir 须为 / 开头绝对路径);
+ *     项目表单检测到目录缺失后调它,成功后前端自动重新检测
  * - prune_server({ serverId, passwordPlain? }) -> null
  *     清理悬空镜像与已退出容器;输出经 'server-log' 事件逐行推送(300s 超时)
  * - preview_compose({ sourcePath }) -> ComposeStack
@@ -1631,6 +1639,148 @@
     return sel;
   }
 
+  /**
+   * 「远程部署目录(可选)」字段(第六批增强):输入框 + 「检测」按钮,
+   * 检测到目录不存在时可在原地确认创建,创建后自动重新检测。
+   *
+   * 检测/创建都针对**当前选中的默认服务器**(项目只在某台服务器上部署才有
+   * 目录可查);未选服务器时提示先选。目录留空时提示无独立目录、无需创建。
+   */
+  function appendRemoteDirField(body, prev) {
+    var row = el('div', 'form-row');
+    var label = el('label', 'form-label', '远程部署目录(可选)');
+    label.setAttribute('for', 'prjf-remote-dir');
+    row.appendChild(label);
+
+    var inputRow = el('div', 'input-btn-row');
+    var input = document.createElement('input');
+    input.className = 'form-input';
+    input.id = 'prjf-remote-dir';
+    input.type = 'text';
+    input.autocomplete = 'off';
+    input.value = prev && prev.remote_dir ? String(prev.remote_dir) : '';
+    input.placeholder = '留空 = 用服务器的部署目录';
+    inputRow.appendChild(input);
+
+    var checkBtn = el('button', 'btn', '检测');
+    checkBtn.type = 'button';
+    checkBtn.id = 'prjf-remote-dir-check-btn';
+    checkBtn.addEventListener('click', onCheckDir);
+    inputRow.appendChild(checkBtn);
+    row.appendChild(inputRow);
+
+    row.appendChild(el('div', 'form-hint',
+      '本项目独立的部署根目录(绝对路径,如 /home/henghao/site);留空则沿用所属服务器配置的远程目录。'));
+
+    // 结果区:检测状态 + 创建入口(不存在时出现)
+    var result = el('div', 'dir-check-result hidden');
+    result.id = 'prjf-remote-dir-result';
+    row.appendChild(result);
+
+    body.appendChild(row);
+
+    /** 当前目标服务器 id(取自「默认服务器」下拉;未选返回空串) */
+    function targetServerId() {
+      return fieldVal('prjf-default-server');
+    }
+
+    function setResult(kind, text) {
+      result.classList.remove('hidden');
+      result.className = 'dir-check-result dir-check-' + kind;
+      result.textContent = text;
+    }
+
+    function busy(on) {
+      checkBtn.disabled = !!on;
+      checkBtn.textContent = on ? '检测中…' : '检测';
+    }
+
+    /** 清空结果(目录或服务器变化时,避免残留上一次的结论) */
+    function clearResult() {
+      result.classList.add('hidden');
+      result.textContent = '';
+    }
+
+    function onCheckDir() {
+      var dir = String(input.value || '').trim();
+      if (!dir) {
+        setResult('hint', '未填独立目录:本项目将沿用服务器配置的远程目录,无需单独创建。');
+        return;
+      }
+      if (dir.indexOf('/') !== 0) {
+        setResult('warn', '需为以 / 开头的绝对路径(如 /home/henghao/site)');
+        return;
+      }
+      var serverId = targetServerId();
+      if (!serverId) {
+        setResult('warn', '请先在上方选择「默认服务器」,再检测该服务器上的目录');
+        return;
+      }
+      busy(true);
+      window.AppBus.invoke('check_remote_dir', { serverId: serverId, dir: dir })
+        .then(function (exists) {
+          busy(false);
+          if (exists === true) {
+            setResult('ok', '✓ 目录已存在:' + dir);
+          } else {
+            renderMissing(dir, serverId);
+          }
+        })
+        .catch(function (err) {
+          busy(false);
+          setResult('fail', '检测失败:' + (errText(err) || '未知错误'));
+        });
+    }
+
+    /** 目录不存在:给出内联二次确认的「创建」入口(不用系统对话框) */
+    function renderMissing(dir, serverId) {
+      result.classList.remove('hidden');
+      result.className = 'dir-check-result dir-check-warn';
+      result.textContent = '';
+      result.appendChild(el('span', 'dir-check-text', '✗ 该服务器上没有此目录:' + dir));
+      var createBtn = el('button', 'btn btn-sm btn-primary', '创建该目录');
+      createBtn.type = 'button';
+      createBtn.addEventListener('click', function () {
+        showCreateConfirm(dir, serverId, createBtn);
+      });
+      result.appendChild(createBtn);
+    }
+
+    function showCreateConfirm(dir, serverId, triggerBtn) {
+      result.textContent = '';
+      result.appendChild(el('span', 'dir-check-text',
+        '将在服务器上执行 mkdir -p ' + dir + ',确认创建?'));
+      var ok = el('button', 'btn btn-sm btn-danger', '确认创建');
+      ok.type = 'button';
+      ok.disabled = !!triggerBtn.disabled;
+      ok.addEventListener('click', function () {
+        ok.disabled = true;
+        ok.textContent = '创建中…';
+        window.AppBus.invoke('create_remote_dir_at', { serverId: serverId, dir: dir })
+          .then(function () {
+            window.toast('目录已创建:' + dir, 'ok');
+            // 创建成功后自动重新检测(用户要求:确认创建后自动复查)
+            onCheckDir();
+          })
+          .catch(function (err) {
+            setResult('fail', '创建失败:' + (errText(err) || '未知错误'));
+          });
+      });
+      result.appendChild(ok);
+      var cancel = el('button', 'btn btn-sm', '取消');
+      cancel.type = 'button';
+      cancel.addEventListener('click', function () { renderMissing(dir, serverId); });
+      result.appendChild(cancel);
+    }
+
+    // 目录或目标服务器变化后旧结论失效:清空结果并隐藏创建入口
+    input.addEventListener('input', clearResult);
+    var serverSel = document.getElementById('prjf-default-server');
+    if (serverSel) serverSel.addEventListener('change', clearResult);
+
+    return input;
+  }
+
   function appendActions(body, errId, onCancel, onSave, saveText) {
     var actions = el('div', 'form-actions');
     var cancel = el('button', 'btn', '取消');
@@ -2305,12 +2455,10 @@
       // ===== 部署位置(第四批):项目级目录 + 默认服务器 =====
       // 背景:服务器只有一个 remote_dir,同服务器多项目共用同一部署目录与
       // docker-compose.yml,切换项目要改服务器配置 —— 这里让项目自带目录。
-      appendField(body, '远程部署目录(可选)', 'prjf-remote-dir', 'text',
-        prev && prev.remote_dir ? String(prev.remote_dir) : '',
-        '留空 = 用服务器的部署目录',
-        '本项目独立的部署根目录(绝对路径,如 /home/henghao/site);留空则沿用所属服务器配置的远程目录。'
-        + '填了独立目录后,需在服务器上先建好该目录(可到 03 页服务器卡片点「创建远程目录」后手动补路径)。');
+      // 第六批:目标服务器下拉**先建**,目录字段才能挂上「检测/创建」——
+      // 检测针对该服务器执行(见 appendRemoteDirField)。
       appendServerSelect(body, prev);
+      appendRemoteDirField(body, prev);
 
       // 发布归档保留数量(第五批):部署成功后按此清理旧 releases 目录
       appendField(body, '发布归档保留数量(可选)', 'prjf-release-keep', 'number',

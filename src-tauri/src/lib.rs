@@ -9,6 +9,7 @@ pub mod manage_exec;
 pub mod manage_logs;
 pub mod manage_stacks;
 pub mod manage_stats;
+pub mod migrate_project;
 pub mod notify;
 pub mod ssh;
 pub mod stack;
@@ -48,6 +49,8 @@ pub fn run() {
       commands::server_env_check,
       commands::install_server_docker,
       commands::create_remote_dir,
+      commands::check_remote_dir,
+      commands::create_remote_dir_at,
       commands::prune_server,
       commands::deploy,
       commands::cancel_deploy,
@@ -111,6 +114,8 @@ pub fn run() {
       manage_logs::manage_log_stream_stop,
       commands::migrate_images,
       commands::migrate_status,
+      migrate_project::migrate_project_preview,
+      migrate_project::migrate_project_start,
       update::update_check,
       update::update_download,
       update::update_install,

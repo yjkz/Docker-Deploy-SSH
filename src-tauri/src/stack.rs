@@ -96,59 +96,7 @@ pub fn parse_compose_file(
     compose_path: &Path,
     local_images: &[(String, String)],
 ) -> Result<ComposeStack, String> {
-    let text = std::fs::read_to_string(compose_path).map_err(|e| {
-        format!(
-            "读取 compose 文件失败 ({}): {}",
-            compose_path.display(),
-            e
-        )
-    })?;
-    let mut value: serde_yaml::Value = serde_yaml::from_str(&text)
-        .map_err(|e| format!("解析 compose 文件失败,不是有效的 YAML: {}", e))?;
-    // serde_yaml 不自动应用合并键(<<):compose 惯用锚点 + `<<: *common` 注入
-    // image/build 等公共字段,必须显式合并,否则相关服务会被误判为未设置 image/build
-    value.apply_merge().map_err(|e| {
-        format!("解析 compose 文件失败,处理 YAML 合并键(<<)失败: {}", e)
-    })?;
-    if !value.is_mapping() {
-        return Err("compose 文件顶层结构不正确,应为键值映射".to_string());
-    }
-
-    // ---- override 检测 + 服务级浅合并(多个 override 按检测顺序,后覆盖前)----
-    let mut overrides: Vec<String> = Vec::new();
-    if let Some(dir) = compose_path.parent() {
-        for override_path in find_override_files(dir) {
-            let file_name = override_path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let ov_text = std::fs::read_to_string(&override_path).map_err(|e| {
-                format!(
-                    "读取 override 文件失败 ({}): {}",
-                    override_path.display(),
-                    e
-                )
-            })?;
-            let mut ov_value: serde_yaml::Value = serde_yaml::from_str(&ov_text).map_err(|e| {
-                format!(
-                    "解析 override 文件失败 ({}),不是有效的 YAML: {}",
-                    override_path.display(),
-                    e
-                )
-            })?;
-            ov_value.apply_merge().map_err(|e| {
-                format!(
-                    "解析 override 文件失败 ({}),处理 YAML 合并键(<<)失败: {}",
-                    override_path.display(),
-                    e
-                )
-            })?;
-            if let Some(ov_services) = ov_value.get("services") {
-                merge_override_services(&mut value, ov_services);
-            }
-            overrides.push(file_name);
-        }
-    }
+    let (value, overrides) = load_compose_document(compose_path)?;
 
     // 项目名:顶层 name(字符串且非空)优先,否则取文件名去扩展名。
     // 显式声明的 name 同时是默认镜像名兜底的最高优先级候选来源。
@@ -317,6 +265,328 @@ pub fn apply_overrides(services: &mut [StackService], overrides: &[ServiceOverri
             svc.mode = o.mode.clone();
         }
     }
+}
+
+/// 读取 compose 文档并应用 override 合并(服务解析与卷解析共用的入口)。
+///
+/// 返回 `(已应用合并键与 override 的顶层 Value, 参与的 override 文件名列表)`。
+/// 抽出的原因:卷解析必须看到与服务解析**完全一致**的文档 —— 否则卷定义写在
+/// override 文件里时会被漏掉,而这个差异极难从结果上察觉。
+fn load_compose_document(
+    compose_path: &Path,
+) -> Result<(serde_yaml::Value, Vec<String>), String> {
+    let text = std::fs::read_to_string(compose_path).map_err(|e| {
+        format!(
+            "读取 compose 文件失败 ({}): {}",
+            compose_path.display(),
+            e
+        )
+    })?;
+    let mut value: serde_yaml::Value = serde_yaml::from_str(&text)
+        .map_err(|e| format!("解析 compose 文件失败,不是有效的 YAML: {}", e))?;
+    // serde_yaml 不自动应用合并键(<<):compose 惯用锚点 + `<<: *common` 注入
+    // image/build 等公共字段,必须显式合并,否则相关服务会被误判为未设置 image/build
+    value.apply_merge().map_err(|e| {
+        format!("解析 compose 文件失败,处理 YAML 合并键(<<)失败: {}", e)
+    })?;
+    if !value.is_mapping() {
+        return Err("compose 文件顶层结构不正确,应为键值映射".to_string());
+    }
+
+    // ---- override 检测 + 服务级浅合并(多个 override 按检测顺序,后覆盖前)----
+    let mut overrides: Vec<String> = Vec::new();
+    if let Some(dir) = compose_path.parent() {
+        for override_path in find_override_files(dir) {
+            let file_name = override_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let ov_text = std::fs::read_to_string(&override_path).map_err(|e| {
+                format!(
+                    "读取 override 文件失败 ({}): {}",
+                    override_path.display(),
+                    e
+                )
+            })?;
+            let mut ov_value: serde_yaml::Value = serde_yaml::from_str(&ov_text).map_err(|e| {
+                format!(
+                    "解析 override 文件失败 ({}),不是有效的 YAML: {}",
+                    override_path.display(),
+                    e
+                )
+            })?;
+            ov_value.apply_merge().map_err(|e| {
+                format!(
+                    "解析 override 文件失败 ({}),处理 YAML 合并键(<<)失败: {}",
+                    override_path.display(),
+                    e
+                )
+            })?;
+            if let Some(ov_services) = ov_value.get("services") {
+                merge_override_services(&mut value, ov_services);
+            }
+            overrides.push(file_name);
+        }
+    }
+    Ok((value, overrides))
+}
+
+// ===== 卷解析(项目跨服务器迁移用;见 migrate_project 模块)=====
+
+/// compose 卷挂载的类型。**只用于迁移决策**:命名卷与项目内相对目录可搬,
+/// 系统绝对路径与外部卷不搬(前者可能带来宿主系统文件,后者可能是多项目共享)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VolumeKind {
+    /// 命名卷(`pgdata` 形式,实际名为 `<项目名>_<key>` 或顶层 `name:` 覆盖值)
+    Named,
+    /// 项目目录内的相对路径挂载(`./data`、`data/` 形式)
+    BindRelative,
+    /// 宿主绝对路径挂载(`/etc/localtime` 形式;不搬,可能带系统文件)
+    BindAbsolute,
+    /// 顶层声明 `external: true` 的卷(不搬,可能是多项目共享资源)
+    External,
+}
+
+/// 单个卷挂载点(服务 `volumes:` 的一项)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeMount {
+    /// 服务名(同一卷被多个服务挂载时逐条列出)
+    pub service: String,
+    /// 短语法左侧 / 长语法 source 原文(`./data`、`pgdata`、`/etc/x`)
+    pub source: String,
+    /// 容器内挂载点(短语法右侧 / 长语法 target)
+    pub target: String,
+    /// 挂载类型
+    pub kind: VolumeKind,
+    /// `Named` 时的实际卷名:顶层 `name:` 覆盖值,否则 `<项目名>_<source>`
+    pub resolved_name: Option<String>,
+    /// 原始项是否只读(短语法 `:ro` 等选项里含 ro)
+    pub read_only: bool,
+}
+
+/// 去重后的卷搬运单元(同一实际卷被多服务挂载时合并为一项)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeSpec {
+    /// 命名卷:compose 中声明的**卷名键**(顶层 `volumes:` 的键,如 `pgdata`);
+    /// 相对目录:路径原文(如 `./data`)。调用方据此拼实际卷名,避免从
+    /// `resolved_name` 反推 —— 卷名本身含下划线时反推会截错(`zetok` + `pg_data`
+    /// 反推成 `data`)。
+    pub key: String,
+    /// `Named` 时的实际卷名(顶层 `name:` 覆盖值,否则 `<项目名>_<key>`)
+    pub resolved_name: Option<String>,
+    pub kind: VolumeKind,
+    /// 容器内挂载点(该卷首次出现的挂载点,展示用)
+    pub target: String,
+}
+
+/// 从 compose 解析卷挂载点列表(纯逻辑,不连服务器)。
+///
+/// `project_name` 用于推导命名卷的实际卷名(Docker Compose 默认命名
+/// `<项目名>_<卷名>`,与顶层 `name:` 覆盖值一致)。同一服务内的同一 source
+/// 只记一次;调用方可用 [`dedupe_volume_specs`] 做跨服务去重。
+pub fn parse_compose_volumes(
+    compose_path: &Path,
+    project_name: &str,
+) -> Result<Vec<VolumeMount>, String> {
+    let (value, _) = load_compose_document(compose_path)?;
+    Ok(collect_volume_mounts(&value, project_name))
+}
+
+/// 从已解析的 compose 文档收集卷挂载点(纯函数,便于单测)。
+pub fn collect_volume_mounts(
+    value: &serde_yaml::Value,
+    project_name: &str,
+) -> Vec<VolumeMount> {
+    // 顶层 volumes: 的 name 覆盖与 external 标记(短语法裸名的实际卷名来源)
+    let top_level = value.get("volumes").and_then(|v| v.as_mapping());
+    let volume_declared_name = |key: &str| -> Option<String> {
+        top_level
+            .and_then(|m| m.get(serde_yaml::Value::String(key.to_string())))
+            .and_then(|decl| decl.get("name"))
+            .and_then(|n| n.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+    let volume_is_external = |key: &str| -> bool {
+        top_level
+            .and_then(|m| m.get(serde_yaml::Value::String(key.to_string())))
+            .and_then(|decl| decl.get("external"))
+            .map(|e| match e {
+                serde_yaml::Value::Bool(b) => *b,
+                serde_yaml::Value::Mapping(_) => true, // external: {name: ...} 形式也算
+                _ => false,
+            })
+            .unwrap_or(false)
+    };
+
+    let Some(services) = value.get("services").and_then(|v| v.as_mapping()) else {
+        return Vec::new();
+    };
+
+    let mut mounts: Vec<VolumeMount> = Vec::new();
+    for (svc_key, svc_val) in services {
+        let Some(service) = svc_key.as_str() else {
+            continue;
+        };
+        let Some(volumes) = svc_val.get("volumes").and_then(|v| v.as_sequence()) else {
+            continue;
+        };
+        let mut seen_sources: Vec<String> = Vec::new();
+        for item in volumes {
+            let Some(mount) = parse_volume_item(service, item, project_name, &volume_declared_name, &volume_is_external) else {
+                continue;
+            };
+            // 同一服务内同一 source 去重(compose 允许但无意义)
+            if seen_sources.contains(&mount.source) {
+                continue;
+            }
+            seen_sources.push(mount.source.clone());
+            mounts.push(mount);
+        }
+    }
+    mounts
+}
+
+/// 解析 `volumes:` 的一项(短语法字符串或长语法映射),失败返回 `None`。
+fn parse_volume_item(
+    service: &str,
+    item: &serde_yaml::Value,
+    project_name: &str,
+    declared_name: &dyn Fn(&str) -> Option<String>,
+    is_external: &dyn Fn(&str) -> bool,
+) -> Option<VolumeMount> {
+    let (source, target, opts) = match item {
+        // 短语法:`source:target[:options]`
+        serde_yaml::Value::String(s) => {
+            let parts = split_volume_shorthand(s)?;
+            parts
+        }
+        // 长语法:{ type, source, target, read_only }
+        serde_yaml::Value::Mapping(m) => {
+            let target = m
+                .get("target")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())?
+                .to_string();
+            let source = m
+                .get("source")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .unwrap_or("")
+                .to_string();
+            let read_only = m
+                .get("read_only")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            (source, target, VolumeOpts { read_only })
+        }
+        _ => return None,
+    };
+    if source.is_empty() || target.is_empty() {
+        return None;
+    }
+
+    let (kind, resolved_name) = classify_volume_source(&source, project_name, declared_name, is_external);
+    Some(VolumeMount {
+        service: service.to_string(),
+        source,
+        target,
+        kind,
+        resolved_name,
+        read_only: opts.read_only,
+    })
+}
+
+/// 短语法切分结果携带的挂载选项。
+struct VolumeOpts {
+    read_only: bool,
+}
+
+/// 切分短语法 `source:target[:options]`。
+///
+/// **不能简单 `split(':')`**,也不能只看第一个冒号:Windows 盘符挂载
+/// `C:\data:/app` 的首个冒号属于盘符,按「第一个冒号切 source」会把 source
+/// 切成 `C`。故先跳过盘符前缀,再按首个冒号定 source 边界;剩余部分若仍含
+/// 冒号,则**最后一个**冒号之后是 options,否则全部是 target。
+fn split_volume_shorthand(s: &str) -> Option<(String, String, VolumeOpts)> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let search_from = if has_windows_drive_prefix(s) { 2 } else { 0 };
+    let first = search_from + s[search_from..].find(':')?;
+    let source = s[..first].trim();
+    let rest = &s[first + 1..];
+    let (target, opts_str) = match rest.rfind(':') {
+        Some(sep) => (&rest[..sep], Some(&rest[sep + 1..])),
+        None => (rest, None),
+    };
+    let target = target.trim();
+    if source.is_empty() || target.is_empty() {
+        return None;
+    }
+    let read_only = opts_str
+        .map(|o| o.split(',').any(|p| p.trim().eq_ignore_ascii_case("ro")))
+        .unwrap_or(false);
+    Some((source.to_string(), target.to_string(), VolumeOpts { read_only }))
+}
+
+/// 是否为 Windows 盘符前缀(`C:\` / `C:/`;单独 `C:` 不算)。
+fn has_windows_drive_prefix(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 3
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && (b[2] == b'\\' || b[2] == b'/')
+}
+
+/// 判定卷 source 的类型,并给出命名卷的实际卷名。
+pub fn classify_volume_source(
+    source: &str,
+    project_name: &str,
+    declared_name: &dyn Fn(&str) -> Option<String>,
+    is_external: &dyn Fn(&str) -> bool,
+) -> (VolumeKind, Option<String>) {
+    let s = source.trim();
+    // 绝对路径(Unix):不搬 —— 可能是系统文件(/etc/localtime)或跨项目共享
+    if s.starts_with('/') {
+        return (VolumeKind::BindAbsolute, None);
+    }
+    // Windows 绝对路径(如 C:\data 或 C:/data):本机路径对服务器无意义,同样不搬
+    if s.len() >= 2 && s.as_bytes()[1] == b':' && s.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
+        return (VolumeKind::BindAbsolute, None);
+    }
+    // 相对路径:项目目录内可搬(compose 要求相对路径以 . 开头)
+    if s.starts_with('.') {
+        return (VolumeKind::BindRelative, None);
+    }
+    // 其余按命名卷处理;external 优先(不搬)
+    if is_external(s) {
+        return (VolumeKind::External, declared_name(s));
+    }
+    let resolved = declared_name(s)
+        .unwrap_or_else(|| format!("{}_{}", project_name, s));
+    (VolumeKind::Named, Some(resolved))
+}
+
+/// 跨服务去重:同一实际卷(同 kind + 同 key)合并为一项,顺序保持首次出现。
+pub fn dedupe_volume_specs(mounts: &[VolumeMount]) -> Vec<VolumeSpec> {
+    let mut specs: Vec<VolumeSpec> = Vec::new();
+    for m in mounts {
+        // key 保留 compose 里的卷名键/路径原文(不从 resolved_name 反推)
+        if specs.iter().any(|s| s.kind == m.kind && s.key == m.source) {
+            continue;
+        }
+        specs.push(VolumeSpec {
+            key: m.source.clone(),
+            resolved_name: m.resolved_name.clone(),
+            kind: m.kind.clone(),
+            target: m.target.clone(),
+        });
+    }
+    specs
 }
 
 /// 按 compose 默认加载顺序检测 `compose_dir` 下的 override 文件:
@@ -1818,5 +2088,246 @@ mod tests {
         let json = r#"{"service":"web","mode":"Local"}"#;
         let o: ServiceOverride = serde_json::from_str(json).unwrap();
         assert_eq!(o.mode, TransferMode::Local);
+    }
+
+    // ===== 卷解析(项目跨服务器迁移)=====
+
+    /// 从 YAML 片段构造 Value 并收集卷挂载点(单测便捷入口)。
+    fn mounts_from_yaml(yaml: &str, project_name: &str) -> Vec<VolumeMount> {
+        let mut value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        value.apply_merge().unwrap();
+        collect_volume_mounts(&value, project_name)
+    }
+
+    #[test]
+    fn test_split_volume_shorthand_basic() {
+        let (src, dst, opts) = split_volume_shorthand("./data:/app/data").unwrap();
+        assert_eq!(src, "./data");
+        assert_eq!(dst, "/app/data");
+        assert!(!opts.read_only);
+
+        // 带选项
+        let (src, dst, opts) = split_volume_shorthand("pgdata:/var/lib/postgresql/data:ro").unwrap();
+        assert_eq!(src, "pgdata");
+        assert_eq!(dst, "/var/lib/postgresql/data");
+        assert!(opts.read_only);
+
+        // 无 source(匿名卷 `- /container/path`)不是合法短语法 → None
+        assert!(split_volume_shorthand("/only/a/target").is_none());
+        // 选项里含冒号时按最后一个冒号切分
+        let (_, dst, opts) = split_volume_shorthand("vol:/data:ro,z").unwrap();
+        assert_eq!(dst, "/data");
+        assert!(opts.read_only);
+    }
+
+    #[test]
+    fn test_split_volume_shorthand_windows_drive_not_confused() {
+        // Windows 绝对路径挂载:`C:\data:/app` 的 source 是 C:\data。
+        // 用「第一个冒号切 source」的规则会把 source 切成 "C" —— 故必须
+        // 先按首个冒号取 source、再由剩余部分定位 target/options。
+        let (src, dst, _) = split_volume_shorthand("C:\\data:/app/data").unwrap();
+        assert_eq!(src, "C:\\data");
+        assert_eq!(dst, "/app/data");
+    }
+
+    #[test]
+    fn test_classify_volume_source_kinds() {
+        let no_override = |_: &str| None;
+        let no_ext = |_: &str| false;
+
+        // 命名卷 → 实际名 <项目名>_<key>
+        let (k, n) = classify_volume_source("pgdata", "zetok", &no_override, &no_ext);
+        assert_eq!(k, VolumeKind::Named);
+        assert_eq!(n, Some("zetok_pgdata".to_string()));
+
+        // 相对路径
+        let (k, n) = classify_volume_source("./data", "zetok", &no_override, &no_ext);
+        assert_eq!(k, VolumeKind::BindRelative);
+        assert_eq!(n, None);
+
+        // 绝对路径不搬
+        let (k, _) = classify_volume_source("/etc/localtime", "zetok", &no_override, &no_ext);
+        assert_eq!(k, VolumeKind::BindAbsolute);
+
+        // Windows 绝对路径同样不搬
+        let (k, _) = classify_volume_source("C:\\logs", "zetok", &no_override, &no_ext);
+        assert_eq!(k, VolumeKind::BindAbsolute);
+    }
+
+    #[test]
+    fn test_classify_volume_source_top_level_name_override() {
+        // 顶层 `volumes: { data: { name: custom } }` 时实际卷名取覆盖值
+        let declared = |key: &str| {
+            if key == "data" {
+                Some("custom_volume".to_string())
+            } else {
+                None
+            }
+        };
+        let no_ext = |_: &str| false;
+        let (k, n) = classify_volume_source("data", "zetok", &declared, &no_ext);
+        assert_eq!(k, VolumeKind::Named);
+        assert_eq!(n, Some("custom_volume".to_string()));
+    }
+
+    #[test]
+    fn test_collect_volume_mounts_short_and_long_syntax() {
+        let yaml = r#"
+services:
+  db:
+    image: postgres:16
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro
+  web:
+    image: app:1
+    volumes:
+      - type: volume
+        source: uploads
+        target: /app/uploads
+"#;
+        let mounts = mounts_from_yaml(yaml, "zetok");
+        assert_eq!(mounts.len(), 3);
+
+        assert_eq!(mounts[0].service, "db");
+        assert_eq!(mounts[0].kind, VolumeKind::Named);
+        assert_eq!(mounts[0].resolved_name, Some("zetok_pgdata".to_string()));
+        assert_eq!(mounts[0].target, "/var/lib/postgresql/data");
+        assert!(!mounts[0].read_only);
+
+        assert_eq!(mounts[1].kind, VolumeKind::BindRelative);
+        assert_eq!(mounts[1].source, "./init");
+        assert!(mounts[1].read_only);
+
+        // 长语法
+        assert_eq!(mounts[2].service, "web");
+        assert_eq!(mounts[2].kind, VolumeKind::Named);
+        assert_eq!(mounts[2].resolved_name, Some("zetok_uploads".to_string()));
+        assert_eq!(mounts[2].target, "/app/uploads");
+    }
+
+    #[test]
+    fn test_collect_volume_mounts_external_not_movable() {
+        let yaml = r#"
+services:
+  web:
+    image: app:1
+    volumes:
+      - shared:/data
+volumes:
+  shared:
+    external: true
+"#;
+        let mounts = mounts_from_yaml(yaml, "zetok");
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].kind, VolumeKind::External);
+    }
+
+    #[test]
+    fn test_collect_volume_mounts_ignores_services_without_volumes() {
+        let yaml = r#"
+services:
+  web:
+    image: app:1
+  db:
+    image: postgres:16
+    volumes:
+      - pgdata:/data
+"#;
+        let mounts = mounts_from_yaml(yaml, "zetok");
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].service, "db");
+    }
+
+    #[test]
+    fn test_dedupe_volume_specs_merges_cross_service() {
+        let yaml = r#"
+services:
+  a:
+    image: x:1
+    volumes:
+      - shared:/data-a
+  b:
+    image: y:1
+    volumes:
+      - shared:/data-b
+"#;
+        let mounts = mounts_from_yaml(yaml, "zetok");
+        assert_eq!(mounts.len(), 2, "同一卷被两服务挂载应逐条列出");
+        let specs = dedupe_volume_specs(&mounts);
+        assert_eq!(specs.len(), 1, "跨服务去重后只保留一项");
+        // key 是 compose 里的卷名键;实际卷名在 resolved_name
+        assert_eq!(specs[0].key, "shared");
+        assert_eq!(specs[0].resolved_name, Some("zetok_shared".to_string()));
+        assert_eq!(specs[0].kind, VolumeKind::Named);
+    }
+
+    #[test]
+    fn test_dedupe_volume_specs_keeps_original_key_with_underscore() {
+        // 回归:卷名键本身含下划线时,若从 `<项目名>_<键>` 反推键名会截错
+        // (`zetok` + `pg_data` 反推成 `data`),导致目标侧卷名算错。
+        // VolumeSpec.key 必须保留 compose 原文。
+        let yaml = r#"
+services:
+  db:
+    image: postgres:16
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+"#;
+        let mounts = mounts_from_yaml(yaml, "zetok");
+        let specs = dedupe_volume_specs(&mounts);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].key, "pg_data", "键名须保留原文,不能反推");
+        assert_eq!(
+            specs[0].resolved_name,
+            Some("zetok_pg_data".to_string()),
+            "实际卷名仍是 <项目名>_<键>"
+        );
+    }
+
+    #[test]
+    fn test_volume_kind_named_and_relative_not_conflated() {
+        // 关键区分:相对路径 `./data` 与命名卷 `data` 的 key 可能同名,
+        // 但 kind 不同,去重时必须视为两项(否则会把宿主目录当命名卷建)
+        let yaml = r#"
+services:
+  a:
+    image: x:1
+    volumes:
+      - ./data:/a
+  b:
+    image: y:1
+    volumes:
+      - data:/b
+"#;
+        let mounts = mounts_from_yaml(yaml, "zetok");
+        let specs = dedupe_volume_specs(&mounts);
+        assert_eq!(specs.len(), 2, "相对目录与命名卷是两项不同资产");
+        assert_eq!(specs[0].kind, VolumeKind::BindRelative);
+        assert_eq!(specs[1].kind, VolumeKind::Named);
+    }
+
+    #[test]
+    fn test_parse_compose_volumes_reads_override_files() {
+        // 卷定义写在 override 文件里时不能漏(与服务解析共用同一份合并文档)
+        let dir = std::env::temp_dir().join(format!("dd-vol-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("docker-compose.yml"),
+            "services:\n  web:\n    image: app:1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("docker-compose.override.yml"),
+            "services:\n  web:\n    volumes:\n      - ./data:/app/data\n",
+        )
+        .unwrap();
+
+        let mounts = parse_compose_volumes(&dir.join("docker-compose.yml"), "zetok").unwrap();
+        assert_eq!(mounts.len(), 1, "override 中的卷定义必须被解析到");
+        assert_eq!(mounts[0].kind, VolumeKind::BindRelative);
+        assert_eq!(mounts[0].source, "./data");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

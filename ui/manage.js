@@ -1186,7 +1186,20 @@
     openModal('迁移镜像 — 当前服务器', body);
 
     var cancelBtn = $('migrate-cancel-btn');
-    if (cancelBtn) cancelBtn.addEventListener('click', closeModal);
+    if (cancelBtn) {
+      cancelBtn.addEventListener('click', function () {
+        // 迁移进行中:先请求取消(镜像边界生效),再关模态;未在迁移则直接关
+        if (migState.active) {
+          AppBus.invoke('migrate_status', { cancel: true }).then(function () {
+            toast('已请求取消,当前镜像传输完成后生效', 'info');
+          }).catch(function (err) {
+            var msg = err && err.message ? err.message : String(err);
+            toast('取消请求失败: ' + msg, 'warn');
+          });
+        }
+        closeModal();
+      });
+    }
     var startBtn = $('migrate-start-btn');
     if (startBtn) {
       startBtn.addEventListener('click', function () {
@@ -1205,16 +1218,19 @@
         setMigrateBusy(true);
         startBtn.disabled = true;
         AppBus.invoke('migrate_images', {
-          sourceId: state.serverId,
-          targetId: targetId,
-          images: imagesToMigrate,
-          sourcePasswordPlain: null,
-          targetPasswordPlain: null
+          req: {
+            sourceId: state.serverId,
+            targetId: targetId,
+            images: imagesToMigrate,
+            sourcePasswordPlain: null,
+            targetPasswordPlain: null
+          }
         }).then(function () {
           // 同步返回 null 不代表成功;结果只经 migrate-done 事件
         }).catch(function (err) {
           migState.active = false;
           setMigrateBusy(false);
+          if (startBtn) startBtn.disabled = false;
           var msg = err && err.message ? err.message : String(err);
           appendMigrateLine('—— 迁移发起失败: ' + msg + ' ——');
         });

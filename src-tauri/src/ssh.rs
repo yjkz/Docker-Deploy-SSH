@@ -1043,6 +1043,136 @@ mod tests {
             .ok();
         std::fs::remove_dir_all(&tmp).ok();
     }
+
+    // ===== 第六批:项目迁移的数据卷搬运(导出 → 导入 roundtrip)=====
+
+    /// 验证「命名卷经临时容器 tar 导出 → 导入到另一个卷」的完整链路:
+    /// 写入已知内容 → 导出 → 导入到新卷 → 比对新卷内容与原始内容逐字节一致。
+    ///
+    /// 需要服务器可执行 docker 且能拉取 busybox(或已存在 busybox/alpine)。
+    /// 运行:`DD_SSH_TEST_HOST=... cargo test migrate_project -- --ignored`
+    #[tokio::test]
+    #[ignore = "需要真实 SSH 服务器 + docker(见函数注释的运行方式)"]
+    async fn test_volume_export_import_roundtrip_real() {
+        use crate::migrate_project::{volume_export_cmd, volume_import_cmd};
+
+        let cfg = test_cfg_from_env()
+            .expect("请设置 DD_SSH_TEST_HOST / DD_SSH_TEST_USER / (DD_SSH_TEST_PASSWORD | DD_SSH_TEST_KEY)");
+        let pw = std::env::var("DD_SSH_TEST_PASSWORD").ok();
+
+        // 用 remote_dir 作为临时工作目录,避免污染真实数据
+        let tmp = "/tmp/dd-migrate-test";
+        let src_vol = "dd_migrate_src";
+        let dst_vol = "dd_migrate_dst";
+
+        // 直连(不写配置),复用 connect_server 之外的裸连接:这里用 SshClient::connect
+        let mut client = SshClient::connect(&cfg, pw.as_deref(), None, Arc::default())
+            .await
+            .expect("connect 失败");
+
+        // 选 tar 镜像:busybox 优先
+        let tar_image = {
+            let (code, _) = exec_collect(&mut client, "docker image inspect busybox:latest")
+                .await
+                .expect("inspect 失败");
+            if code == 0 {
+                "busybox:latest"
+            } else {
+                let (code, out) = exec_collect(&mut client, "docker pull busybox:latest")
+                    .await
+                    .expect("pull 失败");
+                assert_eq!(code, 0, "无法获取 busybox(需服务器出网或预置): {out}");
+                "busybox:latest"
+            }
+        };
+
+        // 准备:清理旧卷与目录
+        let _ = exec_collect(
+            &mut client,
+            &format!("rm -rf {tmp} && mkdir -p {tmp} && docker volume rm -f {src_vol} {dst_vol} 2>/dev/null; true"),
+        )
+        .await
+        .expect("准备环境失败");
+
+        // 1) 建源卷并写入已知内容(含二进制字节,验证二进制安全)
+        let (code, out) = exec_collect(
+            &mut client,
+            &format!(
+                "docker volume create {src_vol} >/dev/null && \
+                 docker run --rm --entrypoint sh -v {src_vol}:/data {tar_image} \
+                 -c 'printf \"hello-volume\\n\" > /data/a.txt; head -c 256 /dev/urandom > /data/b.bin; mkdir -p /data/sub; echo nested > /data/sub/c.txt'"
+            ),
+        )
+        .await
+        .expect("初始化源卷失败");
+        assert_eq!(code, 0, "初始化源卷失败: {out}");
+
+        // 记录源内容摘要(逐文件 sha256)
+        let (code, src_digest) = exec_collect(
+            &mut client,
+            &format!(
+                "docker run --rm --entrypoint sh -v {src_vol}:/data {tar_image} \
+                 -c 'cd /data && find . -type f | sort | xargs sha256sum'"
+            ),
+        )
+        .await
+        .expect("读取源摘要失败");
+        assert_eq!(code, 0, "读取源摘要失败: {src_digest}");
+        assert!(src_digest.contains("a.txt"), "源卷应有 a.txt: {src_digest}");
+
+        // 2) 导出源卷
+        let remote_pkg = format!("{tmp}/vol.tar.gz");
+        let (code, out) = exec_collect(
+            &mut client,
+            &volume_export_cmd(tar_image, src_vol, &remote_pkg),
+        )
+        .await
+        .expect("导出失败");
+        assert_eq!(code, 0, "导出卷失败: {out}");
+
+        let (code, size_out) = exec_collect(&mut client, &format!("stat -c %s {remote_pkg}"))
+            .await
+            .expect("取包大小失败");
+        assert_eq!(code, 0);
+        assert!(
+            size_out.trim().parse::<u64>().unwrap_or(0) > 0,
+            "导出的包不应为空"
+        );
+
+        // 3) 导入到新卷
+        let (code, out) = exec_collect(
+            &mut client,
+            &volume_import_cmd(tar_image, dst_vol, &remote_pkg),
+        )
+        .await
+        .expect("导入失败");
+        assert_eq!(code, 0, "导入卷失败: {out}");
+
+        // 4) 比对目标卷内容与源卷一致
+        let (code, dst_digest) = exec_collect(
+            &mut client,
+            &format!(
+                "docker run --rm --entrypoint sh -v {dst_vol}:/data {tar_image} \
+                 -c 'cd /data && find . -type f | sort | xargs sha256sum'"
+            ),
+        )
+        .await
+        .expect("读取目标摘要失败");
+        assert_eq!(code, 0, "读取目标摘要失败: {dst_digest}");
+        assert_eq!(
+            src_digest.trim(),
+            dst_digest.trim(),
+            "目标卷内容应与源卷逐字节一致"
+        );
+
+        // 5) 清理
+        let _ = exec_collect(
+            &mut client,
+            &format!("rm -rf {tmp}; docker volume rm -f {src_vol} {dst_vol} 2>/dev/null; true"),
+        )
+        .await
+        .ok();
+    }
 }
 
 /// C 阶段追加:交互式 exec 相关方法(独立 impl 块,纯追加,不改任何既有代码)。

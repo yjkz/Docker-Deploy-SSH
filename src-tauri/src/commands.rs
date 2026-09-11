@@ -84,7 +84,8 @@ use crate::docker::{
     start_daemon, tag_image, HostCheckReport, ImageInfo,
 };
 use crate::history::{
-    append_record, load_history, DeployRecord, MODE_ROLLBACK, MODE_SINGLE, MODE_STACK,
+    append_record, load_history, DeployRecord, MODE_MIGRATE, MODE_ROLLBACK, MODE_SINGLE,
+    MODE_STACK,
 };
 use crate::ssh::{
     check_server_env, exec_collect, mkdir_p_cmd, ServerCheckReport, SshClient, INSTALL_DOCKER_CMD,
@@ -94,21 +95,21 @@ use crate::stack::{
 };
 
 /// 取消提示文案(取消导致的失败统一用它,便于前端识别)。
-const CANCELLED_MSG: &str = "部署已取消";
+pub(crate) const CANCELLED_MSG: &str = "部署已取消";
 /// SSH 建连超时(秒):russh 对不可达地址可能长时间挂起且自身不带超时,统一兜底。
 const SSH_CONNECT_TIMEOUT_SECS: u64 = 15;
 /// SSH 检测/建目录类命令的执行超时(秒)(安装 Docker 固定 1800 秒,另行指定)。
-const SSH_EXEC_TIMEOUT_SECS: u64 = 60;
+pub(crate) const SSH_EXEC_TIMEOUT_SECS: u64 = 60;
 /// 导出进度日志的汇报粒度:每 ≥5MB 变化汇报一次。
-const LOG_PROGRESS_STEP: u64 = 5 * 1024 * 1024;
+pub(crate) const LOG_PROGRESS_STEP: u64 = 5 * 1024 * 1024;
 /// 整栈部署:并行打包的并发度上限(实际取 `min(本值, 可用并行度)`)。
 const PACK_CONCURRENCY_CAP: usize = 3;
 /// 镜像包上传失败后的重试等待(秒):给网络/服务端一点恢复时间,再同路径续传重试。
 const UPLOAD_RETRY_DELAY_SECS: u64 = 2;
 /// 整栈部署:单包 `docker load` 的执行超时(秒)。
-const STACK_LOAD_TIMEOUT_SECS: u64 = 600;
+pub(crate) const STACK_LOAD_TIMEOUT_SECS: u64 = 600;
 /// 整栈部署:`docker compose pull` / `up -d` 的执行超时(秒)。
-const STACK_COMPOSE_TIMEOUT_SECS: u64 = 900;
+pub(crate) const STACK_COMPOSE_TIMEOUT_SECS: u64 = 900;
 /// 服务器清理(`prune_server`)的执行超时(秒)。
 const PRUNE_TIMEOUT_SECS: u64 = 300;
 /// 分项目扫描的目录深度上限(起点之下);目录更深时把扫描起点指到项目父目录。
@@ -116,9 +117,9 @@ const CLEANUP_SCAN_MAX_DEPTH: usize = 4;
 /// 部署前/后钩子命令的执行超时(秒)。
 const HOOK_TIMEOUT_SECS: u64 = 600;
 /// 健康检查:轮询间隔(秒)。
-const HEALTH_POLL_INTERVAL_SECS: u64 = 5;
+pub(crate) const HEALTH_POLL_INTERVAL_SECS: u64 = 5;
 /// 健康检查:单轮 `compose ps` 状态查询的执行超时(秒)。
-const HEALTH_PS_TIMEOUT_SECS: u64 = 60;
+pub(crate) const HEALTH_PS_TIMEOUT_SECS: u64 = 60;
 /// 整栈拉取失败时并入错误信息的远端输出末尾行数
 /// (供 [`augment_pull_error`] 依据输出识别私有仓库认证问题)。
 const PULL_OUTPUT_TAIL_LINES: usize = 10;
@@ -865,7 +866,7 @@ async fn connect_and_check(
 ///   `key_pass_enc`;无输入时用存储值,均为 `None` 则按无口令私钥加载)。
 /// - 主机密钥 TOFU:连接成功后首次观察到指纹时落盘到 `ServerConfig`
 ///   (见 [`persist_host_key_if_needed`])。
-async fn connect_server(
+pub(crate) async fn connect_server(
     server_id: &str,
     password_plain: Option<&str>,
     key_passphrase_plain: Option<&str>,
@@ -899,7 +900,7 @@ async fn connect_server(
 ///
 /// 超时错误格式 `{desc}({secs} 秒):{hint}`,如
 /// “连接超时(15 秒):请检查服务器地址与网络”。
-async fn with_timeout<T>(
+pub(crate) async fn with_timeout<T>(
     secs: u64,
     desc: &str,
     hint: &str,
@@ -967,7 +968,60 @@ pub async fn create_remote_dir(
         SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default()),
     )
     .await?;
-    let cmd = mkdir_p_cmd(&server.remote_dir);
+    create_dir_on(&mut client, &server.remote_dir).await
+}
+
+/// 检测远端任意目录是否存在(项目表单的「检测目录」用)。
+///
+/// 与 [`create_remote_dir`] 的区别:目录由调用方给出(项目级 `remote_dir` 可能
+/// 与服务器级目录不同),且**只读**。不校验路径是否在服务器目录之下 —— 项目级
+/// 目录本就是独立绝对路径(见 [`effective_remote_dir`]),限制前缀反而会挡住正当用法;
+/// 前端已强制绝对路径,这里再兜一次防误传相对路径在服务器上乱建。
+#[tauri::command]
+pub async fn check_remote_dir(
+    server_id: String,
+    dir: String,
+    password_plain: Option<String>,
+) -> Result<bool, String> {
+    let dir = dir.trim().to_string();
+    if !dir.starts_with('/') {
+        return Err("远程部署目录需为以 / 开头的绝对路径".to_string());
+    }
+    let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    find_server(&cfg, &server_id)?;
+    let (_srv, mut client) = connect_server(&server_id, password_plain.as_deref(), None).await?;
+    let (code, _out) = with_timeout(
+        SSH_EXEC_TIMEOUT_SECS,
+        "检测目录超时",
+        "请检查服务器网络后重试",
+        exec_collect(&mut client, &test_dir_cmd(&dir)),
+    )
+    .await?;
+    Ok(code == 0)
+}
+
+/// 在远端创建任意指定目录(项目表单的「创建该目录」用)。
+///
+/// 与 [`check_remote_dir`] 同一路径口径:接受项目级独立目录,仅要求绝对路径。
+#[tauri::command]
+pub async fn create_remote_dir_at(
+    server_id: String,
+    dir: String,
+    password_plain: Option<String>,
+) -> Result<(), String> {
+    let dir = dir.trim().to_string();
+    if !dir.starts_with('/') {
+        return Err("远程部署目录需为以 / 开头的绝对路径".to_string());
+    }
+    let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    find_server(&cfg, &server_id)?;
+    let (_srv, mut client) = connect_server(&server_id, password_plain.as_deref(), None).await?;
+    create_dir_on(&mut client, &dir).await
+}
+
+/// `mkdir -p` 远端目录(两个创建命令共用;路径经单引号转义)。
+async fn create_dir_on(client: &mut SshClient, dir: &str) -> Result<(), String> {
+    let cmd = mkdir_p_cmd(dir);
     let code = with_timeout(
         SSH_EXEC_TIMEOUT_SECS,
         "创建目录超时",
@@ -983,7 +1037,7 @@ pub async fn create_remote_dir(
     if code != 0 {
         return Err(format!(
             "远端创建目录 {} 失败(退出码 {},常见原因:无写入权限)",
-            server.remote_dir, code
+            dir, code
         ));
     }
     Ok(())
@@ -2003,10 +2057,10 @@ fn deploy_notify_text(
 
 /// Future 的 panic 兜底包装:被包裹 future 在 poll 中 panic 时返回 `Err(panic 信息)`,
 /// 而不是让整个后台任务静默消失(配合 [`deploy`] 保证 `deploy-done` 恰好 emit 一次)。
-struct CatchPanic<F: std::future::Future>(Pin<Box<F>>);
+pub(crate) struct CatchPanic<F: std::future::Future>(Pin<Box<F>>);
 
 impl<F: std::future::Future> CatchPanic<F> {
-    fn new(fut: F) -> Self {
+    pub(crate) fn new(fut: F) -> Self {
         Self(Box::pin(fut))
     }
 }
@@ -3220,7 +3274,7 @@ async fn remote_disk_precheck(
 /// 行解析复用 [`parse_image_lines`](单行解析失败仅告警跳过);退出码非 0
 /// (远端 Docker 不可用等)以中文错误返回,由调用方决定中止或降级。
 /// 单镜像 / 整栈两条部署管线共用的对比数据源。
-async fn query_remote_image_id_map(
+pub(crate) async fn query_remote_image_id_map(
     client: &mut SshClient,
 ) -> Result<HashMap<String, String>, String> {
     let (code, out) = with_timeout(
@@ -4101,7 +4155,7 @@ pub fn remote_compose_path(remote_dir: &str) -> String {
 /// 检测项目 compose 文件同目录的 override 文件,返回文件名(basename)列表
 /// (按 compose 默认合并顺序;供远端 pull / up 的 `-f` 文件链使用,
 /// 与 [`upload_compose_files`] 上传的 override 文件一致)。
-fn compose_override_names(compose_file: &str) -> Vec<String> {
+pub(crate) fn compose_override_names(compose_file: &str) -> Vec<String> {
     let dir = Path::new(compose_file).parent().unwrap_or_else(|| Path::new(""));
     find_override_files(dir)
         .iter()
@@ -4375,7 +4429,7 @@ pub fn classify_change(
 
 /// 镜像 ID 等价判定(纯函数):剥除 `sha256:` 前缀、忽略大小写后比较,
 /// 容忍不同 docker 版本的输出差异;任一为空视为不等。
-fn same_image_id(a: &str, b: &str) -> bool {
+pub(crate) fn same_image_id(a: &str, b: &str) -> bool {
     fn norm(id: &str) -> &str {
         let id = id.trim();
         id.strip_prefix("sha256:").unwrap_or(id)
@@ -4426,7 +4480,7 @@ fn parse_image_lines(out: &str) -> Vec<ImageInfo> {
 
 /// 解析 `docker ps --format {{json .}}` 输出为 (compose 服务名 → 容器镜像引用)
 /// 映射(同一服务多容器时后者覆盖;无 compose 服务标签的容器跳过)。
-fn parse_container_lines(out: &str) -> HashMap<String, String> {
+pub(crate) fn parse_container_lines(out: &str) -> HashMap<String, String> {
     let mut containers = HashMap::new();
     for line in out.lines() {
         let line = line.trim();
@@ -5833,8 +5887,34 @@ pub fn cat_file_cmd(path: &str) -> String {
 }
 
 /// 拼装 `docker image inspect '<ref>'`(退出码 0 = 服务器上存在该镜像引用)。
+///
+/// **只用于存在性判定**。要取镜像 ID 请用 [`docker_inspect_id_cmd`]:本命令不带
+/// `--format`,输出是 pretty-print 的 JSON 数组(首字符 `[`),按 ID 解析必然失败。
 pub fn docker_inspect_cmd(image: &str) -> String {
     format!("docker image inspect {}", shell_single_quote(image))
+}
+
+/// 拼装 `docker image inspect --format '{{.Id}}' '<ref>'`(输出为完整 64 位
+/// `sha256:...` ID 单行;引用不存在时退出码非 0)。
+///
+/// 与 `docker::image_id_by_ref_blocking`(本地口径)、`REMOTE_IMAGES_CMD_FULL`
+/// (`--no-trunc` 完整 ID 口径)同为准,供 `same_image_id` 跨端比较。
+pub fn docker_inspect_id_cmd(image: &str) -> String {
+    format!(
+        "docker image inspect --format '{{{{.Id}}}}' {}",
+        shell_single_quote(image)
+    )
+}
+
+/// 从 [`docker_inspect_id_cmd`] 的输出解析镜像 ID(纯函数,便于单测):
+/// trim 后剥 `sha256:` 前缀;空输出或落到 JSON 形态(误用无 `--format` 的命令)
+/// → `None`,避免把垃圾当 ID 参与跨端比较。
+pub fn parse_inspect_id(out: &str) -> Option<String> {
+    let v = out.trim();
+    if v.is_empty() || v.starts_with('[') || v.starts_with('{') {
+        return None;
+    }
+    Some(v.strip_prefix("sha256:").unwrap_or(v).to_string())
 }
 
 /// 逐行解析 `ls -1` 输出为条目列表(trim + 去空行;纯函数,便于单测)。
@@ -6101,7 +6181,7 @@ fn emit_progress(app: &AppHandle, step: u8, total: u8, message: &str) {
 /// 组装 `deploy-log` 的整行文本(纯函数,便于单测):
 /// `[HH:MM:SS] <前缀><消息>`(尾随换行剔除;前缀紧贴消息,如
 /// `[12:00:00] [生产] 加载镜像到服务器: …`)。
-fn format_log_line(prefix: &str, msg: &str) -> String {
+pub(crate) fn format_log_line(prefix: &str, msg: &str) -> String {
     format!(
         "[{}] {}{}",
         chrono::Local::now().format("%H:%M:%S"),
@@ -6123,7 +6203,7 @@ fn emit_log(app: &AppHandle, msg: &str) {
 /// [`TempFileGuard::keep`](断点续传活跃时使用)不删除 —— 临时 tar 供失败后
 /// 续传复用,由成功收尾([`checkpoint_cleanup_on_success`])或
 /// `deploy_resume_discard` 显式清理。
-struct TempFileGuard {
+pub(crate) struct TempFileGuard {
     path: PathBuf,
     /// true = 断点活跃,Drop 不删除(保留给续传)
     keep: bool,
@@ -6138,6 +6218,11 @@ impl TempFileGuard {
     /// 断点活跃时使用的守卫:Drop 不删除。
     fn keep(path: PathBuf) -> Self {
         Self { path, keep: true }
+    }
+
+    /// 公开构造(供 [`crate::migrate_project`] 使用;语义同 [`Self::new`])。
+    pub(crate) fn new_pub(path: PathBuf) -> Self {
+        Self::new(path)
     }
 }
 
@@ -6163,7 +6248,7 @@ fn find_server<'a>(cfg: &'a AppConfig, server_id: &str) -> Result<&'a ServerConf
 }
 
 /// 按 ID 查找项目配置。
-fn find_project<'a>(cfg: &'a AppConfig, project_id: &str) -> Result<&'a ProjectConfig, String> {
+pub(crate) fn find_project<'a>(cfg: &'a AppConfig, project_id: &str) -> Result<&'a ProjectConfig, String> {
     cfg.projects
         .iter()
         .find(|p| p.id == project_id)
@@ -6319,7 +6404,7 @@ fn split_remote_file(path: &str) -> (String, String) {
 
 /// 单引号 shell 包裹;内部单引号按 `'\''` 转义。
 /// (与 ssh.rs 内部实现一致;ssh::shell_single_quote 未导出,故本地实现。)
-fn shell_single_quote(s: &str) -> String {
+pub(crate) fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
@@ -6767,6 +6852,122 @@ fn parse_du_output(out: &str) -> Vec<(String, String)> {
         }
     }
     rows
+}
+
+/// 拼「逐路径取字节数」命令(`du -s -B1`):供迁移预检估算卷与归档体积。
+///
+/// 与 [`cleanup_du_cmd`] 的 `du -sh` 区别:这里要**字节数**而非人类可读串,
+/// 便于求和与前端统一格式化。`2>/dev/null` 让不存在/无权限的路径静默跳过。
+pub fn du_bytes_cmd(paths: &[String]) -> String {
+    let quoted: Vec<String> = paths.iter().map(|d| shell_single_quote(d)).collect();
+    format!("du -s -B1 {} 2>/dev/null", quoted.join(" "))
+}
+
+/// 解析 [`du_bytes_cmd`] 的输出为「与入参路径一一对应」的字节数列表。
+///
+/// **按路径匹配回填**(不是按行序):某条路径读不到时它对应 `None`,不会让
+/// 后续体积错位到别的项上(`du` 会跳过失败项,行序与入参不再等长)。
+pub fn parse_du_bytes(out: &str, paths: &[String]) -> Vec<Option<u64>> {
+    let mut result = vec![None; paths.len()];
+    for line in out.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let Some((size, path)) = t.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(bytes) = size.trim().parse::<u64>() else {
+            continue;
+        };
+        let path = path.trim().trim_end_matches('/');
+        if let Some(idx) = paths
+            .iter()
+            .position(|p| p.trim_end_matches('/') == path)
+        {
+            result[idx] = Some(bytes);
+        }
+    }
+    result
+}
+
+/// 取字符串末尾 `n` 行(用于错误信息里附远端输出尾部)。
+pub fn tail_lines(s: &str, n: usize) -> String {
+    let lines: Vec<&str> = s.trim().lines().collect();
+    if lines.is_empty() {
+        return "无输出".to_string();
+    }
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join(" / ")
+}
+
+/// 逐行转发远端输出到指定事件(供迁移等非 deploy-log 场景复用)。
+pub(crate) async fn exec_forwarded_via_event(
+    client: &mut SshClient,
+    cmd: &str,
+    emit_line: &Arc<dyn Fn(&str) + Send + Sync>,
+    what: &str,
+) -> Result<(), String> {
+    let mut buf = String::new();
+    let mut on_line = |line: &str| {
+        emit_line(line.trim_end());
+        buf.push_str(line);
+    };
+    let code = with_timeout(
+        STACK_LOAD_TIMEOUT_SECS,
+        &format!("{}超时", what),
+        "请检查服务器网络后重试",
+        async {
+            client
+                .exec(cmd, &mut on_line)
+                .await
+                .map_err(|e| format!("执行 {} 失败: {}", what, e))
+        },
+    )
+    .await?;
+    if code != 0 {
+        return Err(format!(
+            "{}失败(退出码 {}): {}",
+            what,
+            code,
+            buf.trim().lines().last().unwrap_or("无输出")
+        ));
+    }
+    Ok(())
+}
+
+/// 按 ID 查找服务器配置(公开包装,供 [`crate::migrate_project`] 复用)。
+pub(crate) fn find_server_pub<'a>(
+    cfg: &'a AppConfig,
+    server_id: &str,
+) -> Result<&'a ServerConfig, String> {
+    find_server(cfg, server_id)
+}
+
+/// 写一条 `mode = "migrate"` 的部署历史(项目迁移审计用)。
+///
+/// 迁移既不是部署也不是回滚,单独一种 mode:历史表据此显示徽标,且不提供
+/// 「回滚」按钮(回滚语义对该记录无意义 —— 源服务器上的资产并未删除)。
+pub fn append_migration_history(
+    project_name: &str,
+    source_name: &str,
+    target_name: &str,
+    images: &[String],
+    warnings: &[String],
+) {
+    let mut record = DeployRecord::new_skeleton(
+        MODE_MIGRATE,
+        &format!("{} → {}", source_name, target_name),
+        project_name,
+        images.to_vec(),
+    );
+    record.success = true;
+    record.message = if warnings.is_empty() {
+        format!("已迁移到 {}", target_name)
+    } else {
+        format!("已迁移到 {}({} 条警告)", target_name, warnings.len())
+    };
+    crate::history::append_record(record);
 }
 
 
@@ -7299,7 +7500,7 @@ pub struct MigrateState {
 }
 
 #[derive(Default)]
-struct MigrateStateInner {
+pub(crate) struct MigrateStateInner {
     cancelled: std::sync::atomic::AtomicBool,
     /// 会话代号:每次 start 递增;旧任务收尾前发现代号过期则不再 emit。
     generation: std::sync::atomic::AtomicU64,
@@ -7327,12 +7528,29 @@ impl MigrateState {
             .generation
             .load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// 开始一次迁移:清取消位 + 递增代号(供 [`crate::migrate_project`] 复用,
+    /// 两种迁移共用同一个全局单会话,天然互斥)。
+    pub(crate) fn begin_migration(&self) -> u64 {
+        self.reset();
+        self.next_generation()
+    }
+
+    /// 取出内部 Arc(后台任务持有,避免 `tauri::State` 的生命周期限制)。
+    pub(crate) fn inner_arc(&self) -> Arc<MigrateStateInner> {
+        Arc::clone(&self.inner)
+    }
 }
 
 impl MigrateStateInner {
     fn is_cancelled(&self) -> bool {
         self.cancelled
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 取消标志查询(公开包装,供迁移模块复用)。
+    pub(crate) fn is_cancelled_pub(&self) -> bool {
+        self.is_cancelled()
     }
 }
 
@@ -7388,11 +7606,27 @@ pub fn migrate_images(
     let state = Arc::clone(&migrate_state.inner);
 
     tauri::async_runtime::spawn(async move {
-        let result =
-            run_migrate(&app, &state, migrate_id, &req, images).await;
-        let (success, message, images_done) = match result {
-            Ok((msg, done)) => (true, msg, done),
-            Err((msg, done)) => (false, msg, done),
+        // panic 兜底:迁移任务 panic 时前端会永久停在「迁移中…」,故以错误收尾
+        // (与 deploy_batch 的编排层兜底同一做法)
+        let (success, message, images_done) = match CatchPanic::new(run_migrate(
+            &app,
+            &state,
+            migrate_id,
+            &req,
+            images.clone(),
+        ))
+        .await
+        {
+            Ok(Ok((msg, done))) => (true, msg, done),
+            Ok(Err((msg, done))) => (false, msg, done),
+            Err(panic_info) => {
+                log::error!("镜像迁移任务发生 panic: {}", panic_info);
+                (
+                    false,
+                    "镜像迁移因内部错误中止,详情见日志".to_string(),
+                    vec![false; images.len()],
+                )
+            }
         };
         let _ = app.emit(
             "migrate-done",
@@ -7477,14 +7711,10 @@ async fn run_migrate(
         ));
 
         // 源侧镜像 ID(供目标同 ID 跳过判定;取不到 → 后续 save 阶段报错)
-        let (code, out) = exec_collect(&mut src, &docker_inspect_cmd(image))
+        let (code, out) = exec_collect(&mut src, &docker_inspect_id_cmd(image))
             .await
             .map_err(|e| (format!("源服务器查询镜像 {} 失败: {}", image, e), done.clone()))?;
-        let src_id = if code == 0 {
-            out.trim().strip_prefix("sha256:").map(str::to_string)
-        } else {
-            None
-        };
+        let src_id = if code == 0 { parse_inspect_id(&out) } else { None };
         if src_id.is_none() {
             let msg = format!(
                 "源服务器上不存在镜像 {}(或无权访问),跳过",
@@ -7495,12 +7725,12 @@ async fn run_migrate(
         }
 
         // 目标同 ID 自动跳过(镜像已在目标侧,零传输)
-        let (code, out) = exec_collect(&mut dst, &docker_inspect_cmd(image))
+        let (code, out) = exec_collect(&mut dst, &docker_inspect_id_cmd(image))
             .await
             .map_err(|e| (format!("目标服务器查询镜像 {} 失败: {}", image, e), done.clone()))?;
         if code == 0 {
-            if let Some(dst_id) = out.trim().strip_prefix("sha256:") {
-                if same_image_id(&src_id.clone().unwrap_or_default(), dst_id) {
+            if let Some(dst_id) = parse_inspect_id(&out) {
+                if same_image_id(&src_id.clone().unwrap_or_default(), &dst_id) {
                     emit_line(&format!("目标服务器已有同 ID 镜像,跳过传输: {}", image));
                     done[i] = true;
                     skipped += 1;
@@ -7584,7 +7814,7 @@ async fn run_migrate(
 /// 源服务器 `docker save <image>` → 流式写本地 `out_path`:
 /// 源侧开 `docker save <image> | gzip` 原始通道,Data 块直写本地文件
 /// (源端零落盘;**不经 exec 的按行拆分**,二进制安全)。
-async fn save_gzip_remote(
+pub(crate) async fn save_gzip_remote(
     src: &mut SshClient,
     image: &str,
     out_path: &std::path::Path,
@@ -9348,6 +9578,72 @@ services:
         assert!(!same_image_id("sha256:", "abc"));
         assert!(!same_image_id("", ""));
     }
+
+    // ===== 镜像 ID 查询命令与解析(迁移路径取 ID 的专用口径)=====
+
+    #[test]
+    fn test_docker_inspect_id_cmd_has_format_and_quotes() {
+        // 回归:迁移路径曾用不带 --format 的 docker_inspect_cmd 取 ID,
+        // 输出是 JSON 数组 → 解析恒失败 → 每个镜像都误报「源服务器上不存在」。
+        let cmd = docker_inspect_id_cmd("myapp:latest");
+        assert!(cmd.contains("--format"), "必须带 --format 才能取到 ID 单值");
+        assert!(cmd.contains("{{.Id}}"), "格式串须为 {{{{.Id}}}}");
+        assert!(cmd.contains("'myapp:latest'"), "引用须单引号包裹");
+    }
+
+    #[test]
+    fn test_docker_inspect_id_cmd_quotes_escaped_for_injection() {
+        // 引用含单引号时按 '\'' 转义,不产生注入面
+        let cmd = docker_inspect_id_cmd("a'b");
+        assert!(!cmd.contains("'a'b'"), "未转义的原样拼接会破坏引号");
+        assert!(cmd.contains(r"'\''"), "单引号应转义为 '\\''");
+    }
+
+    #[test]
+    fn test_parse_inspect_id_strips_prefix_and_trim() {
+        let full = "sha256:0123456789abcdef";
+        assert_eq!(parse_inspect_id(&format!("{}\n", full)), Some("0123456789abcdef".into()));
+        assert_eq!(parse_inspect_id("sha256:abc"), Some("abc".into()));
+        // 已无前缀原样返回(兼容不同 docker 版本输出)
+        assert_eq!(parse_inspect_id("abc123"), Some("abc123".into()));
+    }
+
+    #[test]
+    fn test_parse_inspect_id_rejects_json_shape_and_empty() {
+        // 误用无 --format 的 inspect(JSON 数组)时必须返回 None,
+        // 而不是把 "[\n    {\n        \"Id\": \"sha256:abcdef\",\n        \"RepoTags\": null\n    }\n]" 当镜像 ID 参与比较
+        let json_output = "[\n    {\n        \"Id\": \"sha256:abcdef\",\n        \"RepoTags\": null\n    }\n]";
+        assert_eq!(parse_inspect_id(json_output), None);
+        assert_eq!(parse_inspect_id("{\"Id\": \"sha256:abc\"}"), None);
+        assert_eq!(parse_inspect_id(""), None);
+        assert_eq!(parse_inspect_id("   \n  "), None);
+    }
+
+    // ===== 项目级远程目录检测/创建(第六批)=====
+
+    #[test]
+    fn test_test_dir_cmd_quotes_and_escapes() {
+        // 目录存在性检查命令:`test -d '<path>'`,路径单引号包裹防注入
+        let cmd = test_dir_cmd("/home/henghao/site");
+        assert_eq!(cmd, "test -d '/home/henghao/site'");
+        // 含单引号与 shell 元字符时经 '\'' 转义,不留注入面
+        let evil = test_dir_cmd("/tmp/a'; rm -rf /; echo '");
+        assert!(!evil.contains("a'; rm"), "未转义的引号会闭合字符串: {}", evil);
+        assert!(evil.contains(r"'\''"), "应转义为 '\\'': {}", evil);
+        let dollar = test_dir_cmd("/tmp/x$(whoami)`id`");
+        assert!(dollar.contains("'/tmp/x$(whoami)`id`'"), "{}", dollar);
+    }
+
+    #[test]
+    fn test_mkdir_p_cmd_quotes_and_escapes() {
+        // 创建目录命令:`mkdir -p '<path>'`
+        let cmd = mkdir_p_cmd("/home/henghao/site");
+        assert_eq!(cmd, "mkdir -p '/home/henghao/site'");
+        let evil = mkdir_p_cmd("/tmp/a'; rm -rf /; echo '");
+        assert!(!evil.contains("a'; rm"), "{}", evil);
+        assert!(evil.contains(r"'\''"), "{}", evil);
+    }
+
 
     // ===== Task 6:webhook 载荷序列化 =====
 
