@@ -655,19 +655,14 @@
     var batchActive = !!(st.batch && st.batch.active);
 
     if (start) {
-      if (batchActive) {
-        start.disabled = true;
-        start.textContent = '批量部署中…';
-      } else if (st.deploying) {
-        start.disabled = true;
-        start.textContent = '部署中…';
-      } else if (st.checking) {
-        start.disabled = true;
-        start.textContent = '检测中…';
-      } else {
-        start.disabled = false;
-        start.textContent = '开始部署';
-      }
+      // 第六批:四个状态统一走共享助手 —— 部署中/检测中/批量中带步进条,
+      // 空闲态复位(会清掉步进条子节点并解除禁用)。环境闸门不在此处判定:
+      // 未通过宿主机检测时由 showPage 的 LOCKED_PAGES 在进页时拦截,行为与
+      // 改动前一致(此处只负责按运行时状态切换文案与禁用)。
+      var busy = batchActive || st.deploying || st.checking;
+      var label = batchActive ? '批量部署中…'
+        : (st.deploying ? '部署中…' : (st.checking ? '检测中…' : '开始部署'));
+      window.setBtnBusy(start, busy, label);
     }
     // 取消按钮:仅在部署中可用(起点 = 发起 deploy,终点 = deploy-done)
     if (cancel) cancel.disabled = !st.deploying;
@@ -1929,19 +1924,24 @@
     var previewBtn = document.getElementById('migrate-project-preview-btn');
     var startBtn = document.getElementById('migrate-project-start-btn');
     var closeBtn = document.getElementById('migrate-project-modal-close');
+    var running = phase === 'running';
+    // 第六批:running 阶段带步进条(迁移是长时间等待,此处最需要图形反馈)。
+    // setBtnBusy(btn, false, label) 会清掉所有子节点(含步进条)并解除禁用,
+    // 故非 running 阶段同样走它来复位,保证「进得去、出得来」。
     if (previewBtn) {
-      previewBtn.disabled = phase === 'running';
-      previewBtn.textContent = phase === 'running' ? '迁移中…' : '重新预检';
+      window.setBtnBusy(previewBtn, running, running ? '迁移中…' : '重新预检');
     }
     if (startBtn) {
       // 「确认迁移」恒可见、预检通过(errors 为空)后才可用 —— 比显隐切换
       // 更容易理解下一步在哪(本项目对"点不动"类问题的既定口径)
-      var canStart = phase === 'previewed' &&
-        !!(migState.plan && (!migState.plan.errors || migState.plan.errors.length === 0));
-      startBtn.disabled = !canStart;
-      startBtn.textContent = phase === 'running' ? '迁移中…' : '确认迁移';
+      window.setBtnBusy(startBtn, running, running ? '迁移中…' : '确认迁移');
+      if (!running) {
+        var canStart = phase === 'previewed' &&
+          !!(migState.plan && (!migState.plan.errors || migState.plan.errors.length === 0));
+        startBtn.disabled = !canStart;
+      }
     }
-    if (closeBtn) closeBtn.disabled = phase === 'running';
+    if (closeBtn) closeBtn.disabled = running;
   }
 
   function migVal(id) {
@@ -2145,7 +2145,9 @@
 
     migState.previewing = true;
     var previewBtn = document.getElementById('migrate-project-preview-btn');
-    if (previewBtn) { previewBtn.disabled = true; previewBtn.textContent = '预检中…'; }
+    // 第六批:预检要连服务器读 compose/卷/归档,是本页最长的一次等待,走共享
+    // 助手带步进条(此前只是禁用+改文案)
+    window.setBtnBusy(previewBtn, true, '预检中…');
 
     window.AppBus.invoke('migrate_project_preview', {
       projectId: projectId,
@@ -2155,13 +2157,13 @@
       releaseCount: releaseCount
     }).then(function (plan) {
       migState.previewing = false;
-      if (previewBtn) { previewBtn.disabled = false; previewBtn.textContent = '重新预检'; }
+      window.setBtnBusy(previewBtn, false, '重新预检');
       migState.plan = plan || null;
       renderMigratePlan(plan);
       setMigrateButtons('previewed');
     }).catch(function (err) {
       migState.previewing = false;
-      if (previewBtn) { previewBtn.disabled = false; previewBtn.textContent = '开始预检'; }
+      window.setBtnBusy(previewBtn, false, '开始预检');
       migState.plan = null;
       renderMigratePlanError(errText(err) || '未知错误');
       setMigrateButtons('idle');

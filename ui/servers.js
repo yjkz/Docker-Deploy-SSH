@@ -1126,7 +1126,10 @@
       });
   }
 
-  /** 内联二次确认:第一次点击变「确认删除?」,3 秒未点击自动恢复 */
+  /**
+   * 内联二次确认:第一次点击变「确认删除?」,3 秒未点击自动恢复。
+   * 第六批:armed 期间挂 .is-armed(呼吸描边),状态变化不只靠文案与颜色。
+   */
   function armDeleteConfirm(btn, onConfirm) {
     if (btn.__ddArmed) {
       if (btn.__ddTimer) {
@@ -1136,6 +1139,7 @@
       btn.__ddArmed = false;
       btn.textContent = btn.__ddText;
       btn.classList.remove('btn-danger');
+      btn.classList.remove('is-armed');
       onConfirm();
       return;
     }
@@ -1143,10 +1147,12 @@
     btn.__ddText = btn.textContent;
     btn.textContent = '确认删除?';
     btn.classList.add('btn-danger');
+    btn.classList.add('is-armed');
     btn.__ddTimer = window.setTimeout(function () {
       btn.__ddArmed = false;
       btn.textContent = btn.__ddText;
       btn.classList.remove('btn-danger');
+      btn.classList.remove('is-armed');
       btn.__ddTimer = null;
     }, 3000);
   }
@@ -2311,10 +2317,8 @@
       return false;
     }
     function setSaving(saving) {
-      if (saveBtn) {
-        saveBtn.disabled = saving;
-        saveBtn.textContent = saving ? '保存中…' : '保存';
-      }
+      // 第六批:走共享助手,忙碌态带步进条(此前只是禁用+改文案)
+      window.setBtnBusy(saveBtn, saving, saving ? '保存中…' : '保存');
     }
 
     var name = fieldVal('srvf-name');

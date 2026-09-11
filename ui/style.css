@@ -96,6 +96,7 @@
   --ark-line-soft: rgba(8, 10, 11, .18);
   --ark-paper-dim-ink: rgba(8, 10, 11, .62);  /* 微标签墨(alpha .62:亮色纸面上对比过 AA,审计 P1-1;暗色保持 .5) */
   --ark-paper-ink-65: rgba(8, 10, 11, .65);   /* 次级文字墨 */
+  --ark-paper-ink-70: rgba(8, 10, 11, .70);   /* 三级文字墨(第六批补:此前被 2931/2985 引用但从未定义,回退到 inherit 使那两处层级失效) */
   --ark-ink-35: rgba(8, 10, 11, .45);         /* 占位符 / 弱化 mono 文字(P2-1:亮侧 .35→.45,纸面 ≈2.6:1→≈3.1:1;token 名保留 -35 记录沿用史,值以注释为准) */
   --ark-on-signal: #080a0b;            /* 青色实心底上的文字(青恒亮,两主题固定墨色) */
   --ark-on-warn: #080a0b;              /* 琥珀底上的文字(琥珀恒亮,两主题固定墨色) */
@@ -119,12 +120,24 @@
   --font-cjk: "Noto Sans SC", "Source Han Sans SC", "MiSans", "HarmonyOS Sans SC", "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
   --font-cond: "Space Grotesk", "Saira Condensed", "Arial Narrow", "Segoe UI", sans-serif;
   --font-mono: "JetBrains Mono", "Cascadia Mono", "SFMono-Regular", Consolas, "Courier New", monospace;
-  --radius: 0;
+
+  /* ===== 动效 token(第六批新增)=====
+     ark 契约的时长带:直接交互 180-350ms / 区域揭示 500-900ms /
+     注意力循环 1.6-2.4s;按压反馈需在 100ms 内。此前全站 13 处 transition
+     全写字面量 .18s 且无 token,本轮补齐;既有规则不做机械替换(控制改动
+     面),新规则与新调整一律走 token。
+     圆角策略:默认 0 是 ark 的身份特征,仅功能性控件允许 2-4px —— 不用
+     token 表达(避免被误当可调项),由各组件显式声明。 */
+  --ark-dur-press: .09s;    /* 按压即时反馈(<100ms,契约要求) */
+  --ark-dur-fast: .18s;     /* 交互基线(= 全站现有值,零视觉变更) */
+  --ark-dur-modal: .22s;    /* 模态出入场 */
+  --ark-dur-reveal: .45s;   /* 区域揭示(= 现有 page-reveal) */
+  --ark-ease-out: cubic-bezier(.22, .61, .36, 1); /* 到达减速(= 现有 scheme-reveal 曲线) */
 }
 
 /* 暗色 scheme(方案 A「作战控制台」):仅翻转 token 值,组件规则零复制。
    不在此翻转的变量:--ark-signal / --ark-warn / --ark-on-signal / --ark-on-warn /
-   --ark-dock-text-strong / --ink-on-paper-*(常暗表面)/ 字体族 / --radius。 */
+   --ark-dock-text-strong / --ink-on-paper-*(常暗表面)/ 字体族 / 动效 token。 */
 :root[data-ark-theme="ark"][data-ark-scheme="dark"] {
   color-scheme: dark;
   --ark-ink: #f4f6f6;                 /* 墨→纸白:文字 / 规则线反转 */
@@ -139,6 +152,7 @@
   --ark-line-soft: rgba(244, 246, 246, .18);
   --ark-paper-dim-ink: rgba(244, 246, 246, .5);
   --ark-paper-ink-65: rgba(244, 246, 246, .65);
+  --ark-paper-ink-70: rgba(244, 246, 246, .70); /* 三级文字墨(暗):与亮侧同族,按 scheme 调 alpha 先例 */
   --ark-ink-35: rgba(244, 246, 246, .35); /* 暗侧保持 .35(P2-1):近黑上 ≈3.0:1,与亮侧 .45 的 ≈3.1:1 持平,同 --ark-paper-dim-ink 的按 scheme 调 alpha 先例 */
   --ark-on-signal-dim: var(--ark-signal); /* 青淡底上改用青字 */
   --ark-on-ink-55: rgba(8, 10, 11, .6); /* alpha .6:反白行(纸白底)上对比度过 WCAG AA */
@@ -394,7 +408,10 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   font-weight: 600;
   line-height: 1.2;
   cursor: pointer;
-  transition: transform .18s ease, background .18s ease, color .18s ease, border-color .18s ease;
+  transition: transform var(--ark-dur-fast) var(--ark-ease-out),
+              background var(--ark-dur-fast) var(--ark-ease-out),
+              color var(--ark-dur-fast) var(--ark-ease-out),
+              border-color var(--ark-dur-fast) var(--ark-ease-out);
 }
 /* 4px 实心楔形(clip-path 三角),默认墨色 */
 .btn::before {
@@ -409,6 +426,20 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
 }
 .btn:hover { transform: translate(1px, 1px); }
 .btn:hover::before { background: var(--ark-signal); }
+
+/* 按压反馈(第六批补齐):此前 .btn 基类完全没有 :active,全站只有表格幽灵
+   按钮有按压位移 —— 点击后除 hover 外无任何回执。这里沿用同一「机械下压」
+   语言:位移比 hover 再多 1px(共 2px,与 .action-btn-group .btn-sm:active
+   完全一致)。位移取 2px 而非契约的 4-16px:36px 高的小按钮上 4px 会显得脱框,
+   既有语言优先。transition-duration 压到 press token,让按下即时、回弹稍缓
+   (契约要求按压反馈 <100ms)。规则须在 :hover 之后,同特异性下才生效。 */
+.btn:active {
+  transform: translate(2px, 2px);
+  transition-duration: var(--ark-dur-press);
+}
+.btn:active::before { background: var(--ark-signal); }
+/* 墨底按钮按压时楔形已是青色,压深底边以保留可见回执(不换色,守双色纪律) */
+.btn-primary:active, .btn-danger:active { background: var(--ark-ink); }
 
 /* 主操作:墨底纸白字 + 楔形青色 */
 .btn-primary { background: var(--ark-ink); border-color: var(--ark-ink); color: var(--ark-paper); }
@@ -432,6 +463,47 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
 }
 .btn:disabled::before { background: var(--ark-ink); }
 
+/* ===== 按钮忙碌态(第六批)=====
+   此前全站忙碌态一律只是「禁用 + 改文案」,零图形反馈(且 4 份局部 setBusy
+   能力不一致)。这里给一个统一的步进条:三段方块的推进动画,用 steps() 做
+   离散跳变 —— 契约里 steps() 的正当用途是「sprite / 数据步进」,比通用旋转
+   spinner 更贴 ark 的工业语言(且不引入图标资源)。
+   **用真实元素而非 ::after**:::before 是左楔形、::after 已被小按钮的命中区
+   扩展占用(P1-5 审计块),再加伪元素会互相覆盖。由 app.js 的
+   window.setBtnBusy() 插入/移除 .btn-busy-bar。 */
+.btn-busy-bar {
+  flex: none;
+  width: 14px;
+  height: 3px;
+  margin-left: 2px;
+  background: currentColor;
+  /* 三段步进:渐变画出三个方块,整体位移一格循环 */
+  mask-image: repeating-linear-gradient(to right, #000 0 3px, transparent 3px 6px);
+  -webkit-mask-image: repeating-linear-gradient(to right, #000 0 3px, transparent 3px 6px);
+  animation: btn-step .9s steps(6, end) infinite;
+}
+@keyframes btn-step {
+  from { transform: translateX(-6px); }
+  to   { transform: translateX(6px); }
+}
+.btn.is-busy { cursor: progress; }
+/* 忙碌态通常同时 disabled:保留步进条可见,不吃 .btn:disabled 的 .45 折扣 */
+.btn.is-busy:disabled { opacity: .8; }
+
+/* ===== 两步确认的待确认态(第六批)=====
+   armConfirm / armDeleteConfirm 此前只改文案 + 类名,armed 期间无动效提示
+   「还需再点一次」。加一段克制的呼吸(1.8s 落在契约的 1.6-2.4s 注意力循环带,
+   与 .deploy-step 的 step-pulse 同节奏);reduced-motion 下由全局规则归零。 */
+.btn.is-armed {
+  outline: 2px solid var(--ark-signal);
+  outline-offset: 1px;
+  animation: arm-breath 1.8s ease-in-out infinite;
+}
+@keyframes arm-breath {
+  0%, 100% { outline-color: var(--ark-signal); }
+  50%      { outline-color: transparent; }
+}
+
 /* ===== 输入框:全 1px 边框 + 底边 2px 墨,radius 2px,高 36px ===== */
 .text-input,
 .form-input,
@@ -441,19 +513,80 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   border: 1px solid var(--ark-line);
   border-bottom: 2px solid var(--ark-ink);
   border-radius: 2px;
-  background: var(--ark-paper);
+  background: var(--ark-surface);   /* 第六批:原为 --ark-paper。亮色下两者同值
+                                       (#f4f6f6)零影响;暗色下原值(#080a0b)比
+                                       所在面板(--ark-surface #0d1113)更暗,读作
+                                       「凹陷」而非「嵌入面板」,故改用面板表面色。 */
   color: var(--ark-ink);
   font-family: inherit;
   font-size: 13.5px;
   outline: none;
-  transition: border-color .18s ease;
+  transition: border-color var(--ark-dur-fast) var(--ark-ease-out),
+              box-shadow var(--ark-dur-fast) var(--ark-ease-out),
+              background var(--ark-dur-fast) var(--ark-ease-out);
 }
+/* 聚焦:底边 2px 转青(原有)+ 左缘 3px 信号条(第六批)。
+   用 inset 而非柔光投影(ark 不用柔光阴影);inset 3px 与 .rollback-item.active
+   的选中条、.btn 的左楔形是同一「左信号条」母题,给聚焦一个方向线索而非只换颜色
+   —— 契约明确要求「不要只靠透明度做状态变化,要加方向或裁切」。 */
 .text-input:focus,
 .form-input:focus,
-.mapping-input:focus { border-bottom-color: var(--ark-signal); }
+.mapping-input:focus {
+  border-bottom-color: var(--ark-signal);
+  box-shadow: inset 3px 0 0 var(--ark-signal);
+}
 .text-input::placeholder,
 .form-input::placeholder,
 .mapping-input::placeholder { color: var(--ark-ink-35); }
+
+/* 禁用(第六批补齐):此前四个输入类完全没有 :disabled 样式,禁用输入框与
+   可编辑状态外观一致,只能靠试打一个字才发现不可输入。 */
+.text-input:disabled,
+.form-input:disabled,
+.mapping-input:disabled,
+.form-textarea:disabled {
+  opacity: .5;
+  cursor: not-allowed;
+  border-bottom-color: var(--ark-line-soft);
+}
+/* 只读(第六批补齐):与禁用**视觉可区分** —— 只读可选中/可复制,故不降不透明度、
+   不换光标语义,只压一层次级表面色。
+   暗色注意:--ark-paper-dim(#101416)与 --ark-surface(#0d1113) 仅差 3 个色阶,
+   肉眼不可辨(实测确认),等于该状态在暗色下失效;故加左侧 3px 灰标 ——
+   与聚焦的左信号条同为「左缘标记」母题,不引入新颜色,两主题都可辨。 */
+.text-input[readonly],
+.form-input[readonly],
+.mapping-input[readonly],
+.form-textarea[readonly] {
+  background: var(--ark-paper-dim);
+  cursor: default;
+  box-shadow: inset 3px 0 0 var(--ark-line-soft);
+}
+/* 聚焦的左信号条必须压过只读的灰标:两条规则特异性相同(0,2,0),故以源码
+   顺序决胜 —— 只读在前、聚焦在后。顺序反了会出现「聚焦只读框看不到焦点」
+   的静默回归(改动前的版本无此问题,因当时只读根本没有 box-shadow)。 */
+.text-input[readonly]:focus,
+.form-input[readonly]:focus,
+.mapping-input[readonly]:focus,
+.form-textarea[readonly]:focus {
+  box-shadow: inset 3px 0 0 var(--ark-signal);
+}
+
+/* select 自定义箭头(第六批):去掉系统 chrome,用两个 45° 渐变画下指三角 ——
+   呼应 ark 的 45° 几何语言,且不引资源文件。保留下方 option 的显式配色。 */
+select.form-input,
+select.text-input,
+select.mapping-input {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 26px;
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--ark-ink) 50%),
+    linear-gradient(135deg, var(--ark-ink) 50%, transparent 50%);
+  background-position: right 14px center, right 9px center;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+}
 
 /* select 弹层选项显式配色(WebView2 原生弹层跟随系统主题,不读页面
    background/color 之外的规则;显式声明防暗色主题下白字白底不可读) */
@@ -847,6 +980,28 @@ select.text-input option,
   justify-content: center;
   padding: 48px 16px;
   overflow-y: auto;
+  /* 进出场(第六批):此前模态是瞬显瞬隐(仅 classList 切 .hidden,零过渡)。
+     用纯 CSS 的离散过渡做,不动 JS —— 9 条关闭路径分散在 6 个模块,且带
+     rbBusy 守卫与关闭后状态复位(改错即真回归)。
+     display 用 allow-discrete 参与过渡:进入时立即翻转(配合 @starting-style
+     拿到起始值),退出时保留到过渡结束再真正隐藏。
+     优雅降级:不支持 allow-discrete 的 WebView2 会忽略该过渡,行为与改动前
+     完全一致(无白屏/卡死风险)。 */
+  opacity: 1;
+  transition: opacity var(--ark-dur-modal) var(--ark-ease-out),
+              display var(--ark-dur-modal) allow-discrete;
+}
+/* 退出期间的点击穿透:display 到过渡结束才翻成 none,若不处理,这约 140ms
+   (--ark-dur-modal 的 60%)内遮罩仍会吞掉用户点击。pointer-events 不在过渡
+   列表里,加类即生效。 */
+.modal-overlay.hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+/* 入场起始态:元素刚从 display:none 变可见时,浏览器没有「变化前样式」,
+   @starting-style 补上 opacity:0 供过渡取起点。 */
+@starting-style {
+  .modal-overlay { opacity: 0; }
 }
 .modal-card {
   background: var(--ark-surface);
@@ -855,6 +1010,14 @@ select.text-input option,
   width: 560px;
   max-width: 100%;
   box-shadow: 0 12px 32px var(--ark-shadow);
+  /* 卡片自上而下裁切揭示:契约要求「不要只靠透明度做状态变化,要加方向或
+     裁切」,且与切页的 page-reveal 裁切语言同族(那个是横向,此处纵向)。
+     出场不另做动画 —— 由遮罩淡出带走,出场短于入场符合契约。 */
+  animation: modal-wipe var(--ark-dur-modal) var(--ark-ease-out);
+}
+@keyframes modal-wipe {
+  from { clip-path: inset(0 0 100% 0); }
+  to   { clip-path: inset(0); }
 }
 .modal-head {
   display: flex;
@@ -928,16 +1091,22 @@ select.text-input option,
   border: 1px solid var(--ark-line);
   border-bottom: 2px solid var(--ark-ink);
   border-radius: 2px;
-  background: var(--ark-paper);
+  background: var(--ark-surface);   /* 第六批:同 .form-input,暗色下改读面板表面色 */
   color: var(--ark-ink);
   font-family: var(--font-mono);
   font-size: 12.5px;
   line-height: 1.6;
   outline: none;
   resize: vertical;
-  transition: border-color .18s ease;
+  transition: border-color var(--ark-dur-fast) var(--ark-ease-out),
+              box-shadow var(--ark-dur-fast) var(--ark-ease-out),
+              background var(--ark-dur-fast) var(--ark-ease-out);
 }
-.form-textarea:focus { border-bottom-color: var(--ark-signal); }
+/* 聚焦左信号条与单行输入同族(第六批) */
+.form-textarea:focus {
+  border-bottom-color: var(--ark-signal);
+  box-shadow: inset 3px 0 0 var(--ark-signal);
+}
 .form-textarea::placeholder { color: var(--ark-ink-35); }
 
 /* 预设命令 chips:1px 墨线空心小按钮,点击插入模板(悬停墨底反白) */
@@ -1066,6 +1235,15 @@ select.text-input option,
   bottom: -1px;
   height: 3px;
   background: var(--ark-signal);
+  /* 下划线自左侧扫入(第六批):原为静态青条 —— 切换时只有填充块突变,
+     契约要求「不要只靠透明度做状态变化,要加方向或裁切」。纯 CSS:类切换
+     时动画自动重放,无需 JS 追踪来源方向。 */
+  transform-origin: left center;
+  animation: tab-underline var(--ark-dur-fast) var(--ark-ease-out);
+}
+@keyframes tab-underline {
+  from { transform: scaleX(0); }
+  to   { transform: scaleX(1); }
 }
 .mode-tab:disabled,
 .mode-tab:disabled:hover {
@@ -1554,8 +1732,23 @@ select.text-input option,
 .manage-tab:hover { color: var(--ark-ink); }
 .manage-tab.active {
   color: var(--ark-ink);
-  border-bottom-color: var(--ark-signal);
   font-weight: 600;
+  /* 下划线改用 ::after 承载(第六批):原来只切 border-bottom-color,
+     是纯颜色变化 —— 契约要求「不要只靠透明度/颜色做状态变化,要加方向或裁切」。
+     ::after 在本组件之前未被占用,可安全用于扫入动画。 */
+  border-bottom-color: transparent;
+  position: relative;
+}
+.manage-tab.active::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -2px;
+  height: 2px;
+  background: var(--ark-signal);
+  transform-origin: left center;
+  animation: tab-underline var(--ark-dur-fast) var(--ark-ease-out);
 }
 
 /* ===== 镜像拉取栏 ===== */
@@ -2651,7 +2844,7 @@ code {
   gap: 10px;
   padding: 14px 10px;
   border: 1px solid var(--ark-line-soft);
-  border-radius: 6px;
+  border-radius: 4px;   /* 第六批:6px → 4px,收回 ark 契约允许的功能性圆角上限(默认 0,允许 2-4px) */
   background: var(--ark-paper-dim);
 }
 .about-avatar-wrap { line-height: 0; }
@@ -3046,7 +3239,7 @@ code {
 .rollback-list-wrap,
 .rollback-detail-wrap {
   border: 1px solid var(--ark-line-soft);
-  border-radius: 6px;
+  border-radius: 4px;   /* 第六批:6px → 4px,同 .about-card 的契约收回 */
   overflow: hidden;
 }
 .rollback-list-title,
@@ -3075,7 +3268,11 @@ code {
 .rollback-item:hover { background: var(--ink-on-paper-08, rgba(128, 128, 128, 0.06)); }
 .rollback-item.active {
   background: var(--ink-on-paper-08, rgba(128, 128, 128, 0.12));
-  box-shadow: inset 3px 0 0 var(--ark-accent, #c8501e);
+  /* 左信号条(第六批):原为 var(--ark-accent, #c8501e) —— 该 token 从未定义,
+     回退值 #c8501e 是红橙色,违反「失败不用红」的双色纪律。选中态属 signal 的
+     契约职责(激活/选中/主操作),故直接用 --ark-signal;inset 3px 与输入框
+     聚焦条、按钮左楔形同族。 */
+  box-shadow: inset 3px 0 0 var(--ark-signal);
 }
 .rollback-item-head {
   display: flex;

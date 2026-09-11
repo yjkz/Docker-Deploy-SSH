@@ -231,6 +231,44 @@
     return node;
   };
 
+  // ===== 按钮忙碌态(第六批:统一四处局部 setBusy 的能力差异)=====
+  /**
+   * 设置按钮的忙碌态:禁用 + 文案 + 步进条三合一。
+   *
+   * 此前全站忙碌态一律只是「禁用 + 改文案」,零图形反馈;且 settings/notify/
+   * config-io/rollback 各自有一份 setBusy,能力还不一致(后两者不改文案)。
+   * 本助手是唯一口径 —— 步进条由 CSS `.btn-busy-bar` 承载(用真实元素而非
+   * ::after:伪元素已被小按钮命中区扩展占用)。
+   *
+   * @param {HTMLElement} btn 目标按钮
+   * @param {boolean} busy true = 进入忙碌态
+   * @param {string} [label] busy 期间显示的文案;省略则保留原文案
+   * @returns {HTMLElement} 传入的按钮(便于链式)
+   */
+  window.setBtnBusy = function (btn, busy, label) {
+    if (!btn) return btn;
+    // 首次进入时记住原文案,便于调用方只传 busy 也能还原
+    if (busy && btn.dataset.idleText === undefined) {
+      btn.dataset.idleText = btn.textContent;
+    }
+    btn.classList.toggle('is-busy', !!busy);
+    // 注意顺序:textContent 赋值会清空全部子节点(含步进条),故先写文案与
+    // 状态,最后再挂步进条,避免"刚插入就被清掉再补插"的绕路逻辑。
+    if (busy) {
+      btn.disabled = true;
+      btn.textContent = label || btn.dataset.idleText;
+      var bar = document.createElement('span');
+      bar.className = 'btn-busy-bar';
+      bar.setAttribute('aria-hidden', 'true');
+      btn.appendChild(bar);
+    } else {
+      btn.disabled = false;
+      btn.textContent = label || btn.dataset.idleText;
+      delete btn.dataset.idleText;
+    }
+    return btn;
+  };
+
   // ===== 复制文本到剪贴板(成功 toast「已复制」)=====
   window.copyText = function (text) {
     function done() { window.toast('已复制', 'ok'); }

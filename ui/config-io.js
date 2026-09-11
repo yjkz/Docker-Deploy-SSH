@@ -64,7 +64,13 @@
     return el('div', 'cio-note', text);
   }
 
-  /** 操作按钮统一禁用/恢复(导出/导入/浏览/清除四处) */
+  /**
+   * 操作按钮统一禁用/恢复(导出/导入/浏览/清除四处)。
+   *
+   * 第六批:这里**刻意不接** window.setBtnBusy —— 四处是一个按钮组、同时进入
+   * 忙碌态,若每个都挂步进条会有四条同时跑,视觉噪音过大;而它们没有单按钮
+   * 语义,也不该各自改文案。各操作自身有行内回显,反馈不缺。
+   */
   function setBusy(busy) {
     st.busy = busy;
     ['cio-export-btn', 'cio-import-btn', 'cio-import-browse', 'cio-wipe-btn']

@@ -57,6 +57,8 @@
     box.classList.toggle('hidden', !msg);
   }
 
+  // 刷新/重扫是一对组按钮(同时禁用),同 config-io 的理由不接 setBtnBusy 的
+  // 步进条(两条同跑无意义);禁用防重复即可。
   function setBusy(v) {
     busy = v;
     var btn = $('rollback-refresh-btn');
@@ -375,8 +377,10 @@
 
   /**
    * 两步确认(与 03 页项目删除同一套交互):首次点击把按钮变成
-   * 「确认删除?」并加红,3 秒内再点才真正执行;超时自动还原。
+   * 「确认删除?」并加危险样式,3 秒内再点才真正执行;超时自动还原。
    * 用两步而非浏览器 confirm:全站约定不调用系统对话框。
+   * 第六批:armed 期间额外挂 .is-armed —— 契约要求状态变化不能只靠颜色/文案,
+   * 该类的呼吸描边提示「还需再点一次」。
    */
   function armConfirm(btn, onConfirm) {
     if (btn.__rbArmed) {
@@ -387,6 +391,7 @@
       btn.__rbArmed = false;
       btn.textContent = btn.__rbText || '删除';
       btn.classList.remove('btn-danger');
+      btn.classList.remove('is-armed');
       onConfirm();
       return;
     }
@@ -394,11 +399,13 @@
     btn.__rbText = btn.textContent;
     btn.textContent = '确认删除?';
     btn.classList.add('btn-danger');
+    btn.classList.add('is-armed');
     btn.title = '再次点击确认删除(不可恢复)';
     btn.__rbTimer = window.setTimeout(function () {
       btn.__rbArmed = false;
       btn.textContent = btn.__rbText || '删除';
       btn.classList.remove('btn-danger');
+      btn.classList.remove('is-armed');
       btn.__rbTimer = null;
     }, 3000);
   }

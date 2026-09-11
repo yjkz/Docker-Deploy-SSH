@@ -121,12 +121,9 @@
     return el('div', 'set-hint', text);
   }
 
-  /** 按钮忙碌态切换(执行保存/检查期间禁用防重复) */
+  /** 按钮忙碌态切换(执行保存/检查期间禁用防重复;第六批收敛到共享助手) */
   function setBusy(id, busy, label) {
-    var btn = document.getElementById(id);
-    if (!btn) return;
-    btn.disabled = busy;
-    if (label) btn.textContent = label;
+    window.setBtnBusy(document.getElementById(id), busy, label);
   }
 
   /** 模态可见性(#settings-modal 未带 hidden 类) */
