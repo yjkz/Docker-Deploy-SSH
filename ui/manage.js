@@ -565,6 +565,7 @@
     tr.appendChild(tdPorts);
     // 创建时间(格式化 MM-DD HH:mm,tooltip 显示完整)
     var tdCreated = document.createElement('td');
+    tdCreated.className = 'mono';
     tdCreated.textContent = formatTime(c.created_at);
     if (c.created_at) tdCreated.title = c.created_at;
     tr.appendChild(tdCreated);
@@ -661,14 +662,13 @@
     var c = state.containers.find(function (x) { return x.id === containerId; });
     var name = c ? (c.names || containerId) : containerId;
     var isRunning = c && (c.state || '').toLowerCase() === 'running';
-    var msg = isRunning
-      ? '容器「' + name + '」正在运行,删除将强制停止并删除该容器,确定继续吗?'
-      : '确定删除容器「' + name + '」吗?';
+    var title = '确定删除容器「' + name + '」吗?';
+    var risk = isRunning ? '该容器正在运行,删除将强制停止并删除该容器。' : null;
 
-    openModal('删除容器', buildConfirmBody(msg, '删除', function () {
+    openModal('删除容器', buildConfirmBody(title, '删除', function () {
       closeModal();
       doContainerAction(containerId, 'rm', '删除容器');
-    }));
+    }, null, risk));
   }
 
   // ===== 容器详情(inspect) =====
@@ -908,10 +908,12 @@
     tr.appendChild(tdId);
     // 大小
     var tdSize = document.createElement('td');
+    tdSize.className = 'mono';
     tdSize.textContent = img.size || '—';
     tr.appendChild(tdSize);
     // 创建时间(格式化 MM-DD HH:mm,tooltip 显示完整)
     var tdCreated = document.createElement('td');
+    tdCreated.className = 'mono';
     tdCreated.textContent = formatTime(img.created_at);
     if (img.created_at) tdCreated.title = img.created_at;
     tr.appendChild(tdCreated);
@@ -986,7 +988,7 @@
   // ===== 镜像删除 =====
   function confirmRemoveImage(imageId, fullImage) {
     openModal('删除镜像', buildConfirmBody(
-      '确定删除镜像「' + fullImage + '」吗?如果该镜像被容器引用将删除失败,可勾选强制删除。',
+      '确定删除镜像「' + fullImage + '」吗?',
       '删除',
       function () {
         var forceCheck = $('manage-force-check');
@@ -994,7 +996,8 @@
         closeModal();
         doImageRemove(imageId, force);
       },
-      true  // 显示 force 复选框
+      true,  // 显示 force 复选框
+      '如果该镜像被容器引用将删除失败,可勾选下方强制删除。'
     ));
   }
 
@@ -1341,6 +1344,7 @@
     tr.appendChild(tdMount);
     // 创建时间(Docker 25+ 才有,缺失显示 —)
     var tdCreated = document.createElement('td');
+    tdCreated.className = 'mono';
     tdCreated.textContent = v.created_at ? formatTime(v.created_at) : '—';
     if (v.created_at) tdCreated.title = v.created_at;
     tr.appendChild(tdCreated);
@@ -1370,7 +1374,7 @@
 
   function confirmRemoveVolume(name) {
     openModal('删除卷', buildConfirmBody(
-      '确定删除卷「' + name + '」吗?如果该卷正被容器使用将删除失败。',
+      '确定删除卷「' + name + '」吗?',
       '删除',
       function () {
         closeModal();
@@ -1394,7 +1398,9 @@
           toast('删除失败: ' + msg, 'fail');
           startTimerIfEnabled();
         });
-      }
+      },
+      null,
+      '该卷正被容器使用时将删除失败。'
     ));
   }
 
@@ -1595,7 +1601,7 @@
 
   function confirmRemoveNetwork(id, name) {
     openModal('删除网络', buildConfirmBody(
-      '确定删除网络「' + (name || id) + '」吗?如果有容器连接在该网络上将删除失败。',
+      '确定删除网络「' + (name || id) + '」吗?',
       '删除',
       function () {
         closeModal();
@@ -1619,7 +1625,9 @@
           toast('删除失败: ' + msg, 'fail');
           startTimerIfEnabled();
         });
-      }
+      },
+      null,
+      '有容器连接在该网络上时将删除失败。'
     ));
   }
 
@@ -1916,10 +1924,10 @@
     }
   }
 
-  function buildConfirmBody(message, confirmLabel, onConfirm, showForce) {
+  function buildConfirmBody(message, confirmLabel, onConfirm, showForce, risk) {
     var div = document.createElement('div');
-    div.innerHTML =
-      '<p class="confirm-msg">' + escHtml(message) + '</p>' +
+    div.appendChild(window.confirmBlock(risk ? { title: message, risk: risk } : { title: message }));
+    div.innerHTML +=
       (showForce ? '<label class="deploy-checkbox"><input type="checkbox" id="manage-force-check"> <span>强制删除(-f)</span></label>' : '') +
       '<div class="modal-actions">' +
       '<button id="confirm-cancel-btn" class="btn" type="button">取消</button>' +
@@ -2125,7 +2133,9 @@
       function () {
         closeModal();
         doStackAction(st, action);
-      }
+      },
+      null,
+      label === '停止' ? '停止后该栈的全部容器将退出。' : '将按 compose 文件拉起该栈的全部服务。'
     ));
   }
 
@@ -2382,22 +2392,22 @@
       toast('.env 内容过大(上限 256KB),请精简后再保存', 'warn');
       return;
     }
-    // 含 U+FFFD(如 GBK 内容被替换):确认文案追加风险说明,是否保存由用户决定
-    var msg = '保存将覆盖服务器上的 .env,影响下次 compose up,确定?';
-    if (draft.indexOf('\uFFFD') !== -1) {
-      msg += '注意:' + ENV_FFFD_WARN + '。';
-    }
-    openModal('保存 .env', buildStackEnvSaveConfirm(st, session, draft, msg));
+    // 含 U+FFFD(如 GBK 内容被替换):风险句拆出,由确认框 risk 段承载
+    var risk = draft.indexOf('�') !== -1 ? ENV_FFFD_WARN + '。' : null;
+    openModal('保存 .env', buildStackEnvSaveConfirm(st, session, draft, risk));
   }
 
   // 保存确认弹窗主体:布局同 buildConfirmBody,但「取消」不能走默认的 closeModal
   // ——确认弹窗替换编辑器主体后 textarea 已销毁,直接关整个模态会丢草稿且无路径
   // 返回;这里「取消」改为 reopenStackEnvEdit 重建可写编辑体并回填草稿(带会话
   // 校验),确认按钮才 closeModal + 执行保存
-  function buildStackEnvSaveConfirm(st, session, draft, message) {
+  function buildStackEnvSaveConfirm(st, session, draft, risk) {
     var div = document.createElement('div');
-    div.innerHTML =
-      '<p class="confirm-msg">' + escHtml(message) + '</p>' +
+    div.appendChild(window.confirmBlock({
+      title: '保存将覆盖服务器上的 .env,影响下次 compose up,确定?',
+      risk: risk
+    }));
+    div.innerHTML +=
       '<div class="modal-actions">' +
       '<button id="confirm-cancel-btn" class="btn" type="button">取消</button>' +
       '<button id="confirm-ok-btn" class="btn btn-danger" type="button">保存</button>' +
@@ -2606,10 +2616,10 @@
     tr.appendChild(mkStatTd(s.name || s.container_id || '—', true));
     tr.appendChild(mkCpuTd(s.cpu_percent));
     tr.appendChild(mkStatTd(s.mem_usage || '—', true));
-    tr.appendChild(mkStatTd(s.mem_percent != null ? String(s.mem_percent) : '—', false));
+    tr.appendChild(mkStatTd(s.mem_percent != null ? String(s.mem_percent) : '—', true));
     tr.appendChild(mkStatTd(s.net_io || '—', true));
     tr.appendChild(mkStatTd(s.block_io || '—', true));
-    tr.appendChild(mkStatTd(s.pids != null ? String(s.pids) : '—', false));
+    tr.appendChild(mkStatTd(s.pids != null ? String(s.pids) : '—', true));
   }
 
   function mkStatTd(text, mono) {

@@ -491,8 +491,10 @@
   /** 自绘确认条(不调用系统对话框):文案 + 确认/取消 内联按钮 */
   function showInstallConfirm(container, server) {
     container.textContent = '';
-    container.appendChild(el('span', 'confirm-text',
-      '将通过 SSH 执行官方安装脚本,可能需要数分钟,确认?'));
+    container.appendChild(window.confirmBlock({
+      title: '确认在这台服务器上安装 Docker?',
+      risk: '将通过 SSH 执行官方安装脚本,可能需要数分钟。'
+    }));
     var ok = el('button', 'btn btn-danger btn-sm', '确认安装');
     ok.type = 'button';
     ok.addEventListener('click', function () { startInstallDocker(server); });
@@ -904,12 +906,17 @@
     }
 
     body.innerHTML = '';
-    var confirmText = '确认清理勾选项?该操作不可撤销。' +
-      '(无标签镜像 ' + selection.imageIds.length + ' 项、停止容器 ' +
-      selection.containerIds.length + ' 个、未使用卷 ' + selection.volumeNames.length +
-      ' 个' + (selection.builder ? '、构建缓存' : '') +
-      (projOps > 0 ? '、分项目 ' + projOps + ' 项' : '') + ')';
-    body.appendChild(el('div', 'cleanup-hint', confirmText));
+    body.appendChild(window.confirmBlock({
+      title: '确认清理勾选项?',
+      facts: [
+        ['无标签镜像', selection.imageIds.length + ' 项'],
+        ['停止容器', selection.containerIds.length + ' 个'],
+        ['未使用卷', selection.volumeNames.length + ' 个'],
+        ['构建缓存', selection.builder ? '包含' : '不包含'],
+        ['分项目清理', projOps > 0 ? projOps + ' 项' : '无']
+      ],
+      risk: '该操作不可撤销,删除的数据无法恢复。'
+    }));
     var actions = el('div', 'modal-actions');
     var ok = el('button', 'btn btn-danger', '确认执行');
     ok.type = 'button';

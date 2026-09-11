@@ -346,7 +346,7 @@
         (repo.tags || []).forEach(function (t) {
           var row = el('div', 'rollback-tag-row');
           row.appendChild(el('span', 'rollback-tag-name mono', repo.repository + ':' + t.tag));
-          row.appendChild(el('span', 'rollback-tag-created', t.created || ''));
+          row.appendChild(el('span', 'mono rollback-tag-created', t.created || ''));
           if (appProject) {
             var btn = el('button', 'btn btn-sm', '切回此版本');
             btn.type = 'button';
@@ -486,14 +486,16 @@
     };
     renderConfirm(
       '整栈回滚确认',
-      [
-        '项目目录:' + dir,
-        '目标归档:' + ts,
-        services.length ? ('包含服务:' + services.join('、')) : '（归档无清单,按包内镜像标签恢复）',
-        '',
-        '将执行:重载归档内镜像 → 恢复 compose 副本 → docker compose up -d。',
-        '该操作会改变服务器上正在运行的服务版本,请确认目标归档正确。'
-      ].join('\n')
+      window.confirmBlock({
+        title: '确认整栈回滚到归档 ' + ts + '?',
+        facts: [
+          ['项目目录', dir],
+          ['目标归档', ts],
+          ['包含服务', services.length ? services.join('、') : '(归档无清单,按包内镜像标签恢复)'],
+          ['执行步骤', '重载归档内镜像 → 恢复 compose 副本 → docker compose up -d']
+        ],
+        risk: '该操作会改变服务器上正在运行的服务版本,请确认目标归档正确。'
+      })
     );
   }
 
@@ -535,13 +537,16 @@
       };
       renderConfirm(
         '镜像回滚确认',
-        [
-          '项目:' + appProjectName,
-          '历史版本:' + repository + ':' + dateTag,
-          '',
-          '将执行:把历史版本重新指向 compose 使用的标签,然后 compose up -d 重建容器。',
-          '请在下方确认目标标签(默认 latest):'
-        ].join('\n'),
+        window.confirmBlock({
+          title: '确认回滚 ' + repository + ':' + dateTag + '?',
+          facts: [
+            ['项目', appProjectName],
+            ['历史版本', repository + ':' + dateTag],
+            ['执行步骤', '把历史版本重新指向 compose 使用的标签,然后 compose up -d 重建容器'],
+            ['目标标签', '请在下方确认(默认 latest)']
+          ],
+          risk: '重建期间容器将短暂重启。'
+        }),
         { targetInput: defaultTarget }
       );
     }).catch(function (err) {
@@ -550,12 +555,13 @@
   }
 
   /** 渲染确认面板(替换明细区内容;可带目标标签输入框) */
-  function renderConfirm(title, bodyText, opts) {
+  function renderConfirm(title, bodyNode, opts) {
     var box = $('rollback-detail');
     if (!box) return;
     box.textContent = '';
     box.appendChild(el('div', 'rollback-section-title', title));
-    box.appendChild(el('pre', 'rollback-confirm-text', bodyText));
+    box.appendChild(typeof bodyNode === 'string'
+      ? el('pre', 'rollback-confirm-text', bodyNode) : bodyNode);
 
     var targetInput = null;
     if (opts && opts.targetInput !== undefined) {

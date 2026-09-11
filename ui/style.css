@@ -404,7 +404,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   background: var(--ark-paper);
   color: var(--ark-ink);
   font-family: inherit;
-  font-size: 13.5px;
+  font-size: 13px;
   font-weight: 600;
   line-height: 1.2;
   cursor: pointer;
@@ -519,7 +519,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
                                        「凹陷」而非「嵌入面板」,故改用面板表面色。 */
   color: var(--ark-ink);
   font-family: inherit;
-  font-size: 13.5px;
+  font-size: 13px;
   outline: none;
   transition: border-color var(--ark-dur-fast) var(--ark-ease-out),
               box-shadow var(--ark-dur-fast) var(--ark-ease-out),
@@ -670,7 +670,7 @@ select.text-input option,
   margin-bottom: 16px;
   font-size: 13px;
 }
-.servers-error-text { word-break: break-all; display: block; }
+.servers-error-text { overflow-wrap: anywhere; display: block; }
 .check-error .btn { margin-left: 10px; }
 .images-error {
   display: flex;
@@ -678,7 +678,7 @@ select.text-input option,
   justify-content: space-between;
   gap: 10px;
 }
-.images-error-text { flex: 1; word-break: break-all; }
+.images-error-text { flex: 1; overflow-wrap: anywhere; }
 
 /* ===== 01 环境检测 PREFLIGHT ===== */
 .check-list { border-top: 1px solid var(--ark-line); }
@@ -721,7 +721,7 @@ select.text-input option,
   color: var(--ark-paper-ink-65);
   text-align: right;
   max-width: 440px;
-  word-break: break-all;
+  overflow-wrap: anywhere;
 }
 .check-action { padding: 6px 0 10px; }
 
@@ -744,7 +744,7 @@ select.text-input option,
   font-family: var(--font-mono);
   font-size: 12.5px;
 }
-.cmd-text { flex: 1; word-break: break-all; color: var(--ark-ink); }
+.cmd-text { flex: 1; overflow-wrap: anywhere; color: var(--ark-ink); }
 
 /* ===== 02 镜像列表 IMAGES ===== */
 .images-count {
@@ -753,7 +753,7 @@ select.text-input option,
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
   font-size: 11px;
-  letter-spacing: .06em;
+  letter-spacing: .12em;
   color: var(--ark-paper-dim-ink);
 }
 
@@ -768,7 +768,8 @@ select.text-input option,
 }
 .data-table th {
   background: var(--ark-paper-dim);
-  color: var(--ark-paper-ink-65);
+  color: var(--ark-paper-dim-ink);
+  font-family: var(--font-cond);
   font-size: 11px;
   font-weight: 600;
   letter-spacing: .12em;
@@ -881,7 +882,7 @@ select.text-input option,
   margin-top: 3px;
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
-  font-size: 13.5px;
+  font-size: 13px;
   color: var(--ark-ink);
   word-break: break-all;
 }
@@ -927,15 +928,6 @@ select.text-input option,
   gap: 8px;
   flex-wrap: wrap;
 }
-/* 自绘确认条(内联二次确认)文案 */
-.confirm-text {
-  flex: 1;
-  min-width: 220px;
-  font-size: 12.5px;
-  font-weight: 600;
-  color: var(--ark-ink);
-}
-
 /* 运行日志折叠面板:墨黑终端(全页唯一深色块之一)+ 左缘 4px 青条 */
 .log-panel { margin-top: 28px; }
 .log-toggle {
@@ -1057,7 +1049,7 @@ select.text-input option,
 }
 .form-label-en {
   font-family: var(--font-cond);
-  font-size: 10.5px;
+  font-size: 11px;
   font-weight: 700;
   letter-spacing: .14em;
   text-transform: uppercase;
@@ -1099,7 +1091,7 @@ select.text-input option,
 }
 .form-hint {
   margin-top: 4px;
-  font-size: 11.5px;
+  font-size: 12.5px;
   line-height: 1.5;
   color: var(--ark-paper-dim-ink);
 }
@@ -1112,7 +1104,7 @@ select.text-input option,
   margin-top: 5px;
   padding-left: 8px;
   border-left: 3px solid var(--ark-signal);
-  font-size: 11.5px;
+  font-size: 12.5px;
   line-height: 1.5;
   color: var(--ark-ink);
   animation: field-error-reveal var(--ark-dur-fast) var(--ark-ease-out);
@@ -1195,7 +1187,7 @@ select.text-input option,
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-size: 13.5px;
+  font-size: 13px;
   cursor: pointer;
 }
 
@@ -1210,7 +1202,7 @@ select.text-input option,
   text-align: left;
   font-weight: 600;
   font-size: 11px;
-  letter-spacing: .1em;
+  letter-spacing: .12em;
   text-transform: uppercase;
   color: var(--ark-paper-dim-ink);
   border-bottom: 1px solid var(--ark-line);
@@ -1247,7 +1239,7 @@ select.text-input option,
 .preview-status {
   font-family: var(--font-mono);
   font-size: 11px;
-  letter-spacing: .06em;
+  letter-spacing: .12em;
   color: var(--ark-paper-dim-ink);
 }
 /* 预览表内的错误清单(红改墨:沿用 check-error) */
@@ -1275,7 +1267,7 @@ select.text-input option,
   background: transparent;
   color: var(--ark-paper-ink-65);
   font-family: inherit;
-  font-size: 13.5px;
+  font-size: 13px;
   font-weight: 600;
   cursor: pointer;
   transition: color .18s ease, background .18s ease;
@@ -1339,7 +1331,7 @@ select.text-input option,
   min-width: 200px;
   font-family: var(--font-mono);
   font-size: 11px;
-  letter-spacing: .06em;
+  letter-spacing: .12em;
   color: var(--ark-paper-dim-ink);
 }
 .deploy-stack-panel .check-error { margin-bottom: 12px; }
@@ -1384,7 +1376,7 @@ select.text-input option,
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
   font-size: 11px;
-  letter-spacing: .06em;
+  letter-spacing: .12em;
   color: var(--ark-paper-dim-ink);
 }
 
@@ -1504,9 +1496,9 @@ select.text-input option,
 .deploy-step-msg {
   margin-top: 6px;
   min-height: 16px;
-  font-size: 11.5px;
+  font-size: 12.5px;
   color: var(--ark-paper-ink-65);
-  word-break: break-all;
+  overflow-wrap: anywhere;
 }
 
 /* 部署日志终端:墨黑面板,高 320px,左缘 4px 青条,右下角行计数 */
@@ -1521,7 +1513,7 @@ select.text-input option,
   border: 1px solid var(--ark-line);
   border-left: 4px solid var(--ark-signal);
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: 12.5px;
   line-height: 1.7;
   white-space: pre-wrap;
   word-break: break-all;
@@ -1557,7 +1549,7 @@ select.text-input option,
   color: var(--ark-paper);
   border-left: 4px solid var(--ark-signal);
   font-size: 13px;
-  word-break: break-all;
+  overflow-wrap: anywhere;
   opacity: 0;
   transform: translateY(8px);
   transition: opacity .22s ease, transform .22s ease;
@@ -1928,6 +1920,39 @@ select.text-input option,
   margin-bottom: 16px;
   color: var(--ark-ink);
 }
+/* 确认框三段式:主问句 / 事实清单 / 风险提示 */
+.confirm-title {
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1.6;
+  margin: 0 0 10px;
+  color: var(--ark-ink);
+}
+.confirm-facts {
+  margin: 0 0 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.confirm-fact {
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--ark-paper-ink-65);
+  overflow-wrap: anywhere;
+}
+.confirm-fact b {
+  font-weight: 600;
+  color: var(--ark-ink);
+}
+.confirm-risk {
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--ark-warn-text);
+  border-left: 3px solid var(--ark-warn);
+  padding: 2px 0 2px 8px;
+  margin: 2px 0 12px;
+  overflow-wrap: anywhere;
+}
 .modal-actions {
   display: flex;
   justify-content: flex-end;
@@ -1985,7 +2010,7 @@ select.text-input option,
 /* 统一幽灵按钮基础:透明底+软边框+弱化墨字 */
 .action-btn-group .btn-sm {
   padding: 3px 10px 3px 12px;
-  font-size: 11.5px;
+  font-size: 12.5px;
   font-weight: 500;
   min-width: 46px;
   height: 26px;
@@ -2151,9 +2176,10 @@ select.text-input option,
   display: inline-block;
   margin-left: 5px;
   padding: 0 5px;
+  font-family: var(--font-mono);
   font-size: 10px;
   font-weight: 700;
-  letter-spacing: .02em;
+  letter-spacing: .12em;
   background: var(--ark-warn);
   color: var(--ark-on-warn);
   vertical-align: middle;
@@ -2483,7 +2509,7 @@ select.text-input option,
   margin: 0 0 14px;
   padding-bottom: 8px;
   border-bottom: 1px solid var(--ark-line-soft);
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 700;
   color: var(--ark-ink);
 }
@@ -2492,7 +2518,7 @@ select.text-input option,
   margin: 18px 0 8px;
   padding-left: 8px;
   border-left: 3px solid var(--ark-signal);
-  font-size: 13.5px;
+  font-size: 13px;
   font-weight: 700;
   line-height: 1.5;
   color: var(--ark-ink);
@@ -2500,7 +2526,7 @@ select.text-input option,
 .help-content p {
   margin: 0 0 10px;
   font-size: 13px;
-  line-height: 1.85;
+  line-height: 1.7;
   color: var(--ark-ink);
 }
 .help-content ul,
@@ -2510,7 +2536,7 @@ select.text-input option,
 }
 .help-content li {
   font-size: 13px;
-  line-height: 1.85;
+  line-height: 1.7;
   margin-bottom: 4px;
   color: var(--ark-ink);
 }
@@ -2746,8 +2772,8 @@ code {
   border: 1px dashed var(--ark-line);
   background: var(--ark-paper-dim);
   font-size: 12.5px;
-  line-height: 1.7;
-  color: var(--ark-paper-ink-65);
+  line-height: 1.6;
+  color: var(--ark-paper-dim-ink);
 }
 
 /* 选中发布/标签后的动作说明框(青色左条,同 .deploy-log 的强调语言) */
@@ -2758,10 +2784,10 @@ code {
   border-left: 4px solid var(--ark-signal);
   background: var(--ark-paper-dim);
   font-size: 12.5px;
-  line-height: 1.7;
+  line-height: 1.6;
   color: var(--ark-ink);
 }
-.rb-plan-sub { font-size: 11.5px; color: var(--ark-paper-ink-65); }
+.rb-plan-sub { font-size: 12.5px; color: var(--ark-paper-ink-65); }
 
 /* 模态内等宽日志区:复用 .deploy-log 常暗表面,压缩高度适配弹窗 */
 .deploy-modal-log { height: 200px; }
@@ -2813,7 +2839,7 @@ code {
   margin-top: 12px;
   font-size: 12.5px;
   line-height: 1.6;
-  word-break: break-all;
+  overflow-wrap: anywhere;
 }
 .notify-test-ok { color: var(--ark-ink); }
 .notify-test-info { color: var(--ark-paper-ink-65); }
@@ -2831,8 +2857,8 @@ code {
 .cio-note {
   margin: 0 0 10px;
   font-size: 12px;
-  line-height: 1.7;
-  color: var(--ark-paper-ink-65);
+  line-height: 1.6;
+  color: var(--ark-paper-dim-ink);
 }
 
 /* 导入结果行(行内回显;失败用 --ark-stat-hot,同 .notify-test-fail 先例) */
@@ -2841,7 +2867,7 @@ code {
   margin-top: 4px;
   font-size: 12.5px;
   line-height: 1.6;
-  word-break: break-all;
+  overflow-wrap: anywhere;
 }
 .cio-result-ok { color: var(--ark-ink); }
 .cio-result-fail { color: var(--ark-stat-hot); }
@@ -2866,8 +2892,8 @@ code {
 .cio-danger-text {
   margin-bottom: 10px;
   font-size: 12px;
-  line-height: 1.7;
-  color: var(--ark-paper-ink-65);
+  line-height: 1.6;
+  color: var(--ark-paper-dim-ink);
 }
 
 /* ===== 设置中心(settings.js;复用 modal/form-row/deploy-checkbox/radio-row/btn 体系) ===== */
@@ -2924,7 +2950,7 @@ code {
   border-radius: 50%;
   object-fit: cover;
   border: 2px solid var(--ark-line-soft);
-  background: var(--ink-on-paper-08, rgba(128, 128, 128, 0.12));
+  background: var(--ink-on-paper-08);
 }
 /* 头像加载失败时的首字占位 */
 .about-avatar-fallback {
@@ -2972,8 +2998,8 @@ code {
 .set-hint {
   margin: 4px 0 0;
   font-size: 12px;
-  line-height: 1.7;
-  color: var(--ark-paper-ink-65);
+  line-height: 1.6;
+  color: var(--ark-paper-dim-ink);
 }
 
 /* 更新/测试结果行(行内回显;失败用 --ark-stat-hot,同 .notify-test-fail 先例) */
@@ -2981,7 +3007,7 @@ code {
   min-height: 18px;
   font-size: 12.5px;
   line-height: 1.6;
-  word-break: break-all;
+  overflow-wrap: anywhere;
 }
 .set-result-ok { color: var(--ark-ink); }
 .set-result-info { color: var(--ark-paper-ink-65); }
@@ -2997,7 +3023,7 @@ code {
   line-height: 1.7;
   color: var(--ark-paper-ink-65);
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
   max-height: 180px;
   overflow: auto;
 }
@@ -3090,7 +3116,7 @@ code {
   justify-content: space-between;
   gap: 10px;
   padding: 5px 0;
-  border-top: 1px solid var(--ink-on-paper-08, rgba(128, 128, 128, 0.15));
+  border-top: 1px solid var(--ink-on-paper-08);
   font-size: 12.5px;
 }
 .batch-row:first-of-type {
@@ -3115,7 +3141,7 @@ code {
   margin-bottom: 8px;
 }
 .cleanup-section {
-  border-top: 1px solid var(--ink-on-paper-08, rgba(128, 128, 128, 0.15));
+  border-top: 1px solid var(--ink-on-paper-08);
   padding: 8px 0;
 }
 .cleanup-section-head {
@@ -3134,7 +3160,7 @@ code {
 }
 .cleanup-item {
   font-size: 12px;
-  color: var(--ark-paper-ink-65, inherit);
+  color: var(--ark-paper-ink-65);
   padding-left: 24px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -3151,7 +3177,7 @@ code {
   gap: 8px;
   margin-bottom: 12px;
   padding-bottom: 10px;
-  border-bottom: 1px solid var(--ink-on-paper-08, rgba(128, 128, 128, 0.15));
+  border-bottom: 1px solid var(--ink-on-paper-08);
 }
 .cleanup-scanbar-label {
   font-size: 12.5px;
@@ -3182,10 +3208,10 @@ code {
   margin: 14px 0 6px;
   font-size: 13px;
   font-weight: 600;
-  color: var(--ark-paper-ink-70, inherit);
+  color: var(--ark-paper-ink-70);
 }
 .cleanup-project {
-  border-top: 1px solid var(--ink-on-paper-08, rgba(128, 128, 128, 0.15));
+  border-top: 1px solid var(--ink-on-paper-08);
   padding: 8px 0;
 }
 .cleanup-project-head {
@@ -3211,7 +3237,7 @@ code {
   font-size: 11px;
   padding: 1px 6px;
   border-radius: 3px;
-  background: var(--ink-on-paper-08, rgba(128, 128, 128, 0.15));
+  background: var(--ink-on-paper-08);
   color: var(--ark-paper-dim-ink);
 }
 .cleanup-project-row {
@@ -3227,7 +3253,7 @@ code {
 .cleanup-diag {
   margin-top: 12px;
   padding-top: 10px;
-  border-top: 1px solid var(--ink-on-paper-08, rgba(128, 128, 128, 0.15));
+  border-top: 1px solid var(--ink-on-paper-08);
   font-size: 12px;
 }
 .cleanup-diag-summary {
@@ -3236,7 +3262,7 @@ code {
 }
 .cleanup-diag-row {
   margin-top: 8px;
-  color: var(--ark-paper-ink-70, inherit);
+  color: var(--ark-paper-ink-70);
 }
 .cleanup-diag-cmd {
   font-size: 11px;
@@ -3253,9 +3279,9 @@ code {
   max-height: 140px;
   overflow: auto;
   border-radius: 4px;
-  background: var(--ink-on-paper-08, rgba(128, 128, 128, 0.12));
+  background: var(--ink-on-paper-08);
   white-space: pre-wrap;
-  word-break: break-all;
+  overflow-wrap: anywhere;
 }
 
 /* ===== 回滚中心(第三批:按服务器真实项目分列) ===== */
@@ -3286,7 +3312,7 @@ code {
   font-size: 12.5px;
   color: var(--ark-paper-dim-ink);
   margin-bottom: 14px;
-  line-height: 1.7;
+  line-height: 1.6;
 }
 .rollback-layout {
   display: grid;
@@ -3305,12 +3331,14 @@ code {
 }
 .rollback-list-title,
 .rollback-section-title {
+  font-family: var(--font-cond);
   font-size: 11px;
-  letter-spacing: 0.08em;
+  font-weight: 700;
+  letter-spacing: .12em;
   text-transform: uppercase;
   color: var(--ark-paper-dim-ink);
   padding: 8px 12px;
-  background: var(--ink-on-paper-08, rgba(128, 128, 128, 0.08));
+  background: var(--ink-on-paper-08);
 }
 .rollback-section-title {
   margin-top: 12px;
@@ -3326,9 +3354,9 @@ code {
   cursor: pointer;
 }
 .rollback-item:last-child { border-bottom: none; }
-.rollback-item:hover { background: var(--ink-on-paper-08, rgba(128, 128, 128, 0.06)); }
+.rollback-item:hover { background: var(--ink-on-paper-08); }
 .rollback-item.active {
-  background: var(--ink-on-paper-08, rgba(128, 128, 128, 0.12));
+  background: var(--ink-on-paper-08);
   /* 左信号条(第六批):原为 var(--ark-accent, #c8501e) —— 该 token 从未定义,
      回退值 #c8501e 是红橙色,违反「失败不用红」的双色纪律。选中态属 signal 的
      契约职责(激活/选中/主操作),故直接用 --ark-signal;inset 3px 与输入框
@@ -3406,7 +3434,7 @@ code {
   font-weight: 600;
 }
 .rollback-release-meta {
-  font-size: 11.5px;
+  font-size: 12.5px;
   color: var(--ark-paper-dim-ink);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -3431,15 +3459,6 @@ code {
   font-size: 11px;
   color: var(--ark-paper-dim-ink);
   flex: none;
-}
-.rollback-confirm-text {
-  font-size: 12.5px;
-  line-height: 1.8;
-  white-space: pre-wrap;
-  margin: 8px 0 12px;
-  padding: 10px;
-  border-radius: 4px;
-  background: var(--ink-on-paper-08, rgba(128, 128, 128, 0.1));
 }
 .rollback-confirm-input {
   display: flex;
@@ -3473,11 +3492,11 @@ code {
   margin-bottom: 10px;
   border-radius: 4px;
   border-left: 3px solid var(--ark-line);
-  background: var(--ink-on-paper-08, rgba(128, 128, 128, 0.08));
+  background: var(--ink-on-paper-08);
   color: var(--ark-paper-dim-ink);
 }
 .src-summary-warn {
-  border-left-color: var(--ark-stat-warm, #d68a1e);
+  border-left-color: var(--ark-stat-warm);
 }
 .src-summary-text { font-weight: 600; }
 .src-summary-list { color: var(--ark-paper-dim-ink); }
@@ -3544,7 +3563,7 @@ code {
   color: var(--ark-paper-ink-65);
 }
 .migrate-plan-warnings {
-  border-left: 3px solid var(--ark-stat-warm, #d68a1e);
+  border-left: 3px solid var(--ark-stat-warm);
   padding: 8px 12px;
   margin-bottom: 10px;
   display: flex;
@@ -3571,7 +3590,7 @@ code {
   font-family: var(--font-cond);
   font-size: 11px;
   font-weight: 700;
-  letter-spacing: .08em;
+  letter-spacing: .12em;
   text-transform: uppercase;
   color: var(--ark-paper-dim-ink);
   padding: 6px 10px 6px 0;

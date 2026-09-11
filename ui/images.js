@@ -149,12 +149,12 @@
       tr.appendChild(nameCell(img.tag));
 
       var sizeTd = document.createElement('td');
-      sizeTd.className = 'nowrap';
+      sizeTd.className = 'mono nowrap';
       sizeTd.textContent = formatBytes(img.size_bytes);
       tr.appendChild(sizeTd);
 
       var createdTd = document.createElement('td');
-      createdTd.className = 'nowrap';
+      createdTd.className = 'mono nowrap';
       if (isNone(img.created)) {
         createdTd.classList.add('none-text');
         createdTd.textContent = '<none>';

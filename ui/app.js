@@ -416,6 +416,61 @@
     }
   };
 
+  /**
+   * 确认文案三段式构建器:主问句 + 事实清单(键值对) + 风险提示。
+   *
+   * 此前 7 条确认渲染路径有 5 条是纯文本堆叠 —— 问句与「服务会短暂重启」
+   * 风险句同字号同色,信息层级全靠读;config-io 危险区是唯一有结构的,本
+   * 助手把它的层级语言(问句/事实/风险三段)上收为全站唯一口径。样式见
+   * .confirm-title / .confirm-facts / .confirm-fact / .confirm-risk。
+   *
+   * 返回 DOM 节点,按钮由调用方自行追加(各处按钮语义不同)。
+   *
+   * @param {Object} opts
+   * @param {string} opts.title 主问句(15px/700,「要…吗?」句式)
+   * @param {Array<Array<string>>|Array<string>} [opts.facts]
+   *   事实清单:二元数组 [键, 值] 渲染成「键: 值」(键加粗);
+   *   一元字符串则渲染为普通事实行
+   * @param {string} [opts.risk] 风险提示(琥珀色 + 3px 左条,末段)
+   * @returns {HTMLElement}
+   */
+  window.confirmBlock = function (opts) {
+    var root = document.createElement('div');
+    root.className = 'confirm-block';
+    if (opts && opts.title) {
+      var title = document.createElement('p');
+      title.className = 'confirm-title';
+      title.textContent = String(opts.title);
+      root.appendChild(title);
+    }
+    if (opts && opts.facts && opts.facts.length) {
+      var facts = document.createElement('div');
+      facts.className = 'confirm-facts';
+      for (var i = 0; i < opts.facts.length; i++) {
+        var item = opts.facts[i];
+        var line = document.createElement('div');
+        line.className = 'confirm-fact';
+        if (item && item.length === 2 && typeof item[0] === 'string') {
+          var key = document.createElement('b');
+          key.textContent = item[0] + ':';
+          line.appendChild(key);
+          line.appendChild(document.createTextNode(' ' + String(item[1])));
+        } else if (item) {
+          line.textContent = String(Array.isArray(item) ? item.join('') : item);
+        }
+        facts.appendChild(line);
+      }
+      root.appendChild(facts);
+    }
+    if (opts && opts.risk) {
+      var risk = document.createElement('p');
+      risk.className = 'confirm-risk';
+      risk.textContent = String(opts.risk);
+      root.appendChild(risk);
+    }
+    return root;
+  };
+
   // ===== 复制文本到剪贴板(成功 toast「已复制」)=====
   window.copyText = function (text) {
     function done() { window.toast('已复制', 'ok'); }

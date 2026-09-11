@@ -2972,13 +2972,11 @@
   }
 
   /** 模态内二次确认视图:确认执行后进入执行视图,取消返回列表视图 */
-  function renderRbConfirm(lines, onConfirm, onCancel) {
+  function renderRbConfirm(block, onConfirm, onCancel) {
     var body = rbBody();
     if (!body) return;
     body.textContent = '';
-    lines.forEach(function (line) {
-      body.appendChild(el('div', 'confirm-msg', line));
-    });
+    body.appendChild(window.confirmBlock(block));
     var actions = el('div', 'modal-actions');
     var cancel = el('button', 'btn', '取消');
     cancel.type = 'button';
@@ -2996,12 +2994,17 @@
     var rel = selectedRbRelease();
     if (!rel || st.rbBusy) return;
     var rec = st.rbRecord || {};
-    renderRbConfirm([
-      '确认把项目「' + String(rec.project_name || '') + '」@ 服务器「' +
+    renderRbConfirm({
+      title: '确认把项目「' + String(rec.project_name || '') + '」@ 服务器「' +
         String(rec.server_name || '') + '」回滚到发布 ' + String(rel.ts || '') + '?',
-      '将加载 ' + rbPackageCount(rel.files) +
-        ' 个镜像包 → 恢复 compose 副本(如有)→ compose up 重建全部服务,期间服务会短暂重启。'
-    ], function () {
+      facts: [
+        ['镜像包数', rbPackageCount(rel.files) + ' 个'],
+        ['服务清单', rel.hasManifest && Array.isArray(rel.services) && rel.services.length
+          ? rel.services.join('、') : '无清单记录,按镜像包恢复(docker load 自动恢复镜像原标签)'],
+        ['恢复方式', rel.hasComposeCopy ? '恢复 compose 副本后 compose up 重建' : '沿用服务器现有 compose 文件重建']
+      ],
+      risk: '期间服务会短暂重启;目标侧容器将被该归档版本重建。'
+    }, function () {
       beginRbExecution('rollback_execute_stack', {
         serverId: st.rbIds.serverId,
         projectId: st.rbIds.projectId,
@@ -3020,11 +3023,15 @@
       return;
     }
     var rec = st.rbRecord || {};
-    renderRbConfirm([
-      '确认把服务器「' + String(rec.server_name || '') + '」上的 ' +
+    renderRbConfirm({
+      title: '确认把服务器「' + String(rec.server_name || '') + '」上的 ' +
         (st.rbRepository || '') + ':' + dateTag + ' 重新指到「' + target + '」?',
-      '将把目标引用重新指向历史镜像(零拷贝 docker tag)→ compose up 重建引用该标签的服务,期间服务会短暂重启。'
-    ], function () {
+      facts: [
+        ['操作方式', '零拷贝 docker tag(不重新传输镜像)'],
+        ['重建范围', 'compose up 重建引用该标签的服务']
+      ],
+      risk: '期间服务会短暂重启。'
+    }, function () {
       beginRbExecution('rollback_execute_single', {
         serverId: st.rbIds.serverId,
         projectId: st.rbIds.projectId,
