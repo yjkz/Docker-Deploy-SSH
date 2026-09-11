@@ -318,6 +318,15 @@
     if (sp) sp.classList.toggle('hidden', tab !== 'stacks');
     var mp = $('manage-monitor-panel');  // C 阶段追加
     if (mp) mp.classList.toggle('hidden', tab !== 'monitor');
+    // pass 4(P4-F):面板显示时纵向微型 wipe(裁切揭示,与 modal-wipe /
+    // page-reveal 同族)。「移除 → reflow → 复加」重放一次性动画;
+    // reduced-motion 下由全局规则归零。
+    var shown = document.querySelector('.manage-tab-panel:not(.hidden)');
+    if (shown) {
+      shown.classList.remove('panel-wipe');
+      void shown.offsetWidth;
+      shown.classList.add('panel-wipe');
+    }
     if (tab !== 'monitor') monitorStop(true); // C 阶段追加:离开监控 Tab 自动停止
     // 面板高度已切换:立即恢复滚动位置(缓解钳制跳顶)
     applyPendingTabScrollNow();
@@ -1879,8 +1888,9 @@
   }
 
   // ===== 模态框 =====
-  // 触发元素记忆:openModal 时记录 document.activeElement,closeModal 时归还焦点
-  var modalTriggerEl = null;
+  // 焦点管理(pass 4 收编到 app.js 共用三件套):打开移焦入卡、关闭归还触发源、
+  // Tab 圈禁在卡内(document 级监听)。此前本模块私有的 modalTriggerEl 记忆
+  // 已由 window.modalFocusOpen/Close 的栈式记录取代。
 
   function openModal(title, bodyEl) {
     var modal = $('manage-modal');
@@ -1888,9 +1898,7 @@
     var body = $('manage-modal-body');
     if (!modal || !body) return;
     // 仅在模态从关闭态打开时记录触发元素(模态内重开不覆盖)
-    if (modal.classList.contains('hidden')) {
-      modalTriggerEl = document.activeElement || null;
-    }
+    var wasHidden = modal.classList.contains('hidden');
     if (titleEl) titleEl.textContent = title;
     body.innerHTML = '';
     if (bodyEl) body.appendChild(bodyEl);
@@ -1910,18 +1918,15 @@
       else card.classList.remove('modal-wide');
     }
     modal.classList.remove('hidden');
+    if (wasHidden) window.modalFocusOpen(modal);
   }
 
   function closeModal() {
     var modal = $('manage-modal');
     if (modal) modal.classList.add('hidden');
     execOnModalClose(); // C 阶段追加:模态框关闭时清理终端会话
-    // 焦点归还:模态关闭后把焦点还给打开它的元素(仅在元素仍于 DOM 时),
-    // 若该元素已被重渲染移除则静默跳过
-    if (modalTriggerEl) {
-      if (document.contains(modalTriggerEl)) modalTriggerEl.focus();
-      modalTriggerEl = null;
-    }
+    // 焦点归还:归还触发源(栈式记录;触发源已被重渲染移除则静默跳过)
+    window.modalFocusClose(modal);
   }
 
   function buildConfirmBody(message, confirmLabel, onConfirm, showForce, risk) {
@@ -2611,10 +2616,30 @@
     tbody.appendChild(frag);
   }
 
+  /** CPU 档位:<50 normal,50-80 warm,>80 hot;非数值返回 null */
+  function cpuTierOf(val) {
+    var num = parseFloat(val);
+    if (isNaN(num)) return null;
+    return num > 80 ? 'hot' : (num >= 50 ? 'warm' : 'normal');
+  }
+
   function updateStatRow(tr, s) {
+    // pass 4(P4-E):档位迁移检测须在重建行之前(旧档位挂在行属性上)。
+    // 先摘除 stat-flash 再按需「reflow + 复加」:类若常驻,重建的 td 每次刷新
+    // 都会重新命中动画选择器,变成每个刷新周期闪一次。
+    var tier = cpuTierOf(s.cpu_percent);
+    var prevTier = tr.getAttribute('data-stat-tier');
+    tr.classList.remove('stat-flash');
+    if (tier !== null) {
+      if (prevTier !== null && prevTier !== tier) {
+        void tr.offsetWidth;
+        tr.classList.add('stat-flash');
+      }
+      tr.setAttribute('data-stat-tier', tier);
+    }
     tr.innerHTML = '';
     tr.appendChild(mkStatTd(s.name || s.container_id || '—', true));
-    tr.appendChild(mkCpuTd(s.cpu_percent));
+    tr.appendChild(mkCpuTd(s.cpu_percent, tier));
     tr.appendChild(mkStatTd(s.mem_usage || '—', true));
     tr.appendChild(mkStatTd(s.mem_percent != null ? String(s.mem_percent) : '—', true));
     tr.appendChild(mkStatTd(s.net_io || '—', true));
@@ -2629,15 +2654,16 @@
     return td;
   }
 
-  function mkCpuTd(val) {
+  function mkCpuTd(val, tier) {
     var td = document.createElement('td');
     td.className = 'mono';
     var num = parseFloat(val);
     if (!isNaN(num)) {
       td.textContent = String(val);
-      // CPU% 阈值着色:<50 正常,50-80 黄,>80 红
-      if (num > 80) td.classList.add('stat-hot');
-      else if (num >= 50) td.classList.add('stat-warm');
+      // CPU% 阈值着色:<50 正常,50-80 预警,>80 过热;阈值语义以 title 承载
+      // (a11y color-not-only:档位不依赖纯颜色,悬停/辅助技术可读)
+      if (tier === 'hot') { td.classList.add('stat-hot'); td.title = 'CPU 高于 80%'; }
+      else if (tier === 'warm') { td.classList.add('stat-warm'); td.title = 'CPU 50%–80%'; }
     } else {
       td.textContent = val || '—';
     }

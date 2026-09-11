@@ -573,6 +573,7 @@
     st.session += 1; // 开启新会话:此前打开模态发起的异步回调全部视为过期
     buildBody(body);
     overlay.classList.remove('hidden');
+    window.modalFocusOpen(overlay);
     showResult('info', '正在读取通知配置…');
 
     window.AppBus.invoke('notify_get_config')
@@ -592,7 +593,10 @@
   function closeNotifyModal() {
     var overlay = document.getElementById('notify-modal');
     var body = document.getElementById('notify-modal-body');
-    if (overlay) overlay.classList.add('hidden');
+    if (overlay) {
+      overlay.classList.add('hidden');
+      window.modalFocusClose(overlay);
+    }
     if (body) body.textContent = ''; // 移除结果行,进行中的测试回写时自动丢弃
     // 会话收尾:复位进行中的防重标志,重开后的新模态可立即操作
     // (进行中的异步收尾经会话校验发现过期后不会再回写这些标志)

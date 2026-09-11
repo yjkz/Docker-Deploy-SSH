@@ -850,6 +850,20 @@
       var msg = node.querySelector('.deploy-step-msg');
       if (msg) msg.textContent = step === i ? String(message || '') : '';
     }
+    // 屏幕阅读器播报(pass 4):校准仪的视觉状态(done/current 类)SR 感知
+    // 不到,写入 #deploy-progress-live(sr-only + aria-live=polite)低频文本;
+    // 仅步骤边界更新(每步一次),高频 deploy-log 不播。0=重置,清空不播。
+    var live = document.getElementById('deploy-progress-live');
+    if (live) {
+      if (step > 0) {
+        var cur = document.getElementById('deploy-step-' + step);
+        var nameEl = cur ? cur.querySelector('.deploy-step-name') : null;
+        live.textContent = '步骤 ' + step + '/' + total + ':'
+          + (String(message || '') || (nameEl ? nameEl.textContent : '') || '');
+      } else {
+        live.textContent = '';
+      }
+    }
   }
 
   // ===== 部署日志(自动滚底,上限 2000 行,右下角行计数)=====
@@ -915,7 +929,16 @@
     if (tabStack) tabStack.setAttribute('aria-selected', String(mode === 'stack'));
 
     var panel = document.getElementById('deploy-stack-panel');
-    if (panel) panel.classList.toggle('hidden', mode !== 'stack');
+    if (panel) {
+      panel.classList.toggle('hidden', mode !== 'stack');
+      // pass 4(P4-F):整栈面板显示时纵向微型 wipe(同 manage Tab 面板,
+      // 与 modal-wipe/page-reveal 同族裁切语言)
+      if (!panel.classList.contains('hidden')) {
+        panel.classList.remove('panel-wipe');
+        void panel.offsetWidth;
+        panel.classList.add('panel-wipe');
+      }
+    }
 
     var hint = document.getElementById('deploy-project-hint');
     if (hint) {
@@ -1641,12 +1664,18 @@
     body.appendChild(actions);
 
     var modal = document.getElementById('deploy-batch-modal');
-    if (modal) modal.classList.remove('hidden');
+    if (modal) {
+      modal.classList.remove('hidden');
+      window.modalFocusOpen(modal);
+    }
   }
 
   function closeBatchModal() {
     var modal = document.getElementById('deploy-batch-modal');
-    if (modal) modal.classList.add('hidden');
+    if (modal) {
+      modal.classList.add('hidden');
+      window.modalFocusClose(modal);
+    }
   }
 
   /**
@@ -1841,22 +1870,29 @@
       name.textContent = (item.server.name || item.server.id) + ' (' + (item.server.host || '') + ')';
       row.appendChild(name);
       var badge = document.createElement('span');
-      var state, cls;
+      var state, kind;
       if (i < st.batch.idx) {
         var res = st.batch.results[i];
         if (res) {
-          if (res.state === 'success') { state = '成功'; cls = 'badge-running'; }
-          else if (res.state === 'skipped') { state = '已跳过'; cls = 'badge-info'; }
-          else { state = '失败'; cls = 'badge-paused'; }
+          // pass 4:成功/失败改用全站徽章口径(ok=青淡底 / fail=墨底),
+          // 原先错用容器状态类 badge-running/badge-paused —— 「成功」与
+          // 「部署中」同款、「失败」与「暂停」同款,语义错位
+          if (res.state === 'success') { state = '成功'; kind = 'ok'; }
+          else if (res.state === 'skipped') { state = '已跳过'; kind = 'info'; }
+          else { state = '失败'; kind = 'fail'; }
           if (res.message) row.title = res.message;
-        } else { state = '—'; cls = 'badge-info'; }
+        } else { state = '—'; kind = 'info'; }
       } else if (i === st.batch.idx && st.batch.active) {
-        state = '部署中'; cls = 'badge-running';
+        state = '部署中'; kind = 'running';
       } else {
-        state = '等待'; cls = 'badge-info';
+        state = '等待'; kind = 'info';
       }
-      badge.className = 'badge ' + cls;
-      badge.textContent = state;
+      if (kind === 'running') {
+        badge.className = 'badge badge-running';
+        badge.textContent = state;
+      } else {
+        window.fillBadge(badge, kind, state);
+      }
       row.appendChild(badge);
       panel.appendChild(row);
     }
@@ -1977,7 +2013,10 @@
     bindMigrateProjectListeners();
     renderMigrateProjectModal(project, servers, defaultSrc);
     var modal = document.getElementById('migrate-project-modal');
-    if (modal) modal.classList.remove('hidden');
+    if (modal) {
+      modal.classList.remove('hidden');
+      window.modalFocusOpen(modal);
+    }
   }
 
   function closeMigrateProjectModal() {
@@ -1986,7 +2025,10 @@
       return;
     }
     var modal = document.getElementById('migrate-project-modal');
-    if (modal) modal.classList.add('hidden');
+    if (modal) {
+      modal.classList.add('hidden');
+      window.modalFocusClose(modal);
+    }
   }
 
   /** 构建迁移模态内容(选择区 + 计划区 + 日志区) */
@@ -2602,7 +2644,10 @@
       return;
     }
     var overlay = rbOverlay();
-    if (overlay) overlay.classList.add('hidden');
+    if (overlay) {
+      overlay.classList.add('hidden');
+      window.modalFocusClose(overlay);
+    }
     st.rbKind = '';
     st.rbRecord = null;
     st.rbIds = null;
@@ -2652,6 +2697,7 @@
     var overlay = rbOverlay();
     if (!overlay) return;
     overlay.classList.remove('hidden');
+    window.modalFocusOpen(overlay);
     setRbCloseDisabled(false);
 
     var title = document.getElementById('deploy-modal-title');

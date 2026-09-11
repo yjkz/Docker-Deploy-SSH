@@ -356,11 +356,15 @@
     appendDangerGroup(body);
     bindWipeConfirm();
     overlay.classList.remove('hidden');
+    window.modalFocusOpen(overlay);
   }
 
   function closeConfigIoModal() {
     var overlay = document.getElementById('config-io-modal');
-    if (overlay) overlay.classList.add('hidden');
+    if (overlay) {
+      overlay.classList.add('hidden');
+      window.modalFocusClose(overlay);
+    }
   }
 
   // ===== 初始化(入口按钮 / 模态三通道关闭)=====

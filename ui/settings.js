@@ -550,6 +550,7 @@
     st.session += 1; // 开启新会话:此前打开模态发起的异步回调全部视为过期
     buildBody(body);
     overlay.classList.remove('hidden');
+    window.modalFocusOpen(overlay);
     showUpdateMessage('info', '正在读取设置…');
 
     // 外观单选来自 localStorage(即时生效,不经后端);通用/更新来自 app_settings_get
@@ -574,7 +575,10 @@
   function closeSettingsModal() {
     var overlay = document.getElementById('settings-modal');
     var body = document.getElementById('settings-modal-body');
-    if (overlay) overlay.classList.add('hidden');
+    if (overlay) {
+      overlay.classList.add('hidden');
+      window.modalFocusClose(overlay);
+    }
     if (body) body.textContent = ''; // 移除结果区,进行中的异步回写时自动丢弃
     // 会话收尾:复位进行中的防重标志,重开后的新模态可立即操作
     st.saving = false;

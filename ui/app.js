@@ -8,7 +8,12 @@
  * - window.AppBus.invoke / on     Tauri 命令与事件的薄封装
  * - window.AppBus.pickPath(opts)  系统文件/目录选择对话框(tauri-plugin-dialog)
  *                                 → Promise<string|null>(null = 取消/不可用)
- * - window.toast(msg, type)       右下角 Toast(2.5 秒自动消失)
+ * - window.toast(msg, type)       右下角 Toast(2.5 秒自动消失;ok/info=status
+ *                                 礼貌播报,warn/fail=alert 断言播报)
+ * - window.modalFocusOpen(el)     模态打开后调用:记录触发源 + 移焦入卡
+ * - window.modalFocusClose(el)    模态关闭后调用:归还该模态触发源焦点
+ *                                 (Tab 圈禁由本文件的 document 级监听承担,
+ *                                 10 个模态共用;见「模态焦点管理」节)
  * - window.copyText(text)         复制文本到剪贴板(成功 toast「已复制」)
  * - window.toggleScheme(evt)      亮暗主题切换(View Transitions 圆形扩散揭示,
  *                                 持久化 localStorage['dd_scheme'])
@@ -179,8 +184,19 @@
   window.toast = function (message, type) {
     var container = document.getElementById('toast-container');
     if (!container) return;
+    var kind = type || 'info';
     var el = document.createElement('div');
-    el.className = 'toast toast-' + (type || 'info');
+    el.className = 'toast toast-' + kind;
+    // 屏幕阅读器播报(契约 toast-accessibility:不抢焦点 + aria-live):
+    // 成功/信息走 status 礼貌播报;警示/失败走 alert 断言播报 —— 此前 toast
+    // 是纯文本 div,操作结果对 SR 完全不可见(全仓唯一的 live region 只在
+    // servers.js 的表单聚合错误框上)。
+    if (kind === 'warn' || kind === 'fail') {
+      el.setAttribute('role', 'alert');
+    } else {
+      el.setAttribute('role', 'status');
+      el.setAttribute('aria-live', 'polite');
+    }
     el.textContent = message;
     container.appendChild(el);
     window.requestAnimationFrame(function () {
@@ -268,6 +284,88 @@
     }
     return btn;
   };
+
+  // ===== 模态焦点管理(pass 4;契约:focus-management / keyboard-nav / escape-routes)=====
+  // 约定:打开时移焦入卡(容器 tabindex=-1 落点,SR 报 dialog 名)、关闭时
+  // 归还触发源、Tab 循环圈禁在卡内。此前 10 个模态只有 manage(关时还焦)与
+  // help(开时移焦)各做了半套 —— aria-modal="true" 已声明而焦点仍留在触发
+  // 按钮,屏幕阅读器既不知道对话框打开,关闭后也回不到上下文。
+  // 栈式记录:cleanup-modal 可叠在 servers-modal 之上,逐层开关互不串位。
+  var _modalFocusStack = [];
+
+  /** 卡内可聚焦元素选择器(可见性由 Tab 圈禁处按 offsetParent 过滤) */
+  var MODAL_FOCUSABLE = 'a[href], button:not([disabled]), '
+    + 'input:not([disabled]):not([type="hidden"]), select:not([disabled]), '
+    + 'textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+  /**
+   * 模态打开后调用:记录触发源 + 移焦入卡(容器落点)。
+   * @param {HTMLElement} overlay .modal-overlay 根节点
+   */
+  window.modalFocusOpen = function (overlay) {
+    if (!overlay) return;
+    var card = overlay.querySelector('.modal-card');
+    if (!card) return;
+    _modalFocusStack.push({
+      card: card,
+      trigger: (document.activeElement instanceof HTMLElement) ? document.activeElement : null
+    });
+    card.setAttribute('tabindex', '-1');
+    card.focus({ preventScroll: true });
+  };
+
+  /**
+   * 模态关闭后调用:归还该模态的触发源焦点(触发源已从 DOM 移除则跳过)。
+   * @param {HTMLElement} [overlay] 模态根节点;省略按栈顶处理
+   */
+  window.modalFocusClose = function (overlay) {
+    var idx = -1;
+    if (overlay) {
+      var card = overlay.querySelector('.modal-card');
+      for (var i = _modalFocusStack.length - 1; i >= 0; i--) {
+        if (_modalFocusStack[i].card === card) { idx = i; break; }
+      }
+    } else if (_modalFocusStack.length) {
+      idx = _modalFocusStack.length - 1;
+    }
+    if (idx === -1) return;
+    var rec = _modalFocusStack.splice(idx, 1)[0];
+    if (rec.trigger && rec.trigger.isConnected) {
+      rec.trigger.focus({ preventScroll: true });
+    }
+  };
+
+  // Tab 圈禁:模态开启期间 Tab/Shift+Tab 在卡内循环(取 DOM 序最后的开启
+  // 模态 = 视觉最上层,嵌套场景圈在最上层卡内)。容器落点(card 自身持有
+  // 焦点)时 Tab 自然进第一个控件,无需特殊处理。
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Tab') return;
+    var open = document.querySelectorAll('.modal-overlay:not(.hidden)');
+    if (!open.length) return;
+    var card = open[open.length - 1].querySelector('.modal-card');
+    if (!card) return;
+    var items = [];
+    var all = card.querySelectorAll(MODAL_FOCUSABLE);
+    for (var i = 0; i < all.length; i++) {
+      // offsetParent===null 排除 .hidden 面板内的控件(模态内无 fixed 容器)
+      if (all[i].offsetParent !== null) items.push(all[i]);
+    }
+    if (!items.length) return;
+    var first = items[0];
+    var last = items[items.length - 1];
+    var active = document.activeElement;
+    // 容器落点(card 自身持有焦点)视作「圈外」:Tab → 首个,Shift+Tab → 末个
+    var inCard = active !== card && card.contains(active);
+    if (e.shiftKey) {
+      if (!inCard || active === first) {
+        e.preventDefault();
+        last.focus();
+      }
+    } else if (!inCard || active === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  });
 
   // ===== 表单构建与错误处理(本轮统一;此前各模块各自手搓且能力不一)=====
 
@@ -470,6 +568,25 @@
     }
     return root;
   };
+
+  // ===== 截断单元格悬停补全文本(pass 4;契约 truncation-strategy)=====
+  // 以省略号截断的元素,悬停时若真发生了溢出(scrollWidth > clientWidth)
+  // 才把完整文本写入 title —— 委托监听,零渲染路径改动,不扰未截断元素。
+  // 类清单 = 全站带 ellipsis 截断的数据单元格/行(与 style.css 对应)。
+  document.addEventListener('mouseover', function (e) {
+    var t = e.target;
+    if (!(t instanceof Element) || t.title) return;
+    var mark = ' text-truncate port-cell rollback-item-name rollback-item-compose'
+      + ' cleanup-item cleanup-project-dir cleanup-warn-row cleanup-diag-cmd ';
+    var cls = ' ' + t.className + ' ';
+    var hit = false;
+    var names = mark.split(/\s+/);
+    for (var i = 0; i < names.length; i++) {
+      if (names[i] && cls.indexOf(' ' + names[i] + ' ') !== -1) { hit = true; break; }
+    }
+    if (!hit) return;
+    if (t.scrollWidth > t.clientWidth + 1) t.title = t.textContent;
+  });
 
   // ===== 复制文本到剪贴板(成功 toast「已复制」)=====
   window.copyText = function (text) {

@@ -439,6 +439,10 @@
           </div>
         </div>
 
+        <!-- 屏幕阅读器步骤播报(pass 4):校准仪节点的视觉状态 SR 感知不到,
+             步骤切换时由 deploy.js 写入「步骤 N/M:名称」低频文本 -->
+        <div id="deploy-progress-live" class="sr-only" aria-live="polite"></div>
+
         <!-- 部署日志(墨黑面板,自动滚底;上限 2000 行,超出丢弃最旧;右下角行计数) -->
         <div class="log-shell">
           <pre id="deploy-log" class="deploy-log"></pre>

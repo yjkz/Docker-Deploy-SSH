@@ -495,13 +495,17 @@
       navBuilt = true;
     }
     modal.classList.remove('hidden');
-    var closeBtn = $('help-modal-close');
-    if (closeBtn) closeBtn.focus();
+    // 焦点管理(pass 4 收编):移焦入卡(容器落点),关闭时归还触发源;
+    // 原先「聚焦关闭按钮」的私有实现由共用三件套取代
+    window.modalFocusOpen(modal);
   }
 
   function closeHelp() {
     var modal = $('help-modal');
-    if (modal) modal.classList.add('hidden');
+    if (modal) {
+      modal.classList.add('hidden');
+      window.modalFocusClose(modal);
+    }
   }
 
   // ===== 初始化(DOMContentLoaded 后绑定)=====

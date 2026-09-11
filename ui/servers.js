@@ -516,7 +516,10 @@
 
   function closeCleanupModal() {
     var m = cleanupModal();
-    if (m) m.classList.add('hidden');
+    if (m) {
+      m.classList.add('hidden');
+      window.modalFocusClose(m);
+    }
     // 模态关闭即解除卡片 busy(执行标志由关闭时统一复位)
     st.pruning[st.cleanupServerId || ''] = false;
     st.cleanupServerId = null;
@@ -534,6 +537,7 @@
     // 记住本次报告:执行时按它把勾选项翻译成显式目标列表
     st.cleanupReport = null;
     modal.classList.remove('hidden');
+    window.modalFocusOpen(modal);
     var body = cleanupBody();
     body.innerHTML = '';
     var title = document.getElementById('cleanup-modal-title');
@@ -1581,11 +1585,15 @@
     bodyEl.textContent = '';
     buildBody(bodyEl);
     overlay.classList.remove('hidden');
+    window.modalFocusOpen(overlay);
   }
 
   function closeModal() {
     var overlay = document.getElementById('servers-modal');
-    if (overlay) overlay.classList.add('hidden');
+    if (overlay) {
+      overlay.classList.add('hidden');
+      window.modalFocusClose(overlay);
+    }
   }
 
   /**

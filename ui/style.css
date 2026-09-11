@@ -2,7 +2,7 @@
    DockerDeploy SSH — 全站样式(ark light / 纸面反转 重构)
    设计契约:data-ark-theme="ark" + data-ark-depth="complex" + data-ark-scheme="light|dark"
    墨黑(ink)负责文字/规则线/黑壳;纸白(paper)≥75% 构图;
-   青(signal)仅激活/进行中/主操作;酸绿仅成功徽章底;琥珀仅警示。
+   青(signal)仅激活/进行中/主操作;琥珀仅警示;失败=墨底白字(不用红)。
    暗色 scheme 仅翻转 :root token 值,组件规则不复制;常暗表面(dock/终端)例外。
    禁圆角(radius 0,输入框最多 2px)、禁 emoji 图标、禁氛围动效。
    ============================================================ */
@@ -89,7 +89,6 @@
   --ark-terminal-fg: #f4f6f6;        /* 终端文字(常暗表面,两主题固定浅色) */
   --ark-signal: #18d1ff;     /* 青:激活 / 进行中 / 主操作 */
   --ark-signal-dim: #d7f4fd; /* 青 12% 淡底:通过水印 / 选中底 */
-  --ark-ok: #c8eb21;         /* 酸绿:仅成功徽章底(配墨字,当前组件未引用,预留) */
   --ark-warn: #ffd23f;       /* 琥珀:仅警示底(墨字) */
   --ark-fail: var(--ark-ink); /* 失败:墨底白字(双色纪律,不用红;暗色随墨纸翻转) */
   --ark-line: rgba(8, 10, 11, .85);
@@ -97,7 +96,7 @@
   --ark-paper-dim-ink: rgba(8, 10, 11, .62);  /* 微标签墨(alpha .62:亮色纸面上对比过 AA,审计 P1-1;暗色保持 .5) */
   --ark-paper-ink-65: rgba(8, 10, 11, .65);   /* 次级文字墨 */
   --ark-paper-ink-70: rgba(8, 10, 11, .70);   /* 三级文字墨(第六批补:此前被 2931/2985 引用但从未定义,回退到 inherit 使那两处层级失效) */
-  --ark-ink-35: rgba(8, 10, 11, .45);         /* 占位符 / 弱化 mono 文字(P2-1:亮侧 .35→.45,纸面 ≈2.6:1→≈3.1:1;token 名保留 -35 记录沿用史,值以注释为准) */
+  --ark-ink-faint: rgba(8, 10, 11, .45);      /* 占位符 / 弱化 mono 文字(P2-1:亮侧 .45,纸面 ≈3.1:1;pass 4 由 --ark-ink-35 改语义名——亮侧值 .45、暗侧 .35,数字后缀名不副实) */
   --ark-on-signal: #080a0b;            /* 青色实心底上的文字(青恒亮,两主题固定墨色) */
   --ark-on-warn: #080a0b;              /* 琥珀底上的文字(琥珀恒亮,两主题固定墨色) */
   --ark-stat-warm: #7a5f00;            /* 预警状态文字(亮):纸面上的暗琥珀,过 AA */
@@ -121,18 +120,40 @@
   --font-cond: "Space Grotesk", "Saira Condensed", "Arial Narrow", "Segoe UI", sans-serif;
   --font-mono: "JetBrains Mono", "Cascadia Mono", "SFMono-Regular", Consolas, "Courier New", monospace;
 
-  /* ===== 动效 token(第六批新增)=====
+  /* ===== 动效 token(第六批立约;pass 4 收敛完成)=====
      ark 契约的时长带:直接交互 180-350ms / 区域揭示 500-900ms /
-     注意力循环 1.6-2.4s;按压反馈需在 100ms 内。此前全站 13 处 transition
-     全写字面量 .18s 且无 token,本轮补齐;既有规则不做机械替换(控制改动
-     面),新规则与新调整一律走 token。
+     注意力循环 1.6-2.4s;按压反馈需在 100ms 内。全站 transition/animation
+     一律走本块 token,不再写时长字面量。
+     缓动约定:到达/离开统一 --ark-ease-out;注意力循环(呼吸/脉冲)保留
+     关键字 ease-in-out / ease-out —— 循环无「到达」语义,改曲线会破坏既有
+     节奏;数据步进 = steps()(契约认可的唯一离散用法,见 .btn-busy-bar)。
      圆角策略:默认 0 是 ark 的身份特征,仅功能性控件允许 2-4px —— 不用
      token 表达(避免被误当可调项),由各组件显式声明。 */
-  --ark-dur-press: .09s;    /* 按压即时反馈(<100ms,契约要求) */
-  --ark-dur-fast: .18s;     /* 交互基线(= 全站现有值,零视觉变更) */
-  --ark-dur-modal: .22s;    /* 模态出入场 */
-  --ark-dur-reveal: .45s;   /* 区域揭示(= 现有 page-reveal) */
-  --ark-ease-out: cubic-bezier(.22, .61, .36, 1); /* 到达减速(= 现有 scheme-reveal 曲线) */
+  --ark-dur-press: .09s;     /* 按压即时反馈(<100ms,契约要求) */
+  --ark-dur-fast: .18s;      /* 交互基线(hover/颜色/微型揭示) */
+  --ark-dur-modal: .22s;     /* 模态出入场 / 浮层(toast)过渡 */
+  --ark-dur-reveal: .45s;    /* 区域揭示(page-reveal / 阈值 tick) */
+  --ark-dur-attention: 1.8s; /* 注意力循环(arm-breath / step-pulse) */
+  --ark-dur-scheme: .5s;     /* 主题切换 View Transitions */
+  --ark-dur-ticker: .9s;     /* 数据步进 busy 条(btn-step) */
+  --ark-ease-out: cubic-bezier(.22, .61, .36, 1); /* 到达减速(= scheme-reveal 曲线) */
+
+  /* ===== 海拔阴影 token(pass 4):ark 禁柔光阴影,浮层仅两级海拔,
+     颜色统一 --ark-shadow;平面状态强调用 inset 左信号条(母题),不走阴影 ===== */
+  --ark-shadow-float: 0 6px 16px var(--ark-shadow);  /* 海拔 1:悬浮控件(help-fab / toast) */
+  --ark-shadow-modal: 0 12px 32px var(--ark-shadow); /* 海拔 2:模态卡片 */
+
+  /* ===== z-index 阶梯(pass 4 token 化,值 = 既有层级:
+     内容 < 校准节点 < help-fab < 模态遮罩 < toast)===== */
+  --ark-z-step: 1;
+  --ark-z-fab: 880;
+  --ark-z-overlay: 900;
+  --ark-z-toast: 9999;
+
+  /* 琥珀派生(pass 4 沉淀,原组件级 color-mix 字面量;琥珀恒亮,两主题同值) */
+  --ark-warn-45: color-mix(in srgb, var(--ark-warn) 45%, transparent);
+  --ark-warn-50: color-mix(in srgb, var(--ark-warn) 50%, transparent);
+  --ark-warn-60: color-mix(in srgb, var(--ark-warn) 60%, transparent);
 }
 
 /* 暗色 scheme(方案 A「作战控制台」):仅翻转 token 值,组件规则零复制。
@@ -147,13 +168,12 @@
   --ark-dock-bg: #050607;             /* dock 比舞台更深一档 */
   --ark-terminal-bg: #0d1113;         /* 终端面板(组件区已附 1px 线描边) */
   --ark-signal-dim: rgba(24, 209, 255, .14);
-  --ark-ok: rgba(200, 235, 33, .16);
   --ark-line: rgba(244, 246, 246, .85);
   --ark-line-soft: rgba(244, 246, 246, .18);
   --ark-paper-dim-ink: rgba(244, 246, 246, .5);
   --ark-paper-ink-65: rgba(244, 246, 246, .65);
   --ark-paper-ink-70: rgba(244, 246, 246, .70); /* 三级文字墨(暗):与亮侧同族,按 scheme 调 alpha 先例 */
-  --ark-ink-35: rgba(244, 246, 246, .35); /* 暗侧保持 .35(P2-1):近黑上 ≈3.0:1,与亮侧 .45 的 ≈3.1:1 持平,同 --ark-paper-dim-ink 的按 scheme 调 alpha 先例 */
+  --ark-ink-faint: rgba(244, 246, 246, .35); /* 暗侧保持 .35(P2-1):近黑上 ≈3.0:1,与亮侧 .45 的 ≈3.1:1 持平,同 --ark-paper-dim-ink 的按 scheme 调 alpha 先例 */
   --ark-on-signal-dim: var(--ark-signal); /* 青淡底上改用青字 */
   --ark-on-ink-55: rgba(8, 10, 11, .6); /* alpha .6:反白行(纸白底)上对比度过 WCAG AA */
   --ark-overlay: rgba(0, 0, 0, .62);
@@ -230,7 +250,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   font-family: inherit;
   font-size: 11px;
   cursor: pointer;
-  transition: color .18s ease, background .18s ease;
+  transition: color var(--ark-dur-fast) var(--ark-ease-out), background var(--ark-dur-fast) var(--ark-ease-out);
 }
 .dock-num {
   font-family: var(--font-mono);
@@ -286,7 +306,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   background: transparent;
   color: var(--ink-on-paper-72);
   cursor: pointer;
-  transition: color .18s ease, background .18s ease;
+  transition: color var(--ark-dur-fast) var(--ark-ease-out), background var(--ark-dur-fast) var(--ark-ease-out);
 }
 .scheme-toggle:hover { color: var(--ark-dock-text-strong); background: var(--ink-on-paper-05); }
 .scheme-ico { width: 16px; height: 16px; flex: none; }
@@ -326,7 +346,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   from { clip-path: inset(0 0 0 100%); }
   to   { clip-path: inset(0 0 0 0); }
 }
-.page.page-reveal { animation: page-reveal .45s ease-out; }
+.page.page-reveal { animation: page-reveal var(--ark-dur-reveal) var(--ark-ease-out); }
 
 /* ===== 页首体系:超大 condensed 编号 + 双语标题 + 右侧工具 ===== */
 .page-head {
@@ -480,7 +500,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
   /* 三段步进:渐变画出三个方块,整体位移一格循环 */
   mask-image: repeating-linear-gradient(to right, #000 0 3px, transparent 3px 6px);
   -webkit-mask-image: repeating-linear-gradient(to right, #000 0 3px, transparent 3px 6px);
-  animation: btn-step .9s steps(6, end) infinite;
+  animation: btn-step var(--ark-dur-ticker) steps(6, end) infinite;
 }
 @keyframes btn-step {
   from { transform: translateX(-6px); }
@@ -497,7 +517,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
 .btn.is-armed {
   outline: 2px solid var(--ark-signal);
   outline-offset: 1px;
-  animation: arm-breath 1.8s ease-in-out infinite;
+  animation: arm-breath var(--ark-dur-attention) ease-in-out infinite;
 }
 @keyframes arm-breath {
   0%, 100% { outline-color: var(--ark-signal); }
@@ -537,7 +557,7 @@ input[type="checkbox"] { accent-color: var(--ark-ink); }
 }
 .text-input::placeholder,
 .form-input::placeholder,
-.mapping-input::placeholder { color: var(--ark-ink-35); }
+.mapping-input::placeholder { color: var(--ark-ink-faint); }
 
 /* 禁用(第六批补齐):此前四个输入类完全没有 :disabled 样式,禁用输入框与
    可编辑状态外观一致,只能靠试打一个字才发现不可输入。 */
@@ -810,7 +830,7 @@ select.text-input option,
 .data-table .none-text {
   font-family: var(--font-mono);
   font-style: italic;
-  color: var(--ark-ink-35);
+  color: var(--ark-ink-faint);
 }
 .data-table .nowrap { white-space: nowrap; }
 .data-table td.empty-cell {
@@ -965,7 +985,7 @@ select.text-input option,
 .modal-overlay {
   position: fixed;
   inset: 0;
-  z-index: 900;
+  z-index: var(--ark-z-overlay);
   background: var(--ark-overlay);
   display: flex;
   align-items: flex-start;
@@ -1001,7 +1021,7 @@ select.text-input option,
   border-top: 3px solid var(--ark-ink);
   width: 560px;
   max-width: 100%;
-  box-shadow: 0 12px 32px var(--ark-shadow);
+  box-shadow: var(--ark-shadow-modal);
   /* 卡片自上而下裁切揭示:契约要求「不要只靠透明度做状态变化,要加方向或
      裁切」,且与切页的 page-reveal 裁切语言同族(那个是横向,此处纵向)。
      出场不另做动画 —— 由遮罩淡出带走,出场短于入场符合契约。 */
@@ -1028,7 +1048,7 @@ select.text-input option,
   letter-spacing: .1em;
   color: var(--ark-ink);
   padding: 4px 10px;
-  transition: background .18s ease;
+  transition: background var(--ark-dur-fast) var(--ark-ease-out);
 }
 .modal-close:hover { background: var(--ark-paper-dim); border-color: var(--ark-line); }
 .modal-body { padding: 16px 18px; }
@@ -1155,7 +1175,7 @@ select.text-input option,
   border-bottom-color: var(--ark-signal);
   box-shadow: inset 3px 0 0 var(--ark-signal);
 }
-.form-textarea::placeholder { color: var(--ark-ink-35); }
+.form-textarea::placeholder { color: var(--ark-ink-faint); }
 
 /* 预设命令 chips:1px 墨线空心小按钮,点击插入模板(悬停墨底反白) */
 .chip-row {
@@ -1174,7 +1194,7 @@ select.text-input option,
   font-size: 11px;
   letter-spacing: .04em;
   cursor: pointer;
-  transition: background .18s ease, color .18s ease, border-color .18s ease;
+  transition: background var(--ark-dur-fast) var(--ark-ease-out), color var(--ark-dur-fast) var(--ark-ease-out), border-color var(--ark-dur-fast) var(--ark-ease-out);
 }
 .preset-chip:hover {
   background: var(--ark-ink);
@@ -1270,7 +1290,7 @@ select.text-input option,
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
-  transition: color .18s ease, background .18s ease;
+  transition: color var(--ark-dur-fast) var(--ark-ease-out), background var(--ark-dur-fast) var(--ark-ease-out);
 }
 .mode-tab + .mode-tab { border-left: 1px solid var(--ark-line-soft); }
 .mode-tab:hover { color: var(--ark-ink); background: var(--ark-paper-dim); }
@@ -1432,7 +1452,7 @@ select.text-input option,
 }
 .deploy-step-box {
   position: relative;
-  z-index: 1;
+  z-index: var(--ark-z-step);
   width: 52px;
   height: 52px;
   display: flex;
@@ -1476,8 +1496,12 @@ select.text-input option,
   100% { box-shadow: 0 0 0 0 var(--ark-signal-0); }
 }
 .deploy-step.current .deploy-step-box {
-  border: 2px solid var(--ark-signal);
-  animation: step-pulse 1.8s ease-out infinite;
+  border-color: var(--ark-signal);
+  /* pass 4:「1px 边框 + 1px 内缩 outline」替代原 2px 边框 —— 视觉同为 2px
+     青环,但 outline 不参与布局,消除节点 1px 位移(原 1px→2px 会推挤盒尺寸) */
+  outline: 1px solid var(--ark-signal);
+  outline-offset: -1px;
+  animation: step-pulse var(--ark-dur-attention) ease-out infinite;
 }
 .deploy-step-name {
   margin-top: 10px;
@@ -1536,7 +1560,7 @@ select.text-input option,
   position: fixed;
   right: 18px;
   bottom: 18px;
-  z-index: 9999;
+  z-index: var(--ark-z-toast);
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -1548,11 +1572,14 @@ select.text-input option,
   background: var(--ark-ink);
   color: var(--ark-paper);
   border-left: 4px solid var(--ark-signal);
+  /* 海拔 1(pass 4):toast 悬浮于内容之上,补浮层阴影增强分离度;
+     ark 禁柔光阴影的例外同 help-fab——仅浮层元素使用,平面元素不用 */
+  box-shadow: var(--ark-shadow-float);
   font-size: 13px;
   overflow-wrap: anywhere;
   opacity: 0;
   transform: translateY(8px);
-  transition: opacity .22s ease, transform .22s ease;
+  transition: opacity var(--ark-dur-modal) var(--ark-ease-out), transform var(--ark-dur-modal) var(--ark-ease-out);
 }
 .toast-show { opacity: 1; transform: none; }
 .toast-ok, .toast-info { border-left-color: var(--ark-signal); }
@@ -1563,9 +1590,9 @@ select.text-input option,
 /* 旧状态定格退为暗淡底,新状态在其上方揭示;圆心/半径由 app.js 写入根节点变量 */
 ::view-transition-old(root),
 ::view-transition-new(root) { animation: none; mix-blend-mode: normal; }
-::view-transition-old(root) { animation: scheme-fade .5s ease both; }
+::view-transition-old(root) { animation: scheme-fade var(--ark-dur-scheme) var(--ark-ease-out) both; }
 ::view-transition-new(root) {
-  animation: scheme-reveal .5s cubic-bezier(.22, .61, .36, 1) both;
+  animation: scheme-reveal var(--ark-dur-scheme) var(--ark-ease-out) both;
   clip-path: circle(0px at var(--scheme-x, 100%) var(--scheme-y, 0));
 }
 @keyframes scheme-fade { to { opacity: .35; } }
@@ -1697,7 +1724,7 @@ select.text-input option,
   width: auto;
 }
 .manage-interval-select:disabled {
-  opacity: 0.45;
+  opacity: .45;
   cursor: not-allowed;
 }
 /* 自定义间隔的行内输入(本轮替换 window.prompt:系统对话框违反本项目
@@ -1723,7 +1750,7 @@ select.text-input option,
   left: 0;
   padding: 4px 10px;
   font-size: 11px;
-  letter-spacing: 0.12em;
+  letter-spacing: .12em;
   text-transform: uppercase;
   background: var(--ark-ink);
   color: var(--ark-paper);
@@ -1751,7 +1778,7 @@ select.text-input option,
 }
 .overview-label {
   font-size: 11px;
-  letter-spacing: 0.08em;
+  letter-spacing: .08em;
   text-transform: uppercase;
   color: var(--ark-paper-dim-ink);
   font-family: var(--font-cond);
@@ -1781,10 +1808,10 @@ select.text-input option,
   margin-bottom: -2px;
   font-family: var(--font-cjk);
   font-size: 13px;
-  letter-spacing: 0.04em;
+  letter-spacing: .04em;
   color: var(--ark-paper-ink-65);
   cursor: pointer;
-  transition: color .18s; /* 审计 P2-8:.15s → .18s,归入契约交互带 180-350ms */
+  transition: color var(--ark-dur-fast) var(--ark-ease-out); /* pass 4:字面量 → token(补齐缺失的缓动) */
 }
 .manage-tab:hover { color: var(--ark-ink); }
 .manage-tab.active {
@@ -1849,7 +1876,7 @@ select.text-input option,
 .inspect-item-wide { grid-column: span 3; }
 .inspect-label {
   font-size: 11px;
-  letter-spacing: 0.08em;
+  letter-spacing: .08em;
   text-transform: uppercase;
   color: var(--ark-paper-dim-ink);
   font-family: var(--font-cond);
@@ -1960,26 +1987,24 @@ select.text-input option,
   margin-top: 16px;
 }
 
-/* ===== 容器状态徽章变体 ===== */
+/* ===== 容器状态徽章变体 =====
+   pass 4:四个变体原先都声明 border-color,但 .badge 基类没有 border 属性,
+   属无效声明(与 .badge-info 组合时也被 info 自己的 border 覆盖),删除。 */
 .badge-running {
   background: var(--ark-signal);
   color: var(--ark-on-signal);
-  border-color: var(--ark-signal);
 }
 .badge-exited {
   background: transparent;
   color: var(--ark-paper-ink-65);
-  border-color: var(--ark-line-soft);
 }
 .badge-paused {
   background: var(--ark-warn);
   color: var(--ark-on-warn);
-  border-color: var(--ark-warn);
 }
 .badge-created {
   background: transparent;
   color: var(--ark-paper-ink-65);
-  border-color: var(--ark-line-soft);
 }
 
 /* ===== 响应式:窄屏概览网格降列 ===== */
@@ -2017,13 +2042,13 @@ select.text-input option,
   background: transparent;
   border-color: var(--ark-line-soft);
   color: var(--ark-paper-ink-65);
-  transition: background .18s ease, color .18s ease,
-              border-color .18s ease, transform .18s ease; /* P2-8:.15s → .18s */
+  transition: background var(--ark-dur-fast) var(--ark-ease-out), color var(--ark-dur-fast) var(--ark-ease-out),
+              border-color var(--ark-dur-fast) var(--ark-ease-out), transform var(--ark-dur-fast) var(--ark-ease-out);
 }
 .action-btn-group .btn-sm::before {
   width: 3px;
   background: var(--ark-line-soft);
-  transition: background .18s ease; /* P2-8:.15s → .18s */
+  transition: background var(--ark-dur-fast) var(--ark-ease-out);
 }
 
 /* 普通按钮 hover:纸底+墨边+青楔形 */
@@ -2047,7 +2072,7 @@ select.text-input option,
   color: var(--ark-warn-text);
 }
 .action-btn-group .btn-sm.btn-danger::before {
-  background: color-mix(in srgb, var(--ark-warn) 60%, transparent);
+  background: var(--ark-warn-60);
 }
 
 /* 删除按钮 hover:琥珀底+墨字 */
@@ -2097,10 +2122,10 @@ select.text-input option,
 /* 行 hover + 删除按钮:琥珀色(两主题通用,琥珀恒亮) */
 .data-table tbody tr:hover .action-btn-group .btn-sm.btn-danger {
   color: var(--ark-warn);
-  border-color: color-mix(in srgb, var(--ark-warn) 45%, transparent);
+  border-color: var(--ark-warn-45);
 }
 .data-table tbody tr:hover .action-btn-group .btn-sm.btn-danger::before {
-  background: color-mix(in srgb, var(--ark-warn) 50%, transparent);
+  background: var(--ark-warn-50);
 }
 .data-table tbody tr:hover .action-btn-group .btn-sm.btn-danger:hover {
   background: var(--ark-warn);
@@ -2188,7 +2213,7 @@ select.text-input option,
 
 /* ============================================================
  * C 阶段追加:Compose 栈 / 实时监控 / 容器 Exec 终端
- * 遵循 ark-ui:墨 #080a0b / 纸 #f4f6f6 / 信号青 #18d1ff / 状态黄 --ark-warn:#ffd23f（#c8eb21 为 --ark-ok 酸绿，预留）
+ * 遵循 ark-ui:墨 #080a0b / 纸 #f4f6f6 / 信号青 #18d1ff / 状态黄 --ark-warn:#ffd23f（不用红,成功=墨底白字）
  * ============================================================ */
 
 /* 监控面板 CPU% 阈值着色(scheme 感知状态文字 token,审计 P1-3) */
@@ -2402,7 +2427,7 @@ select.text-input option,
   position: fixed;
   right: 24px;
   bottom: 24px;
-  z-index: 880;
+  z-index: var(--ark-z-fab);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2419,9 +2444,9 @@ select.text-input option,
   font-weight: 700;
   line-height: 1;
   cursor: pointer;
-  box-shadow: 0 6px 16px var(--ark-shadow);
-  transition: background .18s ease, color .18s ease, border-color .18s ease,
-    transform .18s ease;
+  box-shadow: var(--ark-shadow-float);
+  transition: background var(--ark-dur-fast) var(--ark-ease-out), color var(--ark-dur-fast) var(--ark-ease-out), border-color var(--ark-dur-fast) var(--ark-ease-out),
+    transform var(--ark-dur-fast) var(--ark-ease-out);
 }
 /* hover 反白:墨底纸字 → 纸底墨字(青色底条不变) */
 .help-fab:hover {
@@ -2478,7 +2503,7 @@ select.text-input option,
   line-height: 1.4;
   text-align: left;
   cursor: pointer;
-  transition: background .18s ease, border-color .18s ease;
+  transition: background var(--ark-dur-fast) var(--ark-ease-out), border-color var(--ark-dur-fast) var(--ark-ease-out);
 }
 .help-nav-item:hover { background: var(--ark-paper-dim); }
 /* 当前章节:左缘青条 + 青淡底(亮墨字/暗青字随 token 翻转) */
@@ -2910,7 +2935,7 @@ code {
   background: transparent;
   color: var(--ink-on-paper-72);
   cursor: pointer;
-  transition: color .18s ease, background .18s ease;
+  transition: color var(--ark-dur-fast) var(--ark-ease-out), background var(--ark-dur-fast) var(--ark-ease-out);
 }
 .dock-icon-btn:hover { color: var(--ark-dock-text-strong); background: var(--ink-on-paper-05); }
 .dock-icon-btn svg { width: 16px; height: 16px; flex: none; }
@@ -3102,7 +3127,7 @@ code {
 }
 .batch-head strong {
   font-size: 13px;
-  letter-spacing: 0.02em;
+  letter-spacing: .02em;
 }
 .batch-stat {
   flex: 1;
@@ -3236,7 +3261,7 @@ code {
 .cleanup-project-badge {
   font-size: 11px;
   padding: 1px 6px;
-  border-radius: 3px;
+  border-radius: 2px; /* pass 4:3px 离群值收回 2px(圆角阶梯 0/2/4) */
   background: var(--ink-on-paper-08);
   color: var(--ark-paper-dim-ink);
 }
@@ -3646,3 +3671,71 @@ code {
 .dir-check-warn { color: var(--ark-warn-text); }
 .dir-check-fail { color: var(--ark-warn-text); }
 .dir-check-hint { color: var(--ark-paper-ink-65); font-weight: 500; }
+
+/* ============================================================
+   设计细节 pass 4(v5.7.3):可访问性补强 + 按压态 + 融合动效
+   (评估基准:ark-ui design-language / ui-ux-pro-max §1 可访问性 §7 动效)
+   ============================================================ */
+
+/* ---- P4-A:焦点环对比补强(浅色) ----
+   signal 青 (#18d1ff) 对纸白 (#f4f6f6) 仅 ≈1.5:1,不满足 WCAG 焦点指示
+   与相邻色 ≥3:1。浅色下 outline 改墨色(对纸白 ≈15:1,与 1px 规则线同语言);
+   青色身份仍由 hover/active/选中信号承载。深色主题青对近黑 ≈10:1 已达标,
+   维持青环。仅覆盖 outline-color 单属性,不改几何;输入类的 P2-6 outline
+   同步变墨(青色底边 + 左信号条仍在,身份不丢)。 */
+:root[data-ark-scheme="light"] :focus-visible { outline-color: var(--ark-ink); }
+
+/* ---- P4-B:终端输入 / .env 编辑器 focus-visible 恢复 ----
+   .manage-terminal-input 基础规则 outline:none、.manage-env-editor:focus 显式
+   outline:none,键盘焦点只剩 border-color 变化,弱于契约 2px outline
+   (同 P2-6 先例)。置于文件末尾,以源码顺序压过 .manage-env-editor:focus。 */
+.manage-terminal-input:focus-visible,
+.manage-env-editor:focus-visible {
+  outline: 2px solid var(--ark-signal);
+  outline-offset: 1px;
+}
+
+/* ---- P4-C:模态卡容器焦点样式抑制 ----
+   app.js 的模态焦点管理把焦点先落在 .modal-card[tabindex="-1"] 上(容器落点,
+   供屏幕阅读器报出 dialog),容器本身不显示焦点环,Tab 一下即进入内容。 */
+.modal-card:focus { outline: none; }
+
+/* ---- P4-D:可点元素按压态补齐(契约:按压反馈 <100ms) ----
+   .btn 系已有「机械下压」语言(pass 3),本组导航/chip/悬浮件此前按压零回执。
+   统一 translateY(1px) 下压 + press token 时长;:not() 排除禁用/锁定项。
+   置于文件末尾,同特异性下 :active 压过 :hover 的位移(help-fab 抬起 → 按下)。 */
+.dock-item:active:not(.disabled),
+.scheme-toggle:active,
+.dock-icon-btn:active,
+.mode-tab:active:not(:disabled),
+.manage-tab:active,
+.help-nav-item:active,
+.preset-chip:active:not(:disabled),
+.help-fab:active,
+.rollback-item:active {
+  transform: translateY(1px);
+  transition-duration: var(--ark-dur-press);
+}
+
+/* ---- P4-E:监控阈值跨越 tick(数据驱动动效) ----
+   CPU 档位(normal↔warm↔hot)迁移时,该行首格左缘闪现一次 3px 信号条
+   (inset 左信号条母题):动效 = 真实档位迁移,非装饰循环;manage.js 检测
+   档位变化后以「移除类 → reflow → 复加」重放,animationend 自清。
+   reduced-motion 下由全局归零规则自动失效。 */
+@keyframes stat-flash {
+  from { box-shadow: inset 3px 0 0 var(--ark-signal); }
+  to   { box-shadow: inset 3px 0 0 transparent; }
+}
+tr.stat-flash > td:first-child {
+  animation: stat-flash var(--ark-dur-reveal) var(--ark-ease-out);
+}
+
+/* ---- P4-F:Tab 面板切换微型 wipe ----
+   面板显示时纵向裁切揭示(交互带 0.18s):与 modal-wipe / page-reveal 同族
+   裁切语言,给高频 Tab 切换一个方向线索;JS 同样用「移除 → reflow → 复加」
+   重放。clip-path 仅在动画期间生效(无 fill),结束后不影响面板内定位。 */
+@keyframes panel-wipe {
+  from { clip-path: inset(0 0 100% 0); }
+  to   { clip-path: inset(0); }
+}
+.panel-wipe { animation: panel-wipe var(--ark-dur-fast) var(--ark-ease-out); }
