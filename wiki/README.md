@@ -37,7 +37,7 @@
 
 ```
 仓库:E:\github\Docker-Deploy-SSH(git,主分支 main)
-代码量:Rust ~21,100 行(19 文件,含 main.rs)+ 原生 JS/HTML/CSS ~16,700 行(无框架无打包器,字体 woff2 自捆绑)
+代码量:Rust ~22,600 行(18 文件,含 main.rs)+ 原生 JS/HTML/CSS ~18,400 行(无框架无打包器,字体 woff2 自捆绑)
 技术:Tauri 2 + tokio + russh/russh-sftp + flate2 + serde_yaml + windows-dpapi + tauri-plugin-dialog
       + tauri-plugin-notification + lettre(rustls)+ argon2 + aes-gcm + reqwest(rustls+socks)+ ureq
 前端调用后端:window.__TAURI__.core.invoke(92 个命令),事件 12 个,字段默认 snake_case
