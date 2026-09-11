@@ -578,6 +578,36 @@ notify: {
 - 目录或服务器变化即清空检测结果(`input`/`change` 监听),避免残留旧结论误导
 - 新增样式 `.dir-check-result` 四态(全部走既有 token)
 
+### 阶段五:ark 设计细节优化 pass 3(随 v5.7.1 发布)
+
+保持 `family=ark` + `depth=complex` 身份不变,补全交互反馈链 + 治理样式技术债。边界依据 ark-ui 参考:
+默认 radius 0 是身份特征(仅功能性控件 2-4px)、不用柔光阴影(POPUCOM 特征)、**状态变化要加方向或裁切**、
+直接交互 180-350ms / 区域揭示 500-900ms / 注意力循环 1.6-2.4s / 按压反馈 <100ms。
+
+- **动效 token**(此前全站 13 处 transition 全写字面量、无 token):`--ark-dur-press .09s` / `--ark-dur-fast
+  .18s`(= 原值,零视觉变更)/ `--ark-dur-modal .22s` / `--ark-dur-reveal .45s` / `--ark-ease-out`
+- **按钮三态**(此前 `:active` 全站缺失、忙碌态零图形反馈):按压位移 2px(与既有幽灵按钮同语言)+ 按压期
+  短时长;忙碌 `.is-busy` 三段方块步进条(`steps()` 离散跳变,比旋转 spinner 更贴工业语言);待确认
+  `.is-armed` 呼吸描边 1.8s。新增 `window.setBtnBusy(btn,busy,label)` 三合一助手,**收敛此前 4 份能力
+  不一致的局部 `setBusy`**(settings/notify 带文案,config-io/rollback 不带);后两者是按钮组,刻意只禁用
+- **输入框五态**(此前 disabled / readonly **零样式**):聚焦加左缘 3px 信号条(inset,与按钮左楔形、
+  rollback 选中条同属「左信号条」母题);禁用降透明;只读 paper-dim 底 + 左缘灰标且不降透明(可选中/复制);
+  select 去系统 chrome 改 45° 渐变三角;底色 paper → surface(暗色下原值比面板更暗、读作「凹陷」)
+- **模态进出场**(此前瞬显瞬隐):遮罩 opacity + `transition-behavior: allow-discrete`,卡片刻画
+  `modal-wipe` 裁切揭示(与切页 page-reveal 同族);`.hidden` 加 `pointer-events:none` 化解退出期吞点击;
+  **纯 CSS 零 JS** —— 9 条关闭路径分散 6 模块且带 rbBusy 守卫,改 JS 风险高于收益;不支持时优雅降级为瞬隐
+- **tab 下划线扫入**:`.mode-tab.active::after` 与 `.manage-tab.active::after` 统一 `tab-underline`
+  (自左 scaleX);后者原为只换 `border-bottom-color` 的纯颜色变化(违反契约)
+- **技术治理**:删死 token `--radius`(零消费);补 `--ark-paper-ink-70`(被引用未定义 → 回退 inherit 使
+  层级静默失效);`.rollback-item.active` 原引用未定义 `--ark-accent` 且回退 `#c8501e` 是红橙色(**违反
+  不用红纪律**)→ 改 `--ark-signal`;圆角越界 6px → 4px(2 处)
+
+**验证**:`node --check` 全通过;ark-ui 审计与基线一致(0 error / 12 pass,1 条既有误报);`cargo test`
+269 passed;真实浏览器渲染亮暗两主题状态矩阵(按钮四态 + 输入框五态 + tab + 模态)并以 `getComputedStyle`
+逐项核对;真实 `index.html` 集成加载**零 JS 运行时错误**;`--force-prefers-reduced-motion` 下四个新动画
+全部归零且元素仍可见可用。过程中修掉一处自己引入的 bug(只读态 `box-shadow` 因特异性相同会盖掉聚焦信号条,
+按源码顺序修正并加注释)。
+
 ### 遗留与取舍（记录在 wiki 07 已知限制）
 
 - 源服务器内容保留不动 ⇒ 迁移后两台同跑,卷数据是导出时刻快照,源后续写入不回传(确认页明确提示尽快停用源)
