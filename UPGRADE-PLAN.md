@@ -635,6 +635,50 @@ notify: {
 全部归零且元素仍可见可用。过程中修掉一处自己引入的 bug(只读态 `box-shadow` 因特异性相同会盖掉聚焦信号条,
 按源码顺序修正并加注释)。
 
+### 阶段六:ark × ui-ux-pro-max 设计评估与细节 pass 4(随 v5.7.3 发布)
+
+以 ark-ui(family=ark / depth=complex 六轴 rubric + 20 条检查项)为主题基准、ui-ux-pro-max
+(§1 可访问性 / §2 交互 / §7 动效)为细节基准做一轮全量评估。评估结论:family/depth 维持不变
+(六轴核验成立),差距集中在可访问性缺口、v5.7.1 动效立约的后半程(既有规则收敛)、细节修复三类。
+
+- **可访问性补强**(ui-ux-pro-max §1 CRITICAL):
+  - 模态焦点三件套:app.js 新增 `modalFocusOpen/Close`(栈式记录,支持 cleanup 叠 servers 的嵌套)+
+    document 级 Tab 圈禁;10 个模态开/关路径全部接线(manage 私有 `modalTriggerEl` 与 help 的
+    「聚焦关闭钮」收编为共用实现)。修复「aria-modal 已声明而焦点不移、关闭不还焦」
+  - toast 播报:ok/info → `role="status"`(polite)、warn/fail → `role="alert"`(断言);
+    此前 toast 对屏幕阅读器不可见(全仓唯一 live region 只在 servers 表单聚合错误框)
+  - 部署步骤播报:校准仪旁新增 `#deploy-progress-live`(sr-only + aria-live),步骤切换写
+    「步骤 N/M:名称」低频文本
+  - 焦点环对比:浅色主题 signal 青 (#18d1ff) 对纸白仅 ≈1.67:1(实测复现),不满足焦点指示 ≥3:1
+    → 浅色下 outline-color 改墨(≈18.3:1,仅覆盖单属性不改几何);深色 ≈10.96:1 维持青环
+  - `.manage-terminal-input` / `.manage-env-editor` 的 `outline:none` 后补 `:focus-visible` 恢复
+    (P2-6 同款;置于文件末以源码顺序压过 env 编辑器的 `:focus outline:none`)
+- **动效/阴影/z-index token 收敛**(v5.7.1「新规则走 token」的后半程):
+  - 新增 `--ark-dur-attention 1.8s` / `--ark-dur-scheme .5s` / `--ark-dur-ticker .9s` /
+    `--ark-shadow-float` / `--ark-shadow-modal` / `--ark-z-step|fab|overlay|toast`;
+    激活死 token `--ark-dur-reveal`(page-reveal 改其消费)
+  - 全量收敛:24 处 `.18s` 时长字面量 → `--ark-dur-fast`;toast `.22s` / scheme `.5s` /
+    `btn-step .9s` / 呼吸与脉冲 `1.8s` 字面量全部 → token;`ease`/`ease-out` 关键字 →
+    `--ark-ease-out`(到达语义统一;循环保留关键字 ease-in-out/ease-out,约定入文件头注释)
+  - 阴影几何 token 化(help-fab/modal-card),toast 补海拔 1 阴影(浮层分离度)
+- **细节修复**:`:active` 按压态补齐 9 类可点元素(dock/tab/chip/fab/rollback-item,press token);
+  `.deploy-step.current` 2px 边框改「1px 边框 + 1px 内缩 outline」消除 1px 位移;批量面板
+  「成功/失败」徽章从 `badge-running/badge-paused`(容器状态类,语义错位)改 `fillBadge` 口径
+  (ok/fail);删除 `.badge-*` 四处无效 `border-color` 声明(基类无 border);3px 圆角离群 → 2px;
+  `color-mix` ×3 沉淀 `--ark-warn-45/50/60`;删死 token `--ark-ok`(零消费,双色纪律注释);
+  `--ark-ink-35` 改语义名 `--ark-ink-faint`(亮 .45/暗 .35,数字后缀名不副实);opacity/字距
+  `0.XX` 写法统一;CPU warm/hot 单元格补阈值 `title`;截断单元格悬停补全文本(app.js 委托监听,
+  仅真溢出时写 title)
+- **融合新动效**(均带信息角色,克制):监控 CPU 档位迁移时行首格闪现一次左缘信号条
+  (`stat-flash`,manage.js 记录前档位 + 移除/reflow/复加);Tab 面板与整栈面板显示时 0.18s
+  纵向微型 wipe(`panel-wipe`,与 modal-wipe/page-reveal 同族)。两者 reduced-motion 下自动归零
+- **刻意不做(记录)**:间距/字号 token 化(churn 大收益小);模态改「从触发源展开」(保留 ark
+  wipe 签名);列表入场 stagger(违反 excessive-motion,page-reveal 已覆盖)
+
+**验证**:`node --check` 8 个 JS 全过;ark-ui 审计目录级 **0 error**(唯一 warning 为 JS 动态构建
+DOM 的既有误报);对比度实测:焦点环亮/暗 18.29:1 / 10.96:1、stat-warm/hot 亮暗四组 5.59–13.14:1、
+badge-ok 暗 8.11:1,全部过 WCAG;时长/缓动字面量 grep 归零(仅 token 定义与注释保留)。
+
 ### 遗留与取舍（记录在 wiki 07 已知限制）
 
 - 源服务器内容保留不动 ⇒ 迁移后两台同跑,卷数据是导出时刻快照,源后续写入不回传(确认页明确提示尽快停用源)
