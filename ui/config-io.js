@@ -54,9 +54,9 @@
     return node ? String(node.value) : '';
   }
 
-  /** 分组标题(mono 小字,样式参照 .notify-group-title 先例) */
-  function groupTitle(text) {
-    return el('div', 'cio-group-title', text);
+  /** 分组标题(中文 + 大写英文;样式见 .form-group-title) */
+  function groupTitle(zh, en) {
+    return window.formGroupTitle(zh, en);
   }
 
   /** 组内说明文字(两行以内的弱化段落) */
@@ -115,11 +115,13 @@
     var pass = passVal('cio-export-pass');
     var pass2 = passVal('cio-export-pass2');
     if (!pass) {
-      window.toast('请输入导出口令', 'fail');
+      window.formFailLoud('cio-error', '请输入导出口令');
+      window.setFieldError(document.getElementById('cio-export-pass'), '此项必填');
       return;
     }
     if (pass !== pass2) {
-      window.toast('两次输入的导出口令不一致', 'fail');
+      window.formFailLoud('cio-error', '两次输入的导出口令不一致');
+      window.setFieldError(document.getElementById('cio-export-pass-confirm'), '与上格口令不一致');
       return;
     }
     if (pass.length < 6) {
@@ -138,7 +140,7 @@
           window.toast('已导出到 ' + path, 'ok');
         })
         .catch(function (err) {
-          window.toast('导出失败:' + (errText(err) || '未知错误'), 'fail');
+          window.formFailLoud('cio-error', '导出失败:' + (errText(err) || '未知错误'));
         })
         .then(function () {
           setBusy(false);
@@ -171,12 +173,13 @@
     }
 
     if (!st.importPath) {
-      window.toast('请先选择配置备份文件', 'fail');
+      window.formFailLoud('cio-error', '请先选择配置备份文件');
       return;
     }
     var pass = passVal('cio-import-pass');
     if (!pass) {
-      window.toast('请输入文件口令', 'fail');
+      window.formFailLoud('cio-error', '请输入文件口令');
+      window.setFieldError(document.getElementById('cio-import-pass'), '此项必填');
       return;
     }
 
@@ -195,7 +198,7 @@
       })
       .catch(function (err) {
         showResult('导入失败:' + (errText(err) || '未知错误'), 'cio-result-fail');
-        window.toast('导入失败:' + (errText(err) || '未知错误'), 'fail');
+        window.formFailLoud('cio-error', '导入失败:' + (errText(err) || '未知错误'));
         setBusy(false);
       });
   }
@@ -212,7 +215,7 @@
         window.setTimeout(function () { window.location.reload(); }, 1200);
       })
       .catch(function (err) {
-        window.toast('清除失败:' + (errText(err) || '未知错误'), 'fail');
+        window.formFailLoud('cio-error', '清除失败:' + (errText(err) || '未知错误'));
         setBusy(false);
       });
   }
@@ -230,7 +233,7 @@
   // ===== 模态框组装 =====
 
   function appendExportGroup(body) {
-    body.appendChild(groupTitle('导出 EXPORT'));
+    body.appendChild(groupTitle('导出', 'EXPORT'));
     body.appendChild(note(
       '将全部服务器 / 部署项目 / 通知配置导出为加密备份文件;' +
       'SSH 密码与私钥口令以加密形式写入文件,导出口令用于派生加密密钥' +
@@ -248,7 +251,7 @@
   }
 
   function appendImportGroup(body) {
-    body.appendChild(groupTitle('导入 IMPORT'));
+    body.appendChild(groupTitle('导入', 'IMPORT'));
     body.appendChild(note(
       '从备份文件恢复配置,导入将整体覆盖当前的服务器 / 部署项目 / 通知配置'));
 
@@ -290,7 +293,10 @@
 
   function appendDangerGroup(body) {
     var box = el('div', 'cio-danger-box');
-    box.appendChild(el('div', 'cio-danger-title', '危险区 DANGER ZONE'));
+    // 危险区标题保留自己的视觉(已有专属 .cio-danger-title),仅把英文拆出
+    var dangerTitle = el('div', 'cio-danger-title', '危险区');
+    dangerTitle.appendChild(el('span', 'form-label-en', 'DANGER ZONE'));
+    box.appendChild(dangerTitle);
     box.appendChild(el('div', 'cio-danger-text',
       '将删除全部服务器、部署项目、通知配置与部署历史;运行日志保留。' +
       '操作立即生效且不可恢复。'));
@@ -341,6 +347,10 @@
     var body = document.getElementById('config-io-modal-body');
     if (!overlay || !body) return;
     body.textContent = '';
+    // 内联错误框(本轮补齐):此前导出/导入/清除失败只有 toast —— 三组内容
+    // 都在同一模态里,用户停在按钮处时看不到已消失的提示。统一走三通道
+    // (内联框 + 滚动到可视区 + toast)。
+    body.appendChild(window.formErrorBox('cio-error'));
     appendExportGroup(body);
     appendImportGroup(body);
     appendDangerGroup(body);

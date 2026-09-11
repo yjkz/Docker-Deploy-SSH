@@ -2003,9 +2003,13 @@
     // ---- 选择区 ----
     var grid = el('div', 'migrate-form-grid');
 
+    body.insertBefore(window.formGroupTitle('迁移目标', 'TARGET'), grid);
     var srcRow = el('div', 'form-row');
-    srcRow.appendChild(el('label', 'form-label', '源服务器(内容所在)'));
+    srcRow.appendChild(window.formLabel('源服务器(内容所在)', 'SOURCE', true, 'migrate-project-source'));
     var srcSel = document.createElement('select');
+    // 本轮修复:此前漏 .form-input,控件退化为 19px 原生外观(与全站 36px
+    // 墨线 + 底边 2px + 45° 三角的规范控件明显不一致)
+    srcSel.className = 'form-input';
     srcSel.id = 'migrate-project-source';
     servers.forEach(function (s) {
       var opt = document.createElement('option');
@@ -2018,8 +2022,9 @@
     grid.appendChild(srcRow);
 
     var tgtRow = el('div', 'form-row');
-    tgtRow.appendChild(el('label', 'form-label', '目标服务器(迁移到)'));
+    tgtRow.appendChild(window.formLabel('目标服务器(迁移到)', 'TARGET', true, 'migrate-project-target'));
     var tgtSel = document.createElement('select');
+    tgtSel.className = 'form-input';   // 同 srcSel:补回缺失的控件样式
     tgtSel.id = 'migrate-project-target';
     servers.forEach(function (s) {
       if (s.id === defaultSrc) return; // 目标不能等于源
@@ -2048,7 +2053,7 @@
 
     // ---- 迁移项 ----
     var optsRow = el('div', 'form-row');
-    optsRow.appendChild(el('label', 'form-label', '迁移内容'));
+    optsRow.appendChild(window.formLabel('迁移内容', 'CONTENT'));
     var optsBox = el('div', 'migrate-options');
 
     var alwaysChk = document.createElement('input');
@@ -2087,12 +2092,16 @@
 
     // 目标部署目录(可选覆盖)
     var dirRow = el('div', 'form-row');
-    dirRow.appendChild(el('label', 'form-label', '目标部署目录(可选)'));
+    dirRow.appendChild(window.formLabel('目标部署目录', 'REMOTE DIR', false, 'migrate-project-dir'));
     var dirInput = document.createElement('input');
+    dirInput.className = 'form-input';  // 同 srcSel:补回缺失的控件样式
     dirInput.type = 'text';
     dirInput.id = 'migrate-project-dir';
     dirInput.placeholder = '留空则沿用项目/服务器配置的目录';
     dirRow.appendChild(dirInput);
+    // 路径类字段补常驻说明(此前只有 placeholder,输入即消失)
+    dirRow.appendChild(el('div', 'form-hint',
+      '留空 = 沿用项目或服务器的部署目录;填了独立目录需在目标服务器上先建好'));
     grid.appendChild(dirRow);
 
     body.appendChild(grid);

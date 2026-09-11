@@ -1581,12 +1581,15 @@
     if (overlay) overlay.classList.add('hidden');
   }
 
-  /** 在 body 内追加一行:标签 + 输入框(+ 可选提示) */
-  function appendField(body, labelText, inputId, inputType, value, placeholder, hint, inputAttrs) {
+  /**
+   * 在 body 内追加一行:标签 + 输入框(+ 可选提示)。
+   *
+   * `en` / `required` 为本轮新增的可选尾参(向后兼容既有 8 参调用):
+   * 英文微标签与必填标记统一由 window.formLabel 渲染,保证全站词法一致。
+   */
+  function appendField(body, labelText, inputId, inputType, value, placeholder, hint, inputAttrs, en, required) {
     var row = el('div', 'form-row');
-    var label = el('label', 'form-label', labelText);
-    label.setAttribute('for', inputId);
-    row.appendChild(label);
+    row.appendChild(window.formLabel(labelText, en, required, inputId));
 
     var input = document.createElement('input');
     input.className = 'form-input';
@@ -1805,6 +1808,10 @@
     var err = el('div', 'form-error');
     err.id = errId;
     err.classList.add('hidden');
+    // 错误出现时让屏幕阅读器播报(契约 aria-live-errors):仅断言式播报,
+    // 不抢焦点;role=status 的礼貌级别足够(错误同时有 toast 与字段内联提示)
+    err.setAttribute('role', 'status');
+    err.setAttribute('aria-live', 'polite');
     body.appendChild(err);
   }
 
@@ -1816,7 +1823,8 @@
    */
   function appendHookBlock(body, labelText, textareaId, presets, prevValue) {
     var row = el('div', 'form-row');
-    row.appendChild(el('label', 'form-label', labelText));
+    // 本轮修复:此前 label 与 textarea 完全无关联(点标签不会聚焦到输入框)
+    row.appendChild(window.formLabel(labelText, 'HOOK', false, textareaId));
 
     var chipRow = el('div', 'chip-row');
     presets.forEach(function (preset) {
@@ -2124,19 +2132,21 @@
     openModal(prev ? '编辑服务器' : '新增服务器', function (body) {
       appendErrorBox(body, 'srvf-error');
 
+      body.appendChild(window.formGroupTitle('连接', 'CONNECTION'));
       appendField(body, '名称', 'srvf-name', 'text',
-        prev ? prev.name : '', '如:生产服务器');
+        prev ? prev.name : '', '如:生产服务器', null, null, 'NAME', true);
       appendField(body, '主机(IP 或域名)', 'srvf-host', 'text',
-        prev ? prev.host : '', '如:192.168.1.100');
+        prev ? prev.host : '', '如:192.168.1.100', null, null, 'HOST', true);
       appendField(body, '端口', 'srvf-port', 'number',
         prev ? prev.port : 22, '', '取值范围 1 - 65535,默认 22',
-        { min: '1', max: '65535', step: '1' });
+        { min: '1', max: '65535', step: '1' }, 'PORT', true);
       appendField(body, '用户名', 'srvf-username', 'text',
-        prev ? prev.username : '', '如:root');
+        prev ? prev.username : '', '如:root', null, null, 'USERNAME', true);
 
       // 认证方式单选
+      body.appendChild(window.formGroupTitle('认证', 'AUTHENTICATION'));
       var authRow = el('div', 'form-row');
-      authRow.appendChild(el('label', 'form-label', '认证方式'));
+      authRow.appendChild(window.formLabel('认证方式', 'METHOD'));
       var radioRow = el('div', 'radio-row');
 
       var radioKey = document.createElement('input');
@@ -2169,9 +2179,7 @@
       // 私钥路径(Key):输入框 + 「浏览」按钮同行(系统选择对话框)
       var keyBlock = el('div', 'form-row');
       keyBlock.id = 'srvf-key-block';
-      var keyLabel = el('label', 'form-label', '私钥路径');
-      keyLabel.setAttribute('for', 'srvf-key-path');
-      keyBlock.appendChild(keyLabel);
+      keyBlock.appendChild(window.formLabel('私钥路径', 'KEY PATH', true, 'srvf-key-path'));
       var keyInput = document.createElement('input');
       keyInput.className = 'form-input';
       keyInput.id = 'srvf-key-path';
@@ -2199,9 +2207,7 @@
       var hasSavedKeyPass = !!(prevAuth.key_pass_enc || (prev && prev.key_pass_enc));
       var keyPassBlock = el('div', 'form-row');
       keyPassBlock.id = 'srvf-key-pass-block';
-      var keyPassLabel = el('label', 'form-label', '私钥口令');
-      keyPassLabel.setAttribute('for', 'srvf-key-pass');
-      keyPassBlock.appendChild(keyPassLabel);
+      keyPassBlock.appendChild(window.formLabel('私钥口令', 'PASSPHRASE', false, 'srvf-key-pass'));
       var keyPassInput = document.createElement('input');
       keyPassInput.className = 'form-input';
       keyPassInput.id = 'srvf-key-pass';
@@ -2231,9 +2237,7 @@
       // 密码(Password)
       var passBlock = el('div', 'form-row');
       passBlock.id = 'srvf-pass-block';
-      var passLabel = el('label', 'form-label', '登录密码');
-      passLabel.setAttribute('for', 'srvf-password');
-      passBlock.appendChild(passLabel);
+      passBlock.appendChild(window.formLabel('登录密码', 'PASSWORD', false, 'srvf-password'));
       var passInput = document.createElement('input');
       passInput.className = 'form-input';
       passInput.id = 'srvf-password';
@@ -2257,15 +2261,20 @@
       radioPass.addEventListener('change', syncAuthBlocks);
       syncAuthBlocks();
 
+      body.appendChild(window.formGroupTitle('部署', 'DEPLOYMENT'));
+      // 路径类字段补常驻 hint(此前只有 placeholder,一输入就消失);
+      // 该目录是部署前的远端根目录,填错会导致 compose 落到意外位置
       appendField(body, '远程部署目录', 'srvf-remote-dir', 'text',
-        prev ? prev.remote_dir : '', '如:/opt/myapp');
+        prev ? prev.remote_dir : '', '如:/opt/myapp',
+        '容器与 compose 文件在服务器上的根目录(绝对路径);不存在时可到服务器卡片点「创建远程目录」',
+        null, 'REMOTE DIR', true);
 
       // 主机密钥指纹(阶段三,TOFU):等宽只读展示 + 「重新信任」;
       // 无指纹(首次连接/已重置)时以灰字 placeholder 提示
       var fingerprint = (prev && prev.host_key_sha256) ? String(prev.host_key_sha256) : '';
       var fpRow = el('div', 'form-row');
       fpRow.id = 'srvf-fp-block';
-      fpRow.appendChild(el('label', 'form-label', '主机密钥指纹'));
+      fpRow.appendChild(window.formLabel('主机密钥指纹', 'HOST KEY', false, 'srvf-fp-value'));
       var fpLine = el('div', 'input-btn-row');
       var fpInput = document.createElement('input');
       fpInput.className = 'form-input mono';
@@ -2306,14 +2315,30 @@
    */
   function saveServer(prev, saveBtn) {
     formClearError('srvf-error');
+    // 清上一轮的字段级错误(整体重校验前先复位)
+    var formBody = document.getElementById('servers-modal-body');
+    if (formBody) window.clearAllFieldErrors(formBody);
 
     function fail(msg) {
-      formFail('srvf-error', msg);
-      var boxNode = document.getElementById('srvf-error');
-      if (boxNode && boxNode.scrollIntoView) {
-        try { boxNode.scrollIntoView({ block: 'nearest' }); } catch (_) { boxNode.scrollIntoView(); }
+      // 顶部聚合框:走全局统一三通道(内联 + 滚动到可视区 + toast)
+      window.formFailLoud('srvf-error', msg);
+      return false;
+    }
+    /**
+     * 字段级错误:把提示贴到出错字段下方并聚焦该字段。
+     * 契约(field-grouping / focus-management)要求错误贴近字段,且多错时
+     * 焦点落到第一个出错字段 —— 此前只有顶部聚合框,长表单滚到底部保存时
+     * 根本看不见「哪一项填错了」。
+     */
+    function fieldFail(controlId, msg) {
+      var control = document.getElementById(controlId);
+      if (control) {
+        window.setFieldError(control, msg);
+        // 焦点给首个出错字段(只取当前尚无焦点的场景,避免多次调用后乱跳)
+        if (document.activeElement !== control) {
+          try { control.focus({ preventScroll: true }); } catch (_) { control.focus(); }
+        }
       }
-      window.toast(msg, 'fail');
       return false;
     }
     function setSaving(saving) {
@@ -2336,21 +2361,27 @@
     var rememberNode = document.getElementById('srvf-remember-key-pass');
     var rememberKeyPass = !!(authType === 'Key' && rememberNode && rememberNode.checked);
 
-    // 缺项聚合提示:一次告知所有未填的必填项
+    // 校验:先在每个出错字段下方贴提示,再用顶部聚合框给整体摘要 ——
+    // 两者并存(契约 error-summary:摘要链接各错误项,同时保留字段内联错误)
     var missing = [];
-    if (!name) missing.push('名称');
-    if (!host) missing.push('主机地址');
-    if (!username) missing.push('用户名');
-    if (!remoteDir) missing.push('远程部署目录');
+    if (!name) { missing.push('名称'); fieldFail('srvf-name', '此项必填'); }
+    if (!host) { missing.push('主机地址'); fieldFail('srvf-host', '此项必填'); }
+    if (!username) { missing.push('用户名'); fieldFail('srvf-username', '此项必填'); }
+    if (!remoteDir) { missing.push('远程部署目录'); fieldFail('srvf-remote-dir', '此项必填'); }
     if (missing.length > 0) return fail('请填写:' + missing.join('、'));
     if (!/^\d+$/.test(portRaw) || Number(portRaw) < 1 || Number(portRaw) > 65535) {
+      fieldFail('srvf-port', '需为 1 - 65535 之间的整数');
       return fail('端口需为 1 - 65535 之间的整数');
     }
-    if (authType === 'Key' && !keyPath) return fail('私钥认证需填写私钥路径');
+    if (authType === 'Key' && !keyPath) {
+      fieldFail('srvf-key-path', '私钥认证需填写私钥路径');
+      return fail('私钥认证需填写私钥路径');
+    }
 
     var prevAuth = (prev && prev.auth) ? prev.auth : {};
     var hasSavedPassword = authType === 'Password' && !!prevAuth.password_enc;
     if (authType === 'Password' && !newPass && !hasSavedPassword) {
+      fieldFail('srvf-password', '密码认证需填写登录密码');
       return fail('密码认证需填写登录密码');
     }
     setSaving(true);
@@ -2440,17 +2471,21 @@
     openModal(prev ? '编辑项目' : '新增项目', function (body) {
       appendErrorBox(body, 'prjf-error');
 
+      body.appendChild(window.formGroupTitle('基本信息', 'BASIC'));
       appendField(body, '名称', 'prjf-name', 'text',
-        prev ? prev.name : '', '如:我的应用');
+        prev ? prev.name : '', '如:我的应用', null, null, 'NAME', true);
 
       if (!prev) {
         appendImportBlock(body);
       }
 
       appendField(body, '镜像过滤关键字', 'prjf-filter', 'text',
-        prev ? prev.image_filter : '', '如:myapp', '部署时按该关键字匹配本地镜像仓库名,留空匹配全部镜像');
+        prev ? prev.image_filter : '', '如:myapp', '部署时按该关键字匹配本地镜像仓库名,留空匹配全部镜像',
+        null, 'IMAGE FILTER');
+      // compose 相对路径在手工建项目时是必填(导入流程会置灰并由导入路径替代)
       var composeInput = appendField(body, 'compose 文件相对路径', 'prjf-compose', 'text',
-        prev ? prev.compose_file : '', '如:docker-compose.yml', '相对远程部署目录的路径');
+        prev ? prev.compose_file : '', '如:docker-compose.yml', '相对远程部署目录的路径',
+        null, 'COMPOSE FILE', !prev);
       if (!prev) {
         // 走导入流程时 compose 相对路径不再参与保存,置灰防误解
         composeInput.disabled = !!fieldVal('prjf-import-path');
@@ -2461,6 +2496,7 @@
       // docker-compose.yml,切换项目要改服务器配置 —— 这里让项目自带目录。
       // 第六批:目标服务器下拉**先建**,目录字段才能挂上「检测/创建」——
       // 检测针对该服务器执行(见 appendRemoteDirField)。
+      body.appendChild(window.formGroupTitle('部署位置', 'DEPLOY TARGET'));
       appendServerSelect(body, prev);
       appendRemoteDirField(body, prev);
 
@@ -2471,11 +2507,11 @@
         '留空 = 默认 5 个',
         '部署成功后每次清理旧发布归档(releases/),只保留最新的 N 个(0 - 50,可填 0 表示不留历史)。' +
         '留空用默认 5 个。「服务器管理 → 清理优化」的归档清理也按此数量。',
-        { min: '0', max: '50', step: '1' });
+        { min: '0', max: '50', step: '1' }, 'RELEASE KEEP');
 
       // 文件映射编辑表格
       var mapRow = el('div', 'form-row');
-      mapRow.appendChild(el('label', 'form-label', '文件映射(本地 → 服务器)'));
+      mapRow.appendChild(window.formLabel('文件映射(本地 → 服务器)', 'FILE MAPPING'));
       var wrap = document.createElement('div');
       wrap.className = 'table-wrap';
       var table = document.createElement('table');
@@ -2514,10 +2550,11 @@
       }
 
       // ===== 生产加固(Task 7):健康检查 / pre-post 钩子 / webhook =====
+      body.appendChild(window.formGroupTitle('生产加固', 'PRODUCTION'));
       appendField(body, '健康检查', 'prjf-health-wait', 'number',
         prev ? (prev.health_wait_secs || 0) : 0, '',
         '部署后轮询容器状态的最长等待秒数,0 为关闭',
-        { min: '0', max: '86400', step: '1' });
+        { min: '0', max: '86400', step: '1' }, 'HEALTH WAIT');
 
       appendHookBlock(body, 'pre-deploy 命令', 'prjf-pre-cmd', PRESET_CMDS.pre,
         prev && prev.pre_deploy_cmd ? String(prev.pre_deploy_cmd) : '');
@@ -2532,7 +2569,7 @@
       appendField(body, '完成通知 webhook', 'prjf-webhook', 'text',
         prev && prev.notify_webhook ? String(prev.notify_webhook) : '',
         'https://hook.example.com/xxx',
-        '部署结束后 POST JSON 结果;留空关闭');
+        '部署结束后 POST JSON 结果;留空关闭', null, 'WEBHOOK');
 
       appendActions(body, 'prjf-error', closeModal, function () {
         saveProject(prev);
@@ -2663,17 +2700,32 @@
   /** 项目表单保存:校验 →(导入流程:preview 校验 + import_compose)→ get_config → 全量写回 */
   function saveProject(prev) {
     formClearError('prjf-error');
+    // 清上一轮的字段级错误(整体重校验前先复位)
+    var formBody = document.getElementById('servers-modal-body');
+    if (formBody) window.clearAllFieldErrors(formBody);
 
     var name = fieldVal('prjf-name');
     var filter = fieldVal('prjf-filter');
     var compose = fieldVal('prjf-compose');
     var importPath = fieldVal('prjf-import-path'); // 编辑表单无此输入框,得空串
 
-    // 缺项聚合提示:一次告知所有未填的必填项
+    // 缺项聚合提示 + 字段级标记(契约 error-summary:摘要与内联错误并存)
     var missing = [];
-    if (!name) missing.push('名称');
-    if (!importPath && !compose) missing.push('compose 文件相对路径');
-    if (missing.length > 0) return formFailLoud('prjf-error', '请填写:' + missing.join('、'));
+    if (!name) {
+      missing.push('名称');
+      window.setFieldError(document.getElementById('prjf-name'), '此项必填');
+    }
+    if (!importPath && !compose) {
+      missing.push('compose 文件相对路径');
+      window.setFieldError(document.getElementById('prjf-compose'),
+        '此项必填(或改用上方「导入 compose 文件」)');
+    }
+    if (missing.length > 0) {
+      // 焦点给首个出错字段(focus-management)
+      var firstBad = document.getElementById(name ? 'prjf-compose' : 'prjf-name');
+      if (firstBad) { try { firstBad.focus({ preventScroll: true }); } catch (_) { firstBad.focus(); } }
+      return formFailLoud('prjf-error', '请填写:' + missing.join('、'));
+    }
 
     var mappings = collectMappings('prjf-error');
     if (mappings === null) return false;

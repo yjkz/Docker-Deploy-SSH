@@ -467,13 +467,22 @@
             <input type="checkbox" id="manage-autorefresh-toggle">
             <span>自动刷新</span>
           </label>
-          <select id="manage-interval-select" class="form-input manage-interval-select" disabled>
+          <select id="manage-interval-select" class="form-input manage-interval-select" disabled
+                  aria-label="自动刷新间隔">
             <option value="5">5s</option>
             <option value="10">10s</option>
             <option value="30" selected>30s</option>
             <option value="60">60s</option>
             <option value="custom">自定义…</option>
           </select>
+          <!-- 自定义间隔的行内输入(选中「自定义…」时显示)。本轮替换掉
+               window.prompt —— 那是全站唯一的系统对话框,违反本项目「自绘
+               确认/输入、不调用系统对话框」的既定纪律。 -->
+          <span id="manage-interval-custom-wrap" class="manage-interval-custom hidden">
+            <input type="number" id="manage-interval-custom" class="form-input form-input-sm"
+                   min="3" max="300" step="1" placeholder="秒" aria-label="自定义刷新间隔(秒)">
+            <button type="button" id="manage-interval-apply" class="btn btn-sm">应用</button>
+          </span>
         </div>
 
         <div id="manage-error" class="check-error hidden"></div>

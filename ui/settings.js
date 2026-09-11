@@ -111,9 +111,9 @@
     return label;
   }
 
-  /** 分组标题(mono 小字,样式见 style.css .set-group-title) */
-  function groupTitle(text) {
-    return el('div', 'set-group-title', text);
+  /** 分组标题(中文 + 大写英文;样式见 .form-group-title) */
+  function groupTitle(zh, en) {
+    return window.formGroupTitle(zh, en);
   }
 
   /** 组内说明文字(弱化段落) */
@@ -186,11 +186,9 @@
   // ===== 模态 body 构建(每次打开重建,事件随元素重建,无重复绑定)=====
 
   /** 单字段行:标签 + 输入框(+ 可选提示);返回输入元素 */
-  function buildField(labelText, inputId, inputType, value, placeholder, hint) {
+  function buildField(labelText, en, inputId, inputType, value, placeholder, hint) {
     var row = el('div', 'form-row');
-    var label = el('label', 'form-label', labelText);
-    label.setAttribute('for', inputId);
-    row.appendChild(label);
+    row.appendChild(window.formLabel(labelText, en, false, inputId));
     var input = document.createElement('input');
     input.className = 'form-input';
     input.id = inputId;
@@ -207,6 +205,10 @@
   function buildBody(body) {
     body.textContent = '';
 
+    // 内联错误框(本轮补齐,同 config-io 的理由:设置是三组内容的长模态,
+    // 保存失败只弹 toast 会一闪而过)
+    body.appendChild(window.formErrorBox('settings-error'));
+
     // 两栏布局(第四批):左侧设置项(外观/通用/更新),右侧「关于」栏。
     // 窄窗口经 CSS 媒体查询回退为单列(关于栏落到下方)。
     var layout = el('div', 'settings-layout');
@@ -217,7 +219,7 @@
     body.appendChild(layout);
 
     // ── 外观 APPEARANCE(单选,即时生效)──
-    main.appendChild(groupTitle('外观 APPEARANCE'));
+    main.appendChild(groupTitle('外观', 'APPEARANCE'));
     var radioRow = el('div', 'radio-row');
     var current = schemeMode();
     SCHEME_OPTIONS.forEach(function (opt) {
@@ -239,7 +241,7 @@
       '显式亮 / 暗并停用跟随'));
 
     // ── 通用 GENERAL ──
-    main.appendChild(groupTitle('通用 GENERAL'));
+    main.appendChild(groupTitle('通用', 'GENERAL'));
     main.appendChild(checkboxRow('settings-close-tray', '关闭窗口时隐藏到托盘', false));
     main.appendChild(hint('开启后点关闭仅隐藏窗口(部署继续),托盘菜单「退出」才真正退出;保存后立即生效'));
     main.appendChild(checkboxRow('settings-auto-update-src', '启动时自动从源更新项目', true));
@@ -248,8 +250,8 @@
       '发现变化即自动同步并重解析(保留已保存的服务分类);关闭后仍可在项目列表点「从源更新」手动执行'));
 
     // ── 更新 UPDATE ──
-    main.appendChild(groupTitle('更新 UPDATE'));
-    main.appendChild(buildField('代理地址 PROXY', 'settings-proxy-input', 'text', '',
+    main.appendChild(groupTitle('更新', 'UPDATE'));
+    main.appendChild(buildField('代理地址', 'PROXY', 'settings-proxy-input', 'text', '',
       '留空直连;支持 http:// 与 socks5://,例如 http://127.0.0.1:7890',
       '仅用于检查更新访问 GitHub;「检查更新 / 测试连接」使用上方输入框当前值,未保存也可测试'));
 
@@ -294,7 +296,7 @@
    * `open_external` 交给系统浏览器(WebView 内直接跳外链会被拦)。
    */
   function buildAboutPanel(aside) {
-    aside.appendChild(groupTitle('关于 ABOUT'));
+    aside.appendChild(groupTitle('关于', 'ABOUT'));
 
     var card = el('div', 'about-card');
 
@@ -489,7 +491,7 @@
       if (!sessionAlive(session)) return;
       st.saving = false;
       setBusy('settings-save-btn', false, '保存设置');
-      window.toast('保存设置失败:' + (errText(err) || '未知错误'), 'fail');
+      window.formFailLoud('settings-error', '保存设置失败:' + (errText(err) || '未知错误'));
     });
   }
 

@@ -269,6 +269,153 @@
     return btn;
   };
 
+  // ===== 表单构建与错误处理(本轮统一;此前各模块各自手搓且能力不一)=====
+
+  /**
+   * 构造字段标签:中文主体 + 可选大写英文微标签 + 可选必填标记。
+   *
+   * 契约要求标签用「中文 + 大写英文微标签」双语(Space Grotesk、字距 .08-.18em),
+   * 此前只有 notify 模块合规,服务器/项目/迁移等全部纯中文;把英文与中文拆成
+   * 两个元素承载,才能各自满足字体与字距要求。
+   *
+   * @param {string} zh 中文标签主体
+   * @param {string} [en] 英文微标签(自动大写);省略则只渲染中文
+   * @param {boolean} [required] 是否必填(渲染信号色方块标记)
+   * @param {string} [htmlFor] 关联的控件 id
+   * @returns {HTMLLabelElement}
+   */
+  window.formLabel = function (zh, en, required, htmlFor) {
+    var label = document.createElement('label');
+    label.className = 'form-label';
+    if (htmlFor) label.setAttribute('for', htmlFor);
+    label.appendChild(document.createTextNode(String(zh)));
+    if (en) {
+      var enSpan = document.createElement('span');
+      enSpan.className = 'form-label-en';
+      enSpan.textContent = String(en);
+      label.appendChild(enSpan);
+    }
+    if (required) {
+      var mark = document.createElement('span');
+      mark.className = 'form-label-req';
+      // 必填对屏幕阅读器也要可读:方块是视觉标记,语义靠这段文本承载
+      mark.setAttribute('aria-hidden', 'true');
+      label.appendChild(mark);
+      var sr = document.createElement('span');
+      sr.className = 'sr-only';
+      sr.textContent = '(必填)';
+      label.appendChild(sr);
+    }
+    return label;
+  };
+
+  /** 表单分组小标题(中文 + 大写英文;样式见 .form-group-title) */
+  window.formGroupTitle = function (zh, en) {
+    var node = document.createElement('div');
+    node.className = 'form-group-title';
+    node.appendChild(document.createTextNode(String(zh)));
+    if (en) {
+      var enSpan = document.createElement('span');
+      enSpan.className = 'form-label-en';
+      enSpan.textContent = String(en);
+      node.appendChild(enSpan);
+    }
+    return node;
+  };
+
+  /**
+   * 表单失败三通道:内联错误框 + 滚动到可视区 + toast。
+   *
+   * 此前五个助手(formFail/formFailLoud/scrollErrorVisible/formClearError/
+   * appendErrorBox)封闭在 servers.js 内,导致服务器表单不得不再写一份等价
+   * 逻辑,而 notify/settings/manage 等 8 个表单干脆只有 toast —— 长表单里
+   * toast 会先消失、顶部内联框又看不见。现上收为全局唯一口径。
+   *
+   * @param {string|HTMLElement} boxOrId 内联错误框的元素或 id
+   * @param {string} msg 错误文案
+   * @returns {boolean} 恒为 false(便于 `return window.formFailLoud(...)` 收尾)
+   */
+  window.formFailLoud = function (boxOrId, msg) {
+    var box = typeof boxOrId === 'string'
+      ? document.getElementById(boxOrId) : boxOrId;
+    if (box) {
+      box.textContent = msg;
+      box.classList.remove('hidden');
+      // 延迟 60ms:点击按钮会触发浏览器对按钮的原生焦点滚动,同步滚动会被其
+      // 覆盖,延后一拍才能生效(servers.js 既有经验,此处保持同口径)。
+      setTimeout(function () {
+        if (box.scrollIntoView) {
+          try { box.scrollIntoView({ block: 'nearest' }); }
+          catch (_) { box.scrollIntoView(); }
+        }
+      }, 60);
+    }
+    window.toast(msg, 'fail');
+    return false;
+  };
+
+  /** 清除内联错误框(表单重开/重新提交前调用) */
+  window.formClearError = function (boxOrId) {
+    var box = typeof boxOrId === 'string'
+      ? document.getElementById(boxOrId) : boxOrId;
+    if (box) {
+      box.textContent = '';
+      box.classList.add('hidden');
+    }
+  };
+
+  /** 构造一个隐藏的内联错误框(表单顶部聚合错误用) */
+  window.formErrorBox = function (id) {
+    var box = document.createElement('div');
+    box.className = 'form-error hidden';
+    if (id) box.id = id;
+    return box;
+  };
+
+  /**
+   * 标记/清除字段级错误:把提示贴在字段下方,并给控件加错误态类。
+   *
+   * 契约要求「错误贴近字段并可通过 aria-describedby 关联」—— 此前全站只有
+   * 表单顶部聚合框,没有任何字段级错误。本助手负责三件事:在字段行内插入
+   * 提示、给控件加 .has-error(底边转信号色)、建立 aria-describedby 关联;
+   * 传入 null/空消息即清除。
+   *
+   * @param {HTMLElement} control 出错的控件(须已插入 DOM)
+   * @param {string|null} msg 错误文案;空则清除该字段的错误
+   */
+  window.setFieldError = function (control, msg) {
+    if (!control || !control.parentNode) return;
+    var row = control.parentNode;
+    var errId = (control.id || 'field') + '-error';
+    var existing = document.getElementById(errId);
+    if (!msg) {
+      control.classList.remove('has-error');
+      control.removeAttribute('aria-invalid');
+      control.removeAttribute('aria-describedby');
+      if (existing && existing.parentNode) existing.parentNode.removeChild(existing);
+      return;
+    }
+    control.classList.add('has-error');
+    control.setAttribute('aria-invalid', 'true');
+    control.setAttribute('aria-describedby', errId);
+    if (!existing) {
+      existing = document.createElement('div');
+      existing.id = errId;
+      existing.className = 'form-field-error';
+      row.appendChild(existing);
+    }
+    existing.textContent = String(msg);
+  };
+
+  /** 批量清除一行/一组的字段级错误(表单重开或整体重校验前调用) */
+  window.clearAllFieldErrors = function (root) {
+    var scope = root || document;
+    var marked = scope.querySelectorAll('.has-error');
+    for (var i = 0; i < marked.length; i++) {
+      window.setFieldError(marked[i], null);
+    }
+  };
+
   // ===== 复制文本到剪贴板(成功 toast「已复制」)=====
   window.copyText = function (text) {
     function done() { window.toast('已复制', 'ok'); }

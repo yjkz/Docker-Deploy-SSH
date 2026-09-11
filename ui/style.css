@@ -1043,13 +1043,50 @@ select.text-input option,
 
 /* ===== 表单(模态框内) ===== */
 .form-row { margin-bottom: 12px; }
+/* 字段标签:中文主体 + 可选大写英文微标签(.form-label-en)。
+   契约要求微标签用 Space Grotesk 且有较开字距(.08-.18em),中文主体保持
+   正常字距 —— 故分开两个元素承载,而非把英文塞进同一段文字(那样两种字体
+   与字距需求互相牵制,是此前 .06em 折中的根因)。 */
 .form-label {
   display: block;
   font-size: 12px;
   font-weight: 600;
-  letter-spacing: .06em;
+  letter-spacing: .02em;
   color: var(--ark-paper-ink-65);
   margin-bottom: 6px;
+}
+.form-label-en {
+  font-family: var(--font-cond);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  margin-left: 7px;
+  color: var(--ark-paper-dim-ink);
+}
+/* 仅供屏幕阅读器的文本(视觉隐藏但保留在无障碍树;必填等语义用它承载,
+   避免只为无障碍额外增加可见文字) */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+/* 必填标记:信号色小方块(非星号 —— 契约禁装饰性字符,方块是同一几何语言的
+   最小单元,且与「左信号条/楔形」同色系,一眼可辨又不喧哗)。
+   挂在标签尾部,不改变标签主体排版。 */
+.form-label-req {
+  display: inline-block;
+  width: 4px;
+  height: 4px;
+  margin-left: 6px;
+  vertical-align: 2px;
+  background: var(--ark-signal);
 }
 .form-input { width: 100%; }
 /* 路径输入行:输入框 + 「浏览」按钮同行(按钮拉伸至输入框同高) */
@@ -1066,15 +1103,34 @@ select.text-input option,
   line-height: 1.5;
   color: var(--ark-paper-dim-ink);
 }
-.form-error {
-  border: 1px solid var(--ark-line);
-  border-left: 4px solid var(--ark-ink);
-  background: var(--ark-surface);
+/* 字段级错误(本轮新增):贴近出错字段的行内提示。契约要求「错误贴近字段并
+   可通过 aria-describedby 关联」—— 此前全站只有表单顶部的聚合错误框,长表单
+   滚到底部按保存时看不见顶部,只能靠 toast 兜。
+   用左缘 3px 信号条 + 自下而上裁切揭示,与输入框聚焦/只读的左缘标记同族;
+   动效走 --ark-dur-fast(直接交互带),不用透明度淡入(契约要求带方向)。 */
+.form-field-error {
+  margin-top: 5px;
+  padding-left: 8px;
+  border-left: 3px solid var(--ark-signal);
+  font-size: 11.5px;
+  line-height: 1.5;
   color: var(--ark-ink);
-  padding: 8px 10px;
-  margin-bottom: 12px;
-  font-size: 12.5px;
-  word-break: break-all;
+  animation: field-error-reveal var(--ark-dur-fast) var(--ark-ease-out);
+}
+@keyframes field-error-reveal {
+  from { clip-path: inset(0 0 100% 0); }
+  to   { clip-path: inset(0); }
+}
+/* 出错字段的输入框:底边转信号色(与聚焦同款线索,但不改边框宽度避免跳动) */
+.form-input.has-error,
+.form-textarea.has-error,
+.mapping-input.has-error {
+  border-bottom-color: var(--ark-signal);
+}
+/* 表单内联错误框:沿用 .form-error,但补一次方向性揭示(出错时才出现,
+   顶部聚合框在长表单里容易被忽略,给一个自左的扫入提示视线) */
+.form-error:not(.hidden) {
+  animation: field-error-reveal var(--ark-dur-fast) var(--ark-ease-out);
 }
 .form-actions {
   display: flex;
@@ -1652,6 +1708,15 @@ select.text-input option,
   opacity: 0.45;
   cursor: not-allowed;
 }
+/* 自定义间隔的行内输入(本轮替换 window.prompt:系统对话框违反本项目
+   「自绘输入/确认」纪律)。与下拉同排,选中「自定义…」时展开。 */
+.manage-interval-custom {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.manage-interval-custom.hidden { display: none; }
+.manage-interval-custom .form-input-sm { width: 68px; }
 
 /* ===== 概览技术面板 ===== */
 .manage-overview {
@@ -2715,17 +2780,31 @@ code {
 /* 通知模态卡片:比默认 560px 略宽,容纳邮件表单(同 .deploy-modal-card 的加宽先例) */
 .notify-modal-card { width: min(640px, 94vw); }
 
-/* 分组标题(mono 小字,同 .server-check-title 的语言;首个分组不留顶距) */
-.notify-group-title {
+/* 表单分组小标题(本轮统一):此前 notify/cio/set 各有一份逐行相同的规则
+   (仅类名不同),现收敛为 .form-group-title;旧类名保留作别名以零风险迁移
+   (JS 侧逐步改用新类,旧类名不再单独定义样式)。
+   排版按契约微标签规范:Space Grotesk(--font-cond)+ 大写字距 .14em;
+   底部 1px 弱线给出分组边界,替代此前的纯留白分隔。 */
+.form-group-title,
+.notify-group-title,
+.cio-group-title,
+.set-group-title {
   margin: 18px 0 8px;
-  font-family: var(--font-mono);
+  font-family: var(--font-cond);
   font-size: 11px;
-  letter-spacing: .12em;
+  font-weight: 700;
+  letter-spacing: .14em;
   text-transform: uppercase;
   color: var(--ark-paper-dim-ink);
+  border-bottom: 1px solid var(--ark-line-soft);
+  padding-bottom: 5px;
 }
-.notify-group-title:first-child { margin-top: 0; }
+.form-group-title:first-child,
+.notify-group-title:first-child,
+.cio-group-title:first-child,
+.set-group-title:first-child { margin-top: 0; }
 /* 紧跟分组标题的开关行去掉上内距,归入该分组视觉 */
+.form-group-title + .deploy-checkbox,
 .notify-group-title + .deploy-checkbox { padding-top: 0; }
 
 /* 测试结果行:行内回显;失败用 --ark-stat-hot(暗红/柔和红,两主题均过 AA) */
@@ -2747,15 +2826,6 @@ code {
 /* ===== 配置中心(config-io.js;复用 modal/form-row/input-btn-row/btn 体系) ===== */
 
 /* 模态内分组标题(参照 .notify-group-title 先例:mono 小字大写字距) */
-.cio-group-title {
-  margin: 18px 0 8px;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  letter-spacing: .12em;
-  text-transform: uppercase;
-  color: var(--ark-paper-dim-ink);
-}
-.cio-group-title:first-child { margin-top: 0; }
 
 /* 组内说明文字(弱化段落,说明导出加密/导入覆盖语义) */
 .cio-note {
@@ -2896,16 +2966,7 @@ code {
   background: var(--ink-on-paper-05);
 }
 
-/* 分组标题(mono 小字,参照 .notify-group-title/.cio-group-title 先例) */
-.set-group-title {
-  margin: 18px 0 8px;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  letter-spacing: .12em;
-  text-transform: uppercase;
-  color: var(--ark-paper-dim-ink);
-}
-.set-group-title:first-child { margin-top: 0; }
+/* （分组标题规则已上收至 .form-group-title,别名覆盖 .set-group-title） */
 
 /* 组内说明文字(弱化段落) */
 .set-hint {

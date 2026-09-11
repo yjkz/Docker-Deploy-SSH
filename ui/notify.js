@@ -109,8 +109,8 @@
   }
 
   /** 分组标题(mono 小字,样式见 style.css .notify-group-title) */
-  function groupTitle(text) {
-    return el('div', 'notify-group-title', text);
+  function groupTitle(zh, en) {
+    return window.formGroupTitle(zh, en);
   }
 
   /** 按钮忙碌态切换(执行测试/保存期间禁用防重复;第六批收敛到共享助手) */
@@ -191,13 +191,17 @@
 
   // ===== 模态 body 构建(每次打开重建,事件随元素重建,无重复绑定)=====
 
-  /** 追加一行输入字段:标签 + 输入框(+ 可选提示);返回输入元素 */
-  function appendField(body, labelText, inputId, inputType, value, placeholder,
+  /**
+   * 追加一行输入字段:标签 + 输入框(+ 可选提示);返回输入元素。
+   *
+   * `zh` / `en` 分离:此前把英文塞进同一段文字(如「SMTP 主机 SMTP HOST」),
+   * 导致中英共用同一字体与字距 —— 而契约要求微标签用 Space Grotesk 且字距
+   * .08-.18em、中文保持正常字距。改用 window.formLabel 后两者可各自合规。
+   */
+  function appendField(body, zh, en, inputId, inputType, value, placeholder,
                        hint, inputAttrs) {
     var row = el('div', 'form-row');
-    var label = el('label', 'form-label', labelText);
-    label.setAttribute('for', inputId);
-    row.appendChild(label);
+    row.appendChild(window.formLabel(zh, en, false, inputId));
 
     var input = document.createElement('input');
     input.className = 'form-input';
@@ -265,30 +269,39 @@
   function buildBody(body) {
     body.textContent = '';
     st.passwordSaved = false;
+    window.formClearError('notify-error');
+
+    // 内联错误框(本轮补齐):此前 notify 表单保存/校验失败只有 toast ——
+    // 这里是长表单(桌面/邮件/事件三组),用户停在底部按钮处时顶部内容已不可见,
+    // toast 2.5s 后消失就再无线索。走全局统一三通道(内联 + 滚动 + toast)。
+    var errBox = window.formErrorBox('notify-error');
+    body.appendChild(errBox);
 
     // ── 桌面通知 ──
-    body.appendChild(groupTitle('桌面通知 DESKTOP'));
+    body.appendChild(groupTitle('桌面通知', 'DESKTOP'));
     body.appendChild(checkboxRow('notify-desktop-enabled', '部署完成时显示系统通知', false));
 
     // ── 邮件通知 ──
-    body.appendChild(groupTitle('邮件通知 EMAIL'));
+    body.appendChild(groupTitle('邮件通知', 'EMAIL'));
     body.appendChild(checkboxRow('notify-email-enabled', '启用邮件通知', false));
-    appendField(body, 'SMTP 主机 SMTP HOST', 'notify-smtp-host', 'text', '',
-      '例如:smtp.example.com');
-    appendField(body, 'SMTP 端口 PORT', 'notify-smtp-port', 'number', '465',
-      null, null, { min: 1, max: 65535, step: 1 });
-    appendField(body, '用户名 USERNAME', 'notify-smtp-username', 'text', '',
-      '留空表示不认证');
+    appendField(body, 'SMTP 主机', 'SMTP HOST', 'notify-smtp-host', 'text', '',
+      '例如:smtp.example.com',
+      '服务器填错会导致测试邮件与部署通知都发不出去');
+    appendField(body, 'SMTP 端口', 'PORT', 'notify-smtp-port', 'number', '465',
+      null, '留空按加密方式取默认端口(SSL 465 / STARTTLS 587 / 不加密 25)',
+      { min: 1, max: 65535, step: 1 });
+    appendField(body, '用户名', 'USERNAME', 'notify-smtp-username', 'text', '',
+      '留空表示不认证', '多数 SMTP 服务的用户名是完整邮箱地址');
     // 密码:不回填明文,placeholder 由 fillForm 按 passwordSaved 决定
-    appendField(body, '密码 PASSWORD', 'notify-smtp-password', 'password', '',
-      '未设置');
+    appendField(body, '密码', 'PASSWORD', 'notify-smtp-password', 'password', '',
+      '未设置', '留空表示沿用已保存密码;密码以系统加密存储,不回显');
     appendSecuritySelect(body);
-    appendField(body, '发件人 FROM', 'notify-email-from', 'text', '',
+    appendField(body, '发件人', 'FROM', 'notify-email-from', 'text', '',
       '例如:bot@example.com(可用「名称 <addr>」格式)');
     appendRecipientsField(body);
 
     // ── 事件订阅 ──
-    body.appendChild(groupTitle('事件订阅 EVENTS'));
+    body.appendChild(groupTitle('事件订阅', 'EVENTS'));
     body.appendChild(checkboxRow('notify-event-success', '部署成功', true));
     body.appendChild(checkboxRow('notify-event-failure', '部署失败', true));
     body.appendChild(checkboxRow('notify-event-cancel', '部署取消', false));
@@ -381,7 +394,10 @@
       list.push(addr);
     });
     if (invalid.length > 0) {
-      window.toast('收件人地址无效(需包含 @):' + invalid.join('、'), 'fail');
+      window.formFailLoud('notify-error',
+        '收件人地址无效(需包含 @):' + invalid.join('、'));
+      window.setFieldError(document.getElementById('notify-email-to'),
+        '需为含 @ 的邮箱地址,一行一个');
       return null;
     }
     return list;
@@ -467,7 +483,8 @@
         if (!sessionAlive(session)) return; // 过期会话:静默丢弃
         st.saving = false;
         setBusy('notify-save-btn', false, '保存配置');
-        window.toast('保存通知配置失败:' + (errText(err) || '未知错误'), 'fail');
+        window.formFailLoud('notify-error',
+          '保存通知配置失败:' + (errText(err) || '未知错误'));
       });
   }
 

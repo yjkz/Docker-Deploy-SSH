@@ -85,6 +85,13 @@
     // 间隔选择
     var ivSel = $('manage-interval-select');
     if (ivSel) ivSel.addEventListener('change', onIntervalChange);
+    // 自定义间隔的行内输入:应用按钮 + Enter 提交(与镜像拉取条同款键盘行为)
+    var ivApply = $('manage-interval-apply');
+    if (ivApply) ivApply.addEventListener('click', applyCustomInterval);
+    var ivInput = $('manage-interval-custom');
+    if (ivInput) ivInput.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') applyCustomInterval();
+    });
 
     // 镜像拉取
     var pullBtn = $('manage-pull-btn');
@@ -941,7 +948,11 @@
     var input = $('manage-pull-input');
     if (!input) return;
     var image = input.value.trim();
-    if (!image) { toast('请输入镜像名', 'warn'); return; }
+    if (!image) {
+      window.setFieldError(input, '此项必填');
+      toast('请输入镜像名', 'warn');
+      return;
+    }
 
     state.opInProgress = true;
     stopTimer();
@@ -1046,7 +1057,11 @@
     if (!source || !newTag) return;
     var image = source.value.trim();
     var tag = newTag.value.trim();
-    if (!tag) { toast('请输入新标签', 'warn'); return; }
+    if (!tag) {
+      window.setFieldError(newTag, '此项必填');
+      toast('请输入新标签', 'warn');
+      return;
+    }
 
     state.opInProgress = true;
     stopTimer();
@@ -1416,7 +1431,11 @@
     var driverInput = $('volume-driver-input');
     if (!nameInput) return;
     var name = nameInput.value.trim();
-    if (!name) { toast('请输入卷名称', 'warn'); return; }
+    if (!name) {
+      window.setFieldError(nameInput, '此项必填');
+      toast('请输入卷名称', 'warn');
+      return;
+    }
     var driver = driverInput ? driverInput.value.trim() : '';
 
     state.opInProgress = true;
@@ -1637,7 +1656,11 @@
     var driverInput = $('network-driver-input');
     if (!nameInput) return;
     var name = nameInput.value.trim();
-    if (!name) { toast('请输入网络名称', 'warn'); return; }
+    if (!name) {
+      window.setFieldError(nameInput, '此项必填');
+      toast('请输入网络名称', 'warn');
+      return;
+    }
     var driver = driverInput ? driverInput.value.trim() : '';
 
     state.opInProgress = true;
@@ -1701,7 +1724,11 @@
     var input = $('network-container-input');
     if (!input) return;
     var container = input.value.trim();
-    if (!container) { toast('请输入容器名或容器 ID', 'warn'); return; }
+    if (!container) {
+      window.setFieldError(input, '此项必填');
+      toast('请输入容器名或容器 ID', 'warn');
+      return;
+    }
 
     state.opInProgress = true;
     stopTimer();
@@ -1760,27 +1787,52 @@
     else stopTimer();
   }
 
+  /** 显示/隐藏自定义间隔的行内输入 */
+  function setCustomIntervalVisible(on) {
+    var wrap = $('manage-interval-custom-wrap');
+    if (wrap) wrap.classList.toggle('hidden', !on);
+    if (on) {
+      var input = $('manage-interval-custom');
+      if (input && !input.value) input.value = String(state.interval);
+    }
+  }
+
+  /**
+   * 应用自定义间隔(原来走 window.prompt —— 全站唯一的系统对话框,违反本项目
+   * 「自绘输入/确认、不调用系统对话框」的纪律;改为下拉旁的行内数字输入)。
+   */
+  function applyCustomInterval() {
+    var ivSel = $('manage-interval-select');
+    var input = $('manage-interval-custom');
+    if (!ivSel || !input) return;
+    var secs = parseInt(String(input.value || '').trim(), 10);
+    if (isNaN(secs) || secs < MIN_INTERVAL || secs > MAX_INTERVAL) {
+      window.setFieldError(input,
+        '需为 ' + MIN_INTERVAL + '-' + MAX_INTERVAL + ' 之间的整数');
+      toast('无效间隔,请输入 ' + MIN_INTERVAL + '-' + MAX_INTERVAL + ' 之间的正整数', 'warn');
+      return;
+    }
+    window.setFieldError(input, null);
+    state.interval = secs;
+    setCustomIntervalVisible(false);
+    savePrefs();
+    resetTimer();
+  }
+
   function onIntervalChange() {
     var ivSel = $('manage-interval-select');
     if (!ivSel) return;
     var val = ivSel.value;
     if (val === 'custom') {
-      var input = window.prompt('请输入刷新间隔(秒),范围 ' + MIN_INTERVAL + '-' + MAX_INTERVAL + ':');
-      if (input === null) {
-        // 取消:回退到上次有效值
-        ivSel.value = String(state.interval);
-        return;
-      }
-      var secs = parseInt(input, 10);
-      if (isNaN(secs) || secs < MIN_INTERVAL || secs > MAX_INTERVAL) {
-        toast('无效间隔,请输入 ' + MIN_INTERVAL + '-' + MAX_INTERVAL + ' 之间的正整数', 'warn');
-        ivSel.value = String(state.interval);
-        return;
-      }
-      state.interval = secs;
-    } else {
-      state.interval = parseInt(val, 10) || 30;
+      // 展开行内输入并把焦点交给它(不再弹系统对话框)
+      setCustomIntervalVisible(true);
+      var input = $('manage-interval-custom');
+      if (input) { try { input.focus(); input.select(); } catch (_) {} }
+      return;
     }
+    window.setFieldError($('manage-interval-custom'), null);
+    setCustomIntervalVisible(false);
+    state.interval = parseInt(val, 10) || 30;
     savePrefs();
     resetTimer();
   }
