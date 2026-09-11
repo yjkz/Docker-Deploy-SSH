@@ -26,7 +26,7 @@
         <p>DockerDeploy SSH 是一款桌面端 Docker 部署工具:在本机构建好镜像后,按
         <strong>docker save 导出压缩 → SFTP 上传 → docker load 装载 → docker compose up 启动</strong>
         的流程把应用送上服务器,<strong>全程不依赖任何镜像仓库</strong>(无需 Docker Hub 或私有 Registry)。</p>
-        <h4>五页导航(左侧黑色 dock,窄窗口时为顶部横条)</h4>
+        <h4>六页导航(左侧黑色 dock,窄窗口时为顶部横条)</h4>
         <table>
           <thead><tr><th>页码</th><th>页面</th><th>作用</th></tr></thead>
           <tbody>
@@ -35,10 +35,11 @@
             <tr><td>03</td><td>服务器管理</td><td>维护服务器(SSH 连接)与部署项目(compose + 文件映射)</td></tr>
             <tr><td>04</td><td>部署向导</td><td>单镜像或整栈(compose)部署到服务器</td></tr>
             <tr><td>05</td><td>远程管理</td><td>经 SSH 管理服务器上的容器 / 镜像 / 卷 / 网络 / 栈 / 实时监控</td></tr>
+            <tr><td>06</td><td>回滚中心</td><td>按服务器实际目录扫描项目,回滚到任意历史版本(归档 / 旧标签)</td></tr>
           </tbody>
         </table>
         <p>02 / 04 页依赖本机 Docker:环境检测未通过时在导航中置灰,点击会提示;
-        03 / 05 页只做远程 SSH 操作,始终可以进入。dock 末端的按钮切换亮暗主题。</p>
+        03 / 05 / 06 页只做远程 SSH 操作,始终可以进入。dock 末端的按钮切换亮暗主题。</p>
         <h4>前置要求</h4>
         <ul>
           <li>本机已安装 Docker Desktop 且包含 docker compose 插件(01 页未安装时会给出可复制的安装命令);</li>
@@ -47,7 +48,7 @@
         </ul>
         <h4>推荐首次使用流程</h4>
         <ul>
-          <li>01 完成环境检测 → 03 新增服务器并「测试连接」→ 03 新增项目(建议直接导入 compose 文件)→ 04 部署 → 05 远程管理核对运行状态。</li>
+          <li>01 完成环境检测 → 03 新增服务器并「测试连接」→ 03 新增项目(建议直接导入 compose 文件)→ 04 部署 → 05 远程管理核对运行状态;部署后可随时在 06 回滚中心回退到历史版本。</li>
         </ul>
         <p>右下角的「?」按钮随时打开本帮助;Esc 或点击遮罩可关闭。</p>`
     },
