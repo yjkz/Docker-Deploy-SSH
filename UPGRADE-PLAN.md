@@ -293,6 +293,33 @@ notify: {
 - 前端(manage.js):镜像 Tab「迁移镜像」按钮 → 模态(目标服务器下拉排除当前 + 镜像多选带大小 + 迁移日志区);`manage_list_servers` 现取保证目标列表新鲜;迁移中按钮禁用,done 后自动刷新
 - 帮助/契约文档随更
 
+### 阶段六:文字样式统一(随 v5.7.2 发布)
+
+用户反馈「整栈回滚确认这块文字都是原样很生硬」;全面普查(171 处 font-size / 46 处 line-height /
+40 处 letter-spacing)定案三项决策(均已用户确认)并外加四项低风险附赠:
+
+- **字号彻底归并**:16 种取值收敛为 10/11/12/12.5/13/15/18/22/34/84(56);淘汰 10.5→11、
+  11.5→12.5、13.5→13、16→15(~20 处声明)。`.manage-table` 表内 11px 覆盖保留(列宽紧张的刻意
+  再压缩);`.manage-terminal` 12px/1.5 与 manage.js 字符量测硬编码耦合,明确不碰
+- **确认框三段式 + 风险分层**:app.js 新增 `window.confirmBlock({title, facts, risk})`,全站 7 条
+  确认渲染路径统一「主问句 15px/700 + 事实清单 12.5px 键值 + 风险提示 12.5px 琥珀 + 左条」
+  (deploy 整栈/单镜像、rollback 整栈/镜像、manage 删容器/镜像/卷/网络/启停栈与 .env 保存、
+  servers 安装 Docker/清理执行);风险句走既有 `--ark-warn-text`/`--ark-warn`,不引入新颜色;
+  config-io 危险区为参照实现不动。rollback.js 原 `
+` 拼 `<pre>` 的 UA 等宽与 1.8 行高问题随之消失
+- **word-break 分类**:散文/错误/toast/结果行 13 处 `break-all` → `overflow-wrap: anywhere`
+  (中文不再硬断词);数据单元格(长哈希)与日志/终端(5 处)保留 break-all
+- **微标签两轨制**:结构标签轨(cond / 11px / 大写 / .12em:各表头与区块标题补 font-family、
+  低区间 .08/.1 升 .12)+ 数据微标签轨(mono 保持);port-badge 归数据轨,.06em 计数行升 .12em
+- **附赠**:hint 族行高统一 1.6、help 正文 1.85→1.7;hint 颜色收敛 `--ark-paper-dim-ink`;
+  tabular-nums 补齐(manage 容器/镜像/卷创建时间 + 大小、监控内存%/PIDs,images 两列,rollback
+  标签时间);18 处死回退清理(rgba 字面量 / `#d68a1e` / `, inherit`);迁移后死规则
+  `.confirm-text`/`.rollback-confirm-text` 删除
+
+**验证**:`node --check` 全通过;ark-ui 审计 0 error / 12 pass 与基线一致;Chrome headless 亮暗两主题
+`getComputedStyle` 断言三段式与断词;淘汰字号与死回退 grep 归零;真实 index.html + Tauri 桩集成加载
+零 JS 错误;`cargo test` 269 passed。
+
 ### 遗留与取舍(记录在 wiki 07 已知限制)
 
 - 实时跟随行数上限 5000 由前端裁剪(后端只管推送);`manage-logs` 事件归属按「当前活跃会话唯一」过滤,后端 streamId 为后端代号,前端未知(全局单流语义下无歧义)
