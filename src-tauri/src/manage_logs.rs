@@ -310,3 +310,39 @@ pub async fn manage_log_stream_stop(logs_state: tauri::State<'_, LogsState>) -> 
     log::info!("日志流停止: generation={}", gen);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generation_guard() {
+        let mut inner = LogsStateInner::default();
+        // 初始无流:任何代号都非当前
+        assert!(!inner.is_current(1));
+        // 运行中仅当前代号有效
+        inner.generation = 1;
+        inner.running = true;
+        assert!(inner.is_current(1));
+        assert!(!inner.is_current(2));
+        // 旧流退出:代号过期,finish 不得清掉新流的 running(防误清新流)
+        inner.generation = 2;
+        inner.running = true;
+        inner.finish(1);
+        assert!(inner.running, "旧代号 finish 不应清 running");
+        inner.finish(2);
+        assert!(!inner.running);
+    }
+
+    #[test]
+    fn test_begin_end_monotonic() {
+        let st = LogsState::default();
+        let g1 = st.begin();
+        // 重复 start 自动替换旧流:代号严格递增
+        let g2 = st.begin();
+        assert!(g2 > g1);
+        st.end();
+        let g3 = st.begin();
+        assert!(g3 > g2);
+    }
+}

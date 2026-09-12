@@ -543,3 +543,48 @@ async fn run_stats_round(client: &mut SshClient) -> RoundOutcome {
         Err(e) => RoundOutcome::CommandFailed(e),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generation_guard() {
+        let mut inner = StatsStateInner::default();
+        assert!(!inner.is_current(1));
+        inner.generation = 1;
+        inner.running = true;
+        assert!(inner.is_current(1));
+        assert!(!inner.is_current(2));
+        // 旧会话自清理:代号过期时 finish 不得清新会话的 running
+        inner.generation = 2;
+        inner.running = true;
+        inner.finish(1);
+        assert!(inner.running, "旧代号 finish 不应清 running");
+        inner.finish(2);
+        assert!(!inner.running);
+    }
+
+    #[test]
+    fn test_is_transport_error() {
+        // 传输层失败(连接不可信,需重连)
+        assert!(is_transport_error("SSH 打开会话通道失败: x"));
+        assert!(is_transport_error("SSH 执行命令失败: x"));
+        assert!(is_transport_error("获取容器统计超时"));
+        assert!(is_transport_error("docker stats 失败(退出码 -1): x"));
+        // 命令层失败(连接仍可用)
+        assert!(!is_transport_error("docker stats 失败(退出码 1): x"));
+        assert!(!is_transport_error("解析失败"));
+    }
+
+    #[test]
+    fn test_begin_end_monotonic() {
+        let st = StatsState::default();
+        let g1 = st.begin();
+        let g2 = st.begin(); // 重复 start 无缝接管:代号严格递增
+        assert!(g2 > g1);
+        st.end();
+        let g3 = st.begin();
+        assert!(g3 > g2);
+    }
+}

@@ -966,6 +966,32 @@ v5.8.1 更新内容 → 确认全自动更新重启。
   改动);浏览器桩截图(标题+说明双输入渲染)交 judge;路径翻倍修复
   待用户真机复测保存版本标题/说明
 
+# 第十二批升级（v5.11.0,进行中）
+
+## 阶段一:commands.rs 结构治理 + 零测试模块补测 ✅
+
+- **commands.rs(10,545 行)按文件头既有分节拆为 `src/commands/` 11 文件**:
+  `deploy`(单镜像+整栈管线,2057 行)/ `rollback`(一键回滚+独立回滚中心+
+  版本说明+manifest,1470)/ `cleanup`(清理分析,1243)/ `migrate`(镜像迁移,
+  475)/ `compose_sources`(项目源更新+compose 解析,494)/ `host_server`(宿主机
+  检测+服务器操作,367)/ `resume`(断点续传,434)/ `batch`(批量部署死代码,
+  292)/ `preview`(部署预览,281)/ `tests`(编排层 134 单测,2249);`mod.rs`
+  (1261)保留跨域共享设施(DeployState、事件结构、emit/finish_deploy_run/
+  webhook/CatchPanic、find_server/resolve_password、remote_join 等)并对各
+  子模块 `pub use` —— **lib.rs 的 commands::xxx 路径零改动**。拆分为脚本
+  机械切分(条目级区间 + 属性行回溯),可见性按编译器反馈最小放宽
+  (pub(crate),仅跨域消费的 22 个符号 + resume 三结构体/RollbackScanDump
+  的字段)
+- **测试**:manage_logs.rs / manage_stats.rs 两个零测试模块补代号守卫
+  (generation begin/finish/is_current,含「旧代号 finish 不得清新流」)+
+  传输错误分类(is_transport_error 三传输两命令层样本)+ 代号严格递增,
+  +5 → `cargo test` 显式确认 `test result: ok. 290 passed; 0 failed;
+  13 ignored`(基线不降);`cargo check` 零警告,clippy 零新增(存量 15 条
+  原样搬家)
+- **JS 大文件拆分**(deploy.js ~3420 / manage.js ~3260 / servers.js ~3020):
+  细案另行提交用户批复后实施(本批先落 Rust 侧)
+
+
 
 
 
