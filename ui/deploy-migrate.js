@@ -148,12 +148,18 @@
   function renderMigrateProjectModal(project, servers, defaultSrc) {
     var body = document.getElementById('migrate-project-modal-body');
     if (!body) return;
-    body.innerHTML = '';
+
+    // 表单语义:选择区/目录输入进 <form novalidate>(第十三批);
+    // 计划区与日志区是**结果输出**不是表单内容,留在 form 之外 ——
+    // 包进去会让「预检结果」成为表单的一部分(B/S 语义与 Enter 提交范围都不对)。
+    var formApi = window.beginForm(body, 'migrate-project-modal-title');
+    var form = formApi.form;
+    form.classList.add('migrate-form');
 
     var hint = el('p', 'confirm-msg',
       '把项目「' + (project.name || project.id) + '」的镜像、compose 文件、数据卷与发布归档' +
-      '从一台服务器搬到另一台,并在目标服务器启动。源服务器的内容会保留不动。');
-    body.appendChild(hint);
+      '从一台服务器搬到另一台,并在目标服务器上启动。源服务器的内容会保留不动。');
+    form.appendChild(hint);
 
     // ---- 选择区 ----
     var grid = el('div', 'migrate-form-grid');
@@ -262,8 +268,8 @@
       '留空 = 沿用项目或服务器的部署目录;填了独立目录需在目标服务器上先建好'));
     grid.appendChild(dirRow);
 
-    body.appendChild(grid);
-    body.insertBefore(gridTitle, grid);
+    form.appendChild(grid);
+    form.insertBefore(gridTitle, grid);
 
     // ---- 动作按钮 ----
     var actions = el('div', 'modal-actions');
@@ -280,14 +286,39 @@
     startBtn.title = '需先完成预检并解决阻断问题';
     startBtn.addEventListener('click', onMigrateStart);
     actions.appendChild(startBtn);
-    body.appendChild(actions);
+    form.appendChild(actions);
+
+    // 表单语义 + 失焦校验 + Enter(第十三批):Enter 只走到**预检**(只读),
+    // 「确认迁移」是执行型动作,必须点击,Enter 不越过它。
+    var v = window.bindFieldValidation(form, [
+      {
+        id: 'migrate-project-dir',
+        test: function (val) { return val === '' || val.indexOf('/') === 0; },
+        message: '目标部署目录需为以 / 开头的绝对路径(如 /opt/myapp),或留空沿用配置'
+      },
+      {
+        id: 'migrate-opt-releases',
+        // 后端按 0-20 夹取,此前超界静默改值;改为提示。**不阻断**:归一
+        // 仍在后端生效,提示只是让用户知道实际会用哪个值。
+        blocking: false,
+        test: function (val) {
+          if (val === '') return true;
+          return /^\d+$/.test(val) && Number(val) >= 0 && Number(val) <= 20;
+        },
+        message: '归档数量需为 0 - 20 之间的整数(0 = 不搬;超界将按边界值执行)'
+      }
+    ]);
+    window.bindFormEnter(form, onMigratePreview);
+    formApi.onSubmit(onMigratePreview);
+    // 源下拉变化会重建目标下拉:重校验(避免残留「源与目标相同」类旧提示)
+    srcSel.addEventListener('change', function () { v.checkField('migrate-project-target'); });
 
     // ---- 计划区 ----
     var planBox = el('div', 'migrate-plan hidden');
     planBox.id = 'migrate-project-plan';
     body.appendChild(planBox);
 
-    // ---- 日志区(恒暗面板) ----
+    // ---- 日志区(恒暗面板)----
     var logHead = el('div', 'migrate-log-head', '执行日志');
     body.appendChild(logHead);
     var log = el('pre', 'migrate-log-body');

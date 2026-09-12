@@ -1025,3 +1025,123 @@ v5.8.1 更新内容 → 确认全自动更新重启。
 
 
 
+
+# 第十三批升级（v5.12.0）— 阶段五:表单校验体系
+
+> 细案经用户批复(2026-09-12),批复口径:六项决策全部采纳 —— ①必填类错误在
+> 首次提交后才参与失焦提示;②输入时清除本字段已有错误(只清不加);③引入
+> `<form novalidate>` 五处;④新增规则候选全部采纳;⑤清理模态扫描起点 Enter;
+> ⑥`setFieldError` 锚点修正带来的排版变化。用户同时授权「一次性完成所有任务,
+> 不再逐阶段批复」。
+
+## 一、三个统一助手(全部落 app.js,零新文件)
+
+- **`window.bindFieldValidation(formRoot, rules)`** —— 失焦校验接线器。**一份
+  规则清单同时供失焦校验与提交期整体校验**(单一事实来源),避免「失焦说合法、
+  提交说非法」两套判定漂移;此前 `saveServer`/`saveProject` 的校验分支与
+  `collectProjectExtras` 的逐字段判定是两份独立实现。
+  - 规则描述符:`{ id|selector, required, test(v), when(), message,
+    formatMessage(v), label, gate, blocking }`
+  - **呈现闸门**:必填类错误只在「表单已提交过一次」或「该字段被填过又清空」
+    时提示(否则 Tab 扫过一张空表满屏标红);格式类错误恒提示
+  - `when()` 为假 → 清除该字段错误(切到密码认证时清掉私钥路径红字)
+  - 失焦失败**只做字段级提示**:不 toast、不滚动、不写顶部聚合框
+  - `validate()` → `{ firstBad, missing, formats, blockingErrors }`,供调用方
+    聚焦首错字段 + 拼既有句式(「请填写:X、Y」/ 格式错误原文)
+  - `blocking: false` = 只提示不阻断(迁移的归档数量越界;后端本就会夹取归一)
+  - **逐字段求错(非逐规则)**:一个字段可挂多条规则(如远程部署目录:必填 +
+    绝对路径),按规则逐条写会出现「后一条通过的规则用 `setFieldError(null)`
+    抹掉前一条刚贴的错误」—— 这是本地校验器抓出的实现缺陷,已改为按字段聚合
+- **`window.bindFormEnter(formRoot, onEnter)`** —— Enter 提交接线。两条纪律:
+  ①只认单行文本类 `input`(textarea 保留换行、select/checkbox 不响应);
+  ②判 `e.isComposing || e.keyCode === 229` —— **中文输入法按 Enter 是上屏候选词**,
+  全站原有 8 处手写 Enter(manage 打标签/创建卷/创建网络/连接容器/自定义间隔、
+  rollback 扫描起点、manage-stacks 终端)均缺这条判断
+- **`window.beginForm(container, labelId)`** —— 表单语义脚手架:清空容器并放入
+  `<form novalidate aria-labelledby=...>`,返回 `{ form, onSubmit, submit }`。
+  **`submit` 恒 `preventDefault`:这是必须的保险** —— HTML 规范里「可阻塞隐式
+  提交的字段恰好一个」时 Enter 会自行提交表单,单镜像回滚视图恰好只有
+  `rb-target-input` 一个文本输入,不接管会导致 WebView 导航(桌面应用里等于白屏)
+
+## 二、`setFieldError` 锚点修正(存量缺陷)
+
+原实现用 `control.parentNode` 作错误锚点。路径类字段(私钥路径 `srvf-key-path`、
+导入 compose 路径 `prjf-import-path`)的父节点是 `.input-btn-row`(`display:flex`),
+而私钥路径**确实会报字段错误** —— 原实现把「私钥认证需填写私钥路径」塞进 nowrap
+的按钮行里,与输入框 + 「浏览」按钮抢宽度。改为 `closest('.form-row') || parentNode`,
+并把错误**插在行内 `form-hint` 之前**(错误先于帮助文案被读到,也不把长说明顶在
+错误与控件之间)。
+
+## 三、规则清单(表单 × 规则)
+
+- **服务器表单**:名称/主机/用户名/远程部署目录必填;端口 1-65535;
+  **远程部署目录 `/` 开头绝对路径(新增)**;私钥路径(Key 认证时必填);
+  登录密码(密码认证且无已存密文时必填)
+- **项目表单**:名称必填;compose 相对路径(无导入路径时必填);健康等待
+  0-86400;webhook `http(s)://` 前缀;项目级远程部署目录绝对路径;归档保留
+  0-50;默认服务器选中项仍存在。`collectProjectExtras` 退化为**纯取值**
+  (校验交给规则清单),文件映射行级校验保留独立实现(错误锚点在 `<td>` 内、
+  文案带行号,与字段级规则不同形状)
+- **通知模态(新增前端侧提示)**:启用邮件时 SMTP 主机/发件人/收件人必填;
+  端口 1-65535 或留空;发件人含 `@`。此前这些只由后端校验(主机/收件人在
+  `validate_email_save`,发件人在发送时 `build_email`),「保存通过、发送才报」
+- **迁移模态(新增)**:目标部署目录绝对路径;归档数量 0-20(**非阻断**提示,
+  后端仍按边界夹取)
+- **单镜像回滚**:目标引用须为完整镜像引用(`repo:tag`,此前只在点「执行回滚」
+  时 toast)
+- **清理模态(新增)**:扫描起点 `/` 开头绝对路径
+- **部署页(新增字段级提示)**:三个下拉缺选时贴 `请选择…` 到对应控件并把焦点
+  给第一个(此前只有 toast,用户滚到页面底部点「开始部署」看不出哪格漏选);
+  选中即清除该错误
+
+## 四、Enter 语义(不越过二次确认)
+
+| 位置 | Enter 目标 | 说明 |
+|---|---|---|
+| 服务器 / 项目表单 | 保存 | 非破坏 |
+| 通知模态 | 保存配置 | 不绑测试桌面/测试邮件 |
+| 迁移模态 | 开始预检 | 只读;「确认迁移」不绑 |
+| 单镜像回滚 | 执行回滚按钮 → 打开二次确认视图 | 确认视图内不注册 Enter |
+| 清理模态 | 重新扫描 | 只读 |
+| **部署页 / 批量模态** | **不绑** | 前者文本输入只有可选的版本标题/说明,Enter 触发「开始部署」风险不对等;后者是多台部署 |
+
+## 五、顺带修复:第十二批拆分的 `window.DeployKit` 双重赋值覆盖(存量 bug)
+
+deploy.js 末尾写了**两个** `window.DeployKit = {...}` 字面量(回滚一个、迁移一个),
+后者整体覆盖前者 —— 拆出的 `deploy-rollback.js` 在模块顶层取到的
+`DATE_TAG_RE` / `appendLogLine` / `refreshHistory` / `renderHistory` /
+`handleDone` / `LOG_MAX_LINES` 全是 `undefined`,**单镜像回滚模态一打开即抛
+「Cannot read properties of undefined (reading 'test')」**(`splitImageRef` 里
+`DATE_TAG_RE.test(...)`)。合并为单一对象(12 键,覆盖两个消费方的全部 `K.*`),
+并新增本地守护脚本 `verify/bridge-integrity.js` 检查「资产赋值次数 ≠ 1」与「消费键未被
+提供」;另核查 ManageKit(12 键)/ServersKit(4 键)均无此问题。
+
+## 六、验证
+
+- **本地校验器 `verify/form-validation.js`**(自建最小 DOM shim + 加载真实 app.js,
+  54 项断言全过):锚点/aria 关联、闸门(空表不标红 / 填过又清空才提示)、
+  `when()` 切换清红字、`blocking:false` 不阻断、一字段多规则取第一条、
+  Enter(IME/textarea/checkbox/disabled/readOnly/非 Enter 键)、`beginForm`
+  的 submit 拦截与 `novalidate`/`aria-labelledby`、`clear()` 复位
+- **浏览器 + Tauri 桩**(`ui/_tauri-stub.js` + `_judge-preview.html` +
+  `http.server 8799`,用完已删桩停服):服务器表单(空表失焦无红 → 端口越界即
+  提示 → 提交出 5 处字段错误 + 缺项摘要 → 切密码认证红字迁移)、Enter 三态
+  (非法拦截不 invoke / 合法真正发起 `save_config_cmd` + `test_server` /
+  IME 与 textarea 均不触发)、通知模态(条件必填、端口、发件人 `@`、保存路径)、
+  迁移模态(结构:输入区在 form 内、计划区与日志区在外;Enter 只走
+  `migrate_project_preview`)、回滚模态(**隐式提交被拦、页面未导航**;
+  Enter → 确认视图;确认视图内 Enter 无 invoke)、清理模态(Enter →
+  `cleanup_preview`)。截图 4 张交 judge **4/4 pass**(overall pass)
+- `cargo test` 显式确认 `test result: ok. 290 passed; 0 failed; 13 ignored`
+  (纯 JS/CSS 改动,基线不变);`cargo clippy --all-targets` 零新增(15 条存量
+  全在 ssh/stack/commands 等本批未触碰的文件);8 个改动 JS 全过 `node --check`
+- 命令/事件计数不变(94 / 12,本批未新增命令),wiki/04 无需改动
+
+## 七、文档与版本
+
+- wiki/07:限制 57/58/59 三条**改写为已实现**(失焦校验接入 / form 语义引入 /
+  required 属性为何仍不用)+ 新增 60(Enter 边界)、61(呈现闸门)
+- wiki/03:表单体系小节新增「失焦校验 / Enter 提交 / 表单语义」三段;
+  JS 模块与全局约定新增**桥接纪律**(单次赋值,含 DeployKit 踩坑记录)
+- wiki/README + wiki/01 + wiki/05:版本 5.12.0;README 批次概要补第十三批
+- 三处版本号:`tauri.conf.json` / `Cargo.toml` / wiki(5.11.0 → 5.12.0)

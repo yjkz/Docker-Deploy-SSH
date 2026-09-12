@@ -66,8 +66,12 @@
     testingDesktop: false, // 桌面测试通知发送中(防重复;随模态关闭复位)
     testingEmail: false,   // 测试邮件发送中(防重复;随模态关闭复位)
     passwordSaved: false,  // 最近一次 get_config 的 passwordSaved(密码 placeholder)
-    session: 0             // 模态会话序号:每次打开 +1,异步收尾据此丢弃过期回调
+    session: 0,            // 模态会话序号:每次打开 +1,异步收尾据此丢弃过期回调
+    rules: null            // 本次模态的校验句柄(buildBody 时重建,随关模态失效)
   };
+
+  /** 取本次模态的校验句柄(模态已关/未建时为 null) */
+  function currentFormApi() { return st.rules; }
 
   // ===== 小工具 =====
 
@@ -261,9 +265,13 @@
   }
 
   function buildBody(body) {
-    body.textContent = '';
     st.passwordSaved = false;
     window.formClearError('notify-error');
+
+    // 表单语义(第十三批):全部控件进 <form novalidate>,原生隐式提交被
+    // 拦下转 onSave(beginForm 的 submit 拦截)。
+    var formApi = window.beginForm(body, 'notify-modal-title');
+    body = formApi.form;
 
     // 内联错误框(本轮补齐):此前 notify 表单保存/校验失败只有 toast ——
     // 这里是长表单(桌面/邮件/事件三组),用户停在底部按钮处时顶部内容已不可见,
@@ -329,6 +337,58 @@
     actions.appendChild(testGroup);
     actions.appendChild(saveBtn);
     body.appendChild(actions);
+
+    // ===== 失焦校验 + Enter 提交(第十三批)=====
+    // 规则与后端 validate_email_save(notify.rs)同口径但放宽:后端只在
+    // 「启用邮件」时校验主机与收件人,发件人由发送时校验(重了但更晚);
+    // 这里在失焦时就把三处都提示到,避免「保存通过、发送才报」。
+    var emailEnabled = function () {
+      var node = document.getElementById('notify-email-enabled');
+      return !!(node && node.checked);
+    };
+    var v = window.bindFieldValidation(body, [
+      {
+        id: 'notify-smtp-host', required: true, when: emailEnabled,
+        label: 'SMTP 主机', message: 'SMTP 主机未填(启用邮件通知时必填)'
+      },
+      {
+        id: 'notify-smtp-port',
+        // 留空 = 按加密方式取默认端口(后端兜底),空值合法
+        test: function (val) {
+          if (val === '') return true;
+          return /^\d+$/.test(val) && Number(val) >= 1 && Number(val) <= 65535;
+        },
+        message: '端口需为 1 - 65535 之间的整数,或留空取加密方式默认端口'
+      },
+      {
+        id: 'notify-email-from', required: true,
+        when: emailEnabled,
+        label: '发件人', message: '发件人未填(启用邮件通知时必填)'
+      },
+      {
+        id: 'notify-email-from',
+        test: function (val) { return val === '' || val.indexOf('@') >= 0; },
+        message: '发件人需含 @(可写「名称 <addr@example.com>」)'
+      },
+      {
+        id: 'notify-email-to', required: true,
+        when: emailEnabled,
+        label: '收件人', message: '收件人未填(启用邮件通知时至少一个)'
+      }
+    ]);
+    // 邮件启用的勾选态变化会改变主机/发件人/收件人的适用性:立即重校验
+    var emailChk = document.getElementById('notify-email-enabled');
+    if (emailChk) {
+      emailChk.addEventListener('change', function () {
+        v.checkField('notify-smtp-host');
+        v.checkField('notify-email-from');
+        v.checkField('notify-email-to');
+      });
+    }
+    window.bindFormEnter(body, onSave);
+    formApi.onSubmit(onSave);
+    st.rules = v; // 保存/测试邮件共用同一份校验句柄
+    return v;
   }
 
   // ===== 填表(get_config 结果 → 表单;密码恒留空不回填)=====
@@ -401,6 +461,11 @@
    * 收集表单 → notify_save_config 的 cfg 入参(测试邮件仅取其 email 部分);
    * 收件人校验失败时已提示并返回 null。端口非法/为 0 传 0
    * (后端按加密方式兜底默认端口:ssl→465、starttls→587、none→25)。
+   *
+   * 第十三批:必填类规则(启用邮件时的主机/发件人/收件人)已上收到表单
+   * 规则清单,由调用点在进来前整体校验;此处只保留**逐行含 @** 的解析
+   * (错误锚点在多行 textarea 上、文案带具体非法地址,形状与字段级规则
+   * 不同),以及端口归一兜底。
    */
   function collectForm() {
     var to = parseRecipients();
@@ -455,6 +520,22 @@
 
   function onSave() {
     if (st.saving) return;
+    // 整体校验(与失焦校验同源):启用邮件时的主机/发件人/收件人必填,
+    // 以及端口与发件人格式。失败时字段级提示已贴好,此处给顶部摘要。
+    var formApi = currentFormApi();
+    var checked = formApi && formApi.validate
+      ? formApi.validate()
+      : { firstBad: null, missing: [], formats: [], blockingErrors: [] };
+    if (checked.blockingErrors.length > 0) {
+      if (checked.firstBad) {
+        try { checked.firstBad.focus({ preventScroll: true }); }
+        catch (_) { checked.firstBad.focus(); }
+      }
+      var msg = checked.missing.length > 0
+        ? '请填写:' + checked.missing.join('、')
+        : checked.blockingErrors[0];
+      return window.formFailLoud('notify-error', msg);
+    }
     var cfg = collectForm();
     if (!cfg) return;
 
@@ -508,6 +589,24 @@
 
   function onTestEmail() {
     if (st.testingEmail) return;
+    // 发送测试邮件走的是同一组邮件字段:同样先整体校验,失败贴字段提示 +
+    // 结果行(与保存同源,避免「保存被拦、测试却发出去」的不一致)
+    var formApi = currentFormApi();
+    var checked = formApi && formApi.validate
+      ? formApi.validate()
+      : { firstBad: null, missing: [], formats: [], blockingErrors: [] };
+    if (checked.blockingErrors.length > 0) {
+      if (checked.firstBad) {
+        try { checked.firstBad.focus({ preventScroll: true }); }
+        catch (_) { checked.firstBad.focus(); }
+      }
+      var msg = checked.missing.length > 0
+        ? '请填写:' + checked.missing.join('、')
+        : checked.blockingErrors[0];
+      window.formFailLoud('notify-error', msg);
+      showResult('fail', msg);
+      return;
+    }
     var cfg = collectForm(); // 表单当前值,不要求先保存
     if (!cfg) return;
 
@@ -597,6 +696,7 @@
     st.saving = false;
     st.testingDesktop = false;
     st.testingEmail = false;
+    st.rules = null; // 校验句柄随模态作废,重开时由 buildBody 重建
   }
 
   // ===== 初始化(入口按钮 / 模态三通道关闭 / pagechange 徽标刷新)=====

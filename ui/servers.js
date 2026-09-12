@@ -1099,14 +1099,29 @@
 
   // ===== 自绘模态框 =====
 
-  function openModal(title, buildBody) {
+  /**
+   * 打开自绘模态。`opts.form = true` 时把渲染目标换成 `<form novalidate>`
+   * (表单语义 + 拦住原生隐式提交,见 app.js `window.beginForm`)。
+   *
+   * @param {string} title 模态标题
+   * @param {function} buildBody 渲染函数 (container, formApi) => void;
+   *   非表单模态 formApi 为 null
+   * @param {Object} [opts] `{ form: true }`
+   */
+  function openModal(title, buildBody, opts) {
     var overlay = document.getElementById('servers-modal');
     var titleEl = document.getElementById('servers-modal-title');
     var bodyEl = document.getElementById('servers-modal-body');
     if (!overlay || !titleEl || !bodyEl) return;
     titleEl.textContent = title;
-    bodyEl.textContent = '';
-    buildBody(bodyEl);
+    if (opts && opts.form) {
+      // 表单模态:内容进 <form>,body 自身只作滚动容器
+      var formApi = window.beginForm(bodyEl, 'servers-modal-title');
+      buildBody(formApi.form, formApi);
+    } else {
+      bodyEl.textContent = '';
+      buildBody(bodyEl, null);
+    }
     overlay.classList.remove('hidden');
     window.modalFocusOpen(overlay);
   }
@@ -1398,53 +1413,23 @@
   }
 
   /**
-   * 收集并校验生产加固表单字段:健康等待秒数 / pre-post 钩子 / webhook。
-   * 校验失败已 formFail 提示并返回 null;钩子留空存 null,webhook 留空存 null。
+   * 收集生产加固表单字段的值:健康等待秒数 / pre-post 钩子 / webhook /
+   * 项目级部署目录 / 默认服务器 / 归档保留数量。
+   *
+   * 第十三批:校验已上收到表单注册的规则清单(与失焦校验同源),本函数
+   * 退化为**纯取值** —— 调用点保证先跑过整体校验,故此处只做类型转换与
+   * 「留空 → null」的归一,不再重复判定与提示。
    */
-  function collectProjectExtras(errId) {
+  function collectProjectExtras() {
     var healthRaw = fieldVal('prjf-health-wait');
-    var healthWait = 0;
-    if (healthRaw !== '') {
-      if (!/^\d+$/.test(healthRaw) || Number(healthRaw) > 86400) {
-        formFailLoud(errId, '健康检查等待秒数需为 0 - 86400 之间的整数(0 为关闭)');
-        return null;
-      }
-      healthWait = Number(healthRaw);
-    }
+    var healthWait = healthRaw === '' ? 0 : Number(healthRaw);
 
     var webhook = fieldVal('prjf-webhook');
-    if (webhook && !/^https?:\/\//i.test(webhook)) {
-      formFailLoud(errId, '完成通知 webhook 需以 http:// 或 https:// 开头,或留空');
-      return null;
-    }
-
     var preCmd = fieldVal('prjf-pre-cmd');
     var postCmd = fieldVal('prjf-post-cmd');
-
-    // 部署位置(第四批):项目级目录 + 默认服务器
     var remoteDir = fieldVal('prjf-remote-dir');
-    if (remoteDir && remoteDir.indexOf('/') !== 0) {
-      formFailLoud(errId, '远程部署目录需为以 / 开头的绝对路径(如 /home/henghao/site),或留空沿用服务器目录');
-      return null;
-    }
     var defaultServer = fieldVal('prjf-default-server');
-    // 选中的服务器必须仍存在(st.cfg 现取);空 = 不指定
-    if (defaultServer && st.cfg &&
-        !st.cfg.servers.some(function (s) { return String(s.id) === defaultServer; })) {
-      formFailLoud(errId, '所选默认服务器已不存在,请重新选择');
-      return null;
-    }
-
-    // 发布归档保留数量(第五批):留空 = 用默认 5;填了须为 0-50 整数
     var keepRaw = fieldVal('prjf-release-keep');
-    var releaseKeep = null;
-    if (keepRaw !== '') {
-      if (!/^\d+$/.test(keepRaw) || Number(keepRaw) > 50) {
-        formFailLoud(errId, '发布归档保留数量需为 0 - 50 之间的整数,或留空使用默认 5 个');
-        return null;
-      }
-      releaseKeep = Number(keepRaw);
-    }
 
     return {
       health_wait_secs: healthWait,
@@ -1453,7 +1438,7 @@
       notify_webhook: webhook ? webhook : null,
       remote_dir: remoteDir ? remoteDir : null,
       default_server_id: defaultServer ? defaultServer : null,
-      release_keep: releaseKeep
+      release_keep: keepRaw === '' ? null : Number(keepRaw)
     };
   }
 
@@ -1667,7 +1652,7 @@
     var prevAuth = (prev && prev.auth) ? prev.auth : { auth_type: 'Key', key_path: null, password_enc: null };
     var prevIsPassword = prevAuth.auth_type === 'Password';
 
-    openModal(prev ? '编辑服务器' : '新增服务器', function (body) {
+    openModal(prev ? '编辑服务器' : '新增服务器', function (body, formApi) {
       appendErrorBox(body, 'srvf-error');
 
       body.appendChild(window.formGroupTitle('连接', 'CONNECTION'));
@@ -1843,7 +1828,54 @@
       var saveBtn = appendActions(body, 'srvf-error', closeModal, function () {
         saveServer(prev, saveBtn);
       });
-    });
+
+      // ===== 表单语义 + 失焦校验 + Enter 提交(第十三批)=====
+      // 校验规则是**单一事实来源**:blur 提示与提交期整体校验共用同一份,
+      // 避免「失焦说合法、提交说非法」两套判定漂移。提交分支仍独立保留
+      // (它还要加密/落盘),提交期只复用这里的文案与呈现。
+      var authIsKey = function () {
+        var node = document.getElementById('srvf-auth-key');
+        return !node || node.checked;
+      };
+      var v = window.bindFieldValidation(body, [
+        { id: 'srvf-name', required: true, label: '名称', message: '此项必填' },
+        { id: 'srvf-host', required: true, label: '主机地址', message: '此项必填' },
+        {
+          id: 'srvf-port', required: true, label: '端口',
+          message: '此项必填',
+          test: function (val) { return /^\d+$/.test(val) && Number(val) >= 1 && Number(val) <= 65535; },
+          formatMessage: function () { return '需为 1 - 65535 之间的整数'; }
+        },
+        { id: 'srvf-username', required: true, label: '用户名', message: '此项必填' },
+        { id: 'srvf-remote-dir', required: true, label: '远程部署目录', message: '此项必填' },
+        {
+          id: 'srvf-remote-dir',
+          test: function (val) { return val === '' || val.indexOf('/') === 0; },
+          message: '需为以 / 开头的绝对路径(如 /opt/myapp)'
+        },
+        {
+          id: 'srvf-key-path', required: true,
+          when: authIsKey, message: '私钥认证需填写私钥路径'
+        },
+        {
+          id: 'srvf-password', required: true,
+          // 已有密文时留空表示沿用(saveServer 的 auth.password_enc 原样透传):
+          // 仅「密码认证且无任何已存密文」时要求填写
+          when: function () { return !authIsKey() && !(prevAuth && prevAuth.password_enc); },
+          message: '密码认证需填写登录密码'
+        }
+      ]);
+      // 认证方式切换:条件字段的规则适用性变了,立即重校验(清除不适用的红字)
+      radioKey.addEventListener('change', function () { v.checkField('srvf-key-path'); v.checkField('srvf-password'); });
+      radioPass.addEventListener('change', function () { v.checkField('srvf-key-path'); v.checkField('srvf-password'); });
+
+      window.bindFormEnter(body, function () { saveServer(prev, saveBtn); });
+      // 隐式提交兜底(规范:单文本字段表单 Enter 会自行 submit)→ 转主入口
+      if (formApi) formApi.onSubmit(function () { saveServer(prev, saveBtn); });
+      // 表单校验句柄挂在 saveBtn 上:saveServer 是唯一保存入口(按钮 + Enter
+      // + 隐式提交三路都到它),由它取句柄做提交期整体校验。
+      saveBtn.__validate = v;
+    }, { form: true });
   }
 
   /**
@@ -1863,21 +1895,13 @@
       return false;
     }
     /**
-     * 字段级错误:把提示贴到出错字段下方并聚焦该字段。
-     * 契约(field-grouping / focus-management)要求错误贴近字段,且多错时
-     * 焦点落到第一个出错字段 —— 此前只有顶部聚合框,长表单滚到底部保存时
-     * 根本看不见「哪一项填错了」。
+     * 焦点给首个出错字段(契约 focus-management)。不滚动:顶部聚合框的
+     * 滚动由 formFailLoud 负责,两处都滚会互相打架;已有焦点则不动,
+     * 避免多次调用后焦点乱跳。
      */
-    function fieldFail(controlId, msg) {
-      var control = document.getElementById(controlId);
-      if (control) {
-        window.setFieldError(control, msg);
-        // 焦点给首个出错字段(只取当前尚无焦点的场景,避免多次调用后乱跳)
-        if (document.activeElement !== control) {
-          try { control.focus({ preventScroll: true }); } catch (_) { control.focus(); }
-        }
-      }
-      return false;
+    function focusQuietly(control) {
+      if (!control || document.activeElement === control) return;
+      try { control.focus({ preventScroll: true }); } catch (_) { control.focus(); }
     }
     function setSaving(saving) {
       // 第六批:走共享助手,忙碌态带步进条(此前只是禁用+改文案)
@@ -1898,29 +1922,23 @@
     var newKeyPass = (authType === 'Key' && keyPassNode) ? keyPassNode.value : '';
     var rememberNode = document.getElementById('srvf-remember-key-pass');
     var rememberKeyPass = !!(authType === 'Key' && rememberNode && rememberNode.checked);
+    var prevAuth = (prev && prev.auth) ? prev.auth : {};
 
     // 校验:先在每个出错字段下方贴提示,再用顶部聚合框给整体摘要 ——
-    // 两者并存(契约 error-summary:摘要链接各错误项,同时保留字段内联错误)
-    var missing = [];
-    if (!name) { missing.push('名称'); fieldFail('srvf-name', '此项必填'); }
-    if (!host) { missing.push('主机地址'); fieldFail('srvf-host', '此项必填'); }
-    if (!username) { missing.push('用户名'); fieldFail('srvf-username', '此项必填'); }
-    if (!remoteDir) { missing.push('远程部署目录'); fieldFail('srvf-remote-dir', '此项必填'); }
-    if (missing.length > 0) return fail('请填写:' + missing.join('、'));
-    if (!/^\d+$/.test(portRaw) || Number(portRaw) < 1 || Number(portRaw) > 65535) {
-      fieldFail('srvf-port', '需为 1 - 65535 之间的整数');
-      return fail('端口需为 1 - 65535 之间的整数');
-    }
-    if (authType === 'Key' && !keyPath) {
-      fieldFail('srvf-key-path', '私钥认证需填写私钥路径');
-      return fail('私钥认证需填写私钥路径');
-    }
-
-    var prevAuth = (prev && prev.auth) ? prev.auth : {};
-    var hasSavedPassword = authType === 'Password' && !!prevAuth.password_enc;
-    if (authType === 'Password' && !newPass && !hasSavedPassword) {
-      fieldFail('srvf-password', '密码认证需填写登录密码');
-      return fail('密码认证需填写登录密码');
+    // 两者并存(契约 error-summary:摘要链接各错误项,同时保留字段内联错误)。
+    // 字段级提示与文案全部来自表单注册的那份规则(与失焦校验同源),此处只
+    // 负责把结果拼成既有的两段句式并聚焦首个出错字段。
+    var checked = saveBtn.__validate
+      ? saveBtn.__validate.validate()
+      : { firstBad: null, missing: [], formats: [], blockingErrors: [] };
+    if (checked.blockingErrors.length > 0) {
+      if (checked.firstBad) focusQuietly(checked.firstBad);
+      // 摘要优先级:缺项聚合(「请填写:X、Y」)→ 首个格式/条件错误原文。
+      // 条件类规则(私钥路径/密码)没有 label,不进缺项清单,故用
+      // blockingErrors[0] 兜底 —— 否则会出现「贴了红字但没有摘要」的静默阻断。
+      return fail(checked.missing.length > 0
+        ? '请填写:' + checked.missing.join('、')
+        : checked.blockingErrors[0]);
     }
     setSaving(true);
 
@@ -2006,7 +2024,7 @@
     var prev = project || null;
     importPreview = { path: '', stack: null, autoName: '' }; // 每次打开表单重置导入预览状态
 
-    openModal(prev ? '编辑项目' : '新增项目', function (body) {
+    openModal(prev ? '编辑项目' : '新增项目', function (body, formApi) {
       appendErrorBox(body, 'prjf-error');
 
       body.appendChild(window.formGroupTitle('基本信息', 'BASIC'));
@@ -2109,10 +2127,63 @@
         'https://hook.example.com/xxx',
         '部署结束后 POST JSON 结果;留空关闭', null, 'WEBHOOK');
 
-      appendActions(body, 'prjf-error', closeModal, function () {
-        saveProject(prev);
+      var saveBtn = appendActions(body, 'prjf-error', closeModal, function () {
+        saveProject(prev, saveBtn);
       });
-    });
+
+      // ===== 表单语义 + 失焦校验 + Enter 提交(第十三批)=====
+      // 规则为**单一事实来源**:blur 提示与提交期整体校验共用,文案沿用
+      // 原先提交期那几句(逐字一致,避免「换个入口换句话」)。
+      var v = window.bindFieldValidation(body, [
+        { id: 'prjf-name', required: true, label: '名称', message: '此项必填' },
+        {
+          id: 'prjf-compose', required: true, label: 'compose 文件相对路径',
+          // 走导入流程时(导入路径非空)该字段置灰不参与保存
+          when: function () { return fieldVal('prjf-import-path') === ''; },
+          message: '此项必填(或改用上方「导入 compose 文件」)'
+        },
+        {
+          id: 'prjf-health-wait',
+          test: function (val) { return val === '' || (/^\d+$/.test(val) && Number(val) <= 86400); },
+          message: '健康检查等待秒数需为 0 - 86400 之间的整数(0 为关闭)'
+        },
+        {
+          id: 'prjf-webhook',
+          test: function (val) { return val === '' || /^https?:\/\//i.test(val); },
+          message: '完成通知 webhook 需以 http:// 或 https:// 开头,或留空'
+        },
+        {
+          id: 'prjf-remote-dir',
+          test: function (val) { return val === '' || val.indexOf('/') === 0; },
+          message: '远程部署目录需为以 / 开头的绝对路径(如 /home/henghao/site),或留空沿用服务器目录'
+        },
+        {
+          id: 'prjf-default-server',
+          // 选中项必须仍存在(服务器可能在另一个窗口被删)
+          test: function (val) {
+            if (val === '') return true;
+            var servers = (st.cfg && st.cfg.servers) ? st.cfg.servers : [];
+            return servers.some(function (s) { return String(s.id) === val; });
+          },
+          message: '所选默认服务器已不存在,请重新选择'
+        },
+        {
+          id: 'prjf-release-keep',
+          test: function (val) { return val === '' || (/^\d+$/.test(val) && Number(val) <= 50); },
+          message: '发布归档保留数量需为 0 - 50 之间的整数,或留空使用默认 5 个'
+        }
+      ]);
+      // 导入路径变化会改变 compose 相对路径的适用性:立刻重校验清除旧红字
+      var importPathNode = document.getElementById('prjf-import-path');
+      if (importPathNode) {
+        importPathNode.addEventListener('input', function () { v.checkField('prjf-compose'); });
+      }
+
+      window.bindFormEnter(body, function () { saveProject(prev, saveBtn); });
+      // 隐式提交兜底(规范:单文本字段表单 Enter 会自行 submit)→ 转主入口
+      if (formApi) formApi.onSubmit(function () { saveProject(prev, saveBtn); });
+      saveBtn.__validate = v;
+    }, { form: true });
   }
 
   /** 追加一行文件映射编辑行(本地路径 / 服务器相对路径 / 目录勾选 / 删除) */
@@ -2201,6 +2272,13 @@
     return last;
   }
 
+  /**
+   * 收集文件映射行(跳过两格皆空的行;服务器相对路径留空按本地末段名兜底)。
+   *
+   * 行级校验留在本函数:错误锚点在表格行(`<td>`)内,提示文案带行号,
+   * 与字段级规则清单(按 id/selector 定位到单个控件)不是同一形状 ——
+   * 第十三批只把**表单字段**的校验上收,行级校验维持原有独立判定。
+   */
   function collectMappings(errId) {
     var mappings = [];
     var tbody = document.getElementById('prjf-mappings-body');
@@ -2236,9 +2314,10 @@
   }
 
   /** 项目表单保存:校验 →(导入流程:preview 校验 + import_compose)→ get_config → 全量写回 */
-  function saveProject(prev) {
+  function saveProject(prev, saveBtn) {
     formClearError('prjf-error');
-    // 清上一轮的字段级错误(整体重校验前先复位)
+    // 清上一轮的字段级错误(整体重校验前先复位;规则外的错误如文件映射行
+    // 提示也在此清掉,否则用户改正后旧提示会留在表格里)
     var formBody = document.getElementById('servers-modal-body');
     if (formBody) window.clearAllFieldErrors(formBody);
 
@@ -2247,30 +2326,26 @@
     var compose = fieldVal('prjf-compose');
     var importPath = fieldVal('prjf-import-path'); // 编辑表单无此输入框,得空串
 
-    // 缺项聚合提示 + 字段级标记(契约 error-summary:摘要与内联错误并存)
-    var missing = [];
-    if (!name) {
-      missing.push('名称');
-      window.setFieldError(document.getElementById('prjf-name'), '此项必填');
-    }
-    if (!importPath && !compose) {
-      missing.push('compose 文件相对路径');
-      window.setFieldError(document.getElementById('prjf-compose'),
-        '此项必填(或改用上方「导入 compose 文件」)');
-    }
-    if (missing.length > 0) {
-      // 焦点给首个出错字段(focus-management)
-      var firstBad = document.getElementById(name ? 'prjf-compose' : 'prjf-name');
-      if (firstBad) { try { firstBad.focus({ preventScroll: true }); } catch (_) { firstBad.focus(); } }
-      return formFailLoud('prjf-error', '请填写:' + missing.join('、'));
+    // 校验:字段级提示 + 顶部聚合摘要(契约 error-summary:两者并存)。
+    // 规则来自表单注册的那份(与失焦校验同源),此处按既有先后拼摘要 ——
+    // 缺项优先于格式错误(与改动前一致)。
+    var v = saveBtn && saveBtn.__validate;
+    var checked = v ? v.validate() : { firstBad: null, missing: [], formats: [], blockingErrors: [] };
+    if (checked.blockingErrors.length > 0) {
+      if (checked.firstBad) {
+        try { checked.firstBad.focus({ preventScroll: true }); }
+        catch (_) { checked.firstBad.focus(); }
+      }
+      return formFailLoud('prjf-error', checked.missing.length > 0
+        ? '请填写:' + checked.missing.join('、')
+        : checked.blockingErrors[0]);
     }
 
     var mappings = collectMappings('prjf-error');
     if (mappings === null) return false;
 
     // 生产加固字段:健康等待秒数 / pre-post 钩子 / webhook(编辑与新建都要带上)
-    var extras = collectProjectExtras('prjf-error');
-    if (extras === null) return false;
+    var extras = collectProjectExtras();
 
     // 导入流程:路径非空时校验解析(有未解决问题则阻止保存)→ import_compose 建项目
     if (importPath) {

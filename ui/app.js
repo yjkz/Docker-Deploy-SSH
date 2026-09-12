@@ -17,6 +17,15 @@
  * - window.copyText(text)         复制文本到剪贴板(成功 toast「已复制」)
  * - window.errText(err)           错误值 → 可展示文本(全站统一口径,
  *                                 空值兜底「未知错误」,非 Error 对象转字符串)
+ * - window.bindFieldValidation(formRoot, rules)
+ *                                 失焦校验接线器(同份规则兼作提交前整体校验;
+ *                                 必填类错误在首次提交后才提示,格式类恒提示)
+ * - window.bindFormEnter(formRoot, onEnter)
+ *                                 Enter 提交接线(仅单行文本 input;判 IME 组合;
+ *                                 不越过二次确认 —— 确认视图不注册即可)
+ * - window.beginForm(container, labelId)
+ *                                 表单语义脚手架:清空容器并放入 <form
+ *                                 novalidate>,拦下原生隐式提交转主入口
  * - window.toggleScheme(evt)      亮暗主题切换(View Transitions 圆形扩散揭示,
  *                                 持久化 localStorage['dd_scheme'])
  * ============================================================ */
@@ -496,7 +505,6 @@
    */
   window.setFieldError = function (control, msg) {
     if (!control || !control.parentNode) return;
-    var row = control.parentNode;
     var errId = (control.id || 'field') + '-error';
     var existing = document.getElementById(errId);
     if (!msg) {
@@ -513,7 +521,19 @@
       existing = document.createElement('div');
       existing.id = errId;
       existing.className = 'form-field-error';
-      row.appendChild(existing);
+      // 锚点取 .form-row 而非 parentNode:路径类字段(私钥路径 / 导入 compose 路径)
+      // 的父节点是 .input-btn-row(display:flex),直接 append 会把提示塞进
+      // nowrap 的按钮行里与输入框抢宽度。取最近 .form-row 后,提示恒在
+      // 「控件 + 按钮」整行之下。
+      var row = control.closest('.form-row') || control.parentNode;
+      // 插在行内提示(form-hint)之前:错误先于帮助文案被读到,也不把
+      // 长说明顶在错误与控件之间。行内无 form-hint 时追加到行尾。
+      var hint = null;
+      for (var i = 0; i < row.children.length; i++) {
+        if (row.children[i].classList.contains('form-hint')) { hint = row.children[i]; break; }
+      }
+      if (hint) row.insertBefore(existing, hint);
+      else row.appendChild(existing);
     }
     existing.textContent = String(msg);
   };
@@ -525,6 +545,311 @@
     for (var i = 0; i < marked.length; i++) {
       window.setFieldError(marked[i], null);
     }
+  };
+
+  /**
+   * 失焦校验接线器:把一份「规则清单」同时接到 blur 校验与提交前整体校验。
+   *
+   * 契约 inline-validation 要求「失焦时校验、不要按键就校验」—— 此前全站
+   * 字段级错误只在点保存时产生(Tab 扫过一张填错的表毫无提示)。本接线器
+   * 让同一份规则同时供两条路径使用,避免「blur 说合法、提交说非法」两套
+   * 判定漂移。
+   *
+   * 三条呈现纪律(与提交期校验不同,避免 Tab 走路时刷屏):
+   * 1. **必填类**错误(required)只在「表单已提交过一次」或「该字段被填过又
+   *    清空」时呈现 —— 否则新建空表上 Tab 一次会挨个标红;
+   * 2. **格式类**错误(给了 test)恒呈现;
+   * 3. blur 失败**只做字段级提示**:不 toast、不滚动、不写顶部聚合框。
+   *
+   * 规则描述符(单条):
+   * - `id` | `selector` 定位控件(动态行用 selector,事件时解析)
+   * - `required` 是否必填;`test(v)` 返回 false 表示格式非法
+   * - `when()` 返回 false 时该规则不适用,并**清除**本字段已有错误
+   *   (如切到密码认证时清掉私钥路径的红字)
+   * - `message` 错误文案;`formatMessage(v)` 出具动态文案(如「第 3 行」)
+   * - `label` 该字段在顶部聚合摘要里的名字(如「名称」),供提交期拼
+   *   「请填写:名称、主机地址」的既有句式;省略则不进摘要
+   * - `gate` 失焦提示是否受「填过 / 已提交」闸门约束。默认:required 规则
+   *   受闸门(test 规则不受);条件存在类规则(「Key 认证时必填私钥路径」)
+   *   用 `{ test, gate: true }` 表达 —— 它语义上是必填(不该在空表上提前
+   *   标红),但提交期要保留自己那句具体文案而非并进「请填写:…」。
+   * - `blocking` 是否阻断调用方的主动作(默认 true)。用 `blocking: false`
+   *   表达「只提示、不阻断」的规则(如后端本就会夹取归一的上限值)——
+   *   这类错误仍贴到字段上,但不进 `blockingErrors`,调用方可照常继续。
+   *
+   * @param {HTMLElement} formRoot 表单根(代理 focusout / change 的最小范围)
+   * @param {Array<Object>} rules 规则清单
+   * @returns {{validate:function, checkField:function, clearField:function,
+   *            markSubmitted:function, clear:function}} validate() →
+   *   `{ firstBad, missing, formats, blockingErrors }`
+   */
+  window.bindFieldValidation = function (formRoot, rules) {
+    // 每个字段的「是否被填过」:必填错误只在填过又清空后即时提示
+    var touched = {};
+    // 「是否已提交过」:一旦为真,必填类错误也参与 blur 提示
+    var submitted = false;
+    var list = (Array.isArray(rules) ? rules : []).filter(Boolean);
+
+    function controlOf(rule) {
+      if (rule.id) return document.getElementById(rule.id);
+      if (rule.selector && formRoot) return formRoot.querySelector(rule.selector);
+      return null;
+    }
+
+    function keyOf(rule) { return rule.id || rule.selector || ''; }
+
+    /**
+     * 求一个字段的错误:{ kind, msg, gated } —— kind 区分「必填」与「格式」,
+     * 提交期摘要按 kind 分批(既有文案是「请填写:X、Y」与具体格式句混排);
+     * gated 决定失焦时是否需等「填过 / 已提交」。合法或规则不适用返回 null。
+     */
+    function errorOf(rule, control) {
+      if (rule.when && !rule.when()) return null;
+      var raw = control ? String(control.value === undefined ? '' : control.value) : '';
+      // 口令类字段首尾空格有意义,不做 trim(与各表单一贯口径一致)
+      var value = (control && control.type === 'password') ? raw : raw.trim();
+      if (rule.required && value === '') {
+        return {
+          kind: 'required', msg: String(rule.message),
+          gated: rule.gate !== false,
+          blocking: rule.blocking !== false
+        };
+      }
+      if (rule.test && !rule.test(value)) {
+        var msg = rule.formatMessage ? rule.formatMessage(value) : rule.message;
+        return {
+          kind: 'format', msg: String(msg || ''),
+          gated: rule.gate === true,
+          blocking: rule.blocking !== false
+        };
+      }
+      return null;
+    }
+
+    /** blur 呈现口径:必填类仅在「已提交过」或「填过又清空」时提示 */
+    function blurMessageOf(rule, control) {
+      var err = errorOf(rule, control);
+      if (!err) return '';
+      if (err.kind === 'required' && !submitted && !touched[keyOf(rule)]) return '';
+      return err.msg;
+    }
+
+    /** 校验一个字段并按结果呈现/清除字段级错误(供 blur 专用) */
+    function checkField(rule) {
+      var control = controlOf(rule);
+      if (!control) return;
+      var msg = blurMessageOf(rule, control);
+      if (msg) window.setFieldError(control, msg);
+      else window.setFieldError(control, null);
+    }
+
+    /**
+     * 整体校验(提交期):逐字段呈现字段级错误,并返回结构化结果 ——
+     * `firstBad` 首个出错控件(焦点管理)、`missing` 必填缺失的字段名清单
+     * (拼「请填写:…」摘要)、`formats` 格式错误文案清单、
+     * `blockingErrors` 需阻断主动作的错误文案(`blocking: false` 的规则
+     * 只提示不阻断,故不进此列)。
+     */
+    function validateAll() {
+      submitted = true;
+      var firstBad = null;
+      var missing = [];
+      var formats = [];
+      var blockingErrors = [];
+      // 逐字段(而非逐规则)求错:一个字段可挂多条规则,若按规则逐条写,
+      // 后一条通过的规则会用 setFieldError(control, null) 抹掉前一条刚
+      // 贴上的错误文案。
+      var seen = [];
+      for (var i = 0; i < list.length; i++) {
+        var control = controlOf(list[i]);
+        if (!control || seen.indexOf(control) !== -1) continue;
+        seen.push(control);
+        var hit = firstErrorOf(rulesFor(control), control);
+        if (!hit) { window.setFieldError(control, null); continue; }
+        window.setFieldError(control, hit.err.msg);
+        if (!hit.err.blocking) continue; // 只提示不阻断
+        if (!firstBad) firstBad = control;
+        if (hit.err.kind === 'required') {
+          // 条件类必填(无 label)不进「请填写:…」摘要
+          if (hit.rule.label) missing.push(hit.rule.label);
+        } else {
+          formats.push(hit.err.msg);
+        }
+        blockingErrors.push(hit.err.msg);
+      }
+      return {
+        firstBad: firstBad, missing: missing, formats: formats,
+        blockingErrors: blockingErrors
+      };
+    }
+
+    /**
+     * 一个字段可挂多条规则(如远程部署目录:必填 + 绝对路径):按登记顺序
+     * 取**第一条**不通过的 —— 与提交期「一字段一条错误」的既有呈现一致。
+     * 返回 `{ rule, err }`(无错返回 null),rule 供摘要读取 label。
+     */
+    function firstErrorOf(rulesOfField, control) {
+      for (var i = 0; i < rulesOfField.length; i++) {
+        var err = errorOf(rulesOfField[i], control);
+        if (err) return { rule: rulesOfField[i], err: err };
+      }
+      return null;
+    }
+
+    /** 取某控件的全部规则(按登记顺序) */
+    function rulesFor(control) {
+      var hit = [];
+      for (var i = 0; i < list.length; i++) {
+        if (controlOf(list[i]) === control) hit.push(list[i]);
+      }
+      return hit;
+    }
+
+    /** 失焦校验(委托):受闸门的规则要等「填过 / 已提交」才提示 */
+    function onFieldBlur(control) {
+      var rulesOfField = rulesFor(control);
+      if (!rulesOfField.length) return;
+      var value = String(control.value === undefined ? '' : control.value);
+      var key = keyOf(rulesOfField[0]);
+      if (value.trim() !== '') touched[key] = true;
+      var hit = firstErrorOf(rulesOfField, control);
+      if (hit && hit.err.gated && !submitted && !touched[key]) {
+        // 未曾填过且尚未提交:不提示(避免 Tab 扫过空表满屏标红)
+        window.setFieldError(control, null);
+        return;
+      }
+      if (hit) window.setFieldError(control, hit.err.msg);
+      else window.setFieldError(control, null);
+    }
+
+    // 失焦校验:focusout 冒泡委托,一次监听覆盖全部规则字段(含动态行)
+    if (formRoot) {
+      formRoot.addEventListener('focusout', function (e) {
+        var control = e.target;
+        if (!control || !control.classList) return;
+        if (control.tagName !== 'INPUT' && control.tagName !== 'TEXTAREA'
+            && control.tagName !== 'SELECT') return;
+        onFieldBlur(control);
+      });
+      // select 在部分交互路径下不发 focusout(纯键盘选择):change 兜一次
+      formRoot.addEventListener('change', function (e) {
+        var control = e.target;
+        if (!control || control.tagName !== 'SELECT') return;
+        onFieldBlur(control);
+      });
+      // 输入时清除本字段已有错误(只清不加:不构成「输入即校验」)
+      formRoot.addEventListener('input', function (e) {
+        var control = e.target;
+        if (!control || !control.classList || !control.classList.contains('has-error')) return;
+        window.setFieldError(control, null);
+      });
+    }
+
+    return {
+      /** 提交期整体校验 → { firstBad, missing, formats } */
+      validate: validateAll,
+      /** 手动校验单个字段(按 id 或 selector 定位,供联动场景调用) */
+      checkField: function (idOrSelector) {
+        for (var i = 0; i < list.length; i++) {
+          var rule = list[i];
+          if (rule.id === idOrSelector || rule.selector === idOrSelector) checkField(rule);
+        }
+      },
+      /** 清单个字段的错误(联动切换时用) */
+      clearField: function (idOrSelector) {
+        var node = document.getElementById(idOrSelector);
+        if (node) window.setFieldError(node, null);
+      },
+      /** 标记「已提交过」:此后必填类错误也参与 blur 提示 */
+      markSubmitted: function () { submitted = true; },
+      /** 复位全部状态与字段级错误(表单重开时调用) */
+      clear: function () {
+        touched = {};
+        submitted = false;
+        window.clearAllFieldErrors(formRoot || document);
+      }
+    };
+  };
+
+  /**
+   * Enter 提交接线:把 Enter 映射到表单的「非破坏性主入口」。
+   *
+   * 全站此前有 8 处手写 Enter(manage 的打标签/创建卷/创建网络/连接容器/
+   * 自定义间隔、rollback 扫描起点、manage-stacks 终端输入),语义与守卫
+   * 各写一遍且都缺 IME 判断 —— 中文输入法按 Enter 是上屏候选词,不判断
+   * 就会在选词时误触发提交。本助手统一这两条纪律:
+   *
+   * 1. **只认单行文本类 input**:textarea 保持换行语义(版本说明 / 收件人 /
+   *    pre-post 钩子都是多行),select / checkbox / radio 一律不响应;
+   * 2. **不越过二次确认**:调用方在「确认视图」不注册本助手即可 —— Enter
+   *    只该走到会再确认一步的主入口(预检 / 打开确认),不直接执行。
+   *
+   * @param {HTMLElement} formRoot 表单根(事件委托范围)
+   * @param {function} onEnter 主入口动作(通常即主按钮的 click 处理器)
+   * @returns {function} 解绑函数(视图切到确认态时调用)
+   */
+  window.bindFormEnter = function (formRoot, onEnter) {
+    if (!formRoot || typeof onEnter !== 'function') return function () {};
+    var TYPED = { text: 1, number: 1, password: 1, search: 1, email: 1, tel: 1, url: 1 };
+    function handler(e) {
+      if (e.key !== 'Enter') return;
+      // 中文输入法组合中:Enter 是上屏候选词,不能当作提交
+      if (e.isComposing || e.keyCode === 229) return;
+      var node = e.target;
+      if (!node || node.tagName !== 'INPUT') return;
+      var type = String(node.type || 'text').toLowerCase();
+      if (!TYPED[type]) return;
+      if (node.disabled || node.readOnly) return;
+      e.preventDefault(); // 拦住 form 的隐式提交,统一走主入口
+      onEnter();
+    }
+    formRoot.addEventListener('keydown', handler);
+    return function () { formRoot.removeEventListener('keydown', handler); };
+  };
+
+  /**
+   * 表单语义脚手架:把「div + 按钮」的既有表单渲染进真实 <form>。
+   *
+   * 全库此前 0 个 <form>(wiki/07 限制 58),故无 AT 角度的表单边界与
+   * Enter 语义。本助手不重建 DOM 结构,只是把容器清空后放入一个
+   * `<form novalidate>` 并把渲染目标改到它 —— 调用方的「一直 append 到
+   * body」写法原样成立,无需逐处改。
+   *
+   * 两个必须有的保险:
+   * - `novalidate` 抑制浏览器原生校验气泡(文案由字段级错误承担,风格统一);
+   * - `submit` 恒拦:HTML 规范里「可阻塞隐式提交的字段恰好一个」时,在该
+   *   字段按 Enter 浏览器会自行提交表单 —— 回滚模态只有目标引用一个文本
+   *   输入,恰好命中,不接管会导致 WebView 导航(桌面应用里等于白屏)。
+   *   拦下后转给调用方登记的主入口动作。
+   *
+   * `labelId` 指向模态标题时,表单在 AT 里是一个有名字的 landmark。
+   *
+   * @param {HTMLElement} container 模态 body(内容会被清空)
+   * @param {string} [labelId] 表单可访问名(通常为模态标题元素 id)
+   * @returns {{form:HTMLFormElement, onSubmit:function, submit:function}}
+   */
+  window.beginForm = function (container, labelId) {
+    var form = document.createElement('form');
+    form.setAttribute('novalidate', 'novalidate');
+    form.className = 'form-root';
+    if (labelId) form.setAttribute('aria-labelledby', labelId);
+    var action = null;
+    form.addEventListener('submit', function (e) {
+      // 恒拦:原生提交会导航整个 WebView
+      e.preventDefault();
+      if (typeof action === 'function') action();
+    });
+    if (container) {
+      container.textContent = '';
+      container.appendChild(form);
+    }
+    return {
+      form: form,
+      /** 登记主入口动作(隐式提交由它接管,通常与主按钮同一处理器) */
+      onSubmit: function (fn) { action = fn; },
+      /** 主动触发主入口(供确认视图的按钮等复用) */
+      submit: function () { if (typeof action === 'function') action(); }
+    };
   };
 
   /**

@@ -58,15 +58,20 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 
 ---
 
+### 第十三批 v5.12.0(阶段五:表单校验体系)— 已完成(commit 见本批)
+- `app.js` 三个统一助手:**`bindFieldValidation`**(失焦校验接线器,一份规则清单兼作提交期整体校验)、**`bindFormEnter`**(Enter 提交:仅单行文本 input、判 IME 组合、不越二次确认)、**`beginForm`**(表单语义:`<form novalidate>` + submit 恒拦截)
+- 五处模态接入真实 `<form>` 语义:服务器表单 / 项目表单 / 通知模态 / 迁移模态(计划区与日志区留在 form 外)/ 单镜像回滚
+- 规则清单:服务器 7 条、项目 7 条、通知 5 条、迁移 2 条、回滚 1 条、清理 1 条(新增候选:远程部署目录/迁移目录/清理起点绝对路径、迁移归档数量非阻断提示、通知主机·发件人·端口、部署页三下拉字段级错误)
+- `setFieldError` 锚点修正:`closest('.form-row')`(路径类字段的父节点是 `.input-btn-row` flex 行,原实现把提示塞进按钮行抢宽度)+ 错误插在 `form-hint` 之前
+- **顺带修复第十二批拆分的存量 bug**:`window.DeployKit` 被赋值两次(后者覆盖前者)→ 拆出的 deploy-rollback.js 顶层 6 个键为 undefined,**单镜像回滚模态打开即崩**;合并为单对象 + 新增 `verify/bridge-integrity.js` 桥接守护
+- 验证:自建本地校验器 54 项断言全过 + 浏览器桩全链路 + 截图交 judge 4/4 pass;`cargo test` 290 passed 不变
+- **待真机复测**:单镜像回滚模态能正常打开(DeployKit 修复后)+ 各表单失焦校验手感
+
+---
+
 ## 待完成
 
-### 阶段五(第十三批,建议 v5.12.0):表单校验体系 — 下一项
-- 范围:失焦(blur)校验 + Enter 提交语义;app.js 已有 `formLabel / setFieldError / clearAllFieldErrors / formFailLoud / formErrorBox / confirmBlock` 助手,补统一 blur 校验接线
-- 顺序:servers → deploy → notify 高频表单先行,不一次全改(全库当前 0 个 `<form>`,引入 form 语义时注意与现有 div+按钮提交的兼容与 Enter 默认行为)
-- **开工前必做**:出细案(哪些表单、校验规则清单、Enter 提交与 confirmBlock 二次确认的交互)交用户批复
-- 参考:wiki/07 已知限制 57-59(无输入即校验/失焦校验未接入、无 form 语义)
-
-### 阶段六(第十四批):批量部署增强 — 排队
+### 阶段六(第十四批):批量部署增强 — 下一项
 - 目标:批量落断点/续传入口 + 「停止批量」当前台可取消(现只能停在台边界)
 - **开工前必核实**:批量走同一 deploy/deploy_stack 命令,断点可能已由后端落盘——疑点在「前端失败后没给续传入口」而非后端;先读 deploy.js 批量队列失败分支与 deploy_resume_status 查询条件再定方案;出细案批复
 - 参考:wiki/07 限制 21/24
@@ -88,12 +93,16 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 2. 整栈部署填标题/说明 → 回滚中心看归档自动补写
 3. 05 概览磁盘数字与服务器 `df -h` 对照(后端 df 解析只过了单测)
 4. 「迁移项目…」模态能正常打开(insertBefore 修复后)
+5. **单镜像回滚模态能正常打开**(第十三批修复 DeployKit 覆盖 bug 后;此前打开必报错)
+6. 各表单失焦校验手感(服务器/项目/通知/迁移/回滚/清理)+ Enter 提交是否符合直觉
 
 ---
 
 ## 当前状态速览
 
-- 版本 v5.11.0;main = origin/main;基线 `cargo test` 290 passed / 13 ignored
+- 版本 v5.12.0;main = origin/main;基线 `cargo test` 290 passed / 13 ignored
 - 命令 94 个(lib.rs 注册;wiki/04 已同步);JS 15 文件(index.html 加载顺序见 wiki/03:13)
 - 前端结构:12 模态;commands/ 11 文件;三大 JS 主文件 2338/2013/2537 行
+- 表单体系(第十三批):5 处模态有真实 `<form novalidate>` 语义;失焦校验 + Enter 提交由 app.js 三助手统一承担
+- 本地校验脚本 `verify/`(零依赖 Node,不参与构建):`form-validation.js`(表单助手 54 断言)/ `bridge-integrity.js`(桥接完整性);改动表单助手或拆出文件桥接时先跑这两个
 - dev 实例:target/debug/config(正式版数据拷贝);前端资源编译期内嵌,**改 JS 后必须重编译重启动才生效**

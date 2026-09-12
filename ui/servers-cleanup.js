@@ -81,12 +81,24 @@
     bar.appendChild(input);
     var btn = el('button', 'btn btn-sm', '重新扫描');
     btn.type = 'button';
-    btn.addEventListener('click', function () {
+    var rescan = function () {
       var v = (input.value || '').trim();
       st.cleanupScanRoot = v || (server.remote_dir || '');
       loadCleanupPreview(server);
-    });
+    };
+    btn.addEventListener('click', rescan);
     bar.appendChild(btn);
+
+    // 失焦校验 + Enter 重新扫描(第十三批;与回滚中心扫描起点同款语义:
+    // 扫描是只读动作,Enter 直接触发不越过任何确认)
+    window.bindFieldValidation(bar, [
+      {
+        id: 'cleanup-scan-root',
+        test: function (val) { return val === '' || val.indexOf('/') === 0; },
+        message: '扫描起点需为以 / 开头的绝对路径(如 /home),或留空用服务器部署目录'
+      }
+    ]);
+    window.bindFormEnter(bar, rescan);
     return bar;
   }
 

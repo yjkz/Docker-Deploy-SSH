@@ -1271,8 +1271,8 @@
     var projectId = prjSel ? String(prjSel.value) : '';
 
     var missing = [];
-    if (!projectId) missing.push('项目');
-    if (!serverId) missing.push('服务器');
+    if (!projectId) { missing.push('项目'); window.setFieldError(prjSel, '请选择部署项目'); }
+    if (!serverId) { missing.push('服务器'); window.setFieldError(srvSel, '请选择目标服务器'); }
     if (missing.length > 0) {
       window.toast('请先选择:' + missing.join('、'), 'warn');
       return;
@@ -1340,13 +1340,19 @@
     if (srvSel) serverId = String(srvSel.value);
     if (prjSel) projectId = String(prjSel.value);
 
-    // 三项都必须已选
+    // 三项都必须已选:字段级错误贴到对应下拉(第十三批;此前只有 toast,
+    // 用户滚到页面底部点「开始部署」时看不出是哪一格漏选)+ 摘要 toast
     var missing = [];
-    if (!imgRef) missing.push('镜像');
-    if (!serverId) missing.push('服务器');
-    if (!projectId) missing.push('项目');
+    if (!imgRef) { missing.push('镜像'); window.setFieldError(imgSel, '请选择本地镜像'); }
+    if (!serverId) { missing.push('服务器'); window.setFieldError(srvSel, '请选择目标服务器'); }
+    if (!projectId) { missing.push('项目'); window.setFieldError(prjSel, '请选择部署项目'); }
     if (missing.length > 0) {
       window.toast('请先选择:' + missing.join('、'), 'warn');
+      var firstBad = document.getElementById(!imgRef ? 'deploy-image'
+        : (!serverId ? 'deploy-server' : 'deploy-project'));
+      if (firstBad) {
+        try { firstBad.focus({ preventScroll: true }); } catch (_) { firstBad.focus(); }
+      }
       return;
     }
 
@@ -1432,10 +1438,14 @@
     var projectId = prjSel ? String(prjSel.value) : '';
 
     var missing = [];
-    if (!projectId) missing.push('项目');
-    if (!serverId) missing.push('服务器');
+    if (!projectId) { missing.push('项目'); window.setFieldError(prjSel, '请选择部署项目'); }
+    if (!serverId) { missing.push('服务器'); window.setFieldError(srvSel, '请选择目标服务器'); }
     if (missing.length > 0) {
       window.toast('请先选择:' + missing.join('、'), 'warn');
+      var firstBad = document.getElementById(!projectId ? 'deploy-project' : 'deploy-server');
+      if (firstBad) {
+        try { firstBad.focus({ preventScroll: true }); } catch (_) { firstBad.focus(); }
+      }
       return;
     }
 
@@ -2250,6 +2260,13 @@
     if (previewBtn) {
       previewBtn.addEventListener('click', runStackPreview);
     }
+    // 镜像下拉:选中即清掉上一次「请选择本地镜像」的字段级提示
+    var imgSelNode = document.getElementById('deploy-image');
+    if (imgSelNode) {
+      imgSelNode.addEventListener('change', function () {
+        window.setFieldError(imgSelNode, null);
+      });
+    }
     var prjSel = document.getElementById('deploy-project');
     if (prjSel) {
       prjSel.addEventListener('change', function () {
@@ -2266,6 +2283,9 @@
         updateProjectHint();
         refreshResumeStatus(); // 项目变化后按新键重查断点横幅
         if (st.mode === 'stack') parseStack(); // 整栈模式:选中即自动解析
+        // 已选即清掉上一次「请选择部署项目」的字段级提示(与全站口径一致:
+        // 由用户改正的动作清除错误,不清其他字段的错误)
+        window.setFieldError(prjSel, null);
       });
     }
     var srvSel = document.getElementById('deploy-server');
@@ -2280,6 +2300,7 @@
         }
         updateProjectHint();
         refreshResumeStatus(); // 服务器变化后按新键重查断点横幅
+        window.setFieldError(srvSel, null);
       });
     }
 
@@ -2325,14 +2346,25 @@
   }
 
   // ===== 第十二批 JS 拆分桥接:共享设施暴露给拆出文件,入口转发 =====
-  window.DeployKit = { st: st, el: el, findById: findById, appendLogLine: appendLogLine, DATE_TAG_RE: DATE_TAG_RE, LOG_MAX_LINES: LOG_MAX_LINES, refreshControls: refreshControls, refreshHistory: refreshHistory, renderHistory: renderHistory, handleDone: handleDone };
+  // 注意:window.DeployKit 必须**一次性**赋值 —— 此前两个拆出文件各写了一个
+  // 同名的桥接对象字面量,后者整体覆盖前者,导致 deploy-rollback.js 在模块
+  // 顶层取到的 DATE_TAG_RE / appendLogLine / refreshHistory / renderHistory /
+  // handleDone / LOG_MAX_LINES 全是 undefined(单镜像回滚模态一打开即报
+  // 「Cannot read properties of undefined (reading 'test')」)。合并为单一
+  // 对象:任何新增拆出文件都只往这里加键,不加第二个 DeployKit。
+  window.DeployKit = {
+    st: st, el: el, findById: findById, refreshControls: refreshControls,
+    // deploy-rollback.js 消费
+    appendLogLine: appendLogLine, DATE_TAG_RE: DATE_TAG_RE,
+    LOG_MAX_LINES: LOG_MAX_LINES, refreshHistory: refreshHistory,
+    renderHistory: renderHistory, handleDone: handleDone,
+    // deploy-migrate.js 消费
+    migState: migState, loadPageData: loadPageData
+  };
   var openRollbackModal = function () { return window.DeployRollback.openRollbackModal.apply(null, arguments); };
   var closeRollbackModal = function () { return window.DeployRollback.closeRollbackModal.apply(null, arguments); };
   var appendRbLog = function () { return window.DeployRollback.appendRbLog.apply(null, arguments); };
   var handleRollbackDone = function () { return window.DeployRollback.handleRollbackDone.apply(null, arguments); };
-
-  // ===== 第十二批 JS 拆分桥接:共享设施暴露给拆出文件,入口转发 =====
-  window.DeployKit = { st: st, el: el, findById: findById, migState: migState, refreshControls: refreshControls, loadPageData: loadPageData };
   var openMigrateProjectModal = function () { return window.DeployMigrate.openMigrateProjectModal.apply(null, arguments); };
   var closeMigrateProjectModal = function () { return window.DeployMigrate.closeMigrateProjectModal.apply(null, arguments); };
 })();

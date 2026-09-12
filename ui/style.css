@@ -1076,6 +1076,10 @@ select.text-input option,
 .modal-body { padding: 16px 18px; }
 
 /* ===== 表单(模态框内) ===== */
+/* 真实 <form> 语义的外壳(第十三批,由 app.js window.beginForm 生成)。
+   浏览器给 form 的默认外边距为 0,这里显式声明只为让「模态正文里多了一层
+   容器」这件事在样式表里有据可查:form 不引入任何盒模型副作用。 */
+.form-root { margin: 0; }
 .form-row { margin-bottom: 12px; }
 /* 字段标签:中文主体 + 可选大写英文微标签(.form-label-en)。
    契约要求微标签用 Space Grotesk 且有较开字距(.08-.18em),中文主体保持

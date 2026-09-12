@@ -337,9 +337,14 @@
       renderRbNotice('服务器上没有镜像仓库「' + (st.rbRepository || '') + '」的历史标签,无法回滚');
       return;
     }
-    body.textContent = '';
+    // 表单语义(第十三批):列表 + 目标引用进 <form novalidate>。
+    // 本视图只有 rb-target-input 一个文本输入 —— 恰好命中 HTML 的「唯一
+    // 可阻塞隐式提交字段」条件,不接管 submit 就会在 Enter 时导航整个
+    // WebView;beginForm 的 submit 拦截即为此而设。
+    var formApi = window.beginForm(body, 'deploy-modal-title');
+    var form = formApi.form;
 
-    body.appendChild(el('div', 'rb-list-hint', '选择要回滚到的历史日期标签(按创建时间倒序):'));
+    form.appendChild(el('div', 'rb-list-hint', '选择要回滚到的历史日期标签(按创建时间倒序):'));
 
     var wrap = el('div', 'table-wrap');
     var table = el('table', 'data-table');
@@ -384,7 +389,7 @@
     });
     table.appendChild(tbody);
     wrap.appendChild(table);
-    body.appendChild(wrap);
+    form.appendChild(wrap);
 
     // 目标引用输入框:默认原始引用,可编辑
     var row = el('div', 'form-row');
@@ -401,11 +406,11 @@
     row.appendChild(input);
     row.appendChild(el('div', 'form-hint',
       '回滚会把所选日期标签重新指向此引用(通常为 compose 引用的原始标签),可编辑'));
-    body.appendChild(row);
+    form.appendChild(row);
 
     var plan = el('div', 'rb-plan hidden');
     plan.id = 'rb-plan';
-    body.appendChild(plan);
+    form.appendChild(plan);
 
     var actions = el('div', 'modal-actions');
     var cancel = el('button', 'btn', '取消');
@@ -418,7 +423,27 @@
     exec.addEventListener('click', confirmRbSingle);
     actions.appendChild(cancel);
     actions.appendChild(exec);
-    body.appendChild(actions);
+    form.appendChild(actions);
+
+    // 失焦校验 + Enter(第十三批):Enter →「执行回滚」按钮(本身只是打开
+    // 二次确认视图,不是执行);确认视图里没有可聚焦输入,不注册 Enter,
+    // 故 Enter 永远越不过「确认执行」那一步。
+    var v = window.bindFieldValidation(form, [
+      {
+        id: 'rb-target-input',
+        test: function (val) { return val.indexOf(':') >= 0; },
+        message: '需为完整镜像引用(如 myapp:latest)'
+      }
+    ]);
+    window.bindFormEnter(form, function () {
+      var btn = document.getElementById('rb-exec-btn');
+      if (btn && !btn.disabled) confirmRbSingle();
+    });
+    formApi.onSubmit(function () {
+      var btn = document.getElementById('rb-exec-btn');
+      if (btn && !btn.disabled) confirmRbSingle();
+    });
+    v.markSubmitted(); // 目标引用的格式提示不设闸门:预填值本就非空,进来即校验
   }
 
   /** 当前选中的日期标签(未选中返回空串) */
@@ -502,6 +527,10 @@
     var target = rbTargetInputValue();
     if (!dateTag || st.rbBusy) return;
     if (!target || target.indexOf(':') < 0) {
+      // 字段级提示(与失焦校验同一句文案)+ toast:按钮可能在没有失焦过的
+      // 情况下直接点(此时 blur 校验没跑过)
+      var input = document.getElementById('rb-target-input');
+      if (input) window.setFieldError(input, '需为完整镜像引用(如 myapp:latest)');
       window.toast('目标引用需为完整镜像引用(如 myapp:latest)', 'warn');
       return;
     }
