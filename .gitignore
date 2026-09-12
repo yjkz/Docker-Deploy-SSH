@@ -34,3 +34,6 @@ targe-1/
 
 # ZCode 会话本地文件(plan 等)
 .zcode/
+
+# SDD 流程产物(审查 diff / 报告;历史资料,不入库)
+.superpowers/
