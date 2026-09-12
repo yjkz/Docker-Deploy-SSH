@@ -123,6 +123,7 @@ pub fn run() {
       update::take_update_pending,
       config::app_settings_get,
       config::app_settings_set,
+      config::open_logs_dir,
       update::open_external,
     ])
     .setup(|app| {

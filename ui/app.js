@@ -15,6 +15,8 @@
  *                                 (Tab 圈禁由本文件的 document 级监听承担,
  *                                 10 个模态共用;见「模态焦点管理」节)
  * - window.copyText(text)         复制文本到剪贴板(成功 toast「已复制」)
+ * - window.errText(err)           错误值 → 可展示文本(全站统一口径,
+ *                                 空值兜底「未知错误」,非 Error 对象转字符串)
  * - window.toggleScheme(evt)      亮暗主题切换(View Transitions 圆形扩散揭示,
  *                                 持久化 localStorage['dd_scheme'])
  * ============================================================ */
@@ -109,7 +111,7 @@
         return picked;
       }, function (err) {
         // 调用失败(权限缺失等)不静默:toast 提示后按取消处理
-        window.toast('打开选择对话框失败:' + (err && err.message ? err.message : err), 'fail');
+        window.toast('打开选择对话框失败:' + window.errText(err), 'fail');
         return null;
       });
     }
@@ -206,6 +208,17 @@
       el.classList.remove('toast-show');
       window.setTimeout(function () { el.remove(); }, 300);
     }, 2500);
+  };
+
+  // ===== errText:错误值 → 可展示文本(全站统一口径)=====
+  // 此前 8 个页面脚本各自内联一份等价实现(7 处空串兜底 + rollback 的
+  // 「未知错误」版),现上收 app.js,取超集语义:空值兜底为「未知错误」,
+  // 非 Error 对象转字符串 —— 避免 toast / 错误框出现空文案。
+  window.errText = function (err) {
+    if (!err) return '未知错误';
+    if (typeof err === 'string') return err;
+    if (err.message) return err.message;
+    return String(err);
   };
 
   // ===== 呈现辅助:内联 SVG 图标 + 状态徽章(供各页面脚本构造 DOM)=====

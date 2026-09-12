@@ -182,12 +182,6 @@
     return node;
   }
 
-  function errText(err) {
-    if (typeof err === 'string') return err;
-    if (err && err.message) return err.message;
-    return '';
-  }
-
   /** docker 对缺失的仓库名 / 标签显示 <none>;空串同样按 <none> 处理 */
   function isNone(value) {
     if (value === null || value === undefined) return true;

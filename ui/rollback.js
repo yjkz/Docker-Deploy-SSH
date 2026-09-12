@@ -50,12 +50,6 @@
     return node;
   }
 
-  function errText(err) {
-    if (!err) return '未知错误';
-    if (typeof err === 'string') return err;
-    return err.message || String(err);
-  }
-
   function showError(msg) {
     var box = $('rollback-error');
     if (!box) return;

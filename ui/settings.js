@@ -78,12 +78,6 @@
     return node;
   }
 
-  function errText(err) {
-    if (typeof err === 'string') return err;
-    if (err && err.message) return err.message;
-    return '';
-  }
-
   /** 读取输入框当前值(元素缺失返回空串) */
   function fieldVal(id) {
     var node = document.getElementById(id);
@@ -250,6 +244,19 @@
     main.appendChild(hint(
       '开启后打开软件会比对导入项目的源 compose(含 .env / override)与配置内副本,' +
       '发现变化即自动同步并重解析(保留已保存的服务分类);关闭后仍可在项目列表点「从源更新」手动执行'));
+
+    // 诊断日志:此前设置中心没有日志入口,排障需手动定位应用目录 logs/。
+    // 打开动作经 open_logs_dir 由系统资源管理器完成(后端确保目录存在)
+    var logRow = el('div', 'form-row');
+    logRow.appendChild(window.formLabel('日志文件', 'LOGS', false, 'settings-open-logs-btn'));
+    var logBtn = el('button', 'btn', '打开日志文件夹');
+    logBtn.type = 'button';
+    logBtn.id = 'settings-open-logs-btn';
+    logBtn.addEventListener('click', onOpenLogs);
+    logRow.appendChild(logBtn);
+    logRow.appendChild(el('div', 'form-hint',
+      '运行日志按日期轮转写在应用目录 logs/ 下,部署 / 连接问题可在此排查'));
+    main.appendChild(logRow);
 
     // ── 更新 UPDATE ──
     main.appendChild(groupTitle('更新', 'UPDATE'));
@@ -585,6 +592,15 @@
       // 成功原文:实际拉到的最新版本即连通性证据
       showUpdateMessage('ok', '连接成功:最新版本 v' + (info.latest || '') +
         '(当前 v' + (info.current || '') + ')');
+    });
+  }
+
+  /** 打开日志文件夹:open_logs_dir 由资源管理器打开应用目录 logs/(后端确保目录存在) */
+  function onOpenLogs() {
+    window.AppBus.invoke('open_logs_dir').then(function () {
+      window.toast('已打开日志文件夹', 'ok');
+    }).catch(function (err) {
+      window.toast('打开日志文件夹失败:' + errText(err), 'fail');
     });
   }
 

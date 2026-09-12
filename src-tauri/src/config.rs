@@ -506,6 +506,27 @@ pub fn app_settings_set(settings: AppSettings) -> std::result::Result<(), String
     save_app_settings(&settings).map_err(|e| format!("保存设置失败: {}", e))
 }
 
+/// 打开日志文件夹(设置中心「诊断」入口;日志由 tauri-plugin-log 写于
+/// `app_dir()/logs` 的 app.log,按日期轮转)。目录尚不存在时先创建,
+/// 保证首次运行(还没写过日志)也能打开。
+#[tauri::command]
+pub fn open_logs_dir() -> std::result::Result<(), String> {
+    let dir = app_dir().join("logs");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建日志目录失败: {}", e))?;
+    // Windows 为发版目标;cfg 兜底其余平台的惯用打开器,命令缺失时报错不 panic
+    #[cfg(target_os = "windows")]
+    let opener = "explorer";
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let opener = "xdg-open";
+    std::process::Command::new(opener)
+        .arg(&dir)
+        .spawn()
+        .map_err(|e| format!("打开日志文件夹失败: {}", e))?;
+    Ok(())
+}
+
 // ===== 部署断点续传(UPGRADE-PLAN 阶段六,独立持久化于 config/resume-deploy.json)=====
 
 /// 断点条目上限:超出后按 `ts` 从最旧开始裁剪(防止无限膨胀)。

@@ -78,12 +78,6 @@
     return node;
   }
 
-  function errText(err) {
-    if (typeof err === 'string') return err;
-    if (err && err.message) return err.message;
-    return '';
-  }
-
   /** 读取表单字段值(元素缺失返回空串) */
   function fieldVal(id) {
     var node = document.getElementById(id);

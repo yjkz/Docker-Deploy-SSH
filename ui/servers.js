@@ -114,12 +114,6 @@
     return node;
   }
 
-  function errText(err) {
-    if (typeof err === 'string') return err;
-    if (err && err.message) return err.message;
-    return '';
-  }
-
   /** 生成服务器/项目 id:优先 crypto.randomUUID,不可用时退化为时间戳+随机串 */
   function uuid() {
     if (window.crypto && typeof window.crypto.randomUUID === 'function') {

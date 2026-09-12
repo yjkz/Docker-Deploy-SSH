@@ -26,12 +26,6 @@
     return node;
   }
 
-  function errText(err) {
-    if (typeof err === 'string') return err;
-    if (err && err.message) return err.message;
-    return '';
-  }
-
   function getRow(key) {
     return document.getElementById('check-' + key);
   }

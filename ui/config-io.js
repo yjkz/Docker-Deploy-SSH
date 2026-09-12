@@ -42,12 +42,6 @@
     return node;
   }
 
-  function errText(err) {
-    if (typeof err === 'string') return err;
-    if (err && err.message) return err.message;
-    return '';
-  }
-
   /** 取输入框当前值(不 trim:口令可能含首尾空格,按原样使用) */
   function passVal(id) {
     var node = document.getElementById(id);

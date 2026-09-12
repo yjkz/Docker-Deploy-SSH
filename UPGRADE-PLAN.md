@@ -833,3 +833,39 @@ v5.8.1 更新内容 → 确认全自动更新重启。
   徽章带最后更新时间;⑤已知取舍(非 bug):「实时」= 轮询采样,`docker stats
   --no-stream` 自身有 ~1-2s 采样窗口,真实帧周期 ≈ 采集耗时 + 设定间隔
   (模块头注释已声明),这是无流式 API 可经 SSH 稳定消费场景下的标准做法
+
+# 第九批升级（v5.8.2）
+
+> **分阶段路线图**(用户批复的执行协议):阶段一 细节优化 → 阶段二 概览磁盘用量 →
+> 阶段三 部署时预填版本说明 → 阶段四 结构治理(commands.rs/JS 拆分 + 补测试)→
+> 阶段五 表单校验体系 → 阶段六 批量部署增强;候选池(容器级指标/部署前强制预览/
+> 服务器探活通知/结构化错误码等)可任意批复节点插入。每阶段完成走完整验证链并
+> **停下等用户批复**再进入下一阶段。以下为阶段一完成记录。
+
+## 阶段一:设置中心日志入口 + errText 统一 + 文档计数同步 ✅
+
+- **设置中心「打开日志文件夹」**:新命令 `open_logs_dir`(`config.rs`,第 94 个
+  注册命令)—— 资源管理器打开 `app_dir()/logs`(tauri-plugin-log 的 app.log
+  按日期轮转,lib.rs 初始化处同路径),目录不存在先 `create_dir_all`(首次运行
+  尚未写过日志也能打开);explorer/open/xdg-open 按 `cfg(target_os)` 兜底,
+  spawn 失败报错不 panic。设置中心「通用」组新增「日志文件 / LOGS」按钮行 +
+  一行说明(此前设置中心无任何日志入口,排障需手动定位应用目录),走 AppBus
+  invoke,成功 toast、失败 toast 附错误文案
+- **errText 全站统一**:8 个页面脚本各内联一份等价实现(check/images/config-io/
+  notify/servers/deploy/settings 的「空串兜底」版 + rollback 的「未知错误」版)
+  上收为 app.js 唯一 `window.errText`,取**超集语义**:空值兜底「未知错误」、
+  字符串原样、Error 取 `message`、其余转字符串 —— 消除 toast / 错误框空文案;
+  app.js 头部功能清单与 wiki/03 公共层表同步登记;app.js pickPath 内联三元
+  表达式一并改用 errText
+- **文档与计数同步**(只改「现状声明」,不改历史批次记录):wiki/README 与
+  wiki/07 测试计数 269 → 283(第七/八批加测未同步的存量失准,以 cargo test
+  实际输出为准);wiki/README 命令计数 92 → 94(与 lib.rs 注册数对齐,此前
+  README 92 / wiki/04 93 两处各差一档);wiki/04 `deploy_batch` 命令条目补
+  「⚠️ 未接入(死代码,批量由前端队列完成)」标注,与 `deploy-batch` 事件
+  条目(04:436)同口径
+- **验证**:`cargo test` 显式确认 `test result: ok. 283 passed; 0 failed;
+  13 ignored`(基线不降;本批无新增 Rust 测试——open_logs_dir 为 spawn 副作用
+  不宜单测,errText 为 JS);`cargo clippy` 新代码零警告(存量 15 条均在
+  ssh/stack/commands 等与本批无关处);9 个改动 JS 全过 `node --check`;
+  界面改动(设置页按钮行)截图交 judge 验收
+
