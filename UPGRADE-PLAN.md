@@ -714,3 +714,58 @@ judge 前后同场景对比(暗色管理页:未连接徽章/概览标签/表头/
 - `external: true` 卷与宿主绝对路径挂载不搬运,只列 warnings 由用户自行准备
 - 卷搬运依赖服务器有 tar 镜像或能拉 busybox;distroless/scratch 项目镜像不含 tar,不能作回退
 - 归档搬运只处理单层目录;取消在卷/镜像边界生效(大文件传输中不即时中断)
+
+---
+
+# 第七批升级（v5.8.0）
+
+**目标**:修掉回滚中心「点项目加载明细卡半天」的性能问题,并为发布归档加上类 GitHub
+Release 的版本说明(标题 + 更新描述),在回滚中心点击归档即可查看/编辑。
+
+**进度**:阶段一(明细批量化)✅ / 阶段二(归档版本说明)✅ —— 随 **v5.8.0** 发布
+
+### 阶段一:明细加载批量化 ✅
+
+**慢因(勘察实证)**:`rollback_project_detail` 对每个归档各发一条 `ls -1` 与一条
+`cat manifest.json`(N+1 串行往返,每次都新开 SSH channel;50 归档 ≈ 100+ 次往返),
+外加逐仓库 `docker images <repo>`;`rollback_list_releases`(部署页回滚模态数据源)
+同款结构。对照 `rollback_scan_projects` 快是因为恒定 5 次命令。
+
+- **新增纯函数 `releases_dump_cmd(dir, ts_list, compose_candidates)` + `parse_releases_dump`**:
+  一条拼接命令批量取回全部归档的文件清单 / manifest.json / release-notes.json +
+  compose 候选文本,标记行 `==RELEASE/MANIFEST/NOTES/COMPOSE:<id>` 切分
+  (与清理分析 `cleanup_cat_composes_cmd`/`split_compose_dump` 同形态,路径全单引号包裹,
+  解析按下标一一对应、缺失段为空值不错位)
+- **`rollback_project_detail` 恒 3 次往返**:①`ls releases` ②批量读 ③一次全量
+  `docker images --no-trunc` 本地按仓库过滤日期标签(替代逐仓库一条命令);
+  所有 exec 包 `with_timeout`(此前循环内 4 处无超时兜底);顺带修复
+  `composeFile` 恒返回第一个候选的失真(现记录实际产出仓库的候选)
+- **`rollback_list_releases` 同款改造**(行为不变只提速;归档数 >100 截断兜底,
+  正常受 release_keep ≤50 约束)
+- 新增单测 6 个(命令拼装引号/空输入/多段切分/未知 ts 隔离/notes 原子写形态/坏 JSON 容错)
+
+### 阶段二:归档版本说明(类 GitHub Release)✅
+
+- **存储**:归档目录内 `release-notes.json`(`{title, body, updatedAt}`,与归档同生共死、
+  跨机器可用);读取并入批量 cat(零额外往返);**原子写**复用 .env 编辑先例
+  (base64 → `.ddtmp.$$(PID)` → `mv`,上限 64KB);**title/body 均空保存 = 删除文件**(清除)
+- **新命令 `rollback_set_release_notes`**(camelCase):安全约束与 `rollback_delete_release`
+  同款(dir 绝对路径 / ts 纯目录名 / 前缀校验防逃逸);`RollbackReleaseDetail` 增
+  `noteTitle` / `noteBody` / `noteUpdatedAt` / `manifestImages` 字段(命令总数 92 → 93)
+- **前端**:归档行可点(回滚/删除按钮 stopPropagation)→ 新模态
+  `#release-detail-modal`(11 号;元信息 + 镜像清单 + 版本标题/说明表单);
+  开/关照抄 config-io 四通道 + `modalFocusOpen/Close`;保存走 `setBtnBusy` 步进条 +
+  `formFailLoud` 三通道,成功就地更新 `detailCache` 与列表行(ts 旁显示标题 +
+  「已备注」徽章);明细加载加**会话序号守卫**(快速连点项目丢弃过期响应)
+
+**验证**:`cargo test` 275 passed(基线 269 + 新增 6)/ 13 ignored;clippy 对新代码零警告;
+`node --check` 全过;新模态 id 与 index.html 逐一核对;浏览器冒烟(06 页加载零 JS 错误、
+模态存在)。真机验收(明细加载速度对比 + 说明编辑全流程)待用户在真实服务器执行。
+
+### 遗留与取舍（记录在 wiki 07 已知限制）
+
+- 版本说明存归档目录内 ⇒ 随归档删除(`rollback_delete_release`)一并消失;跨机迁移项目时
+  归档搬运含该文件(migrate 的归档整体搬运语义),无需单独处理
+- 批量拼接命令按归档数线性增长:`project_detail` 截断 50、`list_releases` 截断 100 兜底
+  (正常受 release_keep ≤50 约束)
+- 部署时暂不支持预填版本说明(说明在回滚中心补写);后续如需可在部署确认面板加可选输入
