@@ -1258,3 +1258,60 @@ deploy-done 双触发。
   全 JS 过 `node --check`;`verify/form-validation.js` 54 断言与
   `verify/bridge-integrity.js` 均通过
 - 命令/事件计数不变(94 / 12,本批未新增命令),wiki/04 无需改动
+
+# 第十四批补丁（v5.13.1）— 修复「未能获取更新说明」
+
+## 缺陷
+
+用户从 v5.8.1 升级到 v5.13.0 后,检查更新弹窗显示「未能获取更新说明,可前往发布页
+查看本次更新内容」。**每次都会发生,非偶发**。
+
+## 根因
+
+`update_check` 主路径(302 重定向探测)拿到 tag 后,把 **剥了 `v` 前缀的展示版本号**
+`info.latest`(`"5.13.0"`)传给了按 tag 查 Release 的抓取函数:
+
+```rust
+info.notes = fetch_release_notes_via_api(proxy.as_deref(), &info.latest).await;
+//                                                 ^^^^^^^^^^^^^^^^^ 剥过前缀
+```
+
+而 GitHub 的 `releases/tags/{tag}` 端点要求**真实 tag 名**(`v5.13.0`),于是请求
+恒为 `/releases/tags/5.13.0` → **404**。
+
+抓取函数当时四个失败分支(客户端构建 / 请求失败 / 非 2xx / JSON 解析)**全部
+`return String::new()` 且无任何日志**,所以 404 被静默吞掉,前端只看到空 notes 的
+兜底文案。
+
+**自第八批(v5.8.1)引入,跨版本升级时才暴露** —— 用户此前从未真正跨版本升级过,
+而缺陷是恒定的(不是偶发),所以「第一次遇到就是你这次」。
+
+## 修复
+
+1. 主路径探测返回 `RedirectProbe { info, tag }`,**抓取改用 `probe.tag`(真实 tag,
+   带 `v` 前缀)**;`info.latest` 保持剥离语义不变(前端展示契约不动)
+2. `fetch_release_notes_via_api` **四个失败分支全部补 `log::warn!`**(带 URL 与
+   HTTP 状态码)—— 无日志是这个缺陷藏 6 个版本的主因
+3. 真机测试 `test_real_redirect_latest_tag` 强化:
+   - 新增 `probe.tag` 必须等于 `gh api` 权威 tag(带前缀)的断言
+   - 新增**对照断言**:用真实 tag 抓到非空说明 + 用剥前缀的值拿到空
+     (这对事实即回归保护)
+   - 移除原先「notes 必须非空」的误断言:测试二进制的 `CARGO_PKG_VERSION` 就是
+     当前源码版本(= 线上最新版),`has_update` 恒为 false,抓取分支本就不执行 ——
+     该断言失败与代码无关(已在本批实施中踩到并修正)
+4. 纯单测 `test_notes_fetch_uses_real_tag_not_stripped_version` 固化端点契约认知
+
+## 验证
+
+- `cargo test` 显式确认 `test result: ok. 292 passed; 0 failed; 13 ignored`
+  (基线 291 + 新增纯单测 1)
+- `cargo test --lib update::tests::test_real_redirect_latest_tag -- --ignored --nocapture`
+  **实测通过**(走真实代理 127.0.0.1:12450 与真实 API):
+  `tag=v5.13.0` → 抓到 926 字说明;`tag=5.13.0` → 空(404)
+- `cargo clippy --all-targets` 与基线逐条比对警告位置完全一致,零新增
+- 另核实:`reqwest::Proxy::all("127.0.0.1:12450")`(设置里代理串无 scheme)
+  **返回 Ok**,不是怀疑的代理解析问题 —— 诊断阶段排除了这个方向
+
+## 文档
+
+wiki/07 新增限制 63(记录端点契约、静默降级的取舍与「必须记日志」的教训)。

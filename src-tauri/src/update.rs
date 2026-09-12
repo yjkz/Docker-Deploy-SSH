@@ -109,14 +109,18 @@ pub async fn update_check(proxy: Option<String>) -> Result<UpdateInfo, String> {
 
     // 主路径:releases/latest 页面 302 重定向探测(无 API 配额限制)
     match update_check_via_redirect(proxy.as_deref(), &current).await {
-        Ok(mut info) => {
+        Ok(mut probe) => {
             // 检测到新版本时按 tag 抓取 Release body 填充 notes(此前主路径
             // notes 恒空,用户检查更新后看不到更新内容);仅 has_update 时发
-            // 这一次请求,失败/限流静默降级为空(前端有「前往发布页」兜底)
-            if info.has_update && info.notes.is_empty() {
-                info.notes = fetch_release_notes_via_api(proxy.as_deref(), &info.latest).await;
+            // 这一次请求,失败/限流静默降级为空(前端有「前往发布页」兜底)。
+            //
+            // 传入 probe.tag(302 Location 里的**真实 tag**,带 v 前缀),
+            // 不能用 info.latest —— 后者剥过前缀,拼出的端点必然 404。
+            if probe.info.has_update && probe.info.notes.is_empty() {
+                probe.info.notes =
+                    fetch_release_notes_via_api(proxy.as_deref(), &probe.tag).await;
             }
-            Ok(info)
+            Ok(probe.info)
         }
         Err(redirect_err) => {
             // 回退路径:GitHub REST API(未认证 60 次/小时按出口 IP 计)
@@ -141,6 +145,19 @@ pub async fn update_check(proxy: Option<String>) -> Result<UpdateInfo, String> {
 
 // ===== 主路径:重定向探测 =====
 
+/// 主路径探测结果:对前端可见的 [`UpdateInfo`] + 抓 notes 所需的**完整 tag**。
+///
+/// 为什么不复用 `info.latest` 去查 Release:`latest` 是**剥了 `v` 前缀**的展示
+/// 版本号(如 `5.13.0`),而 GitHub 的 `releases/tags/{tag}` 端点要求**真实
+/// tag 名**(`v5.13.0`)。早期实现把 `info.latest` 直接拼进该端点,请求恒为
+/// `/releases/tags/5.13.0` → **404 → 静默返回空 notes**,表现为前端弹窗恒显示
+/// 「未能获取更新说明」(第八批引入,第十四批后用户跨版本升级时暴露)。
+struct RedirectProbe {
+    info: UpdateInfo,
+    /// 302 Location 解析出的原始 tag(未剥前缀,如 `v5.13.0`)
+    tag: String,
+}
+
 /// 主路径:请求 releases/latest 页面 URL,从 302 的 `Location` 头解析最新 tag。
 ///
 /// GitHub 对该 html 页面 URL 固定返回 302,`Location` 为
@@ -151,7 +168,7 @@ pub async fn update_check(proxy: Option<String>) -> Result<UpdateInfo, String> {
 async fn update_check_via_redirect(
     proxy: Option<&str>,
     current: &str,
-) -> Result<UpdateInfo, String> {
+) -> Result<RedirectProbe, String> {
     // 禁自动跟随:要自己读 302 的 Location 头,不能让 reqwest 直接追到 tag 页
     let client = build_http_client(proxy, true)?;
     let response = client
@@ -188,14 +205,18 @@ async fn update_check_via_redirect(
     let ordering = compare_versions(current, &latest_display)
         .ok_or_else(|| format!("重定向 tag 非版本号(\"{tag}\")"))?;
 
-    Ok(UpdateInfo {
-        current: current.to_string(),
-        latest: latest_display,
-        has_update: ordering == Ordering::Greater,
-        // 「前往下载」直达该版本 Release 页(Location 本身,https 链接)
-        url: location,
-        // 空 notes:tag 页无 body 摘要;前端 set-notes 对空串已容错(不渲染)
-        notes: String::new(),
+    Ok(RedirectProbe {
+        info: UpdateInfo {
+            current: current.to_string(),
+            latest: latest_display,
+            has_update: ordering == Ordering::Greater,
+            // 「前往下载」直达该版本 Release 页(Location 本身,https 链接)
+            url: location,
+            // 空 notes:tag 页无 body 摘要;前端 set-notes 对空串已容错(不渲染)
+            notes: String::new(),
+        },
+        // 抓 notes 用**真实 tag**(带 v 前缀),不能用剥前缀的 latest
+        tag,
     })
 }
 
@@ -414,29 +435,49 @@ fn truncate_notes(notes: &str) -> String {
 /// 未认证 60 次/小时配额实质影响;限流/网络失败静默降级为空 notes,前端有
 /// 「前往发布页」兜底文案)。响应结构与 [`update_check_via_api`] 的
 /// `releases/latest` 一致,复用 [`LatestRelease`] 反序列化与 [`truncate_notes`]。
+/// 按 tag 抓取 Release body 作为更新说明(主路径补充)。
+///
+/// **失败原因记日志**:本函数有多个「静默返回空串」分支(客户端构建失败 /
+/// 请求失败 / 非 2xx / JSON 解析失败),前端只看到「未能获取更新说明」的兜底
+/// 文案 —— 早期把剥了 `v` 前缀的版本号当 tag 拼端点(恒 404)就是这样藏了很久,
+/// 直到用户跨版本升级才暴露。故每个分支都 `log::warn!` 出具体原因,便于现场排查。
 async fn fetch_release_notes_via_api(proxy: Option<&str>, tag: &str) -> String {
     let client = match build_http_client(proxy, false) {
         Ok(c) => c,
-        Err(_) => return String::new(),
+        Err(e) => {
+            log::warn!("更新说明抓取失败(HTTP 客户端构建): {e}");
+            return String::new();
+        }
     };
+    let url = release_by_tag_url(tag);
     let response = match client
-        .get(release_by_tag_url(tag))
+        .get(&url)
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
     {
         Ok(r) => r,
-        Err(_) => return String::new(),
+        Err(e) => {
+            log::warn!("更新说明抓取失败(请求 {}): {}", url, classify_http_error(&e));
+            return String::new();
+        }
     };
-    if !response.status().is_success() {
+    let status = response.status();
+    if !status.is_success() {
+        // 404 的典型原因就是 tag 名不对(如漏了 v 前缀)
+        log::warn!("更新说明抓取失败(HTTP {}): {}", status.as_u16(), url);
         return String::new();
     }
     let Ok(body) = response.text().await else {
+        log::warn!("更新说明抓取失败(响应体读取): {url}");
         return String::new();
     };
     match serde_json::from_str::<LatestRelease>(&body) {
         Ok(release) => truncate_notes(&release.body),
-        Err(_) => String::new(),
+        Err(e) => {
+            log::warn!("更新说明解析失败({}): {}", e, url);
+            String::new()
+        }
     }
 }
 
@@ -811,6 +852,25 @@ mod tests {
     }
 
     #[test]
+    fn test_notes_fetch_uses_real_tag_not_stripped_version() {
+        // 回归:抓更新说明必须用**真实 tag**(带 v 前缀),不能用 UpdateInfo.latest。
+        //
+        // 历史缺陷:update_check 曾把 info.latest(已剥 v 的 "5.13.0")传给
+        // fetch_release_notes_via_api,拼出 /releases/tags/5.13.0 → GitHub 404
+        // → 静默返回空 notes → 前端弹窗恒显示「未能获取更新说明」。该缺陷自
+        // 第八批引入,每次检查更新都失败(非偶发)但无日志,直到跨版本升级才暴露。
+        assert_eq!(
+            release_by_tag_url("5.13.0"),
+            "https://api.github.com/repos/yjkz/Docker-Deploy-SSH/releases/tags/5.13.0",
+            "剥前缀的值会拼出 404 端点 —— 这正是本回归要防止的误用"
+        );
+        // 正确用法:原样传真实 tag
+        assert!(release_by_tag_url("v5.13.0").ends_with("/tags/v5.13.0"));
+        // 两侧空白仍容错
+        assert!(release_by_tag_url("  v5.13.0  ").ends_with("/tags/v5.13.0"));
+    }
+
+    #[test]
     fn test_installer_download_url() {
         // 与 NSIS 实际产物命名一致:productName 空格 → `.`(GitHub 资产名禁空格);
         // v 前缀容错剥离
@@ -1009,45 +1069,55 @@ mod tests {
         const PROXY: &str = "http://127.0.0.1:12450";
         let current = env!("CARGO_PKG_VERSION").to_string();
 
+        // 权威 tag(带 v 前缀):先取,供 probe.tag 断言使用
+        let gh_tag_expected = {
+            let out = std::process::Command::new("gh")
+                .args(["api", "repos/yjkz/Docker-Deploy-SSH/releases/latest",
+                       "--jq", ".tag_name"])
+                .env("HTTPS_PROXY", PROXY)
+                .output()
+                .expect("无法启动 gh CLI(需安装并加入 PATH)");
+            assert!(out.status.success(),
+                "gh api 执行失败: {}", String::from_utf8_lossy(&out.stderr).trim());
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
         // 主路径:重定向探测应成功,url 为该 tag 的 Release 页
-        let info = update_check_via_redirect(Some(PROXY), &current)
+        let probe = update_check_via_redirect(Some(PROXY), &current)
             .await
             .expect("重定向主路径应成功(需本机代理可用)");
+        let info = probe.info;
         assert!(
             info.url.contains("/releases/tag/"),
             "url 应为 tag Release 页,实际: {}",
             info.url
         );
-        assert!(info.notes.is_empty(), "主路径 notes 应为空");
-
-        // 权威口径:gh api(带 HTTPS_PROXY 环境变量)
-        let output = std::process::Command::new("gh")
-            .args([
-                "api",
-                "repos/yjkz/Docker-Deploy-SSH/releases/latest",
-                "--jq",
-                ".tag_name",
-            ])
-            .env("HTTPS_PROXY", PROXY)
-            .output()
-            .expect("无法启动 gh CLI(需安装并加入 PATH)");
-        assert!(
-            output.status.success(),
-            "gh api 执行失败: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+        assert!(info.notes.is_empty(), "重定向探测本身不抓 notes(应为空)");
+        // 抓 notes 用的 tag 必须是**真实 tag**(带 v 前缀),否则端点 404
+        assert_eq!(
+            probe.tag, gh_tag_expected,
+            "probe.tag 应为真实 tag(带 v 前缀)"
         );
-        let gh_tag = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        assert!(!gh_tag.is_empty(), "gh api 输出为空");
+
         // gh 输出为 tag 原文(带 v 前缀),与 latest(已剥前缀)应一致
+        assert!(
+            !gh_tag_expected.is_empty(),
+            "gh api 输出为空"
+        );
         assert_eq!(
             info.latest,
-            gh_tag.trim_start_matches(['v', 'V']),
+            gh_tag_expected.trim_start_matches(['v', 'V']),
             "重定向解析 tag({})应与 gh api({})一致",
             info.latest,
-            gh_tag
+            gh_tag_expected
         );
 
         // 全链路:主路径成功 → 不应出现「经 API 回退」前缀
+        //
+        // 注意:此处**不断言 notes 非空**。测试二进制的 CARGO_PKG_VERSION 就是
+        // 当前源码版本(= 线上最新版),has_update 恒为 false,抓 notes 的分支
+        // 本就不会执行 —— 曾误加「notes 必须非空」断言,失败原因与代码无关。
+        // 「抓取用真实 tag」这一事实由下面两条独立断言直接覆盖。
         let full = update_check(Some(PROXY.to_string()))
             .await
             .expect("update_check 全链路应成功");
@@ -1055,6 +1125,21 @@ mod tests {
             !full.notes.contains("经 API 回退"),
             "主路径成功时不应回退,notes: {}",
             full.notes
+        );
+
+        // 本轮修复的核心:抓更新说明必须用**真实 tag**(带 v 前缀)。
+        // 真实 tag → 有内容;剥前缀 → 404 → 空。这一对事实即回归保护。
+        let with_v = fetch_release_notes_via_api(Some(PROXY), &probe.tag).await;
+        assert!(
+            !with_v.is_empty(),
+            "用真实 tag({}) 应抓到 Release 说明",
+            probe.tag
+        );
+        let stripped = fetch_release_notes_via_api(Some(PROXY), &info.latest).await;
+        assert!(
+            stripped.is_empty(),
+            "用剥前缀的值({}) 应拿到空(端点 404)—— 这正是历史缺陷的形态",
+            info.latest
         );
     }
 }

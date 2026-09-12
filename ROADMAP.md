@@ -78,6 +78,12 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 - 验证:`cargo test` 291 passed(基线 290 + 新单测)/ clippy 与基线逐条比对零新增 / 浏览器桩跑通全部续传路径(含断点已清理的边界)/ judge pass
 - **待真机复测**:真实服务器上的批量失败 → 续传此台/一键续传;停止批量的即时中止手感
 
+### 第十四批补丁 v5.13.1 — 修复「未能获取更新说明」
+- **根因**:`update_check` 主路径把**剥了 v 前缀**的 `info.latest`(`"5.13.0"`)当 tag 传给 `releases/tags/{tag}` 端点,而 GitHub 要求真实 tag(`v5.13.0`)→ **恒 404**;抓取函数四个失败分支当时全部静默 `return String::new()` 且无日志,故前端只看到「未能获取更新说明」兜底。**自第八批引入,恒定失败(非偶发)**,用户跨版本升级时才暴露
+- **修复**:主路径返回 `RedirectProbe { info, tag }`,抓取改用真实 tag;抓取函数四个分支补 `log::warn!`(带 URL 与状态码);真机测试强化为「probe.tag 等于 gh 权威 tag」+「真实 tag 抓到非空 / 剥前缀拿到空」对照断言
+- 验证:`cargo test` 292 passed / clippy 零新增 / 真机测试 `--ignored` 实测通过(走真实代理与 API)
+- 另核实:`reqwest::Proxy::all("127.0.0.1:12450")`(无 scheme 的代理串)返回 Ok,不是代理解析问题
+
 ---
 
 ## 待完成
@@ -110,7 +116,7 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 
 ## 当前状态速览
 
-- 版本 v5.13.0;main = origin/main;基线 `cargo test` 291 passed / 13 ignored
+- 版本 v5.13.1;main = origin/main;基线 `cargo test` 292 passed / 13 ignored
 - 命令 94 个(lib.rs 注册;wiki/04 已同步);JS 15 文件(index.html 加载顺序见 wiki/03:13)
 - 前端结构:12 模态;commands/ 11 文件;三大 JS 主文件 2338/2013/2537 行
 - 表单体系(第十三批):5 处模态有真实 `<form novalidate>` 语义;失焦校验 + Enter 提交由 app.js 三助手统一承担
