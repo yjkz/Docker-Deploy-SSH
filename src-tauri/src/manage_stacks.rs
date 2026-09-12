@@ -82,7 +82,7 @@ fn compose_prefix(compose_file: &str) -> String {
 
 // ===== Tauri 命令 =====
 
-/// 扫描 remote_dir 下(深度 ≤2)的 compose 文件,返回栈列表
+/// 扫描 remote_dir 下(深度 ≤4,与回滚中心/清理分析的项目扫描口径一致)的 compose 文件,返回栈列表
 #[tauri::command]
 pub async fn manage_list_stacks(
     server_id: String,
@@ -90,9 +90,10 @@ pub async fn manage_list_stacks(
 ) -> Result<Vec<StackRow>, String> {
     let (server, mut client) = connect_server(&server_id, password_plain.as_deref()).await?;
 
-    // find 多 -name 需 \( \) 与 -o 组合;深度 ≤2:remote_dir 本层的文件 + 一层子目录
+    // find 多 -name 需 \( \) 与 -o 组合;深度 ≤4(第八批:与回滚中心/清理分析的
+    // 项目扫描口径统一,原为 ≤2 —— 部署目录下超过一层子目录的栈会扫不到)
     let cmd = format!(
-        "find {} -maxdepth 2 -type f \\( -name 'docker-compose.yml' -o -name 'docker-compose.yaml' -o -name 'compose.yml' -o -name 'compose.yaml' \\)",
+        "find {} -maxdepth 4 -type f \\( -name 'docker-compose.yml' -o -name 'docker-compose.yaml' -o -name 'compose.yml' -o -name 'compose.yaml' \\)",
         shell_quote(&server.remote_dir)
     );
     let (code, out) = with_timeout(
