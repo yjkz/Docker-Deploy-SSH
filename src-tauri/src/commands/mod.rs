@@ -406,6 +406,10 @@ where
         }
         append_record(record.clone());
     }
+    // 托盘 tooltip(第十五批):收尾 —— 清运行态并记录终态(成功/失败/取消)。
+    // 窗口隐藏时用户回来第一眼从托盘就能看到上次部署结果,不必翻历史。
+    let canceled = matches!(&result, Err(e) if e == CANCELLED_MSG);
+    crate::tray_status::set_deploy_finished(&app, result.is_ok(), canceled);
     match &result {
         Ok(()) => {
             if emit_done {
@@ -961,7 +965,12 @@ fn ensure_not_cancelled(app: &AppHandle) -> Result<(), String> {
 /// 批量部署路径(任务级上下文关闭,见 [`DEPLOY_EVENT_CTX`])不 emit ——
 /// 批量的单台进度由 `deploy-batch` 事件表达,避免多台交叉刷屏;
 /// 单发/续传路径无上下文,行为不变。
+///
+/// **托盘 tooltip 的步骤更新在此处同步**(第十五批),且**刻意放在批量抑制
+/// 之前** —— 批量的单台进度虽然不发事件,但 tooltip 恰恰最需要它(窗口隐藏时
+/// 用户看不到批量面板)。回滚执行同样走本管线,故回滚期间 tooltip 也显示步骤。
 fn emit_progress(app: &AppHandle, step: u8, total: u8, message: &str) {
+    crate::tray_status::set_deploy_step(app, step, total);
     if !DeployEventCtx::progress_enabled() {
         return;
     }

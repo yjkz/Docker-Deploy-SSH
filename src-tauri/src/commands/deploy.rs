@@ -141,6 +141,21 @@ async fn run_deploy_steps(
         server.auth.password_enc.as_deref(),
     )?;
     let key_pass = resolve_key_passphrase(&server)?;
+    // 托盘 tooltip(第十五批):置「部署中」运行态。目标串给窗口隐藏时的
+    // 用户看;批量前缀取自当前任务的事件上下文(有 `[服务器名] ` 前缀即批量,
+    // 死代码 deploy_batch 专用;线上批量每台是独立单发,自然逐台刷新)
+    {
+        // 有前缀 = 死代码批量路径专用;线上批量每台是独立单发任务,前缀为空
+        let batch_hint = DeployEventCtx::log_prefix().trim().to_string();
+        crate::tray_status::set_deploy_running(
+            app,
+            false,
+            0,
+            0,
+            &format!("{} / {}", server.name, project.name),
+            &batch_hint,
+        );
+    }
     emit_log(
         app,
         &format!(
@@ -1178,6 +1193,19 @@ async fn run_deploy_stack_steps(
         server.auth.password_enc.as_deref(),
     )?;
     let key_pass = resolve_key_passphrase(&server)?;
+    // 托盘 tooltip(第十五批):整栈「部署中」运行态(同单镜像口径)
+    {
+        // 有前缀 = 死代码批量路径专用;线上批量每台是独立单发任务,前缀为空
+        let batch_hint = DeployEventCtx::log_prefix().trim().to_string();
+        crate::tray_status::set_deploy_running(
+            app,
+            true,
+            0,
+            0,
+            &format!("{} / {}", server.name, project.name),
+            &batch_hint,
+        );
+    }
 
     // 断点续传:落盘键与产物上下文(续传以断点产物为准,正常部署从请求构造)
     // 键优先取断点上下文(清理与加载指向同一键);正常部署按请求现算

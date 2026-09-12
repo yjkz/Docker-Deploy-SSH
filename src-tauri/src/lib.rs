@@ -13,6 +13,7 @@ pub mod migrate_project;
 pub mod notify;
 pub mod ssh;
 pub mod stack;
+pub mod tray_status;
 pub mod update;
 
 use tauri_plugin_log::{Target, TargetKind};
@@ -212,6 +213,11 @@ fn setup_desktop(app: &tauri::App) -> tauri::Result<()> {
         }
       })
       .build(app)?;
+
+    // 托盘就绪:用当前状态刷新一次 tooltip(第十五批动态态)。此后部署/监控
+    // 状态变化会经 tray_status 的 set_* 接口持续更新;窗口隐藏时它是用户唯一
+    // 能看到的状态面(见 wiki/07 限制 19)
+    crate::tray_status::mark_ready(app.handle());
 
     // 主窗口关闭拦截:每次关闭事件现读 settings.json(而非缓存),
     // 保证前端改完设置无需重启即生效;closeToTray=false 不拦截(默认关闭,

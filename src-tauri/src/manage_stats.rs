@@ -159,6 +159,15 @@ pub async fn manage_stats_start(
     let interval = interval_secs
         .unwrap_or(2)
         .clamp(INTERVAL_MIN, INTERVAL_MAX);
+    // 托盘 tooltip(第十五批):监控是长驻后台动作,窗口隐藏时用户从托盘
+    // 就能看到「正在监控哪台」。名称查不到(配置刚删)时回退用 id。
+    {
+        let name = crate::config::load_config()
+            .ok()
+            .and_then(|cfg| cfg.servers.iter().find(|s| s.id == server_id).map(|s| s.name.clone()))
+            .unwrap_or_else(|| server_id.clone());
+        crate::tray_status::set_monitor(&app, true, &name);
+    }
     // 递增 generation:旧循环在下轮检查时发现代号过期而自动退出
     let generation = stats_state.begin();
     log::info!(
@@ -363,9 +372,11 @@ pub async fn manage_stats_start(
 
 /// 停止 docker stats 实时监控(递增 generation 使循环退出)。
 #[tauri::command]
-pub async fn manage_stats_stop(stats_state: tauri::State<'_, StatsState>) -> Result<(), String> {
+pub async fn manage_stats_stop(app: tauri::AppHandle, stats_state: tauri::State<'_, StatsState>) -> Result<(), String> {
     log::info!("收到停止监控请求");
     stats_state.end();
+    // 托盘 tooltip(第十五批):清监控态(部署运行态不受影响,优先级更高)
+    crate::tray_status::set_monitor(&app, false, "");
     Ok(())
 }
 
@@ -425,6 +436,9 @@ fn connect_failure_limit_reached(
     };
     let _ = app.emit(STATS_EVENT, payload);
     state.lock().unwrap().finish(generation);
+    // 托盘 tooltip(第十五批):监控熔断自动退出也要清态 —— 不清的话托盘会
+    // 永远挂着「监控中」,与实际不符(前端可能不在线,收不到 stopped 事件)
+    crate::tray_status::set_monitor(app, false, "");
     true
 }
 

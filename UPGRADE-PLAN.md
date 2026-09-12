@@ -1315,3 +1315,63 @@ info.notes = fetch_release_notes_via_api(proxy.as_deref(), &info.latest).await;
 ## 文档
 
 wiki/07 新增限制 63(记录端点契约、静默降级的取舍与「必须记日志」的教训)。
+
+# 第十五批升级（v5.14.0）— 托盘 tooltip 动态态
+
+> 用户指定「先完成托盘 tooltip 动态态,然后直接推送发布」(跳过细案批复;
+> 项的来源是候选池,用户在解释「结构化错误码 / 托盘 tooltip」含义后选定)。
+
+## 背景
+
+应用支持「关闭到托盘」(settings.close_to_tray)与部署完成自动重启,窗口隐藏时
+**托盘是用户唯一能看到的界面**。原 tooltip 是编译期写死的 `"DockerDeploy SSH"`
+(lib.rs 的 TrayIconBuilder),窗口一关就完全看不到部署进度/成败(wiki/07 限制 19)。
+
+## 实现:新模块 src-tauri/src/tray_status.rs(约 330 行,含 10 单测)
+
+- **状态由后端自行维护,不依赖前端上报** —— 窗口隐藏、前端卡死时 tooltip 仍准确。
+  这是本批最关键的设计决策:若走「前端 invoke 上报」路线,窗口隐藏后事件循环
+  照常跑,但前端任何卡顿都会让 tooltip 撒谎。
+- `tooltip_text(&Status)` **纯函数**生成文本(状态组合全部单测覆盖),全局
+  `Mutex<Option<Status>>` 持状态,`set_*` 接口改写后锁内算出文本、
+  `tray.set_tooltip()` 写入(托盘未就绪时状态照记、静默跳过)。
+- **优先级:部署中 > 回滚执行中 > 监控中 > 空闲**;空闲时附「上次部署成功/失败/
+  已取消」终态后缀,新部署/回滚开始即清(避免「部署中 … 上次失败」的自相矛盾)。
+- 文案形态:
+  - `DockerDeploy SSH`(空闲,无终态)
+  - `DockerDeploy SSH — 部署中 生产服务器 / 我的应用(步骤 3/5)`
+  - `DockerDeploy SSH — 整栈部署中 …` / `DockerDeploy SSH — 批量 2/4 · 部署中 …`
+  - `DockerDeploy SSH — 回滚执行中(期间服务会短暂重启)`
+  - `DockerDeploy SSH — 监控中 生产服务器`
+  - `DockerDeploy SSH — 上次部署失败`
+
+## 挂钩点(全部在后端管线,零前端改动)
+
+| 钩子 | 位置 | 说明 |
+|---|---|---|
+| 部署开始 | `run_deploy_steps` / `run_deploy_stack_steps` 步骤 0 | 解析出 server/project 后置「部署中」+ 目标串;批量前缀取事件上下文 `log_prefix`(死代码批量专用,线上批量每台独立单发自然逐台刷新) |
+| 步骤更新 | `emit_progress` | **刻意放在批量抑制之前** —— 批量的单台进度虽不发事件,但 tooltip 最需要它;回滚不走此函数(无步骤污染) |
+| 部署收尾 | `finish_deploy_run` | 清运行态 + 记终态(成功/失败/取消,取消按 CANCELLED_MSG 判定) |
+| 回滚开始/收尾 | `finish_rollback` | 进入即置「回滚执行中」,CatchPanic 后无论成败清态并记终态 |
+| 监控开始 | `manage_stats_start` | 查配置取服务器名(查不到回退 id),置「监控中」 |
+| 监控停止 | `manage_stats_stop` | 清监控态 |
+| 监控熔断 | `connect_failure_limit_reached` | 连续 3 轮连接失败自动退出时也清态 —— 不清的话前端不在线时托盘永远挂着「监控中」 |
+| 托盘就绪 | lib.rs 建完托盘 | `mark_ready`:置就绪标志并用当前状态刷新一次 |
+
+## 已知边界
+
+- tooltip 文本是系统绘制,**无自动化断言手段**;形态由 `tooltip_text` 的 10 个
+  纯函数单测覆盖,真机悬停效果待用户确认(托盘悬停 1-2 秒出现)
+- 批量部署逐台是独立单发任务,两台之间 tooltip 会瞬间闪现「上次部署成功/失败」
+  再回到「部署中」—— 状态始终准确,仅视觉上有一次刷新(间隔 < 1s)
+- 回滚运行中文案刻意不带步骤(回滚管线无 emit_progress 挂点,步骤号语义不同)
+
+## 验证
+
+- `cargo test` 显式确认 `test result: ok. 302 passed; 0 failed; 13 ignored`
+  (基线 292 + tray_status 10 个纯函数单测:空闲/部署/整栈/批量前缀/监控/
+  优先级互斥/终态后缀/运行中不显终态/无步骤号/回滚)
+- `cargo clippy --all-targets` 与基线一致(10/15),零新增;可见性统一 pub(crate)
+  消除 private_interfaces 警告
+- 真机冒烟:`cargo build` + 启动 app.exe 确认进程存活与正常退出(tooltip 实际
+  悬停效果待用户确认)

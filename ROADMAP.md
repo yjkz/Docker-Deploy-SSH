@@ -84,6 +84,13 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 - 验证:`cargo test` 292 passed / clippy 零新增 / 真机测试 `--ignored` 实测通过(走真实代理与 API)
 - 另核实:`reqwest::Proxy::all("127.0.0.1:12450")`(无 scheme 的代理串)返回 Ok,不是代理解析问题
 
+### 第十五批 v5.14.0(候选池:托盘 tooltip 动态态)— 已完成(commit 见本批)
+- 新模块 `src-tauri/src/tray_status.rs`:tooltip 由纯函数 `tooltip_text` 生成(10 单测覆盖状态组合),**状态由后端管线自行维护**(部署/回滚/监控挂钩,零前端改动)—— 窗口隐藏、前端卡死时托盘仍准确
+- 优先级:部署中 > 回滚执行中 > 监控中 > 空闲;空闲附「上次部署成功/失败/已取消」终态(新一轮开始即清)
+- 挂钩点:两部署管线步骤 0(开始 + 目标串 + 批量前缀)/ `emit_progress`(步骤,**置于批量抑制之前**)/ `finish_deploy_run`(终态)/ `finish_rollback`(进入/退出)/ 监控 start·stop·熔断
+- 细节:监控熔断自动退出也清态(否则前端不在线时托盘永远「监控中」);批量逐台是独立单发,台间 tooltip 瞬闪终态再回「部署中」(状态恒准确,间隔 <1s)
+- 验证:`cargo test` 302 passed(基线 292 + 10)/ clippy 零新增 / 真机冒烟进程存活;**tooltip 悬停效果待用户确认**(系统绘制,无自动化断言手段)
+
 ---
 
 ## 待完成
@@ -97,7 +104,6 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 | 部署前强制预览 | `preview_stack_changes` 已实现未接入部署流程(wiki/03 明示「独立功能」);做成部署前可选/强制预览 |
 | 服务器定时探活+通知 | notify 体系已有桌面/SMTP/webhook;定时探活失败推送 |
 | 结构化错误码 | 现依赖中文文案子串匹配(is_transport_error 等,wiki/07 限制 13);改结构化错误枚举 |
-| 托盘 tooltip 动态态 | 固定文案 → 反映部署/监控状态(wiki/07 限制 19) |
 | image_filter 消费 | 配置字段未被消费(项目下拉过滤,wiki/07 限制 3) |
 | .env 非 UTF-8 | lossy 替换会乱码(wiki/07 限制 17) |
 | Docker data-root 探测 | 概览磁盘按默认 /var/lib/docker 采样;可加 `docker info -f` 探真实数据根 |
@@ -116,7 +122,7 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 
 ## 当前状态速览
 
-- 版本 v5.13.1;main = origin/main;基线 `cargo test` 292 passed / 13 ignored
+- 版本 v5.14.0;main = origin/main;基线 `cargo test` 302 passed / 13 ignored
 - 命令 94 个(lib.rs 注册;wiki/04 已同步);JS 15 文件(index.html 加载顺序见 wiki/03:13)
 - 前端结构:12 模态;commands/ 11 文件;三大 JS 主文件 2338/2013/2537 行
 - 表单体系(第十三批):5 处模态有真实 `<form novalidate>` 语义;失焦校验 + Enter 提交由 app.js 三助手统一承担

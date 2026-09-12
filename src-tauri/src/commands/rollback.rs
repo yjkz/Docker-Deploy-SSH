@@ -1424,6 +1424,10 @@ async fn finish_rollback<F>(app: &AppHandle, fut: F) -> Result<(), String>
 where
     F: std::future::Future<Output = Result<DeployRecord, String>> + Send,
 {
+    // 托盘 tooltip(第十五批):回滚执行中。回滚期间服务会重启,窗口隐藏时
+    // 用户应当能从托盘看出「现在不是空闲,别动手动脚」;收尾(成功/失败)在
+    // 下方 match 内清态
+    crate::tray_status::set_rolling_back(app, true);
     let result = match CatchPanic::new(fut).await {
         Ok(res) => res,
         Err(panic_info) => {
@@ -1431,6 +1435,9 @@ where
             Err("回滚过程发生内部错误,详情见日志".to_string())
         }
     };
+    // 无论成败都清回滚态;成败后的空闲文案分别带「上次部署成功/失败」语义
+    // (回滚的成败也记进同一终态:用户视角「回滚完成」即部署态的一种恢复)
+    crate::tray_status::set_deploy_finished(app, result.is_ok(), false);
     match result {
         Ok(record) => {
             // 通知文案在 record 被消费前组装(正文含项目名与回滚目标)
