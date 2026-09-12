@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "DockerDeploy SSH",
-  "version": "5.7.3",
+  "version": "5.7.4",
   "identifier": "com.dockerdeploy.ssh",
   "build": {
     "frontendDist": "../ui"
