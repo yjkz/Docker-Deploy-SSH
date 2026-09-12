@@ -154,7 +154,10 @@
     batch: null,       // 批量部署:{ active, queue[], idx, success, failed, skipped, aborted, deferred };前端编排串行队列,后端零改动
     rbLogs: [],        // 回滚模态内日志区累积的日志行(deploy-log 镜像)
     resume: null,      // deploy_resume_status 查询到的断点视图(ResumeView;无断点为 null)
-    resumeBusy: false  // deploy_resume_discard 请求进行中(防重复提交)
+    resumeBusy: false, // deploy_resume_discard 请求进行中(防重复提交)
+    pendingReleaseNotes: null // 发起整栈部署时快照的版本说明 { serverId, projectId, body };
+                              // 成功后经 rollback_set_release_notes 补写,失败/取消保留
+                              // (断点续传成功后于 handleDone 补写);批量部署恒 null
   };
 
   /**
@@ -1503,6 +1506,20 @@
     var services = Array.isArray(st.stack.services) ? st.stack.services : [];
     var skipChk = document.getElementById('deploy-stack-skip');
     var archChk = document.getElementById('deploy-stack-archive');
+    // 版本说明(第十一批):发起时快照输入(可选);批量部署无逐台说明,恒不写
+    var notesEl = document.getElementById('deploy-release-notes');
+    var notesBody = notesEl ? String(notesEl.value).trim() : '';
+    if (st.batch && st.batch.active) {
+      st.pendingReleaseNotes = null;
+    } else if (notesBody) {
+      st.pendingReleaseNotes = {
+        serverId: String(server.id),
+        projectId: String(project.id),
+        body: notesBody
+      };
+    } else {
+      st.pendingReleaseNotes = null;
+    }
     var req = {
       project_id: String(project.id),
       server_id: String(server.id),
@@ -1564,6 +1581,7 @@
       var doneDeferred = st.batch.deferred;
       st.batch.deferred = null;
       st.deploying = false;
+      st.pendingReleaseNotes = null; // 批量无逐台说明,清防残留污染后续单发
       refreshControls();
       refreshHistory();
       doneDeferred(p);
@@ -1583,11 +1601,65 @@
       showBanner('fail', (isRollback ? '回滚失败:' : '部署失败:') + (message || '未知错误'));
     }
 
+    // 版本说明补写(第十一批):整栈部署(非回滚)成功且发起时填了说明 →
+    // 历史已先于 deploy-done 落盘(后端 finish 顺序,第十一批同批调整),
+    // 此处查最新成功记录取 release_dir 拆参补写。失败/取消不写(说明保留
+    // 在输入框,断点续传成功后走同一入口补写)
+    if (success && !isRollback && st.pendingReleaseNotes) {
+      var notesCtx = st.pendingReleaseNotes;
+      st.pendingReleaseNotes = null;
+      writeReleaseNotes(notesCtx);
+    }
+
     // 部署/回滚结束(成功/失败/取消均落历史)后刷新部署历史;
     // 并重查断点:失败/取消保留断点 → 横幅给出「从步骤 N 继续」,
     // 成功则断点已被后端清除,查询为空,横幅保持隐藏
     refreshHistory();
     refreshResumeStatus();
+  }
+
+  /**
+   * 补写归档版本说明(第十一批):按发起时快照的 { serverId, projectId, body },
+   * 从部署历史取该服务器+项目最新的成功整栈记录,其 `release_dir` =
+   * `<项目目录>/releases/<时间戳>` 拆出 dir + ts,调
+   * `rollback_set_release_notes` 原子写归档内 release-notes.json。
+   * 写失败只 toast 警示(部署本身已成功,不回滚不重试,用户可在回滚中心
+   * 版本详情里补写);历史缺记录/目录形态异常同样警示后放弃。
+   */
+  function writeReleaseNotes(ctx) {
+    window.AppBus.invoke('get_history').then(function (records) {
+      var rec = null;
+      for (var i = 0; i < records.length; i++) {
+        var r = records[i];
+        if (r && r.mode === 'stack' && r.success === true && r.release_dir &&
+            r.server_id === ctx.serverId && r.project_id === ctx.projectId) {
+          rec = r; // 倒序 = 最新在前,首个匹配即本次发布
+          break;
+        }
+      }
+      var releaseDir = rec ? String(rec.release_dir) : '';
+      var marker = '/releases/';
+      var idx = releaseDir.lastIndexOf(marker);
+      if (idx <= 0) {
+        window.toast('版本说明未写入:未在部署历史中定位到本次发布归档', 'warn');
+        return;
+      }
+      var dir = releaseDir.slice(0, idx);
+      var ts = releaseDir.slice(idx + marker.length);
+      window.AppBus.invoke('rollback_set_release_notes', {
+        serverId: ctx.serverId,
+        dir: dir,
+        ts: ts,
+        title: '',
+        body: ctx.body
+      }).then(function () {
+        window.toast('版本说明已写入发布归档(' + ts + ')', 'ok');
+      }).catch(function (err) {
+        window.toast('版本说明写入失败(部署本身已成功):' + errText(err), 'warn');
+      });
+    }).catch(function (err) {
+      window.toast('版本说明写入失败(部署本身已成功):' + errText(err), 'warn');
+    });
   }
 
   // ===== 批量部署(前端编排:按服务器队列串行调用单发部署,后端零改动)=====

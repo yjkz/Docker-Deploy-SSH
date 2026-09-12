@@ -1192,6 +1192,13 @@ select.text-input option,
               box-shadow var(--ark-dur-fast) var(--ark-ease-out),
               background var(--ark-dur-fast) var(--ark-ease-out);
 }
+/* 版本说明(第十一批,04 部署向导整栈选项区):内容是中文散文,
+   按「内容含中文一律 CJK 轨」纪律覆盖 .form-textarea 的默认 mono 轨。
+   容器 .deploy-stack-options 是 flex-wrap 行,说明行须整行独占
+   (flex 纪律:占满一行的子项显式 width:100%,否则与复选框同行被挤压) */
+.deploy-release-notes-row { width: 100%; }
+.deploy-release-notes-row .form-label { margin-bottom: 6px; }
+.deploy-release-notes { font-family: var(--font-cjk); }
 /* 聚焦左信号条与单行输入同族(第六批) */
 .form-textarea:focus {
   border-bottom-color: var(--ark-signal);

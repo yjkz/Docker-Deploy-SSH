@@ -6,8 +6,9 @@
 //! - `deploy-progress`:`DeployProgress { step, total, message }`,step 1..5
 //!   (1=打标签 2=导出压缩 3=上传镜像 4=同步文件 5=服务器部署)
 //! - `deploy-log`:一行日志字符串,带 `[HH:MM:SS]` 前缀
-//! - `deploy-done`:`DeployDone { success, message }`;emit 后按结果落一条
-//!   部署历史(`history::append_record`,成功/失败/取消统一记录),并按项目
+//! - `deploy-done`:`DeployDone { success, message }`;先落地一条部署历史
+//!   (`history::append_record`,成功/失败/取消统一记录;第十一批起改为先于
+//!   emit,保证前端 done 后立即 get_history 可读到本次记录)再 emit,并按项目
 //!   配置的 `notify_webhook` 异步发送 webhook 通知(尽力而为,失败仅告警)
 //! - `server-log`:`install_server_docker` 安装脚本与 `prune_server` 清理命令的逐行输出
 //!
@@ -1958,8 +1959,9 @@ async fn run_one_deploy_stack(
 ///
 /// 正常结束路径(成功/失败/取消)在通知分发之前按需 emit `deploy-done`
 /// (`emit_done = false` 的批量路径不 emit,结果由 `deploy-batch` 表达),
-/// 之后落地部署历史记录(由管线组装的 [`DeployRecord`],append 失败仅告警,
-/// 不影响收尾),并按项目配置的 `notify_webhook` 异步发送 webhook 通知
+/// emit 前先落地部署历史记录(由管线组装的 [`DeployRecord`],append 失败仅告警,
+/// 不影响收尾;先落盘保证前端 done 后立即查历史可见,第十一批调整),并按项目
+/// 配置的 `notify_webhook` 异步发送 webhook 通知
 /// (尽力而为,失败仅告警);同样调用 [`crate::notify::fire`] 分发通知中心
 /// 通知(桌面/邮件,按 AppConfig.notify 的事件订阅与渠道开关,失败仅告警)。
 ///
@@ -1983,6 +1985,18 @@ where
             )
         }
     };
+    // 先落地部署历史再 emit deploy-done(第十一批):前端在 done 后立即查历史
+    // (部署时预填的版本说明要读最新成功记录的 release_dir),先落盘消除竞态;
+    // webhook/通知仍随后分发,收尾语义不变
+    if let Some(record) = &record {
+        // webhook 通知:项目配置了 notify_webhook 才发;阻塞 HTTP 放 blocking
+        // 线程池 fire-and-forget,失败仅告警,不影响部署收尾
+        if let Some(url) = webhook_url.filter(|u| !u.trim().is_empty()) {
+            let payload = webhook_payload(record);
+            tauri::async_runtime::spawn_blocking(move || send_webhook(&url, &payload));
+        }
+        append_record(record.clone());
+    }
     match &result {
         Ok(()) => {
             if emit_done {
@@ -2009,16 +2023,6 @@ where
             // 通知中心:部署失败/取消(emit deploy-done 之后异步分发,不阻塞收尾)
             crate::notify::fire(app.clone(), kind, title, body).await;
         }
-    }
-    // deploy-done 之后落地部署历史(成功/失败/取消统一记录)
-    if let Some(record) = &record {
-        // webhook 通知:项目配置了 notify_webhook 才发;阻塞 HTTP 放 blocking
-        // 线程池 fire-and-forget,失败仅告警,不影响部署收尾
-        if let Some(url) = webhook_url.filter(|u| !u.trim().is_empty()) {
-            let payload = webhook_payload(record);
-            tauri::async_runtime::spawn_blocking(move || send_webhook(&url, &payload));
-        }
-        append_record(record.clone());
     }
     match (result, record) {
         (Ok(()), Some(record)) => Ok(record),

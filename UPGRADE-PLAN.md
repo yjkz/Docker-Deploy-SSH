@@ -899,6 +899,48 @@ v5.8.1 更新内容 → 确认全自动更新重启。
   段追加一条 `docker info -f` 查询
 - **验证**:`cargo test` 显式确认 `test result: ok. 285 passed; 0 failed;
   13 ignored`(+2);clippy 零新增警告(存量 15 条不变);`node --check` 过;
-  真机(henghao 实连)截图交 judge 验收概览磁盘行
+  截图交 judge 验收概览磁盘行。验证方式按用户要求由 computer-use 驱动真机
+  改为**浏览器 + Tauri 桩**(假 `__TAURI__` 返回模拟 manage_overview 数据,
+  index.html 副本注桩后本地静态服务渲染),后端 df 采样真机端到端由单测
+  覆盖解析、实机数字待用户下次部署时与 `df -h` 对照
+
+# 第十一批升级（v5.10.0）
+
+## 阶段三:部署时预填版本说明 ✅
+
+(第七批遗留 UPGRADE-PLAN:777「后续如需可在部署确认面板加可选输入」;
+补全「部署时写 → 回滚中心看」闭环)
+
+- **链路核实结论**:`DeployRecord.release_dir`(整栈成功 = `<项目目录>/
+  releases/<时间戳>` 完整路径,第四批起)已携带新归档标识,
+  `rollback_set_release_notes` 参数(dir + ts + title + body)恰好可由它拆出
+  ——**无需新增命令/payload 字段**;唯一障碍是原收尾顺序「emit deploy-done →
+  通知(await,SMTP 时秒级)→ 落历史」,前端 done 后立即查历史存在竞态
+- **后端最小改动**(`commands.rs` `finish_deploy_run`):把 `append_record`
+  (与 webhook spawn)挪到 emit **之前**,通知/webhook 时序不变;
+  头部契约注释与 wiki/04 deploy-done 条目同步改写。历史记录内容零变化,
+  消费方只受益(前端 done 后刷新历史必见本次记录)
+- **前端**(deploy.js / index.html / style.css):整栈选项区加可选
+  「版本说明」textarea(`#deploy-release-notes`,maxlength 2000,
+  `.deploy-release-notes` 覆盖 form-textarea 默认 mono 轨为 CJK 轨——
+  内容是中文散文;**仅整栈**:单镜像无归档不提供,批量无逐台说明恒不写)。
+  发起时快照 `st.pendingReleaseNotes { serverId, projectId, body }`;
+  `handleDone` 成功(非回滚)后 `writeReleaseNotes`:get_history 取该
+  服务器+项目最新成功整栈记录 → release_dir 拆 dir/ts → 补写
+  (title 空),成功 toast 带归档 ts,失败仅 warn 警示(部署本身已成功,
+  可回滚中心版本详情补写)。**失败/取消不写且清空快照前的输入留在
+  原输入框**:断点续传成功后走同一 handleDone 入口补写;中途重启软件
+  快照丢失则静默跳过。批量分支收尾显式清快照,防残留污染后续单发
+- **已知取舍**:①说明输入在整栈选项区(随面板显隐),非独立确认步——
+  与现有单页表单流程一致;②续传场景跨软件重启后说明丢失(断点是补救
+  路径,不做跨重启持久化);③title 不在部署时填,归档标题仍由版本详情
+  维护(与第七批「已备注」徽章按 title+body 判定的口径兼容:body 非空
+  同样挂徽章)
+- **验证**:`cargo test` 显式确认 `test result: ok. 285 passed; 0 failed;
+  13 ignored`(finish 语义既有测试覆盖 emit 恰一次/历史/通知,顺序调整
+  后全绿);clippy 零新增;`node --check` 过;浏览器桩渲染整栈选项区
+  截图交 judge;真机端到端(部署一个整栈项目 → 回滚中心看归档说明)
+  待用户下次实际部署时确认
+
 
 
