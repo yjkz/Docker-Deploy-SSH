@@ -154,8 +154,28 @@ pub(crate) fn checkpoint_save(
         project_name: project.name.clone(),
         artifacts,
     };
-    if let Err(e) = save_checkpoint(&cp) {
-        log::warn!("保存部署断点失败(不影响本次部署): {}", e);
+    match save_checkpoint(&cp) {
+        Ok(dropped) => {
+            // 断点表超上限时最旧的条目被裁掉:它们的断点期本地临时 tar 也要
+            // 删 —— 否则那些 tar 既不在断点表里(无法经「放弃断点」回收),
+            // 也不属于任何失败台(用户在界面上看不到),会静默占满临时盘。
+            // 批量部署 N 台各写一条断点,超过 MAX_CHECKPOINTS(10)时必然发生。
+            for old in &dropped {
+                for path in resume_local_tars(old) {
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            log::warn!(
+                                "清理被裁剪断点的临时文件失败 ({}): {}",
+                                path.display(),
+                                e
+                            );
+                        }
+                    }
+                }
+                log::info!("断点表超上限,已裁剪最旧断点 {}", old.key);
+            }
+        }
+        Err(e) => log::warn!("保存部署断点失败(不影响本次部署): {}", e),
     }
 }
 

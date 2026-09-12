@@ -3208,7 +3208,6 @@ code {
 .batch-row {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 10px;
   padding: 5px 0;
   border-top: 1px solid var(--ink-on-paper-08);
@@ -3217,8 +3216,36 @@ code {
 .batch-row:first-of-type {
   border-top: none;
 }
+/* 三列对齐:服务器名(占满)→ 状态徽章 → 动作按钮。
+   此前用 justify-content: space-between + 两个子项,徽章自然靠右;第十四批
+   给失败行加了「续传此台」按钮后变成三个子项,space-between 把徽章推到行中,
+   出现「成功行的徽章在右、失败行的徽章在中」的错列(badges 与按钮间距不一致)。 */
+.batch-row > :first-child {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+/* 徽章列:`flex: none` 不参与收缩;`min-width` 固定住列宽 —— 状态词
+   (成功/失败/已跳过/部署中/等待)长度不一,不固定则右侧动作按钮列会随
+   状态左右跳动(徽章自身仍按内容居中) */
 .batch-row .badge {
   flex: none;
+  min-width: 64px;
+  justify-content: center;
+}
+/* 动作列:所有行等宽(96px,容纳幽灵按钮「续传此台」:4 个 CJK 字
+   ~48px + 左右内边距 23px + 左信号条 4px,再留余量)。
+   没有这一列时,有按钮的行会把徽章往左挤,出现跨行错列。
+   `flex: none` + 固定宽度:按钮不参与收缩,否则窄面板下会被压成竖排文字。 */
+.batch-row-action {
+  flex: none;
+  width: 96px;
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+}
+.batch-row-action .btn {
+  flex: none;
+  white-space: nowrap;
 }
 
 /* ===== 清理分析(阶段八:预览+勾选+定向执行) ===== */
@@ -3532,7 +3559,15 @@ code {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.rollback-release-note-badge { flex: none; }
+/* 「已备注」徽章:`align-self: flex-start` 必填 —— 父容器
+   .rollback-release-info 是 flex-direction: column,column 方向 align-items
+   默认 stretch,不加则徽章被横向拉满整行(用户 2026-09-12 真机截图反馈)。
+   注意**必须用后代选择器**,不能给徽章挂自定义类:`window.fillBadge` 会整体
+   重写 `node.className`('badge badge-info'),调用方预设的类名会被抹掉。 */
+.rollback-release-info > .badge {
+  flex: none;
+  align-self: flex-start;
+}
 /* 按钮/徽章不参与收缩:空间不足时由 info(min-width:0)吸收,
    否则 CJK 按钮的最小内容宽度是单字,会被压成竖排文字(真机截图回归) */
 .rollback-release .btn { flex: none; }

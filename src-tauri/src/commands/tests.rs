@@ -2218,6 +2218,74 @@ services:
     }
 
     #[test]
+    fn test_checkpoint_trim_cleans_dropped_local_tars() {
+        // 断点表超上限时被裁掉的条目,其断点期本地 tar 必须一并清理。
+        // 不清理会静默泄漏临时盘:那些 tar 既不在断点表里(无法经「放弃断点」
+        // 回收),也不属于任何失败台(界面上看不到)。批量部署 N 台各写一条
+        // 断点,超过 MAX_CHECKPOINTS 时必然触发。
+        let _guard = crate::config::TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ddtest-resume-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
+
+        // 建 MAX_CHECKPOINTS 条,每条带一个真实存在的本地 tar(ts 递增)
+        let mut tars = Vec::new();
+        for i in 0..crate::config::MAX_CHECKPOINTS {
+            let tar = dir.join(format!("keep-{}.tar.gz", i));
+            std::fs::write(&tar, b"x").unwrap();
+            tars.push(tar.clone());
+            let mut art = single_art();
+            art.tar_local = Some(tar.to_string_lossy().to_string());
+            let cp = ResumeCheckpoint {
+                key: checkpoint_key(&format!("s{}", i), "p1", MODE_SINGLE),
+                mode: MODE_SINGLE.into(),
+                step_next: 3,
+                ts: format!("2026-09-06 10:00:{:02}", i),
+                server_id: format!("s{}", i),
+                project_id: "p1".into(),
+                server_name: "s".into(),
+                project_name: "p".into(),
+                artifacts: serde_json::to_value(&art).unwrap(),
+            };
+            crate::config::save_checkpoint(&cp).unwrap();
+        }
+
+        // 再写一条(超上限):最旧的 s0 被裁掉,其 tar 应被删除
+        let overflow_tar = dir.join("overflow.tar.gz");
+        std::fs::write(&overflow_tar, b"x").unwrap();
+        let mut art = single_art();
+        art.tar_local = Some(overflow_tar.to_string_lossy().to_string());
+        let cp = ResumeCheckpoint {
+            key: checkpoint_key("s99", "p1", MODE_SINGLE),
+            mode: MODE_SINGLE.into(),
+            step_next: 3,
+            ts: "2026-09-06 11:00:00".into(),
+            server_id: "s99".into(),
+            project_id: "p1".into(),
+            server_name: "s".into(),
+            project_name: "p".into(),
+            artifacts: serde_json::to_value(&art).unwrap(),
+        };
+        let dropped = crate::config::save_checkpoint(&cp).unwrap();
+
+        // 返回值报告了被裁条目(config 层不解析 artifacts,交调用方清理)
+        assert_eq!(dropped.len(), 1, "应只裁掉最旧的 1 条");
+        assert_eq!(dropped[0].server_id, "s0");
+        // 被裁条目的 tar 由 commands 层口径解析得到
+        let dropped_tars = resume_local_tars(&dropped[0]);
+        assert_eq!(dropped_tars, vec![tars[0].clone()]);
+        // 履行清理(与实际调用点 checkpoint_save 同口径)
+        for path in &dropped_tars {
+            std::fs::remove_file(path).unwrap();
+        }
+        assert!(!tars[0].exists(), "被裁断点的本地 tar 应被清理");
+        assert!(tars[1].exists(), "未超限的断点 tar 不应被误删");
+        assert!(overflow_tar.exists(), "新写入断点的 tar 不应被删");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn test_checkpoint_cleanup_on_success_removes_tar_and_checkpoint() {
         // 成功收尾:断点删除 + 保留的本地 tar 删除;文件已不存在时静默
         let _guard = crate::config::TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());

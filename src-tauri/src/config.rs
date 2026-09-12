@@ -530,7 +530,8 @@ pub fn open_logs_dir() -> std::result::Result<(), String> {
 // ===== 部署断点续传(UPGRADE-PLAN 阶段六,独立持久化于 config/resume-deploy.json)=====
 
 /// 断点条目上限:超出后按 `ts` 从最旧开始裁剪(防止无限膨胀)。
-const MAX_CHECKPOINTS: usize = 10;
+/// 裁剪会连带清理被裁条目的本地临时 tar(见 [`trim_checkpoints`])。
+pub(crate) const MAX_CHECKPOINTS: usize = 10;
 
 /// 单条部署断点(`resume-deploy.json` 的值,键见 [`checkpoint_key`])。
 ///
@@ -599,11 +600,16 @@ pub fn load_resume_map() -> HashMap<String, ResumeCheckpoint> {
 
 /// 保存一条断点:读 → 插入(同键覆盖 = 新部署同键覆盖旧断点)→ 超上限裁剪
 /// 最旧 → 原子写回(`.tmp` + rename,复用 [`write_json_atomic`])。
-pub fn save_checkpoint(cp: &ResumeCheckpoint) -> Result<()> {
+///
+/// 被裁剪掉的条目**只从表里移除**;其断点期保留的本地临时 tar 由调用方
+/// ([`crate::commands::checkpoint_save`]) 按 `commands` 层的产物口径清理
+/// —— 本层不解析 `artifacts`(分层约定见 wiki/07 限制 40)。
+pub fn save_checkpoint(cp: &ResumeCheckpoint) -> Result<Vec<ResumeCheckpoint>> {
     let mut map = load_resume_map();
     map.insert(cp.key.clone(), cp.clone());
-    trim_checkpoints(&mut map);
-    write_resume_map(&map)
+    let dropped = trim_checkpoints(&mut map);
+    write_resume_map(&map)?;
+    Ok(dropped)
 }
 
 /// 删除一条断点,返回被删的条目(供调用方清理其临时产物;无则 `None`)。
@@ -616,11 +622,16 @@ pub fn remove_checkpoint(key: &str) -> Result<Option<ResumeCheckpoint>> {
     Ok(removed)
 }
 
-/// 断点条目裁剪(纯函数,便于单测):超过 [`MAX_CHECKPOINTS`] 条时按 `ts`
-/// 从最旧开始移除(`ts` 为 `%F %T` 文本,字典序即时间序)。
-fn trim_checkpoints(map: &mut HashMap<String, ResumeCheckpoint>) {
+/// 断点条目裁剪:超过 [`MAX_CHECKPOINTS`] 条时按 `ts` 从最旧开始移除
+/// (`ts` 为 `%F %T` 文本,字典序即时间序),**返回被移除的条目**供调用方
+/// 清理其临时产物。
+///
+/// 分层说明:本函数只认断点表结构(不解析 `artifacts` —— 那是 commands 层
+/// 的私有约定,见 wiki/07 限制 40),故把条目交回调用方,由
+/// [`save_checkpoint`] 用 `commands` 层的 [`resume_local_tars`] 口径清理。
+pub fn trim_checkpoints(map: &mut HashMap<String, ResumeCheckpoint>) -> Vec<ResumeCheckpoint> {
     if map.len() <= MAX_CHECKPOINTS {
-        return;
+        return Vec::new();
     }
     // 按 ts 升序取出最旧的若干条键,逐个移除
     let mut oldest: Vec<(String, String)> = map
@@ -629,9 +640,13 @@ fn trim_checkpoints(map: &mut HashMap<String, ResumeCheckpoint>) {
         .collect();
     oldest.sort_by(|a, b| a.0.cmp(&b.0));
     let overflow = map.len() - MAX_CHECKPOINTS;
+    let mut dropped = Vec::with_capacity(overflow);
     for (_, key) in oldest.into_iter().take(overflow) {
-        map.remove(&key);
+        if let Some(cp) = map.remove(&key) {
+            dropped.push(cp);
+        }
     }
+    dropped
 }
 
 /// 原子写断点表(config 目录不存在则创建)。

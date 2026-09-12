@@ -76,8 +76,11 @@ const BATCH_STATE_BATCH_DONE: &str = "batch-done";
 ///   落盘与发送;某台的服务器配置缺失只影响该台(emit failed),不中断批量;
 /// - 批量路径不 emit `deploy-progress` / `deploy-done`(单台进度与结果由
 ///   `deploy-batch` 表达),`deploy-log` 每行加 `[服务器名] ` 前缀;
-/// - 与断点续传互斥:批量不落断点、不支持续传(resume = None 且 checkpoint
+/// - 与断点续传互斥:本实现不落断点、不支持续传(resume = None 且 checkpoint
 ///   关闭,见 [`DeployEmitOpts::batch`]),单台失败整台重跑;
+///   **注意:该「批量不落断点」只描述本死代码实现** —— 线上批量由前端队列
+///   逐台调用单发 `deploy`/`deploy_stack`(恒 `checkpoint = true`),因此
+///   线上批量的失败台**有**断点且可续传(第十四批);
 /// - 取消:`cancel_deploy` 置位后,当前台由管线内取消检查中止(报
 ///   「部署已取消」),余台在循环顶部检查后逐台 emit skipped。
 #[tauri::command]

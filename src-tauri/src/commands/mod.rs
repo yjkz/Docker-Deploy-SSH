@@ -296,7 +296,9 @@ pub(crate) struct DeployEmitOpts {
     pub(crate) emit_done: bool,
     /// `deploy-log` 每行追加的前缀(单发 = 空串;批量 = `[服务器名] `)
     pub(crate) log_prefix: String,
-    /// 是否落盘部署断点(批量关闭:批量与断点续传互斥,失败整台重跑)
+    /// 是否落盘部署断点。**仅 `DeployEmitOpts::batch`(死代码 `deploy_batch`)
+    /// 关闭**;线上批量(前端队列逐台调用 `deploy`/`deploy_stack`)恒为 true,
+    /// 故线上批量的失败台有断点可续传(第十四批核实更正)
     pub(crate) checkpoint: bool,
 }
 
@@ -311,7 +313,8 @@ impl DeployEmitOpts {
         }
     }
 
-    /// 批量路径:收敛事件 + 关断点;日志加 `[服务器名] ` 前缀。
+    /// 批量路径(仅死代码 `deploy_batch` 使用):收敛事件 + 关断点;日志加
+    /// `[服务器名] ` 前缀。**线上批量不走这里** —— 前端队列复用 single()。
     fn batch(server_name: &str) -> Self {
         Self {
             emit_progress: false,

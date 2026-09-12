@@ -1145,3 +1145,116 @@ deploy.js 末尾写了**两个** `window.DeployKit = {...}` 字面量(回滚一�
   JS 模块与全局约定新增**桥接纪律**(单次赋值,含 DeployKit 踩坑记录)
 - wiki/README + wiki/01 + wiki/05:版本 5.12.0;README 批次概要补第十三批
 - 三处版本号:`tauri.conf.json` / `Cargo.toml` / wiki(5.11.0 → 5.12.0)
+
+# 第十四批升级（v5.13.0）— 阶段六:批量部署增强
+
+> 细案经用户批复(2026-09-12):**A 单台续传 + 一键批量都要**;**B 停止时不自动续传**;
+> C/D 一并做。用户延续第十三批授权「一次性完成所有任务」。
+
+## 一、开工前核实:文档记载与实现相反(本批最重要的更正)
+
+ROADMAP 阶段六的待核实疑点是「批量走同一 deploy/deploy_stack 命令,断点可能已由
+后端落盘 —— 疑点在『前端失败后没给续传入口』而非后端」。核实结论**比预期更复杂**:
+
+- **批量确实落断点**:前端批量队列走的是普通 `deploy` / `deploy_stack`
+  (deploy.js),而后端这两个命令**恒用 `DeployEmitOpts::single()`**(`checkpoint: true`)。
+  `checkpoint: false` 只属于 `DeployEmitOpts::batch()`,其**唯一调用点在
+  `commands/batch.rs`(死代码 `deploy_batch`,无任何前端调用点)**。且
+  `DeployRequest` 结构体没有 checkpoint 字段,前端从协议上无法关闭。
+- **但 wiki/06、wiki/07(限制 21/40/41)与三处代码注释都写着「批量不落断点」**
+  —— 这个错误记载正是「批量失败后没有续传入口」长期存在的根因:一直以为做不了,
+  实际断点早就在磁盘上。
+- **顺带发现独立缺陷**:断点表超上限(10 条)时 `trim_checkpoints` **只删表项、
+  不删对应的本地 tar**(config.rs)。批量 N 台各写一条断点,超 10 台时最旧的被静默
+  丢弃,其 tar 永久留在临时盘 —— 用户看不到、也无法经「放弃断点」回收。
+
+## 二、A:批量失败/取消后的续传入口(单台 + 一键批量)
+
+- **`st.batch.resumable`**:失败/被取消的台登记为待续传候选(含 serverId/projectId/
+  serverName/mode)。**不登记**「已停止批量」而从未启动的余台(没跑过,无断点)。
+  只登记候选,**是否真可续传由 `deploy_resume_status` 点击时现查**(断点可能已被
+  清理或被同键新部署覆盖)。
+- **两个入口**:行内「续传此台」(单台)与头部「续传未完成服务器(N 台)」(一键批量,
+  仅在批量结束且有待续传台时出现)。单台续传时**继承其余待续传台**(`startResumeBatch`
+  的 carried 逻辑),否则面板被这次单项队列覆盖,别的失败台按钮就消失了。
+- **复用而非另起循环**:待续传台组装成一条**普通批量队列**(每项带 `resumeKey`),
+  `runBatchNext` 增加 resumeKey 分支直接调 `deploy_resume_start`(按 key 复用与单发
+  完全相同的管线,事件/历史/通知收尾一致),串行推进、deferred 等待、面板渲染全部复用。
+- 查询阶段并发(纯读),执行阶段串行(与部署同口径,避免争抢本机 Docker/临时盘)。
+
+## 三、B:「停止批量」可在步骤边界即时中止当前台(不自动续传)
+
+原实现只能停在台边界(等当前台整台跑完),理由写在代码注释里:「批量不落断点,
+半途取消会留下无法续传的半成品」—— **该前提经核实不成立**(见上)。现改为:当前台
+部署中时点「停止批量」→ 发 `cancel_deploy`(步骤边界生效),按钮文案变
+「停止中(当前台将在步骤边界中止)」,中止的台进入待续传列表。
+**不自动续传**:停止是用户的显式意图,接着自动开跑会违背它。
+
+## 四、C:纠正错误文档(四处代码注释 + wiki 两篇)
+
+- `ui/deploy.js`(runBatchNext 停止分支注释)、`commands/batch.rs`(死代码头部)、
+  `commands/mod.rs`(`DeployEmitOpts::checkpoint` 与 `batch()` 的文档)——
+  全部补上「该『批量不落断点』只描述死代码实现;线上批量恒 checkpoint=true」
+- `wiki/06`:三种执行形态那句、断点写入/清除时机那句、「停止」条目全部改写,
+  新增「续传」条目
+- `wiki/07`:限制 21(改写为「批量落断点且支持逐台续传」)、40、41(status/取舍列更新)
+
+## 五、D:断点裁剪时回收本地临时 tar
+
+- `config::trim_checkpoints` 改为返回**被移除的条目**;`save_checkpoint` 返回
+  `Vec<ResumeCheckpoint>`(分层:config 层不解析 `artifacts` —— 那是 commands 层
+  私有约定,见 wiki/07 限制 40)
+- `commands::checkpoint_save` 拿返回值按 `resume_local_tars` 口径清理文件 + 记日志
+- **新增单测** `test_checkpoint_trim_cleans_dropped_local_tars`:建满 10 条带真实
+  tar 的断点 → 再写一条 → 断言只裁最旧 1 条、其 tar 路径可按口径解析出来、
+  未被裁的与新写入的 tar 不受影响
+- `MAX_CHECKPOINTS` 提升为 `pub(crate)` 供测试引用
+
+## 六、顺带修复(浏览器桩暴露的存量 bug):批量部署在第二台永久卡住
+
+**严重 bug,在 HEAD 上复现**:`st.batch.deferred` 被存成对象
+`{ promise, resolve }`,但三个消费方里有两个把它**当函数调用**
+(`handleDone` 的 `doneDeferred(p)`、两处 invoke 失败兜底),抛出的
+
+    TypeError: doneDeferred is not a function
+
+被事件监听器静默吞掉 → **`batchItemResult` 永不执行 → 批量部署第一台结束就卡死**
+(面板停在「部署中」,界面上没有任何错误提示)。本批在浏览器桩里用
+`git show HEAD:ui/deploy.js` 做对照页复现确认(与第十四批改动无关)。
+
+修复:新增 `makeDeferred()` —— 返回**可调用且带 `.promise`** 的把手,从形状上
+消灭这处错配(三个消费形态同时成立);内部 `settled` 标志防 invoke 失败与
+deploy-done 双触发。
+
+## 七、验证
+
+- **浏览器 + Tauri 桩**(可编排桩:`window.__PLAN.deployResults` 指定每台结果、
+  `__CHECKPOINTS` 注入断点、`holdDeploy` 让部署停住不结账):
+  - 四台混合结果(1 成功/1 失败/1 成功/1 取消)→ 面板 2 成功/1 失败/1 跳过、
+    resumable = 失败+取消两台、两个续传入口同时出现
+  - **单台续传**:点「测试机」行 → 只查该台断点 → 续传成功 → 其余待续传台被
+    继承(carried)、按钮仍在
+  - **一键批量续传**:两点全部串行续完,队列排空后面板不再有续传按钮
+  - **断点已被清理的边界**:点击后提示且不进入续传(现查机制生效)
+  - **停止批量**:部署中点停止 → 发 `cancel_deploy`、按钮转「停止中(…边界中止)」、
+    中断台登记为可续传、余台标跳过并收尾
+  - 全程 `__LISTENER_ERRORS` 为空(不再有被吞掉的回调异常)
+- **视觉验收**:judge 首轮打回一处真实缺陷 —— 失败行的徽章被 `space-between`
+  推到行中(「成功行徽章在右、失败行徽章在中」跨行错列)。修复:`.batch-row` 去掉
+  `space-between` 改三列布局(名称占满 + 徽章定宽 64px + **动作槽定宽 96px**);
+  首轮修复后按钮换行,加宽动作槽并 `white-space: nowrap`。复审 **pass**
+  (几何验证:四行徽章左缘全部 1029px、动作槽统一 96px、按钮单行 24px)
+- **顺带修复用户反馈的 UI bug**(回滚中心「已备注」徽章拉满整行):父容器
+  `.rollback-release-info` 是 `flex-direction: column`,`align-items` 默认 `stretch`,
+  徽章被横向拉满。修法 `.rollback-release-info > .badge { flex: none;
+  align-self: flex-start }` —— **必须用后代选择器**:`window.fillBadge` 内部
+  `node.className = 'badge ' + kind` 会整体重写类名,调用方给徽章预设的类
+  (`rollback-release-note-badge`)在运行时已被抹掉,按自定义类写 CSS 不会生效
+  (首版实测 `alignSelf: auto`、徽章 419px 仍拉满;改后代选择器后 50px/419px)。
+  顺带核查全站 34 处 fillBadge 的容器方向,其余均为 row flex 不受影响
+- `cargo test` 显式确认 `test result: ok. 291 passed; 0 failed; 13 ignored`
+  (基线 290 + 本批新增断点裁剪单测 1);`cargo clippy --all-targets` 与基线
+  **逐条比对警告位置完全一致**(仅两处行号因插入测试而位移),零新增;
+  全 JS 过 `node --check`;`verify/form-validation.js` 54 断言与
+  `verify/bridge-integrity.js` 均通过
+- 命令/事件计数不变(94 / 12,本批未新增命令),wiki/04 无需改动
