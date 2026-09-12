@@ -821,6 +821,18 @@
     </div>
   </div>
 
+  <!-- 更新确认模态(检查更新发现新版本时自动弹出;显示更新内容,
+       确认「自动更新」后全自动下载安装重启;内容由 settings.js 构建) -->
+  <div id="update-confirm-modal" class="modal-overlay hidden">
+    <div class="modal-card update-confirm-modal-card" role="dialog" aria-modal="true" aria-labelledby="update-confirm-modal-title">
+      <div class="modal-head">
+        <div id="update-confirm-modal-title" class="modal-title">发现新版本<span class="help-title-en">UPDATE</span></div>
+        <button id="update-confirm-modal-close" class="modal-close" type="button" title="关闭">关闭</button>
+      </div>
+      <div id="update-confirm-modal-body" class="modal-body"></div>
+    </div>
+  </div>
+
   <!-- 帮助:右下角悬浮按钮(所有页面可见)+ 章节式帮助模态框(静态内容由 help.js 渲染) -->
   <button id="help-fab" class="help-fab" type="button" aria-haspopup="dialog"
           aria-controls="help-modal" aria-label="打开使用帮助" title="使用帮助">?</button>

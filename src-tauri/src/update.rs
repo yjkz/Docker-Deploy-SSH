@@ -46,6 +46,12 @@ const GITHUB_LATEST_RELEASE_API: &str =
 /// Release 页面链接兜底值(API 未返回 html_url 时使用,与上面的仓库一致)。
 const GITHUB_RELEASES_PAGE: &str = "https://github.com/yjkz/Docker-Deploy-SSH/releases/latest";
 
+/// 主路径补充:检测到新版本后,按 tag 抓取该 Release 的 body(更新内容展示)。
+/// 仅在 has_update 时调用一次(手动检查频率极低);失败静默降级为空 notes,
+/// 不影响版本检测本身。前缀与 [`GITHUB_LATEST_RELEASE_API`] 同源。
+const GITHUB_RELEASE_BY_TAG_API: &str =
+    "https://api.github.com/repos/yjkz/Docker-Deploy-SSH/releases/tags/";
+
 /// 客户端整体超时:15 秒(自发起请求至响应体接收完毕)。
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -65,8 +71,9 @@ pub struct UpdateInfo {
     /// Release 页面链接(主路径 = 302 Location 本身;API 路径 = html_url,
     /// 前端「前往下载」用)
     pub url: String,
-    /// 版本说明(主路径重定向探测为空串,前端对空 notes 已容错不渲染;
-    /// API 路径 = body,最长 [`NOTES_MAX_CHARS`] 字符,回退时带「经 API 回退」前缀)
+    /// 版本说明(主路径:has_update 时经 API 按 tag 抓取 body,失败为空;
+    /// API 回退路径 = body;均最长 [`NOTES_MAX_CHARS`] 字符,回退时带
+    /// 「经 API 回退」前缀;前端对空 notes 有「前往发布页」兜底)
     pub notes: String,
 }
 
@@ -89,8 +96,9 @@ struct LatestRelease {
 /// - `proxy`:`Some(非空)` → 经该代理请求,支持 `http://` 与 `socks5://`
 ///   (及 socks5h/socks4)前缀,依赖 reqwest 的 `socks` feature;地址无效
 ///   返回中文错误「代理地址无效」;`None`/空串 → 直连。两个路径共用。
-/// - 主路径为重定向探测(notes 为空,前端对空 notes 已容错);回退路径为
-///   GitHub API,成功时 notes 带前缀「经 API 回退(重定向探测失败: …)」。
+/// - 主路径为重定向探测(无配额限制);检测到新版本时经 API 按 tag 抓取
+///   Release body 填充 notes(失败静默为空);回退路径为 GitHub API,成功时
+///   notes 带前缀「经 API 回退(重定向探测失败: …)」。
 /// - 传输层失败(超时/DNS/代理不可达/非预期状态)按类别返回中文错误并附原文;
 ///   回退路径中响应体不是合法 JSON 或 tag 无法解析版本号时,按
 ///   `latest = current`、`has_update = false` 处理并在 notes 说明原因
@@ -101,7 +109,15 @@ pub async fn update_check(proxy: Option<String>) -> Result<UpdateInfo, String> {
 
     // 主路径:releases/latest 页面 302 重定向探测(无 API 配额限制)
     match update_check_via_redirect(proxy.as_deref(), &current).await {
-        Ok(info) => Ok(info),
+        Ok(mut info) => {
+            // 检测到新版本时按 tag 抓取 Release body 填充 notes(此前主路径
+            // notes 恒空,用户检查更新后看不到更新内容);仅 has_update 时发
+            // 这一次请求,失败/限流静默降级为空(前端有「前往发布页」兜底)
+            if info.has_update && info.notes.is_empty() {
+                info.notes = fetch_release_notes_via_api(proxy.as_deref(), &info.latest).await;
+            }
+            Ok(info)
+        }
         Err(redirect_err) => {
             // 回退路径:GitHub REST API(未认证 60 次/小时按出口 IP 计)
             match update_check_via_api(proxy.as_deref(), &current).await {
@@ -390,6 +406,45 @@ fn truncate_notes(notes: &str) -> String {
         let head: String = trimmed.chars().take(NOTES_MAX_CHARS).collect();
         format!("{head}…(已截断)")
     }
+}
+
+/// 按 tag 抓取 Release 说明正文(主路径补充;纯展示用,任何失败返回空串)。
+///
+/// 仅在重定向主路径检测到新版本后调用一次(手动「检查更新」频率极低,不受
+/// 未认证 60 次/小时配额实质影响;限流/网络失败静默降级为空 notes,前端有
+/// 「前往发布页」兜底文案)。响应结构与 [`update_check_via_api`] 的
+/// `releases/latest` 一致,复用 [`LatestRelease`] 反序列化与 [`truncate_notes`]。
+async fn fetch_release_notes_via_api(proxy: Option<&str>, tag: &str) -> String {
+    let client = match build_http_client(proxy, false) {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+    let response = match client
+        .get(release_by_tag_url(tag))
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return String::new(),
+    };
+    if !response.status().is_success() {
+        return String::new();
+    }
+    let Ok(body) = response.text().await else {
+        return String::new();
+    };
+    match serde_json::from_str::<LatestRelease>(&body) {
+        Ok(release) => truncate_notes(&release.body),
+        Err(_) => String::new(),
+    }
+}
+
+/// 拼「按 tag 查 Release」的 API 地址(纯函数,便于单测):tag 剥两侧空白,
+/// 逐字拼到端点常量之后(GitHub tag 含 `/` 时不编码也能命中,但本仓库 tag
+/// 形如 `v5.8.1` 不含斜杠)。
+fn release_by_tag_url(tag: &str) -> String {
+    format!("{}{}", GITHUB_RELEASE_BY_TAG_API, tag.trim())
 }
 
 /// 版本号解析(剥 `v`/`V` 前缀后按 `.` 分段):每段取开头连续数字转 u64
@@ -744,6 +799,15 @@ mod tests {
 
         std::env::remove_var("DD_UPDATE_PENDING_PATH");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_release_by_tag_url() {
+        // 主路径补充抓取的端点拼装:tag 剥两侧空白后拼接(本仓库 tag 带 v 前缀)
+        assert_eq!(
+            release_by_tag_url(" v5.8.1 "),
+            "https://api.github.com/repos/yjkz/Docker-Deploy-SSH/releases/tags/v5.8.1"
+        );
     }
 
     #[test]

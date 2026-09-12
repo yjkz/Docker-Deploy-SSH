@@ -2859,6 +2859,18 @@ code {
 /* 版本详情模态卡片(第七批;宽度同 notify-modal-card 先例) */
 .release-detail-modal-card { width: min(640px, 94vw); }
 
+/* ===== 更新确认模态(用户指定「圆润卡片」样式例外)=====
+   ark 全站 radius 0 纪律在本卡片上由用户明确要求放开:16px 大圆角、
+   取消 3px 顶缘墨线(圆角下会显得怪异)回归 1px 描边;仅此模态生效,
+   不作为其他组件引入圆角的先例。 */
+.update-confirm-modal-card {
+  width: min(560px, 94vw);
+  border-radius: 16px;
+  border-top: 1px solid var(--ark-line-soft);
+  box-shadow: var(--ark-shadow-modal);
+}
+.update-confirm-modal-card .modal-title { font-size: 15px; }
+
 /* 表单分组小标题(本轮统一):此前 notify/cio/set 各有一份逐行相同的规则
    (仅类名不同),现收敛为 .form-group-title;旧类名保留作别名以零风险迁移
    (JS 侧逐步改用新类,旧类名不再单独定义样式)。
@@ -3083,7 +3095,7 @@ code {
   max-height: 180px;
   overflow: auto;
 }
-#settings-download-btn { margin-top: 10px; }
+/* (「前往下载」按钮已随 v5.8.1 更新确认模态改造移除,原 #settings-download-btn 规则删除) */
 
 /* 底部按钮行:左侧「检查更新 / 测试连接」组(margin-right:auto 推开)+ 右侧「保存设置」 */
 .settings-actions { flex-wrap: wrap; }

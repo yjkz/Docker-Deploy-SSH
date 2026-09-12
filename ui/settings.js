@@ -24,8 +24,10 @@
  *   异步收尾先校验会话未过期再回写,防止旧 promise 回写重开后的新模态;
  *   关闭模态时复位防重标志。Esc / 遮罩 / 关闭钮均可关闭。
  * - 「检查更新 / 测试连接」使用输入框当前代理值(未保存也能测),进行中
- *   禁用两钮防重复;结果行内回显,有更新时展示 latest + notes 截断 +
- *   「前往下载」(window.open 打开 Release 页)。
+ *   禁用两钮防重复;结果行内回显,发现新版本时自动弹出「更新确认模态」
+ *   (#update-confirm-modal,用户指定的圆润卡片样式):展示更新内容,
+ *   点「自动更新」一次确认全自动(下载 → 静默安装 → 重启新版);
+ *   下载进行中禁止关闭模态(三通道统一守卫,同 deploy 模态 rbBusy 先例)。
  *
  * 安全说明:与全站一致,一律 createElement + textContent 构建,
  * 不使用 innerHTML 拼接;提示一律 toast / 行内回显,不调用系统对话框。
@@ -361,7 +363,7 @@
     setBusy('settings-test-btn', busy, testLabel || TEST_LABEL);
   }
 
-  /** 有更新:latest + notes 截断展示 + 「前往下载」 */
+  /** 有更新:结果行 + 「查看更新详情」入口(更新内容与确认收进独立模态) */
   function renderUpdateAvailable(info) {
     var area = updateArea();
     if (!area) return;
@@ -371,94 +373,138 @@
       '发现新版本:v' + info.latest + '(当前 v' + info.current + ')'));
     area.appendChild(line);
 
-    var notes = String(info.notes || '');
-    if (notes.length > NOTES_SHOW_MAX) notes = notes.slice(0, NOTES_SHOW_MAX) + '…';
-    if (notes) area.appendChild(el('div', 'set-notes', notes));
-
-    // 「立即更新」:下载 NSIS 安装包(自动更新),完成后二次确认启动静默安装
-    var autoBtn = el('button', 'btn btn-primary', '立即更新(自动下载并安装)');
-    autoBtn.type = 'button';
-    autoBtn.id = 'settings-autoupdate-btn';
-    autoBtn.addEventListener('click', function () { onAutoUpdate(info); });
-    area.appendChild(autoBtn);
-
-    // 「前往下载」保留:手动浏览器下载兜底(自动下载失败/想看 Release 页)
-    var btn = el('button', 'btn', '前往下载');
+    var btn = el('button', 'btn', '查看更新详情');
     btn.type = 'button';
-    btn.id = 'settings-download-btn';
-    btn.addEventListener('click', function () {
-      // Release 页面链接(后端 html_url,兜底 releases/latest 页)
-      window.AppBus.invoke('open_external', { url: info.url }).catch(function (e) { toast('打开浏览器失败: ' + (e && e.message ? e.message : e), 'fail'); });
-    });
+    btn.id = 'settings-update-detail-btn';
+    btn.addEventListener('click', function () { openUpdateConfirmModal(info); });
     area.appendChild(btn);
   }
 
-  // ===== 自动更新:下载安装包 → 确认 → 静默安装并退出 =====
+  // ===== 更新确认模态(检查更新发现新版本时自动弹出;一次确认全自动)=====
+  //
+  // 形态:#update-confirm-modal(圆润卡片,用户指定样式例外)。展示更新内容
+  // (Release 说明),点「自动更新」后全自动:下载 → 直接静默安装 → 重启新版
+  // (不再有第二次「确认安装」步骤)。下载进行中三通道关闭统一被守卫拦截。
 
-  var updating = false;
+  var updating = false;  // 下载/安装进行中(防重复;期间禁止关闭模态)
+  var updateInfo = null; // 当前模态展示的 UpdateInfo
 
-  /** 第一步:下载(按钮转圈 + 行内进度文案);完成后进入确认态 */
-  function onAutoUpdate(info) {
-    if (updating) return;
+  function updateModal() {
+    return document.getElementById('update-confirm-modal');
+  }
+
+  function isUpdateModalVisible() {
+    var overlay = updateModal();
+    return !!(overlay && !overlay.classList.contains('hidden'));
+  }
+
+  /** 打开更新确认模态:版本行 + 更新内容(空 notes 兜底)+ 三个动作按钮 */
+  function openUpdateConfirmModal(info) {
+    var overlay = updateModal();
+    var body = document.getElementById('update-confirm-modal-body');
+    if (!overlay || !body) return;
+    updateInfo = info;
+    body.textContent = '';
+
+    var line = el('div', 'set-result');
+    line.appendChild(el('span', 'set-result-ok',
+      '新版本 v' + (info.latest || '') + '(当前 v' + (info.current || '') + ')'));
+    body.appendChild(line);
+
+    // 更新内容(Release 说明;后端已截 2000 字符,前端再截防撑爆模态)
+    var notes = String(info.notes || '');
+    if (notes.length > NOTES_SHOW_MAX) notes = notes.slice(0, NOTES_SHOW_MAX) + '…';
+    if (notes) {
+      body.appendChild(el('div', 'set-notes', notes));
+    } else {
+      body.appendChild(hint('未能获取更新说明,可前往发布页查看本次更新内容。'));
+    }
+
+    var result = el('div', 'set-result');
+    result.id = 'update-confirm-result';
+    body.appendChild(result);
+
+    var actions = el('div', 'modal-actions');
+    var laterBtn = el('button', 'btn', '稍后再说');
+    laterBtn.type = 'button';
+    laterBtn.addEventListener('click', closeUpdateConfirmModal);
+    var ghBtn = el('button', 'btn', '前往发布页');
+    ghBtn.type = 'button';
+    ghBtn.addEventListener('click', function () {
+      window.AppBus.invoke('open_external', { url: String(info.url || '') })
+        .catch(function (e) { window.toast('打开浏览器失败: ' + errText(e), 'fail'); });
+    });
+    var goBtn = el('button', 'btn btn-primary', '自动更新');
+    goBtn.id = 'update-confirm-go-btn';
+    goBtn.addEventListener('click', function () { onAutoUpdate(goBtn); });
+    actions.appendChild(laterBtn);
+    actions.appendChild(ghBtn);
+    actions.appendChild(goBtn);
+    body.appendChild(actions);
+
+    overlay.classList.remove('hidden');
+    window.modalFocusOpen(overlay);
+  }
+
+  /** 关闭模态:下载/安装进行中禁止(三通道统一走此守卫) */
+  function closeUpdateConfirmModal() {
+    if (updating) {
+      window.toast('正在下载更新,完成后才能关闭', 'warn');
+      return;
+    }
+    var overlay = updateModal();
+    if (overlay) {
+      overlay.classList.add('hidden');
+      window.modalFocusClose(overlay);
+    }
+    var body = document.getElementById('update-confirm-modal-body');
+    if (body) body.textContent = '';
+    updateInfo = null;
+  }
+
+  /** 模态内结果行(kind: ok | info | fail) */
+  function setUpdateResult(kind, text) {
+    var node = document.getElementById('update-confirm-result');
+    if (!node) return;
+    node.textContent = '';
+    node.appendChild(el('span', 'set-result-' + kind, text));
+  }
+
+  /** 确认自动更新:下载成功后直接安装并重启(无第二次确认) */
+  function onAutoUpdate(btn) {
+    var info = updateInfo;
+    if (!info || updating) return;
     updating = true;
-    var btn = document.getElementById('settings-autoupdate-btn');
-    if (btn) { btn.disabled = true; btn.textContent = '正在下载 v' + info.latest + '…'; }
-    showUpdateMessage('info', '正在下载 v' + info.latest + ' 安装包(约 8MB,慢速网络可能需要几分钟)…');
+    window.setBtnBusy(btn, true, '正在下载 v' + (info.latest || '') + '…');
+    setUpdateResult('info', '正在下载 v' + (info.latest || '') + ' 安装包(约 9 MB,视网络而定)…');
 
     window.AppBus.invoke('update_download', { version: String(info.latest || ''), proxy: proxyArg() })
       .then(function (dl) {
-        if (!isModalVisible()) { updating = false; return; }
-        updating = false;
         var d = dl || {};
         var mb = (Number(d.sizeBytes) || 0) / 1024 / 1024;
-        showUpdateMessage('ok', '下载完成(' + mb.toFixed(1) + ' MB),确认后将退出应用并自动安装 v' + (d.version || info.latest));
-        renderInstallConfirm(info, d);
+        setUpdateResult('info', '下载完成(' + mb.toFixed(1) + ' MB),正在安装并重启应用…');
+        return window.AppBus.invoke('update_install', {
+          setupPath: String(d.setupPath || ''),
+          version: String(d.version || info.latest || '')
+        }).then(function () {
+          // 后端 500ms 后 exit(0),安装器 /R 装完自动拉起新版;
+          // 重启后由 take_update_pending 提示「已更新到 vX」(app.js)
+          updating = false;
+          window.setBtnBusy(btn, false, '自动更新');
+        }).catch(function (err) {
+          updating = false;
+          window.setBtnBusy(btn, false, '自动更新');
+          if (!isUpdateModalVisible()) return;
+          setUpdateResult('fail', '启动安装失败:' + (errText(err) || '未知错误') +
+            '(可手动运行:' + (d.setupPath || '') + ')');
+        });
       })
       .catch(function (err) {
         updating = false;
-        if (!isModalVisible()) return;
-        if (btn) { btn.disabled = false; btn.textContent = '立即更新(自动下载并安装)'; }
-        showUpdateMessage('fail', '下载失败:' + (errText(err) || '未知错误'));
-        // 下载失败兜底:提供「前往下载」入口(整包下载交给浏览器)
+        window.setBtnBusy(btn, false, '自动更新');
+        if (!isUpdateModalVisible()) return;
+        setUpdateResult('fail', '下载失败:' + (errText(err) || '未知错误'));
       });
-  }
-
-  /** 第二步:下载完成后,行内二次确认 → 启动静默安装并退出应用 */
-  function renderInstallConfirm(info, downloaded) {
-    var area = updateArea();
-    if (!area) return;
-    // 保留「发现新版本」行与 notes,替换按钮区为确认/取消
-    var oldBtns = area.querySelectorAll('button');
-    Array.prototype.forEach.call(oldBtns, function (b) { b.remove(); });
-
-    var confirm = el('button', 'btn btn-primary', '立即安装并重启应用');
-    confirm.type = 'button';
-    confirm.id = 'settings-install-btn';
-    confirm.addEventListener('click', function () {
-      confirm.disabled = true;
-      showUpdateMessage('info', '正在启动安装程序,应用即将退出,安装完成后会自动重新打开…');
-      window.AppBus.invoke('update_install', {
-        setupPath: String(downloaded.setupPath || ''),
-        version: String(downloaded.version || info.latest || '')
-      })
-        .then(function () {
-          // 后端 500ms 后 exit(0),安装器装完自动拉起新版;此处文案已展示,无需动作
-        })
-        .catch(function (err) {
-          showUpdateMessage('fail', '启动安装失败:' + (errText(err) || '未知错误') + '(可手动运行:' + (downloaded.setupPath || '') + ')');
-          if (confirm) confirm.disabled = false;
-        });
-    });
-    area.appendChild(confirm);
-
-    var cancel = el('button', 'btn', '暂不安装(保留安装包)');
-    cancel.type = 'button';
-    cancel.id = 'settings-install-cancel-btn';
-    cancel.addEventListener('click', function () {
-      showUpdateMessage('info', '已保留安装包:' + (downloaded.setupPath || '') + ',可随时手动运行');
-      renderUpdateAvailable(info); // 恢复按钮区(重新点「立即更新」会命中复用逻辑,秒回确认态)
-    });
-    area.appendChild(cancel);
   }
 
   // ===== 动作:保存 / 检查更新 / 测试连接 =====
@@ -523,6 +569,8 @@
     runUpdateCheck(session, function (info) {
       if (info.hasUpdate === true) {
         renderUpdateAvailable(info);
+        // 发现新版本 → 自动弹出更新确认模态(展示更新内容,确认后全自动更新)
+        openUpdateConfirmModal(info);
       } else {
         showUpdateMessage('ok', '已是最新:当前版本 v' + (info.current || ''));
       }
@@ -573,6 +621,12 @@
   }
 
   function closeSettingsModal() {
+    // 更新确认模态叠在上面时,Esc/遮罩先作用于上层(由其自身守卫决定能否关闭)
+    var updateOverlay = updateModal();
+    if (updateOverlay && !updateOverlay.classList.contains('hidden')) {
+      closeUpdateConfirmModal();
+      return;
+    }
     var overlay = document.getElementById('settings-modal');
     var body = document.getElementById('settings-modal-body');
     if (overlay) {
@@ -583,7 +637,6 @@
     // 会话收尾:复位进行中的防重标志,重开后的新模态可立即操作
     st.saving = false;
     st.checking = false;
-    updating = false; // 自动更新下载中断态复位(后端下载任务完成后回调因模态隐藏被丢弃)
   }
 
   // ===== 初始化(入口按钮 / 模态三通道关闭)=====
@@ -604,6 +657,22 @@
       document.addEventListener('keydown', function (e) {
         if (e.key === 'Escape' && !overlay.classList.contains('hidden')) {
           closeSettingsModal();
+        }
+      });
+    }
+
+    // 更新确认模态:关闭钮 / 遮罩 / Esc 三通道(统一走 closeUpdateConfirmModal
+    // 守卫 —— 下载进行中 toast 拦截,与 deploy 模态 rbBusy 同模式)
+    var ucClose = document.getElementById('update-confirm-modal-close');
+    if (ucClose) ucClose.addEventListener('click', closeUpdateConfirmModal);
+    var ucOverlay = updateModal();
+    if (ucOverlay) {
+      ucOverlay.addEventListener('click', function (e) {
+        if (e.target === ucOverlay) closeUpdateConfirmModal();
+      });
+      document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape' && !ucOverlay.classList.contains('hidden')) {
+          closeUpdateConfirmModal();
         }
       });
     }
