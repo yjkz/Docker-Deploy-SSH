@@ -12,6 +12,8 @@
  *   - rollback_project_detail({ serverId, passwordPlain?, dir }) -> RollbackProjectDetail
  *   - rollback_execute_stack_at({ serverId, passwordPlain?, dir, releaseTs }) -> null(结果走 deploy-log/deploy-done)
  *   - rollback_execute_single({ serverId, passwordPlain?, projectId, repository, dateTag, targetRef }) -> null
+ *   - rollback_set_release_notes({ req: { serverId, passwordPlain?, dir, ts, title, body } })
+ *     -> { updatedAt }(第七批:归档版本说明,存于归档目录内 release-notes.json)
  *
  * 约定(与 manage.js 一致):
  *   - IIFE + DOMContentLoaded 绑定;pagechange 进出页面;离页停止监听与计时;
@@ -34,6 +36,10 @@
   var selectedDir = null;
   var detailCache = null;
   var busy = false;
+  /** 明细加载会话序号:快速连点项目时丢弃过期响应(防旧数据覆盖新数据) */
+  var detailSeq = 0;
+  /** 版本详情模态当前编辑的归档 { dir, ts } */
+  var editingRelease = null;
 
   function $(id) { return document.getElementById(id); }
 
@@ -257,6 +263,7 @@
   function loadDetail(dir, silent) {
     var server = currentServer();
     if (!server || !dir) { renderDetailEmpty(); return Promise.resolve(); }
+    var seq = ++detailSeq; // 会话守卫:只有最新一次请求允许落渲染
     var box = $('rollback-detail');
     if (box && !silent) {
       box.textContent = '';
@@ -267,10 +274,12 @@
       dir: dir
     })
       .then(function (detail) {
+        if (seq !== detailSeq) return;
         detailCache = detail || {};
         renderDetail(detail || {});
       })
       .catch(function (err) {
+        if (seq !== detailSeq) return;
         renderDetailEmpty('读取明细失败:' + errText(err));
       });
   }
@@ -302,18 +311,33 @@
     } else {
       releases.forEach(function (r) {
         var row = el('div', 'rollback-release');
+        row.title = '点击查看版本详情与说明';
+        row.addEventListener('click', function () {
+          openReleaseDetail(r);
+        });
         var info = el('div', 'rollback-release-info');
         info.appendChild(el('span', 'rollback-release-ts mono', r.ts));
+        // 版本标题(第七批):设置了说明的归档在 ts 旁展示
+        if (r.noteTitle) {
+          info.appendChild(el('span', 'rollback-release-title', r.noteTitle));
+        }
         var parts = [];
         if (r.packages && r.packages.length) parts.push(r.packages.length + ' 个镜像包');
         if (r.services && r.services.length) parts.push('服务:' + r.services.join('、'));
         if (r.hasComposeCopy) parts.push('含 compose 副本');
         info.appendChild(el('span', 'rollback-release-meta', parts.join(' · ') || '(空归档)'));
+        // 「已备注」徽章:该归档有版本说明(标题或正文)
+        if (r.noteTitle || r.noteBody) {
+          var noteBadge = el('span', 'rollback-release-note-badge');
+          window.fillBadge(noteBadge, 'info', '已备注');
+          info.appendChild(noteBadge);
+        }
         row.appendChild(info);
 
         var btn = el('button', 'btn btn-sm btn-danger', '回滚到此归档');
         btn.type = 'button';
-        btn.addEventListener('click', function () {
+        btn.addEventListener('click', function (e) {
+          e.stopPropagation(); // 行点击是「查看详情」,按钮动作不触发
           planStackRollback(detail.dir, r.ts, r.services || []);
         });
         row.appendChild(btn);
@@ -323,7 +347,8 @@
         var delBtn = el('button', 'btn btn-sm rollback-del-btn', '删除');
         delBtn.type = 'button';
         delBtn.title = '删除服务器上的这个发布归档(不可恢复)';
-        delBtn.addEventListener('click', function () {
+        delBtn.addEventListener('click', function (e) {
+          e.stopPropagation();
           armConfirm(delBtn, function () {
             deleteRelease(detail.dir, r.ts, delBtn);
           });
@@ -455,6 +480,149 @@
       .then(function () {
         if (btn) { btn.disabled = false; btn.textContent = '删除'; }
       });
+  }
+
+  // ===== 版本详情模态(第七批;类 GitHub Release 的标题 + 更新说明)=====
+  //
+  // 点击归档行打开;说明持久化在归档目录内 release-notes.json(后端
+  // rollback_set_release_notes 原子写),标题与正文均留空保存 = 清除。
+
+  /** 打开版本详情模态:元信息 + 镜像清单(manifest)+ 可编辑的标题与说明 */
+  function openReleaseDetail(rel) {
+    var overlay = $('release-detail-modal');
+    var body = $('release-detail-modal-body');
+    if (!overlay || !body) return;
+    editingRelease = { dir: rel.dir, ts: rel.ts };
+    body.textContent = '';
+
+    var errBox = window.formErrorBox('rn-error');
+    body.appendChild(errBox);
+
+    // 元信息行(复用归档行的 meta 风格)
+    var metaParts = ['归档 ' + rel.ts];
+    if (rel.packages && rel.packages.length) metaParts.push(rel.packages.length + ' 个镜像包');
+    if (rel.services && rel.services.length) metaParts.push('服务:' + rel.services.join('、'));
+    metaParts.push(rel.hasComposeCopy ? '含 compose 副本' : '无 compose 副本');
+    body.appendChild(el('div', 'rollback-release-meta', metaParts.join(' · ')));
+
+    // 镜像清单(manifest 逐服务条目;旧归档无 manifest 时优雅降级)
+    body.appendChild(window.formGroupTitle('镜像清单', 'IMAGES'));
+    if (rel.manifestImages && rel.manifestImages.length) {
+      rel.manifestImages.forEach(function (img) {
+        body.appendChild(el('div', 'rollback-release-meta mono',
+          img.service + ' → ' + img.tag + (img.file ? ('(' + img.file + ')') : '(未留档,仅跳过传输)')));
+      });
+    } else {
+      body.appendChild(el('div', 'rollback-hint-inline',
+        rel.hasManifest ? 'manifest 存在但未记录镜像条目。' : '该归档无 manifest(旧版本发布),镜像以包内标签恢复。'));
+    }
+
+    // 版本标题 + 版本说明(可编辑;保存到归档目录)
+    var titleRow = el('div', 'form-row');
+    titleRow.appendChild(window.formLabel('版本标题', 'TITLE', false, 'rn-title'));
+    var titleInput = el('input', 'form-input');
+    titleInput.id = 'rn-title';
+    titleInput.type = 'text';
+    titleInput.maxLength = 120;
+    titleInput.placeholder = '如:v1.2.0 修复登录超时';
+    titleInput.value = rel.noteTitle || '';
+    titleRow.appendChild(titleInput);
+    body.appendChild(titleRow);
+
+    var bodyRow = el('div', 'form-row');
+    bodyRow.appendChild(window.formLabel('版本说明', 'NOTES', false, 'rn-body'));
+    var ta = document.createElement('textarea');
+    ta.id = 'rn-body';
+    ta.className = 'form-textarea';
+    ta.rows = 6;
+    ta.placeholder = '此次版本更新了什么?(标题与说明都留空并保存 = 清除说明)';
+    ta.value = rel.noteBody || '';
+    bodyRow.appendChild(ta);
+    body.appendChild(bodyRow);
+
+    var result = el('div', 'cio-result');
+    result.id = 'rn-result';
+    if (rel.noteUpdatedAt) result.textContent = '上次保存:' + rel.noteUpdatedAt;
+    body.appendChild(result);
+
+    var actions = el('div', 'modal-actions');
+    var closeBtn = el('button', 'btn', '关闭');
+    closeBtn.type = 'button';
+    closeBtn.addEventListener('click', closeReleaseDetail);
+    var saveBtn = el('button', 'btn btn-primary', '保存说明');
+    saveBtn.id = 'rn-save';
+    saveBtn.type = 'button';
+    saveBtn.addEventListener('click', function () {
+      saveReleaseNotes(saveBtn);
+    });
+    actions.appendChild(closeBtn);
+    actions.appendChild(saveBtn);
+    body.appendChild(actions);
+
+    overlay.classList.remove('hidden');
+    window.modalFocusOpen(overlay);
+  }
+
+  /** 保存版本说明:标题与正文均空 → 后端删除 notes 文件(= 清除) */
+  function saveReleaseNotes(saveBtn) {
+    var server = currentServer();
+    var editing = editingRelease;
+    if (!server || !editing) return;
+    var title = ($('rn-title') || {}).value || '';
+    var noteBody = ($('rn-body') || {}).value || '';
+    window.setBtnBusy(saveBtn, true, '保存中…');
+    window.AppBus.invoke('rollback_set_release_notes', {
+      req: {
+        serverId: server.id,
+        dir: editing.dir,
+        ts: editing.ts,
+        title: title,
+        body: noteBody
+      }
+    })
+      .then(function (saved) {
+        var cleared = !title.trim() && !noteBody.trim();
+        window.toast(cleared ? '已清除版本说明' : '已保存版本说明', 'ok');
+        // 同步缓存并就地刷新明细区(模态保持打开,可继续编辑)
+        applyNotesToCache(editing.ts, cleared ? null : {
+          title: title.trim(),
+          body: noteBody.trim(),
+          at: (saved && saved.updatedAt) || ''
+        });
+        if (selectedDir && detailCache) renderDetail(detailCache);
+        var result = $('rn-result');
+        if (result) {
+          result.textContent = cleared
+            ? '已清除版本说明'
+            : '已保存 · ' + ((saved && saved.updatedAt) || '');
+        }
+      })
+      .catch(function (err) {
+        window.formFailLoud('rn-error', '保存版本说明失败:' + errText(err));
+      })
+      .then(function () {
+        window.setBtnBusy(saveBtn, false, '保存说明');
+      });
+  }
+
+  /** 把保存结果同步进 detailCache(渲染与徽章的单一数据源) */
+  function applyNotesToCache(ts, notes) {
+    if (!detailCache || !Array.isArray(detailCache.releases)) return;
+    detailCache.releases.forEach(function (r) {
+      if (r.ts !== ts) return;
+      r.noteTitle = notes ? notes.title : null;
+      r.noteBody = notes ? notes.body : null;
+      r.noteUpdatedAt = notes ? notes.at : null;
+    });
+  }
+
+  function closeReleaseDetail() {
+    var overlay = $('release-detail-modal');
+    if (overlay) overlay.classList.add('hidden');
+    window.modalFocusClose(overlay);
+    var body = $('release-detail-modal-body');
+    if (body) body.textContent = '';
+    editingRelease = null;
   }
 
   // ===== 回滚计划与确认 =====
@@ -630,6 +798,21 @@
     if (root) {
       root.addEventListener('keydown', function (e) {
         if (e.key === 'Enter') loadProjects(false);
+      });
+    }
+
+    // 版本详情模态:关闭钮 / 遮罩 / Esc 三通道(与 notify/config-io 同款)
+    var rdClose = $('release-detail-modal-close');
+    if (rdClose) rdClose.addEventListener('click', closeReleaseDetail);
+    var rdOverlay = $('release-detail-modal');
+    if (rdOverlay) {
+      rdOverlay.addEventListener('click', function (e) {
+        if (e.target === rdOverlay) closeReleaseDetail();
+      });
+      document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape' && !rdOverlay.classList.contains('hidden')) {
+          closeReleaseDetail();
+        }
       });
     }
 

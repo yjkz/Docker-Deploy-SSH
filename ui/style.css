@@ -2856,6 +2856,9 @@ code {
 /* 通知模态卡片:比默认 560px 略宽,容纳邮件表单(同 .deploy-modal-card 的加宽先例) */
 .notify-modal-card { width: min(640px, 94vw); }
 
+/* 版本详情模态卡片(第七批;宽度同 notify-modal-card 先例) */
+.release-detail-modal-card { width: min(640px, 94vw); }
+
 /* 表单分组小标题(本轮统一):此前 notify/cio/set 各有一份逐行相同的规则
    (仅类名不同),现收敛为 .form-group-title;旧类名保留作别名以零风险迁移
    (JS 侧逐步改用新类,旧类名不再单独定义样式)。
@@ -3474,7 +3477,20 @@ code {
   gap: 10px;
   padding: 8px 0;
   border-bottom: 1px solid var(--ark-line-soft);
+  /* 第七批:归档行可点(打开版本详情);回滚/删除按钮 stopPropagation */
+  cursor: pointer;
+  transition: background var(--ark-dur-fast) var(--ark-ease-out);
 }
+.rollback-release:hover { background: var(--ink-on-paper-08); }
+.rollback-release:active { transform: translateY(1px); transition-duration: var(--ark-dur-press); }
+/* 版本标题(设置了说明的归档在 ts 旁展示;CJK 12.5px 墨色) */
+.rollback-release-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ark-ink);
+  overflow-wrap: anywhere;
+}
+.rollback-release-note-badge { flex: none; }
 .rollback-release-info {
   display: flex;
   flex-direction: column;
