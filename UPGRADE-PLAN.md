@@ -731,18 +731,24 @@ Release 的版本说明(标题 + 更新描述),在回滚中心点击归档即可
 外加逐仓库 `docker images <repo>`;`rollback_list_releases`(部署页回滚模态数据源)
 同款结构。对照 `rollback_scan_projects` 快是因为恒定 5 次命令。
 
-- **新增纯函数 `releases_dump_cmd(dir, ts_list, compose_candidates)` + `parse_releases_dump`**:
+- **新增纯函数 `releases_scan_cmd(dir, limit, compose_candidates, include_images)` + `parse_releases_dump`**:
   一条拼接命令批量取回全部归档的文件清单 / manifest.json / release-notes.json +
-  compose 候选文本,标记行 `==RELEASE/MANIFEST/NOTES/COMPOSE:<id>` 切分
-  (与清理分析 `cleanup_cat_composes_cmd`/`split_compose_dump` 同形态,路径全单引号包裹,
-  解析按下标一一对应、缺失段为空值不错位)
-- **`rollback_project_detail` 恒 3 次往返**:①`ls releases` ②批量读 ③一次全量
-  `docker images --no-trunc` 本地按仓库过滤日期标签(替代逐仓库一条命令);
-  所有 exec 包 `with_timeout`(此前循环内 4 处无超时兜底);顺带修复
-  `composeFile` 恒返回第一个候选的失真(现记录实际产出仓库的候选)
-- **`rollback_list_releases` 同款改造**(行为不变只提速;归档数 >100 截断兜底,
+  compose 候选与全量 `docker images` 文本,标记行 `==RELEASE/MANIFEST/NOTES/COMPOSE/IMAGES`
+  切分(与清理分析 `cleanup_cat_composes_cmd`/`split_compose_dump` 同形态,路径全单引号包裹,
+  解析按标记归属、缺失段为空值不错位)。**二次优化(真机 meiguo 高延迟反馈)**:
+  归档枚举改由远端 `find` 循环完成 —— 命令长度恒定,连"先 ls 再拼装"的往返也省掉
+- **`rollback_project_detail` 单次往返**:远端 `find` 循环批量读全部归档清单/manifest/notes
+  + compose 候选 + 全量 `docker images --no-trunc` 同命令带回,本地按仓库过滤日期标签
+  (替代逐归档/逐仓库 N+1);所有 exec 包 `with_timeout`(此前循环内 4 处无超时兜底);
+  顺带修复 `composeFile` 恒返回第一个候选的失真(现记录实际产出仓库的候选)
+- **`rollback_list_releases` 同款改造**(行为不变只提速;单次往返,`head -n 100` 截断兜底,
   正常受 release_keep ≤50 约束)
-- 新增单测 6 个(命令拼装引号/空输入/多段切分/未知 ts 隔离/notes 原子写形态/坏 JSON 容错)
+- **`rollback_scan_projects` 单次往返**:原 5 次串行(compose find / docker ps / 逐容器
+  inspect / releases find / docker ps -a)合并为一条组合命令,`==ROOTEXISTS` 标记保根目录
+  存在性判定;compose working_dir 从 `docker ps -a` 的 **Labels 字段直读**(stopped 容器
+  的 Labels 同样存在,"compose 被删但容器仍在"的项目依旧可见)
+- 新增单测 9 个(命令拼装引号与段标记/多段切分按归档分组/未知标记隔离/notes 原子写形态/
+  坏 JSON 容错/扫描段切分/根目录缺失/Labels 提取去重)
 
 ### 阶段二:归档版本说明(类 GitHub Release)✅
 

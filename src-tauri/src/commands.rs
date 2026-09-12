@@ -4705,45 +4705,26 @@ pub async fn rollback_list_releases(
     )
     .await?;
 
-    let releases_root = remote_join(&effective_remote_dir(&server, &project), "releases");
-    let (code, out) = with_timeout(
-        SSH_EXEC_TIMEOUT_SECS,
-        "查询发布列表超时",
-        "请检查服务器网络后重试",
-        exec_collect(&mut client, &ls_dir_cmd(&releases_root)),
-    )
-    .await?;
-    if code != 0 {
-        // releases 目录不存在(从未整栈部署)→ 空列表
-        return Ok(Vec::new());
-    }
-    let mut ts_list = parse_ls_lines(&out);
-    ts_list.sort_by(|a, b| b.cmp(a));
-    // 命令行长度保护:批量拼接命令按归档数线性增长,超量截断(正常归档数受
-    // release_keep ≤ 50 约束,该上限仅为极端旧数据兜底)
-    if ts_list.len() > 100 {
-        log::warn!("发布归档数 {} 超过批量读取上限,仅取最近 100 个", ts_list.len());
-        ts_list.truncate(100);
-    }
-    // 第七批:一条拼接命令批量读取全部归档(此前逐归档 ls + cat manifest,N+1 往返)
     let project_dir = effective_remote_dir(&server, &project);
-    let dump_cmd = releases_dump_cmd(&project_dir, &ts_list, &[]);
+    // 第七批二次优化:单次往返 —— find 循环在远端枚举归档并批量读取
+    // (releases 目录不存在时 find 静默无输出 → 空列表,与既有口径一致);
+    // 列表不需要镜像清单与 compose 文本,命令不带这两段
+    let scan_cmd = releases_scan_cmd(&project_dir, 100, &[], false);
     let (_, dump_out) = with_timeout(
         SSH_EXEC_TIMEOUT_SECS,
         "读取发布列表超时",
         "请检查服务器网络后重试",
-        exec_collect(&mut client, &dump_cmd),
+        exec_collect(&mut client, &scan_cmd),
     )
     .await
     .unwrap_or((1, String::new()));
-    let (entries, _) = parse_releases_dump(&dump_out, &ts_list, &[]);
+    let dump = parse_releases_dump(&dump_out, &[]);
 
     let mut briefs = Vec::new();
-    for (i, ts) in ts_list.iter().enumerate() {
-        let entry = &entries[i];
+    for entry in &dump.entries {
         if entry.files.is_empty() {
             // 目录可能刚被清理或不可读,跳过该条目,不拖垮整个列表
-            log::warn!("跳过无法读取的发布目录 {}(批量读取为空)", ts);
+            log::warn!("跳过无法读取的发布目录 {}(批量读取为空)", entry.ts);
             continue;
         }
         let files = entry.files.clone();
@@ -4753,14 +4734,14 @@ pub async fn rollback_list_releases(
             .map(|m| m.images.into_iter().map(|img| img.service).collect())
             .unwrap_or_default();
         briefs.push(ReleaseBrief {
-            ts: ts.clone(),
+            ts: entry.ts.clone(),
             files,
             services,
             has_manifest,
             has_compose_copy,
         });
     }
-    // ts_list 已按新 → 旧排序(时间戳形如 20260905-101010,字符串倒序即时间倒序)
+    // find + sort -r 已按新 → 旧返回(时间戳形如 20260905-101010)
     Ok(briefs)
 }
 
@@ -5252,81 +5233,50 @@ pub async fn rollback_scan_projects(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| server.remote_dir.clone());
 
-    // 1. 扫 compose 文件 → 项目目录
+    // 第七批二次优化:单次往返 —— 组合命令一次带回 compose 文件清单、
+    // releases 归档清单与 `docker ps -a`(Labels 直读 compose working_dir,
+    // 替代此前「docker ps 取 ID → 逐容器 inspect」的两次额外往返)
     let (code, out) = with_timeout(
         SSH_EXEC_TIMEOUT_SECS,
         "扫描项目超时",
         "请检查服务器网络后重试",
-        exec_collect(&mut client, &cleanup_scan_compose_cmd(&root)),
+        exec_collect(&mut client, &rollback_scan_cmd(&root)),
     )
     .await?;
-    if code != 0 {
+    let scan = parse_rollback_scan(&out);
+    if !scan.root_exists {
         return Err(format!(
             "扫描目录「{}」失败(目录可能不存在或无权限)",
             root
         ));
     }
-    let compose_paths = abs_path_lines(&out);
+
+    // 项目目录 = compose 文件父目录 + docker Labels 的 working_dir 合并去重
     let mut dirs: Vec<String> = Vec::new();
-    for p in &compose_paths {
+    for p in &scan.compose_paths {
         if let Some((parent, _)) = p.rsplit_once('/') {
             if !parent.is_empty() && !dirs.iter().any(|d| d == parent) {
                 dirs.push(parent.to_string());
             }
         }
     }
-
-    // 2. 合并 docker 已知的 compose 项目工作目录(label 是权威来源,可补
-    //    上"目录里 compose 文件被删但容器仍在"的情况)
-    let label_cmd = "docker ps --format '{{json .}}'";
-    if let Ok((0, ps_out)) =
-        exec_collect(&mut client, label_cmd).await
-    {
-        let (items, _) = parse_cleanup_ndjson(&ps_out);
-        let cids: Vec<String> = items
-            .iter()
-            .map(|v| jstr(v, "ID"))
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !cids.is_empty() {
-            let quoted: Vec<String> = cids.iter().map(|c| shell_single_quote(c)).collect();
-            let wd_cmd = format!(
-                "docker inspect --format '{{{{index .Config.Labels \"com.docker.compose.project.working_dir\"}}}}' {} 2>/dev/null",
-                quoted.join(" ")
-            );
-            if let Ok((_, wd_out)) = exec_collect(&mut client, &wd_cmd).await {
-                for line in abs_path_lines(&wd_out) {
-                    if !dirs.iter().any(|d| d == &line) {
-                        dirs.push(line);
-                    }
-                }
-            }
+    for wd in compose_working_dirs(&scan.ps_items) {
+        if !dirs.iter().any(|d| d == &wd) {
+            dirs.push(wd);
         }
     }
     dirs.sort();
 
-    // 3. 归档 + 运行容器数
-    let (_, rel_out) = with_timeout(
-        SSH_EXEC_TIMEOUT_SECS,
-        "扫描归档超时",
-        "请检查服务器网络后重试",
-        exec_collect(&mut client, &cleanup_scan_releases_cmd(&root)),
-    )
-    .await?;
-    let release_paths = abs_path_lines(&rel_out);
-
-    let (_, ps_all_out) =
-        exec_collect(&mut client, "docker ps -a --format '{{json .}}'").await.unwrap_or((0, String::new()));
-    let (containers, _) = parse_cleanup_ndjson(&ps_all_out);
-
     let mut projects = Vec::new();
     for dir in dirs {
-        let compose_file = compose_paths
+        let compose_file = scan
+            .compose_paths
             .iter()
             .find(|p| p.rsplit_once('/').map(|(d, _)| d) == Some(dir.as_str()))
             .cloned()
             .unwrap_or_default();
-        let mut releases: Vec<String> = release_paths
+        let mut releases: Vec<String> = scan
+            .release_paths
             .iter()
             .filter(|r| project_dir_of_release(r) == dir)
             .cloned()
@@ -5350,7 +5300,8 @@ pub async fn rollback_scan_projects(
             .map(|p| p.name.clone())
             .unwrap_or_default();
         // 运行容器数:以 Names 前缀/目录名近似归属(无 labels 时的兜底)
-        let running = containers
+        let running = scan
+            .ps_items
             .iter()
             .filter(|c| {
                 let status = jstr(c, "Status").to_lowercase();
@@ -5395,46 +5346,38 @@ pub async fn rollback_project_detail(
 
     let dir = dir.trim().trim_end_matches('/').to_string();
     let releases_root = remote_join(&dir, "releases");
-    // ① 列 releases 根目录(第七批起明细恒 3 次往返:此步 + ②批量读 + ③全量镜像)
-    let (code, out) = with_timeout(
-        SSH_EXEC_TIMEOUT_SECS,
-        "查询归档超时",
-        "请检查服务器网络后重试",
-        exec_collect(&mut client, &ls_dir_cmd(&releases_root)),
-    )
-    .await?;
-    let mut ts_list = if code == 0 { parse_ls_lines(&out) } else { Vec::new() };
-    ts_list.sort_by(|a, b| b.cmp(a));
-    ts_list.truncate(50); // 与既有口径一致:明细最多展示最近 50 个归档
-
-    // ② 批量读取:每个归档的文件清单 + manifest.json + release-notes.json,
-    //    外加项目 compose 候选文本 —— 一条拼接命令,替代此前的逐归档 N+1 往返
+    // ① 单次往返批量读取(第七批二次优化):归档枚举由远端 find 循环完成 ——
+    //    命令长度恒定,连"先 ls 再拼装"的往返都省掉;manifest / 版本说明 /
+    //    compose 候选 / 全量镜像列表一条命令全部带回,整次明细仅 1 次 SSH 往返
     let compose_candidates = [
         remote_join(&dir, "docker-compose.yml"),
         remote_join(&dir, "compose.yml"),
     ];
-    let dump_cmd = releases_dump_cmd(&dir, &ts_list, &compose_candidates);
+    let scan_cmd = releases_scan_cmd(&dir, 50, &compose_candidates, true);
     let (_, dump_out) = with_timeout(
         SSH_EXEC_TIMEOUT_SECS,
         "读取归档详情超时",
         "请检查服务器网络后重试",
-        exec_collect(&mut client, &dump_cmd),
+        exec_collect(&mut client, &scan_cmd),
     )
     .await
     .unwrap_or((1, String::new()));
-    let (entries, compose_texts) = parse_releases_dump(&dump_out, &ts_list, &compose_candidates);
+    let dump = parse_releases_dump(&dump_out, &compose_candidates);
 
     let mut releases: Vec<RollbackReleaseDetail> = Vec::new();
-    for (i, ts) in ts_list.iter().enumerate() {
-        let entry = &entries[i];
+    for entry in &dump.entries {
         if entry.files.is_empty() {
             // 文件清单为空 = 归档目录刚被清理或不可读:跳过,不拖垮明细(与既有口径一致)
             continue;
         }
-        let files = entry.files.clone();
-        let packages: Vec<String> = files.iter().filter(|f| f.ends_with(".tar.gz")).cloned().collect();
-        let has_manifest = files.iter().any(|f| f == "manifest.json");
-        let has_compose_copy = files.iter().any(|f| f == "docker-compose.yml");
+        let packages: Vec<String> = entry
+            .files
+            .iter()
+            .filter(|f| f.ends_with(".tar.gz"))
+            .cloned()
+            .collect();
+        let has_manifest = entry.files.iter().any(|f| f == "manifest.json");
+        let has_compose_copy = entry.files.iter().any(|f| f == "docker-compose.yml");
         let (services, manifest_images) = match parse_release_manifest(&entry.manifest) {
             Some(m) => (
                 m.images.iter().map(|img| img.service.clone()).collect(),
@@ -5447,8 +5390,8 @@ pub async fn rollback_project_detail(
             None => (None, None, None),
         };
         releases.push(RollbackReleaseDetail {
-            ts: ts.clone(),
-            dir: remote_join(&releases_root, ts),
+            ts: entry.ts.clone(),
+            dir: remote_join(&releases_root, &entry.ts),
             packages,
             services,
             manifest_images,
@@ -5460,12 +5403,12 @@ pub async fn rollback_project_detail(
         });
     }
 
-    // ③ 日期标签:取 compose 候选的镜像仓库名,然后**一次**全量 `docker images`
-    //    拉回、本地按仓库过滤日期标签(此前逐仓库各发一条命令,R 个仓库 R 次往返)
+    // ② 日期标签:compose 候选解析仓库名;镜像列表已在 ① 带回,本地按仓库过滤(零往返)
     let mut repositories: Vec<RollbackTagDetail> = Vec::new();
     let mut compose_file = String::new();
+    let image_items = parse_cleanup_ndjson(&dump.images).0;
     for (i, cand) in compose_candidates.iter().enumerate() {
-        let repos = compose_image_repos(&compose_texts[i]);
+        let repos = compose_image_repos(&dump.compose_texts[i]);
         if repos.is_empty() {
             continue;
         }
@@ -5473,20 +5416,11 @@ pub async fn rollback_project_detail(
             // 修复:此前恒返回第一个候选名;现记录实际产出仓库的候选
             compose_file = cand.clone();
         }
-        let (_, img_out) = with_timeout(
-            SSH_EXEC_TIMEOUT_SECS,
-            "查询镜像标签超时",
-            "请检查服务器网络后重试",
-            exec_collect(&mut client, REMOTE_IMAGES_CMD_FULL),
-        )
-        .await
-        .unwrap_or((1, String::new()));
-        let (items, _) = parse_cleanup_ndjson(&img_out);
         for repo in repos {
             if repo.trim().is_empty() || repositories.iter().any(|r| r.repository == repo) {
                 continue;
             }
-            let mut tags: Vec<TagBrief> = items
+            let mut tags: Vec<TagBrief> = image_items
                 .iter()
                 .filter(|v| jstr(v, "Repository") == repo && is_date_tag(&jstr(v, "Tag")))
                 .map(|v| TagBrief {
@@ -5505,10 +5439,10 @@ pub async fn rollback_project_detail(
     if compose_file.is_empty() {
         // compose 可读但未声明任何 image(或两个候选都读不到):回退到可读到
         // 文本的候选,保持"能识别到 compose 文件"这一信息不丢失
-        if let Some((i, _)) = compose_texts
+        if let Some(i) = dump
+            .compose_texts
             .iter()
-            .enumerate()
-            .find(|(_, t)| !t.trim().is_empty())
+            .position(|t| !t.trim().is_empty())
         {
             compose_file = compose_candidates[i].clone();
         }
@@ -7003,11 +6937,15 @@ fn split_compose_dump(out: &str) -> Vec<(String, String)> {
 // 此前 rollback_project_detail / rollback_list_releases 对每个归档各发一条
 // `ls -1` 与一条 `cat manifest.json`(N+1 串行往返,50 个归档 ≈ 100+ 次
 // channel 打开,是明细加载卡顿的根因)。这里仿 [`cleanup_cat_composes_cmd`]
-// 的「一条拼接命令 + 标记行切分」形态,把全部归档压进单次往返。
+// 的「一条拼接命令 + 标记行切分」形态,把全部归档压进单次往返;
+// 二次优化后归档枚举也由远端 `find` 循环完成 —— **整条命令长度恒定**,
+// 不再需要"先 ls 再拼装"的两次往返。
 
 /// [`parse_releases_dump`] 产出的单个归档批量读取结果。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ReleaseDumpEntry {
+    /// 归档时间戳(目录名)
+    pub ts: String,
     /// 归档内文件名清单(`ls -1`;目录不可读/被清理时为空)
     pub files: Vec<String>,
     /// manifest.json 文本(缺失/读取失败为空,调用方按"无清单"降级)
@@ -7016,36 +6954,42 @@ pub struct ReleaseDumpEntry {
     pub notes: String,
 }
 
-/// 拼「逐归档批量读取」命令:一次往返取回全部归档的文件清单、manifest.json
-/// 与 release-notes.json,外加项目 compose 候选文本。
+/// [`parse_releases_dump`] 的完整产出。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReleasesDump {
+    /// 归档条目(远端返回顺序,find + sort -r 即新 → 旧;上限由命令内 head 截断)
+    pub entries: Vec<ReleaseDumpEntry>,
+    /// compose 候选文本(与入参候选按下标一一对应;缺失为空)
+    pub compose_texts: Vec<String>,
+    /// `docker images` 全量 NDJSON 文本(include_images 时;供本地按仓库过滤)
+    pub images: String,
+}
+
+/// 拼「归档明细单次往返」命令:远端 `find` 枚举 `<dir>/releases` 下的归档
+/// (新 → 旧,`head` 截断),`while read` 循环逐归档输出文件清单、manifest 与
+/// release-notes;可选附加 compose 候选文本与全量 `docker images`。
 ///
-/// 标记行格式(解析见 [`parse_releases_dump`]):
-/// - `==RELEASE:<ts>` 后跟该归档的 `ls -1` 文件清单
-/// - `==MANIFEST:<ts>` 后跟 manifest.json 文本(`2>/dev/null`,缺失静默为空)
-/// - `==NOTES:<ts>` 后跟 release-notes.json 文本(同上)
-/// - `==COMPOSE:<path>` 后跟 compose 候选文本(同上)
-///
-/// 全部路径经 [`shell_single_quote`] 包裹;`ts` 由调用方先行校验为纯目录名。
-pub fn releases_dump_cmd(dir: &str, ts_list: &[String], compose_candidates: &[String]) -> String {
+/// 标记行格式(解析见 [`parse_releases_dump`]):`==RELEASE:<ts>` /
+/// `==MANIFEST:<ts>` / `==NOTES:<ts>` / `==COMPOSE:<path>` / `==IMAGES`。
+/// 全部路径经 [`shell_single_quote`] 包裹;归档枚举在远端完成,**命令长度
+/// 与归档数量无关**。
+pub fn releases_scan_cmd(
+    dir: &str,
+    limit: usize,
+    compose_candidates: &[String],
+    include_images: bool,
+) -> String {
     let mut out = String::new();
-    for ts in ts_list {
-        let rd = remote_join(dir, &format!("releases/{}", ts));
-        out.push_str(&format!(
-            "printf '==RELEASE:%s\\n' {}; ls -1 {} 2>/dev/null; printf '\\n'; ",
-            shell_single_quote(ts),
-            shell_single_quote(&rd)
-        ));
-        out.push_str(&format!(
-            "printf '==MANIFEST:%s\\n' {}; cat {} 2>/dev/null; printf '\\n'; ",
-            shell_single_quote(ts),
-            shell_single_quote(&remote_join(&rd, "manifest.json"))
-        ));
-        out.push_str(&format!(
-            "printf '==NOTES:%s\\n' {}; cat {} 2>/dev/null; printf '\\n'; ",
-            shell_single_quote(ts),
-            shell_single_quote(&remote_join(&rd, "release-notes.json"))
-        ));
-    }
+    out.push_str(&format!(
+        "find {} -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -r | head -n {} \
+         | while IFS= read -r d; do \
+         printf '==RELEASE:%s\\n' \"${{d##*/}}\"; ls -1 \"$d\" 2>/dev/null; printf '\\n'; \
+         printf '==MANIFEST:%s\\n' \"${{d##*/}}\"; cat \"$d/manifest.json\" 2>/dev/null; printf '\\n'; \
+         printf '==NOTES:%s\\n' \"${{d##*/}}\"; cat \"$d/release-notes.json\" 2>/dev/null; printf '\\n'; \
+         done; ",
+        shell_single_quote(&remote_join(dir, "releases")),
+        limit
+    ));
     for cand in compose_candidates {
         out.push_str(&format!(
             "printf '==COMPOSE:%s\\n' {}; cat {} 2>/dev/null; printf '\\n'; ",
@@ -7053,67 +6997,201 @@ pub fn releases_dump_cmd(dir: &str, ts_list: &[String], compose_candidates: &[St
             shell_single_quote(cand)
         ));
     }
+    if include_images {
+        // REMOTE_IMAGES_CMD_FULL 含 format 花括号,直接拼接不走 format! 转义
+        out.push_str("printf '==IMAGES\\n'; ");
+        out.push_str(REMOTE_IMAGES_CMD_FULL);
+        out.push_str(" 2>/dev/null; printf '\\n'; ");
+    }
     out
 }
 
-/// 解析 [`releases_dump_cmd`] 的输出(纯函数,便于单测)。
+/// 解析 [`releases_scan_cmd`] 的输出(纯函数,便于单测)。
 ///
-/// 返回 `(归档条目, compose 候选文本)`,两个列表都与入参**按下标一一对应**;
-/// 某段在输出中缺失(远端无该归档/候选)时对应项为空值,不会错位到别的项。
-fn parse_releases_dump(
-    out: &str,
-    ts_list: &[String],
-    compose_candidates: &[String],
-) -> (Vec<ReleaseDumpEntry>, Vec<String>) {
-    let mut entries: Vec<ReleaseDumpEntry> = vec![ReleaseDumpEntry::default(); ts_list.len()];
-    let mut compose_texts = vec![String::new(); compose_candidates.len()];
+/// `compose_candidates` 为空时 `compose_texts` 为空;`==IMAGES` 段只有在命令
+/// 带了 `include_images` 时才出现,缺失时 `images` 为空串。未知标记与散行
+/// (不属于任何已知段)一律忽略,不会错位进别的段。
+fn parse_releases_dump(out: &str, compose_candidates: &[String]) -> ReleasesDump {
+    let mut dump = ReleasesDump {
+        compose_texts: vec![String::new(); compose_candidates.len()],
+        ..ReleasesDump::default()
+    };
     const SEC_NONE: u8 = 0;
     const SEC_FILES: u8 = 1;
     const SEC_MANIFEST: u8 = 2;
     const SEC_NOTES: u8 = 3;
     const SEC_COMPOSE: u8 = 4;
+    const SEC_IMAGES: u8 = 5;
     let mut kind = SEC_NONE;
     let mut idx = usize::MAX;
     for line in out.lines() {
         if let Some(rest) = line.strip_prefix("==RELEASE:") {
             kind = SEC_FILES;
-            idx = ts_list.iter().position(|t| *t == rest.trim()).unwrap_or(usize::MAX);
+            dump.entries.push(ReleaseDumpEntry {
+                ts: rest.trim().to_string(),
+                ..ReleaseDumpEntry::default()
+            });
+            idx = dump.entries.len() - 1; // 后续文件清单行归属这个新条目
         } else if let Some(rest) = line.strip_prefix("==MANIFEST:") {
             kind = SEC_MANIFEST;
-            idx = ts_list.iter().position(|t| *t == rest.trim()).unwrap_or(usize::MAX);
+            idx = dump
+                .entries
+                .iter()
+                .position(|e| e.ts == rest.trim())
+                .unwrap_or(usize::MAX);
         } else if let Some(rest) = line.strip_prefix("==NOTES:") {
             kind = SEC_NOTES;
-            idx = ts_list.iter().position(|t| *t == rest.trim()).unwrap_or(usize::MAX);
+            idx = dump
+                .entries
+                .iter()
+                .position(|e| e.ts == rest.trim())
+                .unwrap_or(usize::MAX);
         } else if let Some(rest) = line.strip_prefix("==COMPOSE:") {
             kind = SEC_COMPOSE;
             idx = compose_candidates
                 .iter()
                 .position(|c| *c == rest.trim())
                 .unwrap_or(usize::MAX);
-        } else if idx != usize::MAX {
+        } else if line.trim() == "==IMAGES" {
+            kind = SEC_IMAGES;
+            idx = usize::MAX;
+        } else {
             match kind {
                 SEC_FILES => {
                     if !line.trim().is_empty() {
-                        entries[idx].files.push(line.trim().to_string());
+                        if let Some(e) = dump.entries.get_mut(idx) {
+                            e.files.push(line.trim().to_string());
+                        }
                     }
                 }
                 SEC_MANIFEST => {
-                    entries[idx].manifest.push_str(line);
-                    entries[idx].manifest.push('\n');
+                    if let Some(e) = dump.entries.get_mut(idx) {
+                        e.manifest.push_str(line);
+                        e.manifest.push('\n');
+                    }
                 }
                 SEC_NOTES => {
-                    entries[idx].notes.push_str(line);
-                    entries[idx].notes.push('\n');
+                    if let Some(e) = dump.entries.get_mut(idx) {
+                        e.notes.push_str(line);
+                        e.notes.push('\n');
+                    }
                 }
                 SEC_COMPOSE => {
-                    compose_texts[idx].push_str(line);
-                    compose_texts[idx].push('\n');
+                    if let Some(t) = dump.compose_texts.get_mut(idx) {
+                        t.push_str(line);
+                        t.push('\n');
+                    }
+                }
+                SEC_IMAGES => {
+                    dump.images.push_str(line);
+                    dump.images.push('\n');
                 }
                 _ => {}
             }
         }
     }
-    (entries, compose_texts)
+    dump
+}
+
+// ===== 回滚中心项目扫描(第七批二次优化;纯函数,便于单测)=====
+//
+// 此前扫描是 5 次串行往返(compose find / docker ps / 逐容器 inspect /
+// releases find / docker ps -a)。组合成一条命令后单次往返带回全部数据;
+// compose working_dir 从 `docker ps -a` 的 Labels 字段直读,省掉 inspect 步。
+
+/// 拼「回滚中心项目扫描」单往返命令:compose 文件 find + releases 归档 find +
+/// `docker ps -a`。`==ROOTEXISTS:0/1` 标记根目录存在性(此前由 find 退出码判定,
+/// 组合命令的退出码取自末段,不再可靠)。
+pub fn rollback_scan_cmd(root: &str) -> String {
+    format!(
+        "[ -d {root} ] && echo '==ROOTEXISTS:1' || echo '==ROOTEXISTS:0'; \
+         printf '==COMPOSEFILES\\n'; {compose}; \
+         printf '==RELEASES\\n'; {releases}; \
+         printf '==PSALL\\n'; docker ps -a --format '{{{{json .}}}}' 2>/dev/null",
+        root = shell_single_quote(root),
+        compose = cleanup_scan_compose_cmd(root),
+        releases = cleanup_scan_releases_cmd(root),
+    )
+}
+
+/// [`rollback_scan_cmd`] 的解析产出。
+#[derive(Debug, Default)]
+struct RollbackScanDump {
+    /// 扫描起点目录存在(不存在时调用方返回与旧版一致的中文错误)
+    root_exists: bool,
+    /// compose 文件绝对路径清单
+    compose_paths: Vec<String>,
+    /// releases 归档目录绝对路径清单
+    release_paths: Vec<String>,
+    /// `docker ps -a` 的 NDJSON 条目(docker 不可用/失败时为空)
+    ps_items: Vec<serde_json::Value>,
+}
+
+/// 解析 [`rollback_scan_cmd`] 的输出(纯函数,便于单测)。
+/// 各段以标记行切分;PS 段为 NDJSON,逐行解析、坏行跳过(与清理分析同口径)。
+fn parse_rollback_scan(out: &str) -> RollbackScanDump {
+    let mut dump = RollbackScanDump::default();
+    const S_NONE: u8 = 0;
+    const S_COMPOSE: u8 = 1;
+    const S_RELEASES: u8 = 2;
+    const S_PS: u8 = 3;
+    let mut kind = S_NONE;
+    let mut ps_buf = String::new();
+    for line in out.lines() {
+        if let Some(rest) = line.strip_prefix("==ROOTEXISTS:") {
+            kind = S_NONE;
+            dump.root_exists = rest.trim() == "1";
+        } else if line.trim() == "==COMPOSEFILES" {
+            kind = S_COMPOSE;
+        } else if line.trim() == "==RELEASES" {
+            kind = S_RELEASES;
+        } else if line.trim() == "==PSALL" {
+            kind = S_PS;
+        } else {
+            match kind {
+                S_COMPOSE => {
+                    let t = line.trim();
+                    if t.starts_with('/') {
+                        dump.compose_paths.push(t.to_string());
+                    }
+                }
+                S_RELEASES => {
+                    let t = line.trim();
+                    if t.starts_with('/') {
+                        dump.release_paths.push(t.to_string());
+                    }
+                }
+                S_PS => {
+                    ps_buf.push_str(line);
+                    ps_buf.push('\n');
+                }
+                _ => {}
+            }
+        }
+    }
+    dump.ps_items = parse_cleanup_ndjson(&ps_buf).0;
+    dump
+}
+
+/// 从 `docker ps -a` 的 NDJSON 条目提取 compose 项目工作目录
+/// (`Labels."com.docker.compose.project.working_dir"`,去重;纯函数,便于单测)。
+/// 替代此前「docker ps 取 ID → 逐容器 inspect」的往返;stopped 容器的 Labels
+/// 同样存在,因此"compose 文件被删但容器仍在"的项目依旧可见。
+fn compose_working_dirs(items: &[serde_json::Value]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for v in items {
+        let wd = v
+            .get("Labels")
+            .and_then(|l| l.get("com.docker.compose.project.working_dir"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !wd.is_empty() && !out.iter().any(|d| d == &wd) {
+            out.push(wd);
+        }
+    }
+    out
 }
 
 /// 项目目录 = 发布归档路径去末尾两级(`<dir>/releases/<ts>` → `<dir>`)。
@@ -8352,70 +8430,124 @@ services:
     // ---- 第七批:回滚明细批量读取 + 版本说明 ----
 
     #[test]
-    fn test_releases_dump_cmd_quotes_and_markers() {
-        let ts_list = vec!["20260905-101010".to_string()];
+    fn test_releases_scan_cmd_markers_and_flags() {
         let candidates = vec!["/app/docker-compose.yml".to_string()];
-        let cmd = releases_dump_cmd("/app", &ts_list, &candidates);
-        // 三类归档标记 + compose 标记齐全
-        assert!(cmd.contains("==RELEASE:%s"));
-        assert!(cmd.contains("==MANIFEST:%s"));
-        assert!(cmd.contains("==NOTES:%s"));
-        assert!(cmd.contains("==COMPOSE:%s"));
-        // 路径单引号包裹 + releases/<ts> 拼装
-        assert!(cmd.contains("'/app/releases/20260905-101010'"));
-        assert!(cmd.contains("'/app/releases/20260905-101010/manifest.json'"));
-        assert!(cmd.contains("'/app/releases/20260905-101010/release-notes.json'"));
-        assert!(cmd.contains("'/app/docker-compose.yml'"));
-        // ts 作为 printf 参数同样被单引号包裹
-        assert!(cmd.contains("'20260905-101010'"));
-    }
-
-    #[test]
-    fn test_releases_dump_cmd_empty_inputs() {
-        assert_eq!(releases_dump_cmd("/app", &[], &[]), "");
+        let with_images = releases_scan_cmd("/app", 50, &candidates, true);
+        // find 循环 + 截断 + 三类归档段 + compose 段 + 镜像段
+        assert!(with_images.contains("find '/app/releases' -mindepth 1 -maxdepth 1 -type d"));
+        assert!(with_images.contains("sort -r | head -n 50"));
+        assert!(with_images.contains("while IFS= read -r d"));
+        assert!(with_images.contains("==RELEASE:%s"));
+        assert!(with_images.contains("==MANIFEST:%s"));
+        assert!(with_images.contains("==NOTES:%s"));
+        assert!(with_images.contains("==COMPOSE:%s"));
+        assert!(with_images.contains("==IMAGES"));
+        assert!(with_images.contains("'/app/docker-compose.yml'"));
+        // 归档内路径由远端循环变量拼接($d),不再逐归档展开字面路径
+        assert!(with_images.contains("cat \"$d/manifest.json\""));
+        assert!(with_images.contains("cat \"$d/release-notes.json\""));
+        // include_images=false 时不带镜像段(list_releases 用)
+        let no_images = releases_scan_cmd("/app", 100, &[], false);
+        assert!(!no_images.contains("==IMAGES"));
+        assert!(no_images.contains("head -n 100"));
     }
 
     #[test]
     fn test_parse_releases_dump_sections() {
-        let ts_list = vec!["20260905-101010".to_string(), "20260901-090000".to_string()];
         let candidates = vec!["/app/docker-compose.yml".to_string()];
+        // 远端输出按归档分组:每个归档的 RELEASE/MANIFEST/NOTES 相邻
         let out = "==RELEASE:20260905-101010\n\
                    app.tar.gz\n\
                    manifest.json\n\
                    ==MANIFEST:20260905-101010\n\
                    {\"project\":\"app\",\"images\":[]}\n\
+                   ==RELEASE:20260901-090000\n\
                    ==NOTES:20260901-090000\n\
                    {\"title\":\"v1\",\"body\":\"fix\",\"updatedAt\":\"t\"}\n\
                    ==COMPOSE:/app/docker-compose.yml\n\
-                   services:\n  web:\n    image: app:latest\n";
-        let (entries, compose_texts) = parse_releases_dump(out, &ts_list, &candidates);
-        assert_eq!(entries.len(), 2);
-        // 第一个归档:有文件清单与 manifest,无 notes
-        assert_eq!(entries[0].files, vec!["app.tar.gz", "manifest.json"]);
-        assert!(entries[0].manifest.contains("\"project\":\"app\""));
-        assert!(entries[0].notes.is_empty());
-        // 第二个归档:无输出段(远端缺失)→ 默认空值,不错位
-        assert!(entries[1].files.is_empty());
-        assert!(entries[1].manifest.is_empty());
-        assert!(entries[1].notes.contains("\"title\":\"v1\""));
-        // compose 候选文本按下标对应
-        assert!(compose_texts[0].contains("image: app:latest"));
+                   services:\n  web:\n    image: app:latest\n\
+                   ==IMAGES\n\
+                   {\"Repository\":\"app\",\"Tag\":\"20260901-090000\"}\n";
+        let dump = parse_releases_dump(out, &candidates);
+        assert_eq!(dump.entries.len(), 2);
+        assert_eq!(dump.entries[0].ts, "20260905-101010");
+        assert_eq!(dump.entries[0].files, vec!["app.tar.gz", "manifest.json"]);
+        assert!(dump.entries[0].manifest.contains("\"project\":\"app\""));
+        assert!(dump.entries[0].notes.is_empty());
+        // 第二个归档只有 NOTES 段(files/manifest 为空,不错位)
+        assert_eq!(dump.entries[1].ts, "20260901-090000");
+        assert!(dump.entries[1].files.is_empty());
+        assert!(dump.entries[1].notes.contains("\"title\":\"v1\""));
+        assert!(dump.compose_texts[0].contains("image: app:latest"));
+        assert!(dump.images.contains("\"Repository\":\"app\""));
     }
 
     #[test]
     fn test_parse_releases_dump_empty_and_unknown() {
-        let ts_list = vec!["20260905-101010".to_string()];
-        let (entries, compose_texts) = parse_releases_dump("", &ts_list, &[]);
-        assert_eq!(entries.len(), 1);
-        assert!(entries[0].files.is_empty());
-        assert!(compose_texts.is_empty());
-        // 未知 ts / 空行不进任何段
-        let (entries, _) = parse_releases_dump(
-            "==RELEASE:99999999-999999\nstray.tar.gz\n\n",
-            &ts_list,
+        let dump = parse_releases_dump("", &[]);
+        assert!(dump.entries.is_empty());
+        assert!(dump.images.is_empty());
+        // 标记即条目:==RELEASE 后的清单行归入该条目,文件清单忽略空行;
+        // ==IMAGES 段独立收集
+        let dump = parse_releases_dump(
+            "==RELEASE:99999999-999999\nstray.tar.gz\n\n==IMAGES\n{x}\n",
             &[],
         );
-        assert!(entries[0].files.is_empty());
+        assert_eq!(dump.entries.len(), 1);
+        assert_eq!(dump.entries[0].ts, "99999999-999999");
+        assert_eq!(dump.entries[0].files, vec!["stray.tar.gz"]);
+        assert!(dump.images.contains("{x}"));
+    }
+
+    #[test]
+    fn test_rollback_scan_cmd_sections() {
+        let cmd = rollback_scan_cmd("/home/henghao");
+        assert!(cmd.starts_with("[ -d '/home/henghao' ]"));
+        assert!(cmd.contains("==ROOTEXISTS:1"));
+        assert!(cmd.contains("==COMPOSEFILES"));
+        assert!(cmd.contains("==RELEASES"));
+        assert!(cmd.contains("==PSALL"));
+        assert!(cmd.contains("docker ps -a --format '{{json .}}'"));
+        // compose find 复用清理分析的拼装(深度 4,排除 releases/.git)
+        assert!(cmd.contains("-maxdepth 4"));
+        assert!(cmd.contains("'*/releases/*'"));
+    }
+
+    #[test]
+    fn test_parse_rollback_scan_sections() {
+        let out = "==ROOTEXISTS:1\n\
+                   ==COMPOSEFILES\n\
+                   /home/x/app/docker-compose.yml\n\
+                   ==RELEASES\n\
+                   /home/x/app/releases/20260905-101010\n\
+                   ==PSALL\n\
+                   {\"Names\":\"app\",\"Status\":\"Up 1 hour\",\"Labels\":{\"com.docker.compose.project.working_dir\":\"/home/x/app\"}}\n\
+                   not-json\n";
+        let scan = parse_rollback_scan(out);
+        assert!(scan.root_exists);
+        assert_eq!(scan.compose_paths, vec!["/home/x/app/docker-compose.yml"]);
+        assert_eq!(
+            scan.release_paths,
+            vec!["/home/x/app/releases/20260905-101010"]
+        );
+        assert_eq!(scan.ps_items.len(), 1); // 坏行跳过
+        assert_eq!(compose_working_dirs(&scan.ps_items), vec!["/home/x/app"]);
+    }
+
+    #[test]
+    fn test_parse_rollback_scan_root_missing() {
+        let scan = parse_rollback_scan("==ROOTEXISTS:0\n");
+        assert!(!scan.root_exists);
+    }
+
+    #[test]
+    fn test_compose_working_dirs_dedupe_and_skip_empty() {
+        let items: Vec<serde_json::Value> = vec![
+            serde_json::json!({"Labels": {"com.docker.compose.project.working_dir": "/a"}}),
+            serde_json::json!({"Labels": {"com.docker.compose.project.working_dir": "/a"}}),
+            serde_json::json!({"Names": "no-labels"}),
+        ];
+        assert_eq!(compose_working_dirs(&items), vec!["/a"]);
     }
 
     #[test]
