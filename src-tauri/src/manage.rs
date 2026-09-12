@@ -229,6 +229,21 @@ pub struct ManageOverview {
     mem_total: String,
     /// 宿主机内存占用百分比(四舍五入整数)
     mem_percent: String,
+    /// 宿主机根文件系统磁盘已用(人类可读;采样不可用为空串 → 前端不显示该行)
+    root_disk_used: String,
+    /// 宿主机根文件系统磁盘总量(人类可读)
+    root_disk_total: String,
+    /// 宿主机根文件系统占用百分比(四舍五入整数)
+    root_disk_percent: String,
+    /// Docker 数据目录(/var/lib/docker)所在文件系统已用 —— 仅当它是独立挂载点
+    /// (与根分区不同文件系统)时非空,否则前端不追加第二行
+    docker_disk_used: String,
+    /// Docker 数据目录所在文件系统总量(人类可读)
+    docker_disk_total: String,
+    /// Docker 数据目录所在文件系统占用百分比(四舍五入整数)
+    docker_disk_percent: String,
+    /// Docker 数据目录的挂载点路径(展示用,如 /mnt/data)
+    docker_disk_mount: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -339,6 +354,8 @@ pub async fn manage_overview(
         }
         _ => None,
     };
+    let root_disk = host.root_disk.as_ref();
+    let docker_disk = host.docker_disk.as_ref();
 
     Ok(ManageOverview {
         docker_version: info.server_version,
@@ -359,19 +376,45 @@ pub async fn manage_overview(
         mem_used: host.mem_used.map(format_bytes_metric).unwrap_or_default(),
         mem_total: host.mem_total.map(format_bytes_metric).unwrap_or_default(),
         mem_percent: mem_percent.map(|p| format!("{p}%")).unwrap_or_default(),
+        root_disk_used: root_disk
+            .map(|d| format_bytes_metric(d.used_kb * 1024))
+            .unwrap_or_default(),
+        root_disk_total: root_disk
+            .map(|d| format_bytes_metric(d.total_kb * 1024))
+            .unwrap_or_default(),
+        root_disk_percent: root_disk
+            .and_then(|d| disk_percent(d.used_kb, d.total_kb))
+            .map(|p| format!("{p}%"))
+            .unwrap_or_default(),
+        docker_disk_used: docker_disk
+            .map(|d| format_bytes_metric(d.used_kb * 1024))
+            .unwrap_or_default(),
+        docker_disk_total: docker_disk
+            .map(|d| format_bytes_metric(d.total_kb * 1024))
+            .unwrap_or_default(),
+        docker_disk_percent: docker_disk
+            .and_then(|d| disk_percent(d.used_kb, d.total_kb))
+            .map(|p| format!("{p}%"))
+            .unwrap_or_default(),
+        docker_disk_mount: docker_disk
+            .map(|d| d.mount.clone())
+            .unwrap_or_default(),
     })
 }
 
 // ===== 宿主机性能采样(概览指标;纯函数,便于单测)=====
 
 /// 拼宿主机性能采样命令:单次 exec 完成 —— /proc/stat 两次采样(间隔 1s)
-/// 差分算 CPU 占用,/proc/meminfo 取内存总量与可用量,nproc 取核心数。
-/// 标记行 `==CPU1/==MEM/==NPROC/==CPU2` 供解析切分;grep 全部 `2>/dev/null`,
-/// /proc 不存在的系统输出为空段(解析为空 → 前端「—」)。
+/// 差分算 CPU 占用,/proc/meminfo 取内存总量与可用量,nproc 取核心数,
+/// `df -kP` 取根分区与 /var/lib/docker 所在文件系统用量(-P POSIX 格式,
+/// 长设备名不折行;目录不存在时该行缺失,stdout 仍有根分区行)。
+/// 标记行 `==CPU1/==MEM/==NPROC/==DISK/==CPU2` 供解析切分;grep/df 全部
+/// `2>/dev/null`,/proc 缺失的系统输出为空段(解析为空 → 前端「—」)。
 pub(crate) fn host_metrics_cmd() -> String {
     "echo '==CPU1'; grep '^cpu ' /proc/stat 2>/dev/null; \
      echo '==MEM'; grep -E '^(MemTotal|MemAvailable|MemFree|Buffers|Cached):' /proc/meminfo 2>/dev/null; \
      echo '==NPROC'; nproc 2>/dev/null; \
+     echo '==DISK'; df -kP / /var/lib/docker 2>/dev/null; \
      sleep 1; echo '==CPU2'; grep '^cpu ' /proc/stat 2>/dev/null"
         .to_string()
 }
@@ -387,6 +430,19 @@ struct HostMetrics {
     mem_total: Option<u64>,
     /// 内存已用(字节;= total - available,无 available 时 = total - free - buffers - cached)
     mem_used: Option<u64>,
+    /// 根分区(/)所在文件系统样本(KB 口径,来自 df -kP)
+    root_disk: Option<DfSample>,
+    /// Docker 数据目录所在文件系统样本 —— 仅当 /var/lib/docker 本身是挂载点
+    /// (独立文件系统)时为 Some;与根分区同盘时 df 报告的挂载点是 /,归入 root
+    docker_disk: Option<DfSample>,
+}
+
+/// `df -kP` 单行解析样本(1024-blocks 口径)。
+#[derive(Debug, Default, PartialEq)]
+struct DfSample {
+    total_kb: u64,
+    used_kb: u64,
+    mount: String,
 }
 
 /// 解析宿主机性能采样输出(纯函数,便于单测)。
@@ -396,7 +452,8 @@ fn parse_host_metrics(out: &str) -> HostMetrics {
     const S_CPU1: u8 = 1;
     const S_MEM: u8 = 2;
     const S_NPROC: u8 = 3;
-    const S_CPU2: u8 = 4;
+    const S_DISK: u8 = 4;
+    const S_CPU2: u8 = 5;
     let mut kind = S_NONE;
     let mut cpu1 = String::new();
     let mut cpu2 = String::new();
@@ -419,6 +476,10 @@ fn parse_host_metrics(out: &str) -> HostMetrics {
                 kind = S_NPROC;
                 continue;
             }
+            "==DISK" => {
+                kind = S_DISK;
+                continue;
+            }
             "==CPU2" => {
                 kind = S_CPU2;
                 continue;
@@ -429,6 +490,17 @@ fn parse_host_metrics(out: &str) -> HostMetrics {
             S_CPU1 => cpu1 = line.trim().to_string(),
             S_CPU2 => cpu2 = line.trim().to_string(),
             S_NPROC => m.cores = line.trim().parse().ok(),
+            S_DISK => {
+                if let Some(s) = split_df_line(line) {
+                    if s.mount == "/var/lib/docker" {
+                        // /var/lib/docker 自身是挂载点 = Docker 数据在独立文件系统
+                        m.docker_disk = Some(s);
+                    } else if m.root_disk.is_none() {
+                        // df 对每个参数各输出一行;同盘时两行挂载点都是 /,首行即根分区
+                        m.root_disk = Some(s);
+                    }
+                }
+            }
             S_MEM => {
                 if let Some((key, value)) = split_meminfo_line(line) {
                     match key.as_str() {
@@ -463,6 +535,32 @@ fn split_meminfo_line(line: &str) -> Option<(String, u64)> {
     let (key, rest) = line.split_once(':')?;
     let value = rest.trim().split_whitespace().next()?.parse().ok()?;
     Some((key.trim().to_string(), value))
+}
+
+/// 切 `df -kP` 行(纯函数):`/dev/sda1 40203644 8372440 29787180 21% /`
+/// → DfSample { total_kb: 40203644, used_kb: 8372440, mount: "/" }。
+/// 首列设备名按惯例不含空白;挂载点理论上可含空格,故自第 6 列起重新拼接。
+/// 表头(`Filesystem 1024-blocks …`,第 2 列非数字)与残行 → None。
+fn split_df_line(line: &str) -> Option<DfSample> {
+    let t: Vec<&str> = line.split_whitespace().collect();
+    if t.len() < 6 {
+        return None;
+    }
+    let total_kb = t[1].parse().ok()?;
+    let used_kb = t[2].parse().ok()?;
+    Some(DfSample {
+        total_kb,
+        used_kb,
+        mount: t[5..].join(" "),
+    })
+}
+
+/// 磁盘占用百分比(四舍五入整数;total 为 0 → None)。纯函数便于单测。
+fn disk_percent(used_kb: u64, total_kb: u64) -> Option<u64> {
+    if total_kb == 0 {
+        return None;
+    }
+    Some(((used_kb as f64) / (total_kb as f64) * 100.0).round() as u64)
 }
 
 /// 用两次 /proc/stat `cpu ` 汇总行差分计算 CPU 占用百分比(纯函数,便于单测)。
@@ -1081,6 +1179,10 @@ mod tests {
                    Cached:          2210844 kB\n\
                    ==NPROC\n\
                    8\n\
+                   ==DISK\n\
+                   Filesystem 1024-blocks Used Available Capacity Mounted on\n\
+                   /dev/sda1  40203644 8372440 29787180 21% /\n\
+                   /dev/sda1  40203644 8372440 29787180 21% /\n\
                    ==CPU2\n\
                    cpu  150 0 150 750 0 0 0 0 0 0\n";
         let m = parse_host_metrics(out);
@@ -1089,6 +1191,48 @@ mod tests {
         assert_eq!(m.mem_total, Some(16088764 * 1024));
         // used = total - available
         assert_eq!(m.mem_used, Some((16088764 - 9905408) * 1024));
+        // df 表头被跳过;/ 与 /var/lib/docker 同盘时两行挂载点都是 /,
+        // 首行即根分区,Docker 不单列
+        let root = m.root_disk.unwrap();
+        assert_eq!(root.total_kb, 40203644);
+        assert_eq!(root.used_kb, 8372440);
+        assert_eq!(root.mount, "/");
+        assert_eq!(m.docker_disk, None);
+    }
+
+    #[test]
+    fn test_parse_host_metrics_docker_separate_mount() {
+        // /var/lib/docker 是独立挂载点:df 第二行挂载点为自身路径 → 单列 Docker 盘
+        let out = "==DISK\n\
+                   /dev/sda1 40203644 8372440 29787180 21% /\n\
+                   /dev/vdb1 82067888 12400000 65483544 16% /var/lib/docker\n";
+        let m = parse_host_metrics(out);
+        let root = m.root_disk.unwrap();
+        assert_eq!(root.mount, "/");
+        assert_eq!(root.total_kb, 40203644);
+        let docker = m.docker_disk.unwrap();
+        assert_eq!(docker.mount, "/var/lib/docker");
+        assert_eq!(docker.total_kb, 82067888);
+        assert_eq!(docker.used_kb, 12400000);
+        // 无 DISK 段(/proc 缺失等)→ 磁盘字段为空
+        let m = parse_host_metrics("==NPROC\n2\n");
+        assert_eq!(m.root_disk, None);
+        assert_eq!(m.docker_disk, None);
+    }
+
+    #[test]
+    fn test_split_df_line_and_disk_percent() {
+        // 挂载点含空格:自第 6 列起重新拼接
+        let s = split_df_line("/dev/sda1 1000 250 750 25% /mnt/my data").unwrap();
+        assert_eq!((s.total_kb, s.used_kb, s.mount.as_str()), (1000, 250, "/mnt/my data"));
+        // 表头(第 2 列非数字)与残行 → None
+        assert_eq!(split_df_line("Filesystem 1024-blocks Used Available Capacity Mounted on"), None);
+        assert_eq!(split_df_line("/dev/sda1 1000 250"), None);
+        assert_eq!(split_df_line(""), None);
+        // 百分比:常规 / 满 / 空盘
+        assert_eq!(disk_percent(250, 1000), Some(25));
+        assert_eq!(disk_percent(1000, 1000), Some(100));
+        assert_eq!(disk_percent(0, 0), None);
     }
 
     #[test]

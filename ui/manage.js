@@ -378,6 +378,22 @@
       $('ov-mem').textContent = ov.mem_total
         ? (ov.mem_used || '—') + ' / ' + ov.mem_total + (ov.mem_percent ? '(' + ov.mem_percent + ')' : '')
         : '—';
+      // 宿主机文件系统用量(第十批):根分区恒展示;Docker 数据目录
+      // (/var/lib/docker)独立挂载时追加「Docker 数据盘」一段 —— 与根分区
+      // 同盘时后端不单列,隐藏该段(宽格第二行,采样不可用则整行不出现)
+      var hostDisk = $('ov-hostdisk');
+      var diskParts = [];
+      if (ov.root_disk_total) {
+        diskParts.push('根分区 / ' + (ov.root_disk_used || '—') + ' / ' + ov.root_disk_total +
+          (ov.root_disk_percent ? '(' + ov.root_disk_percent + ')' : ''));
+      }
+      if (ov.docker_disk_mount && ov.docker_disk_total) {
+        diskParts.push('Docker 数据盘 ' + ov.docker_disk_mount + ' ' +
+          (ov.docker_disk_used || '—') + ' / ' + ov.docker_disk_total +
+          (ov.docker_disk_percent ? '(' + ov.docker_disk_percent + ')' : ''));
+      }
+      hostDisk.textContent = diskParts.join(' · ');
+      hostDisk.classList.toggle('is-on', diskParts.length > 0);
       hideError();
     }).catch(function (err) {
       var msg = err && err.message ? err.message : String(err);

@@ -869,3 +869,36 @@ v5.8.1 更新内容 → 确认全自动更新重启。
   ssh/stack/commands 等与本批无关处);9 个改动 JS 全过 `node --check`;
   界面改动(设置页按钮行)截图交 judge 验收
 
+# 第十批升级（v5.9.0）
+
+## 阶段二:远程管理概览新增宿主机磁盘用量 ✅
+
+(分阶段路线图阶段二;部署最怕盘满——`docker load` 在 /var/lib/docker 所在
+文件系统写满时失败,此前的概览只有 CPU/内存没有磁盘)
+
+- **采样扩展**(`manage.rs`):`host_metrics_cmd` 单次 exec 追加 `==DISK` 段
+  —— `df -kP / /var/lib/docker 2>/dev/null`(-P POSIX 格式,长设备名不折行;
+  目录不存在时该行缺失,stdout 仍有根分区行)。解析沿用标记行切分:挂载点为
+  `/` 的行归根分区(首行,同盘时 df 对两个参数输出两行 `/`),挂载点恰为
+  `/var/lib/docker` 的行 = Docker 数据目录在**独立文件系统**时才单列
+  (`DfSample { total_kb, used_kb, mount }`,挂载点含空格自第 6 列重新拼接,
+  df 表头第 2 列非数字天然跳过)
+- **payload 扩展**(`ManageOverview` 7 个新展示串字段,snake_case 延续
+  batch 8 口径):`root_disk_used / root_disk_total / root_disk_percent` +
+  `docker_disk_used / docker_disk_total / docker_disk_percent / docker_disk_mount`
+  (采样不可用为空串;百分比 = used/total 四舍五入,与 mem_percent 同口径)
+- **前端**(`manage.js` / `index.html` / `style.css`):不新增概览格(宽格
+  span-4 整行,插普通格会留 3 格空洞)——在「磁盘占用」宽格内加第二行
+  `.overview-sub`(标签升级为「磁盘占用 DISK USAGE」):`根分区 / x / y(p%)`,
+  Docker 数据盘独立挂载时追加 `Docker 数据盘 <挂载点> x / y(p%)`,采样不可用
+  整行隐藏(`.is-on` 类切换,display 切换无动效——数据刷新非状态迁移)
+- **测试**:+2(独立挂载解析 / split_df_line 与 disk_percent 变体含表头跳过、
+  含空格挂载点、残行、空盘),`test_parse_host_metrics` 同步补 ==DISK 段
+- **已知取舍**:Docker 实际数据根(`docker info .DockerRootDir`,如自定义
+  data-root 指到别处)未探测,当前按默认 /var/lib/docker 采样;后续如需可在此
+  段追加一条 `docker info -f` 查询
+- **验证**:`cargo test` 显式确认 `test result: ok. 285 passed; 0 failed;
+  13 ignored`(+2);clippy 零新增警告(存量 15 条不变);`node --check` 过;
+  真机(henghao 实连)截图交 judge 验收概览磁盘行
+
+

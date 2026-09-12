@@ -1814,6 +1814,19 @@ select.text-input option,
   font-variant-numeric: tabular-nums;
   word-break: break-all;
 }
+/* 概览宽格第二行(第十批):宿主机根分区 / Docker 数据盘文件系统用量。
+   默认隐藏(后端未采到时不留空行),由 manage.js 按采样结果加 .is-on 显示;
+   含挂载点路径与数字,用 overflow-wrap 而非 break-all(散文式断行) */
+.overview-sub {
+  display: none;
+  margin-top: 2px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ark-ink);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.overview-sub.is-on { display: block; }
 
 /* ===== Tab 分段控件 =====
    [审计 P2-7 决策] 面板级 tab:激活态 = 青色下划线 + 600 字重、无墨底填充,
