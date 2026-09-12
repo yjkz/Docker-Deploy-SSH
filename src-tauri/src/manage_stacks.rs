@@ -103,7 +103,7 @@ pub async fn manage_list_stacks(
     let archived_filter = if include_archived {
         String::new()
     } else {
-        " ! -path '*/releases/*'"
+        String::from(" ! -path '*/releases/*'")
     };
     let cmd = format!(
         "find {} -maxdepth 4 -type f \\( -name 'docker-compose.yml' -o -name 'docker-compose.yaml' -o -name 'compose.yml' -o -name 'compose.yaml' \\){} ",
