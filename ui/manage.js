@@ -371,6 +371,13 @@
         (ov.containers_total || '0');
       $('ov-images').textContent = ov.images_total || '0';
       $('ov-disk').textContent = ov.disk_used || '—';
+      // 宿主机性能指标(空串 = 采样不可用,/proc 缺失等 → 「—」)
+      $('ov-cpu').textContent = ov.cpu_percent
+        ? ov.cpu_percent + (ov.cpu_cores ? '(' + ov.cpu_cores + ' 核)' : '')
+        : '—';
+      $('ov-mem').textContent = ov.mem_total
+        ? (ov.mem_used || '—') + ' / ' + ov.mem_total + (ov.mem_percent ? '(' + ov.mem_percent + ')' : '')
+        : '—';
       hideError();
     }).catch(function (err) {
       var msg = err && err.message ? err.message : String(err);

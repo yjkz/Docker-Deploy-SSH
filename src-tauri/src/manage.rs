@@ -219,6 +219,16 @@ pub struct ManageOverview {
     containers_total: String,
     images_total: String,
     disk_used: String,
+    /// 宿主机 CPU 占用百分比(两次 /proc/stat 采样差分;取不到为空串 → 前端「—」)
+    cpu_percent: String,
+    /// 宿主机逻辑核心数(nproc)
+    cpu_cores: String,
+    /// 宿主机内存已用(人类可读)
+    mem_used: String,
+    /// 宿主机内存总量(人类可读)
+    mem_total: String,
+    /// 宿主机内存占用百分比(四舍五入整数)
+    mem_percent: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -311,6 +321,25 @@ pub async fn manage_overview(
         disk_parts.join(" | ")
     };
 
+    // 3. 宿主机性能采样(概览指标):单次 exec —— /proc/stat 两次采样(间隔 1s)
+    //    差分算 CPU 占用,/proc/meminfo 取内存,nproc 取核心数;/proc 不存在的
+    //    系统(macOS 等)解析为空,前端按「—」降级。内部含 1s 采样间隔,超时放宽
+    let (_, host_out) = with_timeout(
+        EXEC_TIMEOUT_SECS + 5,
+        "获取宿主机性能超时",
+        "请检查服务器网络后重试",
+        exec_collect(&mut client, &host_metrics_cmd()),
+    )
+    .await
+    .unwrap_or((1, String::new()));
+    let host = parse_host_metrics(&host_out);
+    let mem_percent = match (host.mem_used, host.mem_total) {
+        (Some(used), Some(total)) if total > 0 => {
+            Some(((used as f64) / (total as f64) * 100.0).round() as u64)
+        }
+        _ => None,
+    };
+
     Ok(ManageOverview {
         docker_version: info.server_version,
         os: info.operating_system,
@@ -322,7 +351,154 @@ pub async fn manage_overview(
         containers_total: info.containers.to_string(),
         images_total: info.images.to_string(),
         disk_used,
+        cpu_percent: host
+            .cpu_percent
+            .map(|p| format!("{p:.1}%"))
+            .unwrap_or_default(),
+        cpu_cores: host.cores.map(|c| c.to_string()).unwrap_or_default(),
+        mem_used: host.mem_used.map(format_bytes_metric).unwrap_or_default(),
+        mem_total: host.mem_total.map(format_bytes_metric).unwrap_or_default(),
+        mem_percent: mem_percent.map(|p| format!("{p}%")).unwrap_or_default(),
     })
+}
+
+// ===== 宿主机性能采样(概览指标;纯函数,便于单测)=====
+
+/// 拼宿主机性能采样命令:单次 exec 完成 —— /proc/stat 两次采样(间隔 1s)
+/// 差分算 CPU 占用,/proc/meminfo 取内存总量与可用量,nproc 取核心数。
+/// 标记行 `==CPU1/==MEM/==NPROC/==CPU2` 供解析切分;grep 全部 `2>/dev/null`,
+/// /proc 不存在的系统输出为空段(解析为空 → 前端「—」)。
+pub(crate) fn host_metrics_cmd() -> String {
+    "echo '==CPU1'; grep '^cpu ' /proc/stat 2>/dev/null; \
+     echo '==MEM'; grep -E '^(MemTotal|MemAvailable|MemFree|Buffers|Cached):' /proc/meminfo 2>/dev/null; \
+     echo '==NPROC'; nproc 2>/dev/null; \
+     sleep 1; echo '==CPU2'; grep '^cpu ' /proc/stat 2>/dev/null"
+        .to_string()
+}
+
+/// [`host_metrics_cmd`] 的解析产出。
+#[derive(Debug, Default, PartialEq)]
+struct HostMetrics {
+    /// 两次 /proc/stat 采样差分的 CPU 占用(0-100,一位小数)
+    cpu_percent: Option<f64>,
+    /// 逻辑核心数(nproc)
+    cores: Option<u32>,
+    /// 内存总量(字节)
+    mem_total: Option<u64>,
+    /// 内存已用(字节;= total - available,无 available 时 = total - free - buffers - cached)
+    mem_used: Option<u64>,
+}
+
+/// 解析宿主机性能采样输出(纯函数,便于单测)。
+fn parse_host_metrics(out: &str) -> HostMetrics {
+    let mut m = HostMetrics::default();
+    const S_NONE: u8 = 0;
+    const S_CPU1: u8 = 1;
+    const S_MEM: u8 = 2;
+    const S_NPROC: u8 = 3;
+    const S_CPU2: u8 = 4;
+    let mut kind = S_NONE;
+    let mut cpu1 = String::new();
+    let mut cpu2 = String::new();
+    let mut mem_total_kb = None::<u64>;
+    let mut mem_avail_kb = None::<u64>;
+    let mut mem_free_kb = None::<u64>;
+    let mut buffers_kb = None::<u64>;
+    let mut cached_kb = None::<u64>;
+    for line in out.lines() {
+        match line.trim() {
+            "==CPU1" => {
+                kind = S_CPU1;
+                continue;
+            }
+            "==MEM" => {
+                kind = S_MEM;
+                continue;
+            }
+            "==NPROC" => {
+                kind = S_NPROC;
+                continue;
+            }
+            "==CPU2" => {
+                kind = S_CPU2;
+                continue;
+            }
+            _ => {}
+        }
+        match kind {
+            S_CPU1 => cpu1 = line.trim().to_string(),
+            S_CPU2 => cpu2 = line.trim().to_string(),
+            S_NPROC => m.cores = line.trim().parse().ok(),
+            S_MEM => {
+                if let Some((key, value)) = split_meminfo_line(line) {
+                    match key.as_str() {
+                        "MemTotal" => mem_total_kb = Some(value),
+                        "MemAvailable" => mem_avail_kb = Some(value),
+                        "MemFree" => mem_free_kb = Some(value),
+                        "Buffers" => buffers_kb = Some(value),
+                        "Cached" => cached_kb = Some(value),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    m.cpu_percent = cpu_percent_between(&cpu1, &cpu2);
+    if let Some(total) = mem_total_kb {
+        m.mem_total = Some(total * 1024);
+        // MemAvailable(3.14+ 内核)优先;老内核回退 free + buffers + cached
+        let avail = mem_avail_kb.or_else(|| {
+            Some(mem_free_kb.unwrap_or(0) + buffers_kb.unwrap_or(0) + cached_kb.unwrap_or(0))
+        });
+        if let Some(avail) = avail {
+            m.mem_used = Some(total.saturating_sub(avail) * 1024);
+        }
+    }
+    m
+}
+
+/// 切 meminfo 行的「键 值 单位」(纯函数):`MemTotal:  16332000 kB` → ("MemTotal", 16332000)。
+fn split_meminfo_line(line: &str) -> Option<(String, u64)> {
+    let (key, rest) = line.split_once(':')?;
+    let value = rest.trim().split_whitespace().next()?.parse().ok()?;
+    Some((key.trim().to_string(), value))
+}
+
+/// 用两次 /proc/stat `cpu ` 汇总行差分计算 CPU 占用百分比(纯函数,便于单测)。
+/// busy = Δtotal - Δidle - Δiowait,占用 = busy / Δtotal;Δtotal 为 0 或解析
+/// 失败(空段/字段不足)→ None。
+fn cpu_percent_between(prev: &str, next: &str) -> Option<f64> {
+    fn jiffies(line: &str) -> Option<(u64, u64)> {
+        // 严格匹配 "cpu "(带空格)的汇总行;"cpu0" 等每核心行不算
+        let v = line.strip_prefix("cpu ")?.trim();
+        let nums: Vec<u64> = v.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+        if nums.is_empty() {
+            return None;
+        }
+        let total: u64 = nums.iter().sum();
+        let idle = nums.get(3).copied().unwrap_or(0) + nums.get(4).copied().unwrap_or(0);
+        Some((total, idle))
+    }
+    let (p_total, p_idle) = jiffies(prev)?;
+    let (n_total, n_idle) = jiffies(next)?;
+    let d_total = n_total.checked_sub(p_total)?;
+    let d_idle = n_idle.checked_sub(p_idle)?;
+    if d_total == 0 {
+        return None;
+    }
+    let busy = d_total.saturating_sub(d_idle);
+    Some((busy as f64 / d_total as f64 * 1000.0).round() / 10.0)
+}
+
+/// 字节 → 人类可读(≥1GB 显示 GB 一位小数,否则 MB 取整)。
+fn format_bytes_metric(bytes: u64) -> String {
+    let gb = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    if gb >= 1.0 {
+        format!("{gb:.1} GB")
+    } else {
+        format!("{:.0} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
 }
 
 #[tauri::command]
@@ -865,4 +1041,78 @@ pub async fn manage_network_disconnect(
         exec_action(&mut client, &cmd),
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cpu_percent_between() {
+        // 常规差分:Δtotal=300, Δidle=100, busy=200 → 66.7%
+        let p = cpu_percent_between(
+            "cpu  100 0 100 700 0 0 0 0 0 0",
+            "cpu  200 0 200 800 0 0 0 0 0 0",
+        )
+        .unwrap();
+        assert!((p - 66.7).abs() < 0.1, "实际 {p}");
+        // 计数器无增长(采样过快)→ None
+        assert_eq!(
+            cpu_percent_between(
+                "cpu  100 0 100 700 0 0 0 0 0 0",
+                "cpu  100 0 100 700 0 0 0 0 0 0",
+            ),
+            None
+        );
+        // 空段 / 非 cpu 行 → None
+        assert_eq!(cpu_percent_between("", ""), None);
+        assert_eq!(cpu_percent_between("cpu0 1 2 3", "cpu0 4 5 6"), None);
+    }
+
+    #[test]
+    fn test_parse_host_metrics() {
+        let out = "==CPU1\n\
+                   cpu  100 0 100 700 0 0 0 0 0 0\n\
+                   ==MEM\n\
+                   MemTotal:       16088764 kB\n\
+                   MemAvailable:    9905408 kB\n\
+                   MemFree:         5204300 kB\n\
+                   Buffers:          322148 kB\n\
+                   Cached:          2210844 kB\n\
+                   ==NPROC\n\
+                   8\n\
+                   ==CPU2\n\
+                   cpu  150 0 150 750 0 0 0 0 0 0\n";
+        let m = parse_host_metrics(out);
+        assert!((m.cpu_percent.unwrap() - 66.7).abs() < 0.1);
+        assert_eq!(m.cores, Some(8));
+        assert_eq!(m.mem_total, Some(16088764 * 1024));
+        // used = total - available
+        assert_eq!(m.mem_used, Some((16088764 - 9905408) * 1024));
+    }
+
+    #[test]
+    fn test_parse_host_metrics_fallback_and_missing() {
+        // 老内核无 MemAvailable:回退 free + buffers + cached
+        let out = "==MEM\n\
+                   MemTotal:       1000000 kB\n\
+                   MemFree:         400000 kB\n\
+                   Buffers:         100000 kB\n\
+                   Cached:          200000 kB\n";
+        let m = parse_host_metrics(out);
+        assert_eq!(m.mem_total, Some(1000000 * 1024));
+        assert_eq!(m.mem_used, Some((1000000 - 700000) * 1024));
+        assert_eq!(m.cpu_percent, None);
+        assert_eq!(m.cores, None);
+        // /proc 不存在的系统:全空输出 → 全空
+        let m = parse_host_metrics("");
+        assert_eq!(m, HostMetrics::default());
+    }
+
+    #[test]
+    fn test_format_bytes_metric() {
+        assert_eq!(format_bytes_metric(512 * 1024 * 1024), "512 MB");
+        assert_eq!(format_bytes_metric(2 * 1024 * 1024 * 1024), "2.0 GB");
+        assert_eq!(format_bytes_metric(15 * 1024 * 1024 * 1024 + 5), "15.0 GB");
+    }
 }

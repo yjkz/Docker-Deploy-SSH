@@ -814,3 +814,22 @@ Release 的版本说明(标题 + 更新描述),在回滚中心点击归档即可
 **验证**:`cargo test` 279 passed(基线 269 + 第七批 9 + 本批 1);`node --check` 全过;
 模态 id 与 index.html 核对;真实验证路径 = 用户装着 v5.8.0 检查更新 → 弹出模态显示
 v5.8.1 更新内容 → 确认全自动更新重启。
+
+### 阶段三:概览宿主机性能指标 + 监控模块审计 ✅
+
+- **概览新增宿主机性能指标**:`manage_overview` 增 `cpu_percent` / `cpu_cores` /
+  `mem_used` / `mem_total` / `mem_percent`(snake_case 展示串;采样不可用为空串 →
+  前端「—」)。单次 exec 完成采样:`/proc/stat` 两次采样(间隔 1s)差分算 CPU 占用
+  (busy = Δtotal - Δidle - Δiowait)、`/proc/meminfo` 取内存(MemAvailable 优先,
+  老内核回退 free+buffers+cached)、`nproc` 取核心数;/proc 缺失的系统(macOS 等)
+  优雅降级。前端概览格新增「CPU 占用(含核心数)」「内存 已用/总量(百分比)」两格
+  (随自动刷新同步刷新)。新增纯函数单测 4 个(采样差分/解析与老内核回退/格式化/边界)
+- **监控模块审计(结论:无错漏)**:逐项核对 manage_stats.rs(545 行)与 manage.js
+  监控侧 —— ①generation 单会话 + 轮间 200ms 步进退出,重复 start 无缝接管;
+  ②会话级 SSH 连接跨轮复用,单轮失败三分类(权限拒绝停止 / 命令失败继续 /
+  传输失败重连),连续 3 轮连接失败熔断;③旧版 Docker `--format json` 降级模板;
+  ④前端事件先订阅后 invoke、行差异更新、**切 Tab / 切服务器均停监控**
+  (manage.js:219/330)、**跨服务器事件三重丢弃**(server_id 不匹配直接 return)、
+  徽章带最后更新时间;⑤已知取舍(非 bug):「实时」= 轮询采样,`docker stats
+  --no-stream` 自身有 ~1-2s 采样窗口,真实帧周期 ≈ 采集耗时 + 设定间隔
+  (模块头注释已声明),这是无流式 API 可经 SSH 稳定消费场景下的标准做法
