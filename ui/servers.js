@@ -1226,9 +1226,9 @@
       if (srvMatch) {
         srvTd.textContent = String(srvMatch.name || srvMatch.host);
       } else if (project.default_server_id) {
-        srvTd.appendChild(el('span', 'none-text', '(服务器已删除)'));
+        srvTd.appendChild(el('span', 'none-cjk', '(服务器已删除)'));
       } else {
-        srvTd.appendChild(el('span', 'none-text', '(未指定)'));
+        srvTd.appendChild(el('span', 'none-cjk', '(未指定)'));
       }
       tr.appendChild(srvTd);
 
@@ -1238,15 +1238,20 @@
       if (project.remote_dir) {
         dirTd.textContent = String(project.remote_dir);
       } else if (srvMatch) {
-        dirTd.appendChild(el('span', 'none-text', '继承 ' + String(srvMatch.remote_dir || '?')));
+        dirTd.appendChild(el('span', 'none-cjk', '继承 ' + String(srvMatch.remote_dir || '?')));
       } else {
-        dirTd.appendChild(el('span', 'none-text', '继承服务器'));
+        dirTd.appendChild(el('span', 'none-cjk', '继承服务器'));
       }
       tr.appendChild(dirTd);
 
       var filterTd = document.createElement('td');
       filterTd.className = 'mono';
-      filterTd.textContent = String(project.image_filter || '(空,匹配全部)');
+      // pass 5:中文占位符出 mono 轨道(宋体回退),数据值保持 mono
+      if (project.image_filter) {
+        filterTd.textContent = String(project.image_filter);
+      } else {
+        filterTd.appendChild(el('span', 'none-cjk', '(空,匹配全部)'));
+      }
       tr.appendChild(filterTd);
 
       var composeTd = document.createElement('td');
@@ -2119,7 +2124,7 @@
       if (svc.image) {
         tdImg.textContent = String(svc.image);
       } else {
-        tdImg.appendChild(el('span', 'none-text', '(未设 image 字段)'));
+        tdImg.appendChild(el('span', 'none-cjk', '(未设 image 字段)'));
       }
       tr.appendChild(tdImg);
 

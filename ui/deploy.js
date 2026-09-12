@@ -1012,7 +1012,7 @@
     if (svc.image) {
       tdImg.textContent = String(svc.image);
     } else {
-      tdImg.appendChild(el('span', 'none-text', '(未设 image 字段)'));
+      tdImg.appendChild(el('span', 'none-cjk', '(未设 image 字段)'));
     }
     tr.appendChild(tdImg);
 
