@@ -612,6 +612,10 @@
         <div id="manage-stacks-panel" class="manage-tab-panel hidden" role="tabpanel" aria-label="栈">
           <div class="manage-pull-bar">
             <button id="manage-stack-refresh-btn" class="btn btn-sm" type="button">刷新栈</button>
+            <label class="manage-autorefresh" title="勾选后把 releases/ 归档内的 compose 副本也列入栈列表(默认排除——那是回滚留档,不是可操作栈)">
+              <input type="checkbox" id="manage-stacks-archived-toggle">
+              <span>显示归档副本</span>
+            </label>
           </div>
           <div class="table-wrap">
             <table class="data-table manage-table">

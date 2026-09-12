@@ -82,19 +82,33 @@ fn compose_prefix(compose_file: &str) -> String {
 
 // ===== Tauri 命令 =====
 
-/// 扫描 remote_dir 下(深度 ≤4,与回滚中心/清理分析的项目扫描口径一致)的 compose 文件,返回栈列表
+/// 扫描 remote_dir 下(深度 ≤4,与回滚中心/清理分析的项目扫描口径一致)的
+/// compose 文件,返回栈列表。
+///
+/// `include_archived`(camelCase;缺省 false):默认**排除**本应用部署归档内的
+/// compose 副本(`*/releases/*` 下的文件 —— 深度放开到 4 后会被扫进来,但那是
+/// 回滚留档不是可操作栈);勾选「显示归档副本」时不过滤。
 #[tauri::command]
 pub async fn manage_list_stacks(
     server_id: String,
     password_plain: Option<String>,
+    include_archived: Option<bool>,
 ) -> Result<Vec<StackRow>, String> {
+    let include_archived = include_archived.unwrap_or(false);
     let (server, mut client) = connect_server(&server_id, password_plain.as_deref()).await?;
 
     // find 多 -name 需 \( \) 与 -o 组合;深度 ≤4(第八批:与回滚中心/清理分析的
-    // 项目扫描口径统一,原为 ≤2 —— 部署目录下超过一层子目录的栈会扫不到)
+    // 项目扫描口径统一,原为 ≤2 —— 部署目录下超过一层子目录的栈会扫不到)。
+    // 默认追加 ! -path '*/releases/*' 排除归档副本(与项目扫描同一排除口径)。
+    let archived_filter = if include_archived {
+        String::new()
+    } else {
+        " ! -path '*/releases/*'"
+    };
     let cmd = format!(
-        "find {} -maxdepth 4 -type f \\( -name 'docker-compose.yml' -o -name 'docker-compose.yaml' -o -name 'compose.yml' -o -name 'compose.yaml' \\)",
-        shell_quote(&server.remote_dir)
+        "find {} -maxdepth 4 -type f \\( -name 'docker-compose.yml' -o -name 'docker-compose.yaml' -o -name 'compose.yml' -o -name 'compose.yaml' \\){} ",
+        shell_quote(&server.remote_dir),
+        archived_filter
     );
     let (code, out) = with_timeout(
         EXEC_TIMEOUT_SECS,

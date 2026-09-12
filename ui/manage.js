@@ -1995,6 +1995,11 @@
   function bindEventsC() {
     var sr = $('manage-stack-refresh-btn');
     if (sr) sr.addEventListener('click', function () { refreshStacks(); });
+    // 「显示归档副本」勾选切换即自动刷新列表(默认不勾 = 排除归档副本)
+    var archivedToggle = $('manage-stacks-archived-toggle');
+    if (archivedToggle) {
+      archivedToggle.addEventListener('change', function () { refreshStacks(); });
+    }
 
     var ms = $('monitor-start-btn');
     if (ms) ms.addEventListener('click', monitorStart);
@@ -2007,10 +2012,19 @@
   }
 
   // ===== Compose 栈列表 =====
+  /** 「显示归档副本」勾选态(默认不勾 = 排除 releases/ 归档内的 compose 副本) */
+  function stacksArchivedFlag() {
+    var t = $('manage-stacks-archived-toggle');
+    return !!(t && t.checked);
+  }
+
   function refreshStacks() {
     if (!state.serverId || state.inFlight) return;
     state.inFlight = true;
-    AppBus.invoke('manage_list_stacks', { serverId: state.serverId }).then(function (list) {
+    AppBus.invoke('manage_list_stacks', {
+      serverId: state.serverId,
+      includeArchived: stacksArchivedFlag()
+    }).then(function (list) {
       state.inFlight = false;
       renderStacks(list || []);
     }).catch(function (err) {
