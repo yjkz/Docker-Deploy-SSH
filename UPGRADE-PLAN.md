@@ -679,6 +679,34 @@ notify: {
 DOM 的既有误报);对比度实测:焦点环亮/暗 18.29:1 / 10.96:1、stat-warm/hot 亮暗四组 5.59–13.14:1、
 badge-ok 暗 8.11:1,全部过 WCAG;时长/缓动字面量 grep 归零(仅 token 定义与注释保留)。
 
+### 阶段七:字体轨道筛查与统一(随 v5.7.4 发布)
+
+用户审查发现「认证 AUTH」「待确认」「(未指定)/继承服务器/(空,匹配全部)」「已连接」等细节
+文字与全站格格不入。**根因**:`--font-mono`(JetBrains Mono)与 `--font-cond`(Space Grotesk)
+都没有汉字字形,这些中文元素回退到系统 generic monospace/sans-serif——Windows 下即**宋体**
+(细衬线),与全站 Noto Sans SC 黑体冲突;`.none-text` 还叠加仿斜,双重违和。
+
+- **全量筛查**:45 处 `--font-mono` + 11 处 `--font-cond` 声明逐个按「实际内容是否含中文」分类
+- **系统性兜底**:两个轨道字体栈尾部内置 `"Noto Sans SC", "Microsoft YaHei"`——日志/终端/
+  路径值/数据行里夹杂的中文一律渲染为黑体,任何组件再漏也不落到宋体
+- **中文主体元素出轨道(17 类)**:`.badge`(CJK/500,徽章文字是中文状态词——「待检测/待确认/
+  已连接/部署中」的主要来源)/ `.data-table th` 与 `.migrate-plan-table th`、`.help-content th`
+  (表头中英混排)/ `.form-group-title` 四别名(中文主体曾随容器落 cond)/ `.kv-key`(键名
+  「认证 AUTH」混排,字距 .14em→.08em)/ `.overview-label` / `.inspect-label` /
+  `.manage-overview-label` / `.rollback-list-title` / `.migrate-plan-label` / `.migrate-log-head` /
+  `.banner-ok` / `.modal-close` / `.log-toggle` / `.cio-danger-title` / `.server-check-title`
+- **中文占位符**:新增 `.none-cjk`(CJK + 弱化墨);`.none-text` 的 mono 斜体只保留给 `<none>`
+  这类 ASCII 数据值;servers.js 五处 + deploy.js 一处中文占位换类,`(空,匹配全部)` 改条件渲染;
+  行 hover 反色配套 `.none-cjk` 色变
+- **规则入约**:style.css 文件头 + wiki/03 立约「mono/cond 只承载 ASCII;内容含中文的元素
+  一律 --font-cjk」;字距按「中文主体不进轨道」收敛(.12/.14em → .08em)
+
+**验证**:`node --check` 全过;浏览器实测各元素 computed font-family 全部解析到 Noto Sans SC
+栈(徽章/kv 键/表头/分组标题/none-cjk/modal-close/log-toggle/banner-ok);真页截图 +
+临时 DOM 探针条(待检测/待确认/已连接/失败徽章 + 三种中文占位)确认中文全部黑体、无宋体残留;
+judge 前后同场景对比(暗色管理页:未连接徽章/概览标签/表头/占位符)确认修复达成、无字距/
+字重/布局回归。
+
 ### 遗留与取舍（记录在 wiki 07 已知限制）
 
 - 源服务器内容保留不动 ⇒ 迁移后两台同跑,卷数据是导出时刻快照,源后续写入不回传(确认页明确提示尽快停用源)
