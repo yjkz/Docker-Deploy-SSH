@@ -942,5 +942,30 @@ v5.8.1 更新内容 → 确认全自动更新重启。
   截图交 judge;真机端到端(部署一个整栈项目 → 回滚中心看归档说明)
   待用户下次实际部署时确认
 
+## 真机反馈修复 + 标题预填(用户实测 v5.10.0 后,同批追加)✅
+
+用户真机实测发现两件事:
+
+1. **版本详情保存恒败(第七批潜伏 bug,真机首曝)**:保存报
+   `bash: .../<项目>/releases/<ts>/releases/<ts>/release-notes.json.ddtmp.N:
+   No such file or directory` —— `RollbackReleaseDetail.dir` 存的是
+   **归档完整路径**(`remote_join(releases_root, ts)`,5398 行),版本详情
+   模态保存时误把它当**项目目录**传给 `rollback_set_release_notes`(命令
+   内部还会再拼一层 `releases/<ts>`),路径翻倍必然落空。同命令的部署
+   预填补写路径无此问题(用历史 release_dir 经 lastIndexOf 拆分,天然
+   防御项目目录本身含 `/releases/` 的情况);删除归档/执行回滚不受影响
+   (走 selectedDir)。**修复**:模态保存改用明细请求的项目目录
+   `selectedDir`(rollback.js `openReleaseDetail`)。注意:此 bug 意味着
+   第七批的版本说明保存从上线起在真实服务器上就不可用(当时验证未覆盖
+   真机写入),本次一并根治
+2. **部署时缺版本标题输入**:补「版本标题」input(`#deploy-release-title`,
+   与说明同区,均可选);快照与补写带 title。**标题仅作展示备注,归档
+   目录名/时间戳标识不变**;回滚中心列表恒为「时间戳 + 标题并排 +
+   已备注徽章」(第三批起实现,标题从不覆盖时间戳,本次向用户确认该行为)
+- **验证**:`node --check` 过;`cargo test` 285 passed 显式确认(后端零
+  改动);浏览器桩截图(标题+说明双输入渲染)交 judge;路径翻倍修复
+  待用户真机复测保存版本标题/说明
+
+
 
 

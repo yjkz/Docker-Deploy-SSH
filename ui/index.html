@@ -326,8 +326,13 @@
                 <span>强制留档(便于回滚,较慢)</span>
               </label>
               <div class="form-hint deploy-stack-options-hint">未变化的服务跳过打包/上传/装载;强制留档时未变化镜像仍打包进发布目录(供回滚 docker load),仅跳过装载,可与上一项同开</div>
-              <!-- 版本说明(第十一批,可选):随本次发布归档写入 release-notes.json,
-                   回滚中心版本详情可查看/编辑;部署成功后自动补写,留空则跳过 -->
+              <!-- 版本标题/版本说明(第十一批,可选):随本次发布归档写入 release-notes.json,
+                   回滚中心版本详情可查看/编辑;部署成功后自动补写,均留空则跳过。
+                   标题仅作展示备注,不改归档目录名(时间戳标识恒不变、列表恒显示) -->
+              <div class="form-row deploy-release-notes-row">
+                <label class="form-label" for="deploy-release-title">版本标题</label>
+                <input id="deploy-release-title" class="form-input" type="text" maxlength="120" autocomplete="off" spellcheck="false" placeholder="如:v1.2.0 修复登录超时(可选,仅作备注,不影响归档时间戳)">
+              </div>
               <div class="form-row deploy-release-notes-row">
                 <label class="form-label" for="deploy-release-notes">版本说明</label>
                 <textarea id="deploy-release-notes" class="form-textarea deploy-release-notes" rows="3" maxlength="2000" placeholder="本次改了什么?留空跳过。写入发布归档的 release-notes.json,回滚中心版本详情可查看"></textarea>

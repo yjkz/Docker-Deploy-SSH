@@ -486,7 +486,11 @@
     var overlay = $('release-detail-modal');
     var body = $('release-detail-modal-body');
     if (!overlay || !body) return;
-    editingRelease = { dir: rel.dir, ts: rel.ts };
+    // dir 必须是**项目目录**(rollback_set_release_notes 会自行拼 releases/<ts>;
+    // 第十一批修复:此前误用详情行自带的归档完整路径 rel.dir,拼接后变成
+    // <项目>/releases/<ts>/releases/<ts>,保存恒报 No such file or directory。
+    // selectedDir 即本次明细请求(rollback_project_detail)的项目目录)
+    editingRelease = { dir: selectedDir, ts: rel.ts };
     body.textContent = '';
 
     var errBox = window.formErrorBox('rn-error');

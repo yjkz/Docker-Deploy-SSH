@@ -155,9 +155,10 @@
     rbLogs: [],        // 回滚模态内日志区累积的日志行(deploy-log 镜像)
     resume: null,      // deploy_resume_status 查询到的断点视图(ResumeView;无断点为 null)
     resumeBusy: false, // deploy_resume_discard 请求进行中(防重复提交)
-    pendingReleaseNotes: null // 发起整栈部署时快照的版本说明 { serverId, projectId, body };
-                              // 成功后经 rollback_set_release_notes 补写,失败/取消保留
-                              // (断点续传成功后于 handleDone 补写);批量部署恒 null
+    pendingReleaseNotes: null // 发起整栈部署时快照的版本备注 { serverId, projectId,
+                              // title, body };成功后经 rollback_set_release_notes
+                              // 补写,失败/取消保留(断点续传成功后于 handleDone
+                              // 补写);批量部署恒 null
   };
 
   /**
@@ -1506,15 +1507,19 @@
     var services = Array.isArray(st.stack.services) ? st.stack.services : [];
     var skipChk = document.getElementById('deploy-stack-skip');
     var archChk = document.getElementById('deploy-stack-archive');
-    // 版本说明(第十一批):发起时快照输入(可选);批量部署无逐台说明,恒不写
+    // 版本标题/说明(第十一批):发起时快照输入(均可选,标题仅作展示备注,
+    // 不影响归档时间戳命名);批量部署无逐台备注,恒不写
+    var titleEl = document.getElementById('deploy-release-title');
     var notesEl = document.getElementById('deploy-release-notes');
+    var notesTitle = titleEl ? String(titleEl.value).trim() : '';
     var notesBody = notesEl ? String(notesEl.value).trim() : '';
     if (st.batch && st.batch.active) {
       st.pendingReleaseNotes = null;
-    } else if (notesBody) {
+    } else if (notesTitle || notesBody) {
       st.pendingReleaseNotes = {
         serverId: String(server.id),
         projectId: String(project.id),
+        title: notesTitle,
         body: notesBody
       };
     } else {
@@ -1619,12 +1624,13 @@
   }
 
   /**
-   * 补写归档版本说明(第十一批):按发起时快照的 { serverId, projectId, body },
-   * 从部署历史取该服务器+项目最新的成功整栈记录,其 `release_dir` =
-   * `<项目目录>/releases/<时间戳>` 拆出 dir + ts,调
-   * `rollback_set_release_notes` 原子写归档内 release-notes.json。
-   * 写失败只 toast 警示(部署本身已成功,不回滚不重试,用户可在回滚中心
-   * 版本详情里补写);历史缺记录/目录形态异常同样警示后放弃。
+   * 补写归档版本备注(第十一批):按发起时快照的 { serverId, projectId,
+   * title, body },从部署历史取该服务器+项目最新的成功整栈记录,其
+   * `release_dir` = `<项目目录>/releases/<时间戳>` 拆出 dir + ts,调
+   * `rollback_set_release_notes` 原子写归档内 release-notes.json(标题仅作
+   * 展示备注,归档目录名/时间戳不变)。写失败只 toast 警示(部署本身已
+   * 成功,不回滚不重试,用户可在回滚中心版本详情里补写);历史缺记录/
+   * 目录形态异常同样警示后放弃。
    */
   function writeReleaseNotes(ctx) {
     window.AppBus.invoke('get_history').then(function (records) {
@@ -1650,8 +1656,8 @@
         serverId: ctx.serverId,
         dir: dir,
         ts: ts,
-        title: '',
-        body: ctx.body
+        title: ctx.title || '',
+        body: ctx.body || ''
       }).then(function () {
         window.toast('版本说明已写入发布归档(' + ts + ')', 'ok');
       }).catch(function (err) {
