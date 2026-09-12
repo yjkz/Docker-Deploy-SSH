@@ -991,6 +991,36 @@ v5.8.1 更新内容 → 确认全自动更新重启。
 - **JS 大文件拆分**(deploy.js ~3420 / manage.js ~3260 / servers.js ~3020):
   细案另行提交用户批复后实施(本批先落 Rust 侧)
 
+## 阶段二:JS 大文件拆分 + 迁移模态存量 bug 修复 ✅
+
+(细案经用户批复;原则:只沿原作者留好的缝拆「模态级/独立状态域」,
+不动管线与共享 st,不盲拆)
+
+- **拆分结果**(主文件 → 新文件,依赖经宿主尾部 `window.<Kit>` 桥接、
+  入口经同名 var 别名转发,host 调用点零改动):
+  - `deploy.js` 3420 → **2338** + `deploy-rollback.js` 620(一键回滚模态
+    全族,st.rb* 状态域,window.DeployRollback)+ `deploy-migrate.js` 532
+    (项目迁移模态,migState,window.DeployMigrate)
+  - `manage.js` 3257 → **2013** + `manage-stacks.js` 1274(C 阶段独立状态域
+    ——原 2004 行注释「不触碰上方 state 对象」就是现成的缝:Compose 栈/
+    .env/实时监控/Exec 终端/日志跟随/离页清理,window.ManageStacks)
+  - `servers.js` 3019 → **2537** + `servers-cleanup.js` 490(清理分析模态,
+    window.ServersCleanup)
+  - index.html script 顺序:4 个新文件排在各自宿主后(拆出文件只挂
+    window.* 不做初始化,顺序宽松但保持可读)
+- **拆分方法**:脚本先做双向依赖分析(区域→宿主顶层声明的正向外依赖
+  逐个桥接;宿主→区域顶层函数的反向入口逐个别名),不猜不盲切
+- **意外收获——修复迁移模态存量 bug**:`renderMigrateProjectModal` 的
+  `body.insertBefore(标题, grid)` 在 grid 尚未 append 到 body 时调用,
+  按 DOM 规范必抛 NotFoundError —— **「迁移项目…」模态自该行引入起
+  打开即报错**(与拆分无关,HEAD 版本即如此,本次浏览器验证时暴露)。
+  修复:标题持引用、待 grid 挂载后紧贴其前插入
+- **验证**:7 个 JS 全过 `node --check`;id 存在性核对(拆出文件引用的
+  动态 id 均由同文件自建,静态缺失为已知审计误报);浏览器桩渲染四个
+  界面(回滚模态/迁移模态/05 栈 tab/03 清理模态)截图交 judge **4/4
+  pass**;`cargo test` 290 passed 不变(纯 JS/HTML 改动)
+
+
 
 
 
