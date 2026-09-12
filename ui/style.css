@@ -3162,6 +3162,7 @@ code {
 }
 .batch-stat {
   flex: 1;
+  min-width: 0; /* 同 flex 收缩纪律:统计文字长时不挤压右侧「停止批量」按钮 */
   font-size: 12px;
   color: var(--ark-paper-dim-ink);
   font-variant-numeric: tabular-nums;
@@ -3430,6 +3431,7 @@ code {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  min-width: 0; /* 无此值时省略号不生效,长目录名会把右侧徽章挤出视野 */
 }
 .rollback-item-badge { flex: none; }
 .rollback-item-meta {
@@ -3483,14 +3485,19 @@ code {
 }
 .rollback-release:hover { background: var(--ink-on-paper-08); }
 .rollback-release:active { transform: translateY(1px); transition-duration: var(--ark-dur-press); }
-/* 版本标题(设置了说明的归档在 ts 旁展示;CJK 12.5px 墨色) */
+/* 版本标题(设置了说明的归档在 ts 旁展示;与 meta 同款单行省略,防长标题换行撑高行) */
 .rollback-release-title {
   font-size: 12.5px;
   font-weight: 600;
   color: var(--ark-ink);
-  overflow-wrap: anywhere;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .rollback-release-note-badge { flex: none; }
+/* 按钮/徽章不参与收缩:空间不足时由 info(min-width:0)吸收,
+   否则 CJK 按钮的最小内容宽度是单字,会被压成竖排文字(真机截图回归) */
+.rollback-release .btn { flex: none; }
 .rollback-release-info {
   display: flex;
   flex-direction: column;
@@ -3501,6 +3508,7 @@ code {
 .rollback-release-ts {
   font-size: 13px;
   font-weight: 600;
+  white-space: nowrap;
 }
 .rollback-release-meta {
   font-size: 12.5px;

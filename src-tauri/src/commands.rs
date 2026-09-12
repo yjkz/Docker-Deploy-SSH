@@ -5236,7 +5236,7 @@ pub async fn rollback_scan_projects(
     // 第七批二次优化:单次往返 —— 组合命令一次带回 compose 文件清单、
     // releases 归档清单与 `docker ps -a`(Labels 直读 compose working_dir,
     // 替代此前「docker ps 取 ID → 逐容器 inspect」的两次额外往返)
-    let (code, out) = with_timeout(
+    let (_, out) = with_timeout(
         SSH_EXEC_TIMEOUT_SECS,
         "扫描项目超时",
         "请检查服务器网络后重试",
