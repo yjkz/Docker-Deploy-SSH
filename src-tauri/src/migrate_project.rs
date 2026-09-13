@@ -697,7 +697,7 @@ async fn run_migrate_project(
     macro_rules! check_cancel {
         () => {
             if state.is_cancelled_pub() {
-                return Err((commands::CANCELLED_MSG.to_string(), warnings));
+                return Err((crate::errors::cancelled(), warnings));
             }
         };
     }

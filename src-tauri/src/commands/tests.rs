@@ -621,16 +621,17 @@ services:
             project_name: "p".into(),
             images: vec![],
             success: false,
-            message: CANCELLED_MSG.into(),
+            message: crate::errors::cancelled(),
             duration_secs: 3,
             release_dir: None,
             server_id: None,
             project_id: None,
         };
-        // 取消(固定文案)→ cancel 标题
-        let (title, body) = deploy_notify_text(false, CANCELLED_MSG, &Some(record));
+        // 取消(错误码 canceled)→ cancel 标题;正文剥标记展示纯文案
+        let (title, body) = deploy_notify_text(false, &crate::errors::cancelled(), &Some(record));
         assert_eq!(title, "部署已取消");
         assert!(body.contains(CANCELLED_MSG));
+        assert!(!body.contains("dderr"), "正文不得带码标记: {}", body);
         // 普通失败 → failure 标题
         let (title, _) = deploy_notify_text(false, "健康检查未通过", &None);
         assert_eq!(title, "部署失败");
@@ -643,15 +644,16 @@ services:
 
     #[test]
     fn test_hook_failure_result_cancel_passthrough() {
-        // 取消错误原样透传(Pre/Post 同口径):包装成其他文案会让
-        // spawn_deploy_task 的 cancel 判定失配,把取消误报为部署失败
+        // 取消错误(码 canceled)原样透传(Pre/Post 同口径):包装成其他文案会让
+        // 收尾的 cancel 判定失配,把取消误报为部署失败
+        let cancelled = crate::errors::cancelled();
         assert_eq!(
-            hook_failure_result(HookKind::Pre, CANCELLED_MSG),
-            Some(CANCELLED_MSG.to_string())
+            hook_failure_result(HookKind::Pre, &cancelled),
+            Some(cancelled.clone())
         );
         assert_eq!(
-            hook_failure_result(HookKind::Post, CANCELLED_MSG),
-            Some(CANCELLED_MSG.to_string())
+            hook_failure_result(HookKind::Post, &cancelled),
+            Some(cancelled)
         );
     }
 
@@ -693,8 +695,8 @@ services:
 
     #[test]
     fn test_rollback_notify_text_failure_and_cancel() {
-        // 取消(固定文案)→ cancel 标题;普通失败 → failure 标题
-        let (title, _) = rollback_notify_text(false, CANCELLED_MSG, &None);
+        // 取消(错误码 canceled)→ cancel 标题;普通失败 → failure 标题
+        let (title, _) = rollback_notify_text(false, &crate::errors::cancelled(), &None);
         assert_eq!(title, "回滚已取消");
         let (title, body) = rollback_notify_text(false, "回滚目标发布目录不存在", &None);
         assert_eq!(title, "回滚失败");

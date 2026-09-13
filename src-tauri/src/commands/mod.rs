@@ -96,6 +96,10 @@ use crate::stack::{
 };
 
 /// 取消提示文案(取消导致的失败统一用它,便于前端识别)。
+/// 第十六批起:错误串经 [`crate::errors::cancelled`] 挂 `[dderr:canceled]` 标记,
+/// 流程判定一律用 `code_of(e) == Some(ErrCode::Cancelled)`(不再比对文案);
+/// 本常量仅存文案本体供 tests.rs 断言(生产已全部走 errors::cancelled)。
+#[allow(dead_code)]
 pub(crate) const CANCELLED_MSG: &str = "部署已取消";
 // ===== 子模块(第十二批结构治理:按文件头分节拆分;本文件保留跨域共享设施)=====
 // 各子模块经 pub use 再导出,lib.rs 的 commands::xxx 路径不变。
@@ -201,7 +205,12 @@ pub struct DeployProgress {
 #[derive(Debug, Clone, Serialize)]
 pub struct DeployDone {
     pub success: bool,
+    /// 结果消息(第十六批起失败/取消时可带 `[dderr:*]` 码标记;成功为纯文案)
     pub message: String,
+    /// 结果类别码(第十六批,camelCase):"canceled"/"transport"/… 见 wiki/04
+    /// 码表;成功为 None;未知/旧式错误也为 None(前端按无码降级,版本错配安全)
+    #[serde(rename = "errorCode", skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<&'static str>,
 }
 
 /// `deploy` 命令的请求参数。
@@ -408,7 +417,8 @@ where
     }
     // 托盘 tooltip(第十五批):收尾 —— 清运行态并记录终态(成功/失败/取消)。
     // 窗口隐藏时用户回来第一眼从托盘就能看到上次部署结果,不必翻历史。
-    let canceled = matches!(&result, Err(e) if e == CANCELLED_MSG);
+    // 第十六批:取消判定走错误码(不再比对文案)
+    let canceled = matches!(&result, Err(e) if crate::errors::code_of(e) == Some(crate::errors::ErrCode::Cancelled));
     crate::tray_status::set_deploy_finished(&app, result.is_ok(), canceled);
     match &result {
         Ok(()) => {
@@ -418,6 +428,7 @@ where
                     DeployDone {
                         success: true,
                         message: "部署完成".to_string(),
+                        error_code: None,
                     },
                 );
             }
@@ -426,12 +437,23 @@ where
             crate::notify::fire(app.clone(), "success", title, body).await;
         }
         Err(e) => {
-            emit_log(&app, &format!("部署失败: {}", e));
-            // 取消导致的失败(固定文案 CANCELLED_MSG)按 cancel 事件分发
-            let kind = if e.as_str() == CANCELLED_MSG { "cancel" } else { "failure" };
+            emit_log(&app, &format!("部署失败: {}", crate::errors::strip(e)));
+            // 取消导致的失败按错误码分发(第十六批,不再比对文案)
+            let kind = if crate::errors::code_of(e) == Some(crate::errors::ErrCode::Cancelled) {
+                "cancel"
+            } else {
+                "failure"
+            };
             let (title, body) = deploy_notify_text(false, e, &record);
             if emit_done {
-                let _ = app.emit("deploy-done", DeployDone { success: false, message: e.clone() });
+                let _ = app.emit(
+                    "deploy-done",
+                    DeployDone {
+                        success: false,
+                        message: e.clone(),
+                        error_code: crate::errors::code_of(e).map(|c| c.as_str()),
+                    },
+                );
             }
             // 通知中心:部署失败/取消(emit deploy-done 之后异步分发,不阻塞收尾)
             crate::notify::fire(app.clone(), kind, title, body).await;
@@ -447,9 +469,10 @@ where
 
 /// 组装部署收尾通知的标题与正文(纯函数,便于单测)。
 ///
-/// 标题:成功=「部署成功」;取消(错误文案为 CANCELLED_MSG)=「部署已取消」;
+/// 标题:成功=「部署成功」;取消(错误码 canceled)=「部署已取消」;
 /// 其余失败=「部署失败」。正文含项目名 + 服务器名 + 结果消息 + 耗时;
 /// `record` 为 `None`(管线 panic,记录丢失)时用兜底文案。
+/// `message` 允许带错误码标记:正文剥标记后展示(第十六批)。
 fn deploy_notify_text(
     success: bool,
     message: &str,
@@ -457,7 +480,7 @@ fn deploy_notify_text(
 ) -> (String, String) {
     let title = if success {
         "部署成功".to_string()
-    } else if message == CANCELLED_MSG {
+    } else if crate::errors::code_of(message) == Some(crate::errors::ErrCode::Cancelled) {
         "部署已取消".to_string()
     } else {
         "部署失败".to_string()
@@ -465,9 +488,12 @@ fn deploy_notify_text(
     let body = match record {
         Some(r) => format!(
             "项目「{}」@ 服务器「{}」:{}(耗时 {} 秒)",
-            r.project_name, r.server_name, message, r.duration_secs
+            r.project_name,
+            r.server_name,
+            crate::errors::strip(message),
+            r.duration_secs
         ),
-        None => format!("{}(部署详情缺失,详见应用日志)", message),
+        None => format!("{}(部署详情缺失,详见应用日志)", crate::errors::strip(message)),
     };
     (title, body)
 }
@@ -654,7 +680,7 @@ async fn exec_forwarded_inner(
         }
     };
     if saw_cancel.load(Ordering::SeqCst) {
-        return Err(CANCELLED_MSG.to_string());
+        return Err(crate::errors::cancelled());
     }
     if code != 0 {
         let mut msg = format!("远端命令执行失败(退出码 {}): {}", code, cmd);
@@ -670,7 +696,7 @@ async fn exec_forwarded_inner(
     // 末尾取消复查:命令可能全程无输出、回调一次都未触发,
     // 结束后再查一次取消标志,保证取消后不会把该步误报为成功。
     if is_cancelled(app) {
-        return Err(CANCELLED_MSG.to_string());
+        return Err(crate::errors::cancelled());
     }
     Ok(())
 }
@@ -954,7 +980,7 @@ fn reset_cancelled(app: &AppHandle) {
 /// 各步骤之间的取消检查:已取消则返回错误中止管线。
 fn ensure_not_cancelled(app: &AppHandle) -> Result<(), String> {
     if is_cancelled(app) {
-        Err(CANCELLED_MSG.to_string())
+        Err(crate::errors::cancelled())
     } else {
         Ok(())
     }

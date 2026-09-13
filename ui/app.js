@@ -17,6 +17,10 @@
  * - window.copyText(text)         复制文本到剪贴板(成功 toast「已复制」)
  * - window.errText(err)           错误值 → 可展示文本(全站统一口径,
  *                                 空值兜底「未知错误」,非 Error 对象转字符串)
+ * - window.parseErrCode(err)      错误码(第十六批):'\u001f[dderr:<code>]'
+ *                                 标记 → code 字符串('canceled' 等,见 wiki/04);
+ *                                 无标记返回 null —— 判定不认识码时按无码降级
+ * - window.errStripCode(err)      剥掉错误码标记的可展示文本(errText 的码安全版)
  * - window.bindFieldValidation(formRoot, rules)
  *                                 失焦校验接线器(同份规则兼作提交前整体校验;
  *                                 必填类错误在首次提交后才提示,格式类恒提示)
@@ -225,10 +229,29 @@
   // 非 Error 对象转字符串 —— 避免 toast / 错误框出现空文案。
   window.errText = function (err) {
     if (!err) return '未知错误';
-    if (typeof err === 'string') return err;
-    if (err.message) return err.message;
-    return String(err);
+    var s;
+    if (typeof err === 'string') s = err;
+    else if (err.message) s = err.message;
+    else s = String(err);
+    // 第十六批:剥掉可能存在的错误码标记(\u001f[dderr:*]),展示层永不带码 ——
+    // 全站 68 处 errText 调用点零改动自动获得码安全;判定请用 parseErrCode
+    return s.replace(/^\u001f\[dderr:[a-z_]+\]/, '');
   };
+
+  // ===== 错误码(第十六批):机器可读的错误类别,消除中文文案匹配 =====
+  // 后端错误串可带头部标记 `\u001f[dderr:<code>]`(控制字符,UI 不渲染),
+  // 前端判定(如「是否取消」「是否传输失败」)一律先 parseErrCode 取码;
+  // 取不到码(旧式错误/版本错配)返回 null,调用方回退旧文案匹配或默认分支。
+  // 码表见 wiki/04(canceled/transport/auth/perm_denied/timeout/network/
+  // protocol/config/parse/fs/input/internal)。
+  // 展示一律走 errText(已剥码);errStripCode 是其同义别名(码改造期过渡用)。
+  window.parseErrCode = function (err) {
+    if (err == null) return null;
+    var s = typeof err === 'string' ? err : (err && err.message) || String(err);
+    var m = /^\u001f\[dderr:([a-z_]+)\]/.exec(s);
+    return m ? m[1] : null;
+  };
+  window.errStripCode = function (err) { return window.errText(err); };
 
   // ===== 呈现辅助:内联 SVG 图标 + 状态徽章(供各页面脚本构造 DOM)=====
   var SVG_NS = 'http://www.w3.org/2000/svg';

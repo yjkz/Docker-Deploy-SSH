@@ -1423,3 +1423,87 @@ tauri 的 `set_tooltip` = `run_item_main_thread!`(投递主线程 + `rx.recv()` 
 - `verify/scope-integrity.js` / `verify/bridge-integrity.js` / `verify/form-validation.js`
   (54 断言)全 PASS;`cargo test` 显式确认 `test result: ok. 302 passed; 0 failed;
   13 ignored`(与 v5.14.0 基线一致,纯前端修复)。
+
+# 第十六批升级(v5.15.0)— 结构化错误码
+
+> 候选池项,用户选定「先搞定结构化错误码」并要求**低耦合、后期增减好维护**;
+> 首批范围批复:一次做全量错误类(12 类)。
+
+## 背景
+
+全后端错误通道统一是 `Result<T, String>`,但流程判定长期依赖**中文字面子串匹配**:
+
+- 后端 `e == CANCELLED_MSG`(部署/回滚收尾判定 cancel 事件,4 处);
+- `is_transport_error` 匹配 4 个中文短语区分传输层/命令层(决定监控重连,wiki/07 限制 13);
+- 前端 `message === '部署已取消'` 逐字匹配(部署横幅/批量循环/历史徽章,7 处)。
+
+文案匹配的脆性:改文案即断判定、无法国际化、判定语义不可见。
+
+## 设计:`[dderr:*]` 前缀旁路(低耦合核心)
+
+**不改 94 个命令签名与事件结构**,错误串仍是一个 String,头部带
+`\u001f[dderr:<code>]` 标记(US 控制字符开头:UI 不渲染、不与用户数据撞车、
+老版本前端收到也肉眼无感):
+
+```
+errors::tagged(ErrCode::Cancelled, "部署已取消")
+  => "\u001f[dderr:canceled]部署已取消"
+errors::code_of(s) => Some(ErrCode::Cancelled)  // 判定
+errors::strip(s)   => "部署已取消"               // 展示
+```
+
+- **渐进采纳**:未挂码的旧式错误 `code_of` 得 None,行为与旧版一致;
+- **判定只认码不认文案**;无码/未知码一律按无码降级(前后端版本错配安全,
+  单测锁定);
+- **加类**:枚举加变体 + `as_str`/`from_str_raw` 各一行;**删类**:编译器
+  穷尽匹配逐点报出使用处 —— 增减只动 errors.rs 与使用点,契约(码名)不变;
+- **文案匹配仅存留于远端工具原样输出解析**(docker permission denied /
+  pull 401)—— 外部工具输出无法挂码,是合法存留区(文档明示)。
+
+## 12 类错误码(canceled/transport/auth/perm_denied/timeout/network/
+protocol/config/parse/fs/input/internal)
+
+码表与来源见 wiki/04「全局错误约定」。首批实际挂码:cancel 链路、ssh.rs
+全域(认证/传输/超时/Fs/Protocol)、with_timeout、exec_json_list、stats
+分类;network/internal 预留(枚举已含,使用点后续按需接入)。
+
+## 改造清单
+
+### 后端
+- `errors.rs`(新,约 230 行含 7 单测):tagged/code_of/strip/cancelled/perm_denied
+- 取消链路:mod.rs(deploy_notify_text 判码、finish 判码、3 生产点)、
+  deploy.rs(hook_failure_result 透传+剥码包装、pull map_err、1 生产点)、
+  rollback.rs(notify_text 判码、finish 判码)、migrate.rs/migrate_project.rs(4 生产点)
+- ssh.rs:connect 认证失败/主机密钥变更→auth、密钥加载→auth/fs、
+  通道/PTY/SFTP 通道→transport、文件读写→fs、远端建目录退出码→protocol
+- manage.rs:`with_timeout`→timeout、`exec_json_list`→protocol/transport/
+  perm_denied;manage_stacks.rs 权限兜底→perm_denied
+- manage_stats.rs:`StatsPayload` 增 `errorCode`(camelCase 可选);
+  exec_stats_collect 生产点挂码(timeout/transport/protocol/perm_denied);
+  `is_transport_error` 改按 transport/timeout 码判定;熔断 payload 挂码
+- `DeployDone` 增 `errorCode`(camelCase 可选;mod.rs/rollback.rs 4 构造点)
+
+### 前端
+- app.js:`parseErrCode`/`errStripCode` 全局助手;**`errText` 自动剥码**
+  (68 处既有调用零改动获得码安全展示)
+- deploy.js:部署横幅/批量续传收尾/批量单发收尾/历史徽章取消判定改
+  「码优先 + 文案回退」(回退兼容旧历史记录);批量待续传登记改按 state
+  (skipped 只在取消时产生);契约注释更新
+- manage-stacks.js:监控错误 banner/toast 与终端会话结束原因剥码展示
+  (分类判定看 payload.errorCode,现有 stopped 机制不变)
+
+## 已知边界
+
+- 历史 deployments.json 里的旧记录是无码纯文案:历史徽章判定走文案回退,
+  新记录带码 —— 新旧并存,无需迁移
+- `CANCELLED_MSG` 常量保留(文案本体),但**判定不再引用它**
+- update.rs 的 reqwest 错误未挂 network 码(错误已经 classify_http_error
+  分好类,用户可见性无差);挂码属锦上添花,后续需要时接入
+
+## 验证
+
+- `cargo test` 显式确认 `test result: ok. 308 passed; 0 failed; 13 ignored`
+  (基线 302 + errors 6;is_transport_error 测试改为按码断言并新增
+  「无码保守按命令层」用例;map_key_load_error 测试改断码+剥码文案)
+- 前端:三 verify(scope-integrity / bridge-integrity / form-validation 54)全 PASS;
+  parseErrCode 行为断言(码解析/无码 null/防伪装误读/剥码/未知码降级)

@@ -91,6 +91,13 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 - 细节:监控熔断自动退出也清态(否则前端不在线时托盘永远「监控中」);批量逐台是独立单发,台间 tooltip 瞬闪终态再回「部署中」(状态恒准确,间隔 <1s)
 - 验证:`cargo test` 302 passed(基线 292 + 10)/ clippy 零新增 / 真机冒烟进程存活;**tooltip 悬停效果待用户确认**(系统绘制,无自动化断言手段)
 
+### 第十六批 v5.15.0(候选池:结构化错误码)— 已完成
+- 新模块 `src-tauri/src/errors.rs`:错误串头部 `[dderr:<code>]` 前缀旁路(US 控制字符开头,UI 不渲染),**零命令签名改动**;12 个错误类(canceled/transport/auth/perm_denied/timeout/network/protocol/config/parse/fs/input/internal),加类 = 枚举加变体两行,删类 = 编译器穷尽检查兜底;7 单测
+- 后端:取消链路(mod.rs/deploy.rs/rollback.rs/migrate)生产→`errors::cancelled()`、判定→`code_of`;ssh.rs 全域挂码(认证/传输/超时/Fs/Protocol);`with_timeout` 挂 timeout;`exec_json_list` 挂 protocol/transport;stats 传输判定 `is_transport_error` 改按码;`DeployDone`/`StatsPayload` 增 `errorCode` 字段(camelCase 可选)
+- 前端:`parseErrCode`/`errStripCode`(app.js);`errText` 自动剥码(68 处调用零改动);deploy.js 取消判定 5 处改码优先+文案回退;历史徽章/批量循环/监控错误展示兼容新旧格式
+- 文案匹配存留区:仅远端工具原样输出解析(docker permission denied / pull 401),见 wiki/04
+- 验证:`cargo test` 308 passed(基线 302 + errors 6,含 is_transport_error 测试改造);三 verify 全 PASS;行为断言(码解析/剥码/防误读)
+
 ### 第十五批补丁 v5.14.1(修复 05 远程管理页监听全断)— 已完成
 - 根因:第十二批拆分把 manage.js 的 IIFE 局部助手 `$` 留在宿主,manage-stacks.js 40+ 处裸 `$(...)` 在 DOMContentLoaded 即抛 `ReferenceError` → **栈/监控/终端/日志跟随按钮监听全断**(点击无反应、invoke 不发出、后端日志零记录),潜伏 v5.11.0 → v5.14.0 三个版本;「容器/镜像/卷/网络还能用」的边界恰好等于拆分边界
 - 修复(4 行):manage-stacks.js 补 `$` 定义;**新守护 `verify/scope-integrity.js`**(全链加载 + 触发 DOM 回调,专抓初始化回调里的自由标识符断裂,TDD 先红后绿 + 行为级验证点击发出 `manage_stats_start`)
@@ -109,7 +116,6 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 | 容器级指标 | 概览只有宿主机维度;manage_stats 流扩展容器聚合 |
 | 部署前强制预览 | `preview_stack_changes` 已实现未接入部署流程(wiki/03 明示「独立功能」);做成部署前可选/强制预览 |
 | 服务器定时探活+通知 | notify 体系已有桌面/SMTP/webhook;定时探活失败推送 |
-| 结构化错误码 | 现依赖中文文案子串匹配(is_transport_error 等,wiki/07 限制 13);改结构化错误枚举 |
 | image_filter 消费 | 配置字段未被消费(项目下拉过滤,wiki/07 限制 3) |
 | .env 非 UTF-8 | lossy 替换会乱码(wiki/07 限制 17) |
 | Docker data-root 探测 | 概览磁盘按默认 /var/lib/docker 采样;可加 `docker info -f` 探真实数据根 |
@@ -128,7 +134,7 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 
 ## 当前状态速览
 
-- 版本 v5.14.1;main = origin/main;基线 `cargo test` 302 passed / 13 ignored
+- 版本 v5.15.0;main = origin/main;基线 `cargo test` 308 passed / 13 ignored
 - 命令 94 个(lib.rs 注册;wiki/04 已同步);JS 15 文件(index.html 加载顺序见 wiki/03:13)
 - 前端结构:12 模态;commands/ 11 文件;三大 JS 主文件 2338/2013/2537 行
 - 表单体系(第十三批):5 处模态有真实 `<form novalidate>` 语义;失焦校验 + Enter 提交由 app.js 三助手统一承担

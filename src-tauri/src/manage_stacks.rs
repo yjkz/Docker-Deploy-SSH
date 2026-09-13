@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::manage::{
     connect_server, exec_action, exec_json_list, is_docker_perm_denied, shell_quote,
-    with_timeout, ActionResult, EXEC_TIMEOUT_SECS, PERM_DENIED_MSG,
+    with_timeout, ActionResult, EXEC_TIMEOUT_SECS,
 };
 use crate::ssh::exec_collect;
 
@@ -219,7 +219,7 @@ pub async fn manage_stack_logs(
     .await?;
     if code != 0 {
         if is_docker_perm_denied(&out) {
-            return Err(PERM_DENIED_MSG.to_string());
+            return Err(crate::errors::perm_denied());
         }
         return Err(format!("docker compose logs 失败(退出码 {}): {}", code, out.trim()));
     }

@@ -58,7 +58,9 @@
  *     单镜像模式 step 1..5(打标签/导出压缩/上传镜像/同步文件/服务器部署);
  *     整栈模式  step 1..6(分类确认/打包/上传/装载/拉取/启动)
  * - 'deploy-log'      string(带 [HH:MM:SS] 前缀的一行日志)
- * - 'deploy-done'     { success, message }(取消固定 message === "部署已取消")
+ * - 'deploy-done'     { success, message, errorCode? }(失败/取消可带码标记与
+ *                      errorCode 字段;取消判定 parseErrCode === 'canceled',
+ *                      回退文案匹配;第十六批)
  *
  * 交互约定:
  * - 页首「单镜像 / 整栈部署(compose)」双 tab 切换模式;单镜像模式行为不变;
@@ -1623,10 +1625,11 @@
       renderProgress(stepCount() + 1, ''); // step > total:当前模式全部节点置为完成态
       showBanner('ok', isRollback ? '回滚完成' : '部署完成');
       window.toast(isRollback ? '回滚完成' : '部署完成', 'ok');
-    } else if (message === '部署已取消') {
+    } else if (window.parseErrCode(p) === 'canceled' || message === '部署已取消') {
+      // 第十六批:优先按错误码判定;码缺失(旧式错误/版本错配)回退文案匹配
       showBanner('warn', '已取消');
     } else {
-      showBanner('fail', (isRollback ? '回滚失败:' : '部署失败:') + (message || '未知错误'));
+      showBanner('fail', (isRollback ? '回滚失败:' : '部署失败:') + (window.errStripCode(message) || '未知错误'));
     }
 
     // 版本说明补写(第十一批):整栈部署(非回滚)成功且发起时填了说明 →
@@ -1857,9 +1860,9 @@
         if (!st.batch || !st.batch.active) return;
         var p = payload || {};
         var state = p.success === true ? 'success'
-          : (p.message === '部署已取消' ? 'skipped' : 'failed');
-        if (p.message === '部署已取消') st.batch.aborted = true;
-        batchItemResult(state, p.message || '');
+          : (window.parseErrCode(p) === 'canceled' || p.message === '部署已取消' ? 'skipped' : 'failed');
+        if (window.parseErrCode(p) === 'canceled' || p.message === '部署已取消') st.batch.aborted = true;
+        batchItemResult(state, window.errStripCode(p.message) || '');
       });
       window.AppBus.invoke('deploy_resume_start', { key: item.resumeKey })
         .catch(function (err) {
@@ -1893,10 +1896,11 @@
           if (!st.batch || !st.batch.active) return;
           var p = payload || {};
           var state;
+          var canceled = window.parseErrCode(p) === 'canceled' || p.message === '部署已取消';
           if (p.success === true) state = 'success';
-          else if (p.message === '部署已取消') { state = 'skipped'; st.batch.aborted = true; }
+          else if (canceled) { state = 'skipped'; st.batch.aborted = true; }
           else state = 'failed';
-          batchItemResult(state, p.message || '');
+          batchItemResult(state, window.errStripCode(p.message) || '');
         });
       })
       .catch(function (err) {
@@ -1951,7 +1955,9 @@
     // aborted 分支里直接入表,不经本函数,压根没跑过)。
     // 续传成功的台不会走到这里入表(且 startResumeBatch 已把它从 carried
     // 里排除),故「续传成功 → 按钮消失」是自然结果。
-    var interrupted = (state === 'failed' || (message === '部署已取消'));
+    // (第十六批:message 可能带码标记,这里的 message 已是剥标记后的展示文案,
+    //  判定看 state —— 'skipped' 只在取消时产生,不再比对文案)
+    var interrupted = (state === 'failed' || state === 'skipped');
     if (interrupted && item && item.serverId && item.project) {
       var sid = String(item.serverId);
       var exists = false;
@@ -2288,15 +2294,18 @@
   /** 结果徽章:成功→badge-ok / 取消→badge-warn / 失败→badge-fail(title 带结果消息) */
   function historyResultBadge(rec) {
     var message = String(rec.message || '');
+    // 第十六批:历史记录里可能是新格式(带码标记)或旧记录(纯文案),
+    // 判定优先按码、回退文案匹配;title 展示剥标记后的文案
+    var canceled = window.parseErrCode(message) === 'canceled' || message === '部署已取消';
     var badge;
     if (rec.success === true) {
       badge = window.fillBadge(el('span'), 'ok', '成功');
-    } else if (message === '部署已取消') {
+    } else if (canceled) {
       badge = window.fillBadge(el('span'), 'warn', '取消');
     } else {
       badge = window.fillBadge(el('span'), 'fail', '失败');
     }
-    badge.title = message || (rec.success === true ? '部署完成' : '未知错误');
+    badge.title = window.errStripCode(message) || (rec.success === true ? '部署完成' : '未知错误');
     return badge;
   }
 

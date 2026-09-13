@@ -1388,11 +1388,11 @@ async fn rollback_execute_stack_at_inner(
 }
 
 /// 组装回滚收尾通知的标题与正文(纯函数,便于单测)。///
-/// 标题:成功=「回滚成功」;取消(错误文案为 CANCELLED_MSG)=「回滚已取消」;
+/// 标题:成功=「回滚成功」;取消(错误码 canceled)=「回滚已取消」;
 /// 其余失败=「回滚失败」。正文含项目名 + 服务器名 + 结果消息 + 耗时
 /// (成功时消息为「回滚到 <目标 release ts / 镜像标签>」,回滚目标随之入文);
 /// `record` 为 `None`(panic 或配置读取等早期失败,记录未组装/随错误丢失)
-/// 时用兜底文案。
+/// 时用兜底文案。`message` 允许带错误码标记:正文剥标记后展示(第十六批)。
 pub(crate) fn rollback_notify_text(
     success: bool,
     message: &str,
@@ -1400,7 +1400,7 @@ pub(crate) fn rollback_notify_text(
 ) -> (String, String) {
     let title = if success {
         "回滚成功".to_string()
-    } else if message == CANCELLED_MSG {
+    } else if crate::errors::code_of(message) == Some(crate::errors::ErrCode::Cancelled) {
         "回滚已取消".to_string()
     } else {
         "回滚失败".to_string()
@@ -1408,9 +1408,12 @@ pub(crate) fn rollback_notify_text(
     let body = match record {
         Some(r) => format!(
             "项目「{}」@ 服务器「{}」:{}(耗时 {} 秒)",
-            r.project_name, r.server_name, message, r.duration_secs
+            r.project_name,
+            r.server_name,
+            crate::errors::strip(message),
+            r.duration_secs
         ),
-        None => format!("{}(回滚详情缺失,详见应用日志)", message),
+        None => format!("{}(回滚详情缺失,详见应用日志)", crate::errors::strip(message)),
     };
     (title, body)
 }
@@ -1447,6 +1450,7 @@ where
                 DeployDone {
                     success: true,
                     message: "回滚完成".to_string(),
+                    error_code: None,
                 },
             );
             // 通知中心:回滚成功(emit deploy-done 之后异步分发,不阻塞收尾)
@@ -1455,11 +1459,23 @@ where
             Ok(())
         }
         Err(e) => {
-            emit_log(app, &format!("回滚失败: {}", e));
-            // 取消导致的失败(固定文案 CANCELLED_MSG)按 cancel 事件分发
-            let kind = if e == CANCELLED_MSG { "cancel" } else { "failure" };
+            emit_log(app, &format!("回滚失败: {}", crate::errors::strip(&e)));
+            // 取消导致的失败按错误码分发(第十六批,不再比对文案)
+            let kind = if crate::errors::code_of(&e) == Some(crate::errors::ErrCode::Cancelled) {
+                "cancel"
+            } else {
+                "failure"
+            };
             let (title, body) = rollback_notify_text(false, &e, &None);
-            let _ = app.emit("deploy-done", DeployDone { success: false, message: e.clone() });
+            let _ = app.emit(
+                "deploy-done",
+                DeployDone {
+                    success: false,
+                    message: e.clone(),
+                    error_code: crate::errors::code_of(&e)
+                        .map(|c| c.as_str()),
+                },
+            );
             // 通知中心:回滚失败/取消(emit deploy-done 之后异步分发)
             crate::notify::fire(app.clone(), kind, title, body).await;
             Err(e)

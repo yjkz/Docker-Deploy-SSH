@@ -3,6 +3,7 @@ pub mod config;
 pub mod config_io;
 pub mod crypto;
 pub mod docker;
+pub mod errors;
 pub mod history;
 pub mod manage;
 pub mod manage_exec;

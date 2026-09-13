@@ -601,10 +601,12 @@
       // 停止本地监控;普通单轮失败后端会继续轮询,前端只提示不打断。
       // 每轮失败都有 banner;首轮失败再加 toast 强化提醒(避免用户没注意
       // banner 误以为「只刷了一次就停了」),同一失败段内不重复弹。
-      showMonitorError(String(payload.error), !!payload.stopped);
+      // (第十六批:error 可带码标记,展示一律剥掉;分类判定看 payload.errorCode)
+      var errText = window.errStripCode(String(payload.error));
+      showMonitorError(errText, !!payload.stopped);
       if (!cState.mon.errShown) {
         cState.mon.errShown = true;
-        toast('监控数据异常: ' + String(payload.error), 'warn');
+        toast('监控数据异常: ' + errText, 'warn');
       }
       if (payload.stopped) monitorStop(true);
       return;
@@ -861,9 +863,11 @@
     if (payload.data) termWrite(String(payload.data));
     if (payload.eof) {
       // 后端附带结束原因(写失败/远端退出码/通道关闭);用户主动关闭不带原因
+      // (第十六批:原因文案剥码标记后展示)
       if (payload.error) {
-        termAppendLine('[会话已结束: ' + String(payload.error) + ']');
-        toast('终端会话结束: ' + String(payload.error), 'warn');
+        var reason = window.errStripCode(String(payload.error));
+        termAppendLine('[会话已结束: ' + reason + ']');
+        toast('终端会话结束: ' + reason, 'warn');
       } else {
         termAppendLine('[会话已结束]');
       }

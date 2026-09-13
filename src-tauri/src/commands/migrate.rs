@@ -261,7 +261,7 @@ async fn run_migrate(
     let mut skipped: usize = 0;
     for (i, image) in images.iter().enumerate() {
         if state.is_cancelled() {
-            return Err((CANCELLED_MSG.to_string(), done));
+            return Err((crate::errors::cancelled(), done));
         }
         emit_line(&format!(
             "({}/{}) 开始迁移 {}",
@@ -316,7 +316,7 @@ async fn run_migrate(
         // ② 上传到目标 /tmp(进度经 migrate-log;断点续传不必需,全新上传)
         if state.is_cancelled() {
             drop(guard);
-            return Err((CANCELLED_MSG.to_string(), done));
+            return Err((crate::errors::cancelled(), done));
         }
         emit_line(&format!("({}/{}) 上传到目标服务器…", i + 1, total));
         let last = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -341,7 +341,7 @@ async fn run_migrate(
         // ③ 目标 docker load(输出转发 migrate-log)
         if state.is_cancelled() {
             drop(guard);
-            return Err((CANCELLED_MSG.to_string(), done));
+            return Err((crate::errors::cancelled(), done));
         }
         let remote_tar = format!("/tmp/{}", tar_name);
         emit_line(&format!("({}/{}) 目标服务器装载: docker load -i {}", i + 1, total, remote_tar));

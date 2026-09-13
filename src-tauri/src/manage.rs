@@ -28,6 +28,9 @@ pub(crate) const EXEC_TIMEOUT_SECS: u64 = 60;
 pub(crate) const PULL_TIMEOUT_SECS: u64 = 300;
 
 /// 非 root 用户无 docker.sock 权限时的明确中文提示。
+/// 第十六批:判定与展示文案分离 —— 生产一律用 [`crate::errors::perm_denied`]
+/// (带 perm_denied 码);本常量已无引用,文案本体收编进 errors::perm_denied。
+#[allow(dead_code)]
 pub(crate) const PERM_DENIED_MSG: &str =
     "当前 SSH 用户无 Docker 权限(无法访问 /var/run/docker.sock),请将该用户加入 docker 组或使用 root 用户连接";
 
@@ -48,7 +51,10 @@ pub(crate) async fn with_timeout<T>(
 ) -> Result<T, String> {
     match tokio::time::timeout(Duration::from_secs(secs), fut).await {
         Ok(res) => res,
-        Err(_) => Err(format!("{}({} 秒):{}", desc, secs, hint)),
+        Err(_) => Err(crate::errors::tagged(
+            crate::errors::ErrCode::Timeout,
+            format!("{}({} 秒):{}", desc, secs, hint),
+        )),
     }
 }
 
@@ -100,7 +106,7 @@ pub(crate) fn is_docker_perm_denied(out: &str) -> bool {
     lower.contains("permission denied") && lower.contains("docker.sock")
 }
 
-/// 执行列表类命令,返回解析后的 Vec;非 0 退出码 → Err(含权限兜底)。
+/// 执行列表类命令,返回解析后的 Vec;非 0 退出码 → Err(含权限兜底,挂码)。
 pub(crate) async fn exec_json_list<T: serde::de::DeserializeOwned>(
     client: &mut SshClient,
     cmd: &str,
@@ -108,9 +114,18 @@ pub(crate) async fn exec_json_list<T: serde::de::DeserializeOwned>(
     let (code, out) = exec_collect(client, cmd).await?;
     if code != 0 {
         if is_docker_perm_denied(&out) {
-            return Err(PERM_DENIED_MSG.to_string());
+            return Err(crate::errors::perm_denied());
         }
-        return Err(format!("命令执行失败(退出码 {}): {}", code, out.trim()));
+        // 退出码 -1 是 exec 未收到 ExitStatus 的默认值(连接已断):Transport
+        let cls = if code == -1 {
+            crate::errors::ErrCode::Transport
+        } else {
+            crate::errors::ErrCode::Protocol
+        };
+        return Err(crate::errors::tagged(
+            cls,
+            format!("命令执行失败(退出码 {}): {}", code, out.trim()),
+        ));
     }
     parse_ndjson(&out)
 }
@@ -304,7 +319,7 @@ pub async fn manage_overview(
             let (code, out) = exec_collect(&mut client, "docker info --format json").await?;
             if code != 0 {
                 if is_docker_perm_denied(&out) {
-                    return Err(PERM_DENIED_MSG.to_string());
+                    return Err(crate::errors::perm_denied());
                 }
                 return Err(format!("docker info 失败(退出码 {}): {}", code, out.trim()));
             }
@@ -643,7 +658,7 @@ pub async fn manage_container_inspect(
     .await?;
     if code != 0 {
         if is_docker_perm_denied(&out) {
-            return Err(PERM_DENIED_MSG.to_string());
+            return Err(crate::errors::perm_denied());
         }
         return Err(format!("docker inspect 失败(退出码 {}): {}", code, out.trim()));
     }
@@ -704,7 +719,7 @@ pub async fn manage_container_logs(
     .await?;
     if code != 0 {
         if is_docker_perm_denied(&out) {
-            return Err(PERM_DENIED_MSG.to_string());
+            return Err(crate::errors::perm_denied());
         }
         return Err(format!("docker logs 失败(退出码 {}): {}", code, out.trim()));
     }
@@ -908,7 +923,7 @@ pub async fn manage_volume_inspect(
     .await?;
     if code != 0 {
         if is_docker_perm_denied(&out) {
-            return Err(PERM_DENIED_MSG.to_string());
+            return Err(crate::errors::perm_denied());
         }
         return Err(format!("docker volume inspect 失败(退出码 {}): {}", code, out.trim()));
     }
@@ -1035,7 +1050,7 @@ pub async fn manage_network_inspect(
     .await?;
     if code != 0 {
         if is_docker_perm_denied(&out) {
-            return Err(PERM_DENIED_MSG.to_string());
+            return Err(crate::errors::perm_denied());
         }
         return Err(format!("docker network inspect 失败(退出码 {}): {}", code, out.trim()));
     }

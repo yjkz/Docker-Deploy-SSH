@@ -70,22 +70,36 @@ fn host_fingerprint(key: &russh::keys::key::PublicKey) -> String {
 ///   → 提示「可能已加密需口令」或文件损坏;
 /// - 其余(路径不存在、格式不支持等)→ 通用「加载私钥失败」并附原始错误。
 fn map_key_load_error(key_path: &str, had_passphrase: bool, e: russh::keys::Error) -> String {
+    use crate::errors::{tagged, ErrCode};
     match e {
-        russh::keys::Error::KeyIsEncrypted => format!(
-            "私钥已加密,请输入私钥口令或先在服务器设置中保存口令 ({})",
-            key_path
+        russh::keys::Error::KeyIsEncrypted => tagged(
+            ErrCode::Auth,
+            format!(
+                "私钥已加密,请输入私钥口令或先在服务器设置中保存口令 ({})",
+                key_path
+            ),
         ),
         russh::keys::Error::KeyIsCorrupt | russh::keys::Error::CouldNotReadKey
         | russh::keys::Error::Pkcs8(_)
             if had_passphrase =>
         {
-            format!("私钥口令错误或私钥已损坏 ({})", key_path)
+            tagged(
+                ErrCode::Auth,
+                format!("私钥口令错误或私钥已损坏 ({})", key_path),
+            )
         }
-        russh::keys::Error::Pkcs8(_) | russh::keys::Error::Der(_) => format!(
-            "加载私钥失败 ({}): 私钥可能已加密(需提供口令)或文件已损坏",
-            key_path
+        russh::keys::Error::Pkcs8(_) | russh::keys::Error::Der(_) => tagged(
+            ErrCode::Auth,
+            format!(
+                "加载私钥失败 ({}): 私钥可能已加密(需提供口令)或文件已损坏",
+                key_path
+            ),
         ),
-        e => format!("加载私钥失败 ({}): {}", key_path, e),
+        // 文件读不到/权限不足等本地文件系统问题
+        e => tagged(
+            ErrCode::Fs,
+            format!("加载私钥失败 ({}): {}", key_path, e),
+        ),
     }
 }
 
@@ -143,41 +157,62 @@ impl SshClient {
             .await
             .map_err(|e| match e {
                 // check_server_key 返回 false 时 russh 以 UnknownKey 中止建连
-                russh::Error::UnknownKey => {
-                    "服务器主机密钥已变更!可能为服务器重装/换 IP,也可能存在中间人风险。如确认无误,请在服务器管理中重新信任该主机。"
-                        .to_string()
-                }
-                e => format!("SSH 连接失败 ({}:{}): {}", cfg.host, cfg.port, e),
+                russh::Error::UnknownKey => crate::errors::tagged(
+                    crate::errors::ErrCode::Auth,
+                    "服务器主机密钥已变更!可能为服务器重装/换 IP,也可能存在中间人风险。如确认无误,请在服务器管理中重新信任该主机。",
+                ),
+                // 其余建连失败:对端不可达/网络断,挂 Transport(连接不可信)
+                e => crate::errors::tagged(
+                    crate::errors::ErrCode::Transport,
+                    format!("SSH 连接失败 ({}:{}): {}", cfg.host, cfg.port, e),
+                ),
             })?;
 
         match cfg.auth.auth_type {
             AuthType::Key => {
                 let key_path = cfg.auth.key_path.as_deref().ok_or_else(|| {
-                    "SSH 密钥认证失败: 未配置私钥路径(key_path 为空)".to_string()
+                    crate::errors::tagged(
+                        crate::errors::ErrCode::Config,
+                        "SSH 密钥认证失败: 未配置私钥路径(key_path 为空)",
+                    )
                 })?;
                 let key = russh::keys::load_secret_key(key_path, key_passphrase)
                     .map_err(|e| map_key_load_error(key_path, key_passphrase.is_some(), e))?;
                 let ok = handle
                     .authenticate_publickey(&cfg.username, Arc::new(key))
                     .await
-                    .map_err(|e| format!("SSH 公钥认证失败 (用户 {}): {}", cfg.username, e))?;
+                    .map_err(|e| {
+                        crate::errors::tagged(
+                            crate::errors::ErrCode::Auth,
+                            format!("SSH 公钥认证失败 (用户 {}): {}", cfg.username, e),
+                        )
+                    })?;
                 if !ok {
-                    return Err(format!(
-                        "SSH 公钥认证失败: 服务器拒绝了密钥 (用户 {}, 私钥 {})",
-                        cfg.username, key_path
+                    return Err(crate::errors::tagged(
+                        crate::errors::ErrCode::Auth,
+                        format!(
+                            "SSH 公钥认证失败: 服务器拒绝了密钥 (用户 {}, 私钥 {})",
+                            cfg.username, key_path
+                        ),
                     ));
                 }
             }
             AuthType::Password => {
-                let password = password_plain.ok_or_else(|| "需要密码".to_string())?;
+                let password = password_plain
+                    .ok_or_else(|| crate::errors::tagged(crate::errors::ErrCode::Input, "需要密码"))?;
                 let ok = handle
                     .authenticate_password(&cfg.username, password)
                     .await
-                    .map_err(|e| format!("SSH 密码认证失败 (用户 {}): {}", cfg.username, e))?;
+                    .map_err(|e| {
+                        crate::errors::tagged(
+                            crate::errors::ErrCode::Auth,
+                            format!("SSH 密码认证失败 (用户 {}): {}", cfg.username, e),
+                        )
+                    })?;
                 if !ok {
-                    return Err(format!(
-                        "SSH 密码认证失败: 密码错误或被拒绝 (用户 {})",
-                        cfg.username
+                    return Err(crate::errors::tagged(
+                        crate::errors::ErrCode::Auth,
+                        format!("SSH 密码认证失败: 密码错误或被拒绝 (用户 {})", cfg.username),
                     ));
                 }
             }
@@ -199,11 +234,11 @@ impl SshClient {
             .handle
             .channel_open_session()
             .await
-            .map_err(|e| format!("SSH 打开会话通道失败: {}", e))?;
+            .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Transport, format!("SSH 打开会话通道失败: {}", e)))?;
         channel
             .exec(true, cmd)
             .await
-            .map_err(|e| format!("SSH 执行命令失败 ({}): {}", cmd, e))?;
+            .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Transport, format!("SSH 执行命令失败 ({}): {}", cmd, e)))?;
 
         let mut exit_code: i32 = -1;
         // 字节级缓冲,避免多字节字符被 TCP 分块截断时输出乱码
@@ -258,7 +293,7 @@ impl SshClient {
     ) -> Result<(), String> {
         let total = tokio::fs::metadata(local)
             .await
-            .map_err(|e| format!("读取本地文件元数据失败 ({}): {}", local.display(), e))?
+            .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Fs, format!("读取本地文件元数据失败 ({}): {}", local.display(), e)))?
             .len();
         let remote_path = join_remote(remote_dir, remote_name);
 
@@ -306,7 +341,7 @@ impl SshClient {
         let mut files: Vec<(PathBuf, String, u64)> = Vec::new();
         let mut subdirs: Vec<String> = Vec::new();
         walk_local_files(local_dir, &top_remote, &mut files, &mut subdirs)
-            .map_err(|e| format!("遍历本地目录失败 ({}): {}", local_dir.display(), e))?;
+            .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Fs, format!("遍历本地目录失败 ({}): {}", local_dir.display(), e)))?;
         let total: u64 = files.iter().map(|f| f.2).sum();
 
         // 2. 远端建目录:顶层 mkdir -p;子目录合并成一条 mkdir -p
@@ -370,14 +405,14 @@ impl SshClient {
             .handle
             .channel_open_session()
             .await
-            .map_err(|e| format!("SSH 打开 SFTP 通道失败: {}", e))?;
+            .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Transport, format!("SSH 打开 SFTP 通道失败: {}", e)))?;
         channel
             .request_subsystem(true, "sftp")
             .await
-            .map_err(|e| format!("SSH 请求 sftp 子系统失败: {}", e))?;
+            .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Transport, format!("SSH 请求 sftp 子系统失败: {}", e)))?;
         SftpSession::new(channel.into_stream())
             .await
-            .map_err(|e| format!("SFTP 会话初始化失败: {}", e))
+            .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Transport, format!("SFTP 会话初始化失败: {}", e)))
     }
 }
 
@@ -559,7 +594,7 @@ async fn stat_remote_size(sftp: &SftpSession, remote_path: &str) -> Result<Optio
     match sftp.metadata(remote_path.to_string()).await {
         Ok(meta) => Ok(Some(meta.len())),
         Err(SftpError::Status(status)) if status.status_code == StatusCode::NoSuchFile => Ok(None),
-        Err(e) => Err(format!("SFTP 查询远端文件大小失败 ({}): {}", remote_path, e)),
+        Err(e) => Err(crate::errors::tagged(crate::errors::ErrCode::Fs, format!("SFTP 查询远端文件大小失败 ({}): {}", remote_path, e))),
     }
 }
 
@@ -580,7 +615,7 @@ async fn copy_file_to_remote(
 ) -> Result<(), String> {
     let mut local_file = tokio::fs::File::open(local)
         .await
-        .map_err(|e| format!("打开本地文件失败 ({}): {}", local.display(), e))?;
+        .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Fs, format!("打开本地文件失败 ({}): {}", local.display(), e)))?;
     let flags = if start_offset > 0 {
         OpenFlags::CREATE | OpenFlags::WRITE
     } else {
@@ -589,18 +624,18 @@ async fn copy_file_to_remote(
     let mut remote_file = sftp
         .open_with_flags(remote_path.to_string(), flags)
         .await
-        .map_err(|e| format!("SFTP 打开远端文件失败 ({}): {}", remote_path, e))?;
+        .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Fs, format!("SFTP 打开远端文件失败 ({}): {}", remote_path, e)))?;
 
     if start_offset > 0 {
         // 断点续传:本地读指针与远端写指针都跳过已传前缀
         local_file
             .seek(SeekFrom::Start(start_offset))
             .await
-            .map_err(|e| format!("本地文件 seek 失败 ({}): {}", local.display(), e))?;
+            .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Fs, format!("本地文件 seek 失败 ({}): {}", local.display(), e)))?;
         remote_file
             .seek(SeekFrom::Start(start_offset))
             .await
-            .map_err(|e| format!("SFTP 远端文件 seek 失败 ({}): {}", remote_path, e))?;
+            .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Fs, format!("SFTP 远端文件 seek 失败 ({}): {}", remote_path, e)))?;
     }
 
     let mut buf = vec![0u8; CHUNK_SIZE];
@@ -608,14 +643,14 @@ async fn copy_file_to_remote(
         let n = local_file
             .read(&mut buf)
             .await
-            .map_err(|e| format!("读取本地文件失败 ({}): {}", local.display(), e))?;
+            .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Fs, format!("读取本地文件失败 ({}): {}", local.display(), e)))?;
         if n == 0 {
             break;
         }
         remote_file
             .write_all(&buf[..n])
             .await
-            .map_err(|e| format!("SFTP 写入远端文件失败 ({}): {}", remote_path, e))?;
+            .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Fs, format!("SFTP 写入远端文件失败 ({}): {}", remote_path, e)))?;
         *sent += n as u64;
         on_progress(*sent, total);
     }
@@ -623,7 +658,7 @@ async fn copy_file_to_remote(
     remote_file
         .shutdown()
         .await
-        .map_err(|e| format!("SFTP 关闭远端文件失败 ({}): {}", remote_path, e))?;
+        .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Fs, format!("SFTP 关闭远端文件失败 ({}): {}", remote_path, e)))?;
     Ok(())
 }
 
@@ -767,25 +802,24 @@ mod tests {
     /// 有口令但解不开 → 「私钥口令错误或私钥已损坏」;无口令路径 → 通用失败。
     #[test]
     fn test_map_key_load_error() {
+        use crate::errors::{code_of, strip, ErrCode};
         // Error 未实现 Copy,各断言分别构造
+        let enc = map_key_load_error("/k", false, russh::keys::Error::KeyIsEncrypted);
         assert!(
-            map_key_load_error("/k", false, russh::keys::Error::KeyIsEncrypted)
-                .contains("私钥已加密"),
+            strip(&enc).contains("私钥已加密"),
             "加密私钥未提供口令应提示输入口令"
         );
-        assert_eq!(
-            map_key_load_error("/k", true, russh::keys::Error::KeyIsCorrupt),
-            "私钥口令错误或私钥已损坏 (/k)"
-        );
-        assert_eq!(
-            map_key_load_error("/k", true, russh::keys::Error::CouldNotReadKey),
-            "私钥口令错误或私钥已损坏 (/k)"
-        );
+        assert_eq!(code_of(&enc), Some(ErrCode::Auth));
+        let wrong_pass = map_key_load_error("/k", true, russh::keys::Error::KeyIsCorrupt);
+        assert_eq!(strip(&wrong_pass), "私钥口令错误或私钥已损坏 (/k)");
+        assert_eq!(code_of(&wrong_pass), Some(ErrCode::Auth));
+        let corrupt = map_key_load_error("/k", true, russh::keys::Error::CouldNotReadKey);
+        assert_eq!(strip(&corrupt), "私钥口令错误或私钥已损坏 (/k)");
         // 未提供口令时的损坏/读失败:走通用「加载私钥失败」并附原始错误
-        assert_eq!(
-            map_key_load_error("/k", false, russh::keys::Error::KeyIsCorrupt),
-            "加载私钥失败 (/k): The key is corrupt"
-        );
+        let generic = map_key_load_error("/k", false, russh::keys::Error::KeyIsCorrupt);
+        assert_eq!(strip(&generic), "加载私钥失败 (/k): The key is corrupt");
+        // 本地文件系统类(读不到/权限不足)挂 fs 码
+        assert_eq!(code_of(&generic), Some(ErrCode::Fs));
     }
 
     /// 离线加密私钥 roundtrip:russh 生成的 ed25519 密钥加密为 PKCS#8 PEM 后,
@@ -1201,15 +1235,15 @@ impl SshClient {
             .handle
             .channel_open_session()
             .await
-            .map_err(|e| format!("SSH 打开交互式会话通道失败: {}", e))?;
+            .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Transport, format!("SSH 打开交互式会话通道失败: {}", e)))?;
         channel
             .request_pty(true, "xterm-256color", cols, rows, 0, 0, &[])
             .await
-            .map_err(|e| format!("SSH 请求伪终端(PTY)失败: {}", e))?;
+            .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Transport, format!("SSH 请求伪终端(PTY)失败: {}", e)))?;
         channel
             .exec(true, cmd)
             .await
-            .map_err(|e| format!("SSH 启动交互式命令 ({}) 失败: {}", cmd, e))?;
+            .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Transport, format!("SSH 启动交互式命令 ({}) 失败: {}", cmd, e)))?;
         Ok(channel)
     }
 }
@@ -1242,11 +1276,11 @@ impl SshClient {
             .handle
             .channel_open_session()
             .await
-            .map_err(|e| format!("SSH 打开会话通道失败: {}", e))?;
+            .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Transport, format!("SSH 打开会话通道失败: {}", e)))?;
         channel
             .exec(true, cmd)
             .await
-            .map_err(|e| format!("SSH 执行命令失败 ({}): {}", cmd, e))?;
+            .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Transport, format!("SSH 执行命令失败 ({}): {}", cmd, e)))?;
 
         *exit_code = -1;
         let mut buf: Vec<u8> = Vec::new();
@@ -1303,7 +1337,7 @@ impl SshClient {
         let mut remote_file = sftp
             .open(remote_path.to_string())
             .await
-            .map_err(|e| format!("SFTP 打开远端文件失败 ({}): {}", remote_path, e))?;
+            .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Fs, format!("SFTP 打开远端文件失败 ({}): {}", remote_path, e)))?;
         let total = remote_file
             .metadata()
             .await
@@ -1315,12 +1349,12 @@ impl SshClient {
             if !parent.as_os_str().is_empty() {
                 tokio::fs::create_dir_all(parent)
                     .await
-                    .map_err(|e| format!("无法创建本地目录 {}: {}", parent.display(), e))?;
+                    .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Fs, format!("无法创建本地目录 {}: {}", parent.display(), e)))?;
             }
         }
         let mut local_file = tokio::fs::File::create(local)
             .await
-            .map_err(|e| format!("无法创建本地文件 {}: {}", local.display(), e))?;
+            .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Fs, format!("无法创建本地文件 {}: {}", local.display(), e)))?;
 
         let mut received: u64 = 0;
         let mut buf = vec![0u8; CHUNK_SIZE];
@@ -1328,26 +1362,26 @@ impl SshClient {
             let n = remote_file
                 .read(&mut buf)
                 .await
-                .map_err(|e| format!("SFTP 读取远端文件失败 ({}): {}", remote_path, e))?;
+                .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Fs, format!("SFTP 读取远端文件失败 ({}): {}", remote_path, e)))?;
             if n == 0 {
                 break;
             }
             local_file
                 .write_all(&buf[..n])
                 .await
-                .map_err(|e| format!("写入本地文件失败 ({}): {}", local.display(), e))?;
+                .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Fs, format!("写入本地文件失败 ({}): {}", local.display(), e)))?;
             received += n as u64;
             on_progress(received, total);
         }
         local_file
             .flush()
             .await
-            .map_err(|e| format!("刷新本地文件失败 ({}): {}", local.display(), e))?;
+            .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Fs, format!("刷新本地文件失败 ({}): {}", local.display(), e)))?;
         // 显式关闭远端句柄(等价 File::close)以等待远端确认
         remote_file
             .shutdown()
             .await
-            .map_err(|e| format!("SFTP 关闭远端文件失败 ({}): {}", remote_path, e))?;
+            .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Fs, format!("SFTP 关闭远端文件失败 ({}): {}", remote_path, e)))?;
         Ok(())
     }
 
@@ -1364,11 +1398,11 @@ impl SshClient {
             .handle
             .channel_open_session()
             .await
-            .map_err(|e| format!("SSH 打开会话通道失败: {}", e))?;
+            .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Transport, format!("SSH 打开会话通道失败: {}", e)))?;
         channel
             .exec(true, cmd)
             .await
-            .map_err(|e| format!("SSH 执行命令失败 ({}): {}", cmd, e))?;
+            .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Transport, format!("SSH 执行命令失败 ({}): {}", cmd, e)))?;
         Ok(channel)
     }
 }

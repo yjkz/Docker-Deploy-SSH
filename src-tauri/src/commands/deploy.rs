@@ -518,7 +518,7 @@ pub fn upload_retry_failure_msg(retry_err: &str, first_err: &str) -> String {
 }
 
 /// 镜像包上传重试前的等待:提示 + 固定间隔(轮间检查取消)。
-/// 取消 → 返回 [`CANCELLED_MSG`] 中止,不再重试;否则由调用方对**同一远端路径**
+/// 取消 → 返回错误码 canceled 的错误中止,不再重试;否则由调用方对**同一远端路径**
 /// 执行重试 —— `sftp_upload(resume=true)` 的 stat 命中远端半成品 → 断点续传生效。
 async fn upload_retry_wait(app: &AppHandle) -> Result<(), String> {
     emit_log(app, "上传中断,2 秒后从断点续传重试");
@@ -850,17 +850,21 @@ impl HookKind {
 
 /// 钩子执行失败的结果映射(纯函数,便于单测)。
 ///
-/// - 取消(错误文案为 [`CANCELLED_MSG`])一律原样透传,Pre/Post 同口径
-///   (与 pull 步骤一致):`spawn_deploy_task` 按该文案判定 cancel 事件,
-///   包装成其他文案会判定失配,把用户取消误报为部署失败(通知走 failure);
-/// - `Pre` 其余失败:包装为「<钩子名>执行失败,部署中止:<原因>」;
+/// - 取消(错误码 canceled,第十六批)一律原样透传(标记随串保留),Pre/Post
+///   同口径(与 pull 步骤一致):收尾按 `code_of` 判定 cancel 事件,包装成
+///   其他文案会判定失配,把用户取消误报为部署失败(通知走 failure);
+/// - `Pre` 其余失败:包装为「<钩子名>执行失败,部署中止:<原因>」(剥标记展示);
 /// - `Post` 其余失败:返回 `None`,由调用方仅告警、不影响部署结果。
 pub(crate) fn hook_failure_result(which: HookKind, e: &str) -> Option<String> {
-    if e == CANCELLED_MSG {
+    if crate::errors::code_of(e) == Some(crate::errors::ErrCode::Cancelled) {
         return Some(e.to_string());
     }
     match which {
-        HookKind::Pre => Some(format!("{}执行失败,部署中止: {}", which.label(), e)),
+        HookKind::Pre => Some(format!(
+            "{}执行失败,部署中止: {}",
+            which.label(),
+            crate::errors::strip(e)
+        )),
         HookKind::Post => None,
     }
 }
@@ -1558,7 +1562,7 @@ async fn run_deploy_stack_steps(
             )
             .await
             .map_err(|e| {
-                if e == CANCELLED_MSG {
+                if crate::errors::code_of(&e) == Some(crate::errors::ErrCode::Cancelled) {
                     e
                 } else {
                     augment_pull_error(&format!(
@@ -1764,7 +1768,7 @@ async fn pack_local_images(
     }
 
     if cancelled {
-        return Err(CANCELLED_MSG.to_string());
+        return Err(crate::errors::cancelled());
     }
     if let Some(e) = first_error {
         return Err(e);

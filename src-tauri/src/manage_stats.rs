@@ -26,10 +26,7 @@ use std::time::Duration;
 
 use tauri::Emitter;
 
-use crate::manage::{
-    connect_server, is_docker_perm_denied, parse_ndjson, with_timeout, EXEC_TIMEOUT_SECS,
-    PERM_DENIED_MSG,
-};
+use crate::manage::{connect_server, is_docker_perm_denied, parse_ndjson, with_timeout, EXEC_TIMEOUT_SECS};
 use crate::ssh::{exec_collect, SshClient};
 
 /// 轮询间隔上下限(秒)。
@@ -133,11 +130,16 @@ pub struct StatsRow {
 struct StatsPayload {
     server_id: String,
     stats: Vec<StatsRow>,
-    /// 单轮失败时的中文错误提示;成功轮为 None。
+    /// 单轮失败时的中文错误提示(第十六批起可带 `[dderr:*]` 码标记);成功轮为 None。
     error: Option<String>,
     /// true 表示后端监控循环已自行终止(权限拒绝 / 连续连接失败),
     /// 前端据此把 UI 置回「已停止」;普通单轮失败为 false(循环继续)。
     stopped: bool,
+    /// 错误类别码(第十六批,camelCase;`error` 为 None 时也是 None):
+    /// "canceled"/"transport"/"auth"/"perm_denied"/"timeout"/… 见 wiki/04 码表。
+    /// 前端优先按码分类,无码回退旧行为(版本错配时安全)。
+    #[serde(rename = "errorCode", skip_serializing_if = "Option::is_none")]
+    error_code: Option<&'static str>,
 }
 
 // ===== Tauri 命令 =====
@@ -235,8 +237,9 @@ pub async fn manage_stats_start(
                         let payload = StatsPayload {
                             server_id: server_id.clone(),
                             stats: Vec::new(),
-                            error: Some(err),
+                            error: Some(err.clone()),
                             stopped: false,
+                            error_code: Some(crate::errors::ErrCode::Transport.as_str()),
                         };
                         let _ = app.emit(STATS_EVENT, payload);
                         // 本轮无连接可执行,等待后进入下一轮重试
@@ -273,6 +276,7 @@ pub async fn manage_stats_start(
                         stats: rows,
                         error: None,
                         stopped: false,
+                        error_code: None,
                     };
                     let _ = app.emit(STATS_EVENT, payload);
                 }
@@ -282,8 +286,9 @@ pub async fn manage_stats_start(
                     let payload = StatsPayload {
                         server_id: server_id.clone(),
                         stats: Vec::new(),
-                        error: Some(PERM_DENIED_MSG.to_string()),
+                        error: Some(crate::errors::perm_denied()),
                         stopped: true,
+                        error_code: Some(crate::errors::ErrCode::PermDenied.as_str()),
                     };
                     let _ = app.emit(STATS_EVENT, payload);
                     state.lock().unwrap().finish(generation);
@@ -297,13 +302,22 @@ pub async fn manage_stats_start(
                         round,
                         generation,
                         started.elapsed().as_secs_f64(),
-                        err
+                        crate::errors::strip(&err)
                     );
                     let payload = StatsPayload {
                         server_id: server_id.clone(),
                         stats: Vec::new(),
-                        error: Some(err),
+                        error: Some(err.clone()),
                         stopped: false,
+                        // 命令层错误码:退出码非 0 → protocol,解析失败 → parse
+                        error_code: Some(
+                            if err.starts_with("docker stats 失败") {
+                                crate::errors::ErrCode::Protocol
+                            } else {
+                                crate::errors::ErrCode::Parse
+                            }
+                            .as_str(),
+                        ),
                     };
                     let _ = app.emit(STATS_EVENT, payload);
                 }
@@ -314,13 +328,21 @@ pub async fn manage_stats_start(
                         round,
                         generation,
                         started.elapsed().as_secs_f64(),
-                        err
+                        crate::errors::strip(&err)
                     );
                     let payload = StatsPayload {
                         server_id: server_id.clone(),
                         stats: Vec::new(),
-                        error: Some(err),
+                        error: Some(err.clone()),
                         stopped: false,
+                        error_code: Some(
+                            if err.contains("超时") {
+                                crate::errors::ErrCode::Timeout
+                            } else {
+                                crate::errors::ErrCode::Transport
+                            }
+                            .as_str(),
+                        ),
                     };
                     let _ = app.emit(STATS_EVENT, payload);
                     // 旧连接已不可信:先丢弃再重连;重连失败计入连续失败计数
@@ -428,11 +450,14 @@ fn connect_failure_limit_reached(
     let payload = StatsPayload {
         server_id: server_id.to_string(),
         stats: Vec::new(),
+        // 熔断停止:连接类失败,挂 transport 码(第十六批);文案剥内层标记
         error: Some(format!(
             "连续 {} 轮连接失败,监控已停止:{}",
-            MAX_CONNECT_FAILURES, err
+            MAX_CONNECT_FAILURES,
+            crate::errors::strip(err)
         )),
         stopped: true,
+        error_code: Some(crate::errors::ErrCode::Transport.as_str()),
     };
     let _ = app.emit(STATS_EVENT, payload);
     state.lock().unwrap().finish(generation);
@@ -455,7 +480,11 @@ const CMD_STATS_TEMPLATE: &str = "docker stats --no-stream --format '{{json .}}'
 static JSON_SHORTHAND_OK: AtomicBool = AtomicBool::new(true);
 
 /// 单轮套超时执行 docker stats 并返回输出;旧版 Docker 自动降级模板重试。
+/// 错误串挂码(第十六批):超时 → Timeout;权限拒绝 → PermDenied;
+/// 命令非零退出 → Protocol(退出码 -1 表示连接已断,归 Transport);
+/// 传输层(SSH 通道/执行失败)由 ssh.rs 生产点挂 Transport。
 async fn exec_stats_collect(client: &mut SshClient) -> Result<String, String> {
+    use crate::errors::ErrCode;
     if JSON_SHORTHAND_OK.load(Ordering::Relaxed) {
         let (code, out) = with_timeout(
             EXEC_TIMEOUT_SECS,
@@ -463,7 +492,17 @@ async fn exec_stats_collect(client: &mut SshClient) -> Result<String, String> {
             "请检查服务器网络后重试",
             exec_collect(client, CMD_STATS_JSON),
         )
-        .await?;
+        .await
+        .map_err(|e| {
+            if crate::errors::code_of(&e) == Some(ErrCode::Transport) {
+                // 连接已断(ssh.rs 已挂 Transport)保留原码;超时由下方 Timeout 分支处理
+                e
+            } else if crate::errors::code_of(&e) == Some(ErrCode::Timeout) {
+                e
+            } else {
+                crate::errors::tagged(ErrCode::Timeout, e)
+            }
+        })?;
         // 简写可用:退出码 0 且输出为 NDJSON(每行 '{' 开头;空输出视为无容器)。
         // 旧版 Docker 会把 "json" 当模板文本,每行原样输出 "json" 且退出码 0。
         if code == 0
@@ -474,7 +513,7 @@ async fn exec_stats_collect(client: &mut SshClient) -> Result<String, String> {
             return Ok(out);
         }
         if code != 0 && is_docker_perm_denied(&out) {
-            return Err(PERM_DENIED_MSG.to_string());
+            return Err(crate::errors::perm_denied());
         }
         JSON_SHORTHAND_OK.store(false, Ordering::Relaxed);
     }
@@ -487,12 +526,13 @@ async fn exec_stats_collect(client: &mut SshClient) -> Result<String, String> {
     .await?;
     if code != 0 {
         if is_docker_perm_denied(&out) {
-            return Err(PERM_DENIED_MSG.to_string());
+            return Err(crate::errors::perm_denied());
         }
-        return Err(format!(
-            "docker stats 失败(退出码 {}): {}",
-            code,
-            out.trim()
+        // 退出码 -1 是 exec 未收到 ExitStatus 的默认值,通常意味着连接已断
+        let cls = if code == -1 { ErrCode::Transport } else { ErrCode::Protocol };
+        return Err(crate::errors::tagged(
+            cls,
+            format!("docker stats 失败(退出码 {}): {}", code, out.trim()),
         ));
     }
     Ok(out)
@@ -512,15 +552,13 @@ enum RoundOutcome {
 }
 
 /// 判断单轮错误是否属于 SSH 传输层失败(连接不可信,需要重连)。
-/// `exec_stats_collect` 的错误来源:传输层(`SSH 打开会话通道失败` /
-/// `SSH 执行命令失败`,以及套超时后的 `获取容器统计超时`)与命令层
-/// (`docker stats 失败(退出码 N)`)。退出码 -1 是 exec 未收到
-/// ExitStatus 的默认值,通常意味着连接已断,同样按传输层失败处理。
+/// 第十六批:改按错误码判定(transport/timeout 均视为连接不可信);
+/// 无码错误(旧式文案)保守按命令层处理 —— 与旧行为一致。
 fn is_transport_error(err: &str) -> bool {
-    err.contains("SSH 打开会话通道失败")
-        || err.contains("SSH 执行命令失败")
-        || err.contains("获取容器统计超时")
-        || err.contains("退出码 -1")
+    matches!(
+        crate::errors::code_of(err),
+        Some(crate::errors::ErrCode::Transport) | Some(crate::errors::ErrCode::Timeout)
+    )
 }
 
 /// 用会话内复用的连接执行一轮 docker stats:
@@ -529,7 +567,12 @@ async fn run_stats_round(client: &mut SshClient) -> RoundOutcome {
     let out = match exec_stats_collect(client).await {
         Ok(out) => out,
         Err(err) => {
-            if err == PERM_DENIED_MSG || is_docker_perm_denied(&err) {
+            // 权限拒绝按码判定(perm_denied);远端 docker 原样输出仍走
+            // is_docker_perm_denied 文案兜底(匹配的是 docker 的英文输出,
+            // 无法挂码 —— 外部工具输出是文案匹配的唯一合法存留区,见 wiki/07)
+            if crate::errors::code_of(&err) == Some(crate::errors::ErrCode::PermDenied)
+                || is_docker_perm_denied(&err)
+            {
                 return RoundOutcome::PermDenied;
             }
             if is_transport_error(&err) {
@@ -581,13 +624,20 @@ mod tests {
 
     #[test]
     fn test_is_transport_error() {
-        // 传输层失败(连接不可信,需重连)
-        assert!(is_transport_error("SSH 打开会话通道失败: x"));
-        assert!(is_transport_error("SSH 执行命令失败: x"));
-        assert!(is_transport_error("获取容器统计超时"));
-        assert!(is_transport_error("docker stats 失败(退出码 -1): x"));
+        use crate::errors::{tagged, ErrCode};
+        // 传输层失败(连接不可信,需重连)—— 第十六批起按码判定
+        assert!(is_transport_error(&tagged(
+            ErrCode::Transport,
+            "SSH 打开会话通道失败: x"
+        )));
+        assert!(is_transport_error(&tagged(ErrCode::Timeout, "获取容器统计超时")));
         // 命令层失败(连接仍可用)
-        assert!(!is_transport_error("docker stats 失败(退出码 1): x"));
+        assert!(!is_transport_error(&tagged(
+            ErrCode::Protocol,
+            "docker stats 失败(退出码 1): x"
+        )));
+        // 无码旧式错误保守按命令层(与旧行为一致:不重连)
+        assert!(!is_transport_error("SSH 打开会话通道失败: x"));
         assert!(!is_transport_error("解析失败"));
     }
 
