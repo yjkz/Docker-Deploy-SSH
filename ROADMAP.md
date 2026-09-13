@@ -112,6 +112,18 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 - 排查中排除 v5.14.0 托盘挂钩(`set_tooltip` 同步等主线程,常驻时毫秒级返回,非根因)
 - 验证:三 verify 脚本全 PASS / `cargo test` 302 passed 与基线一致(纯前端修复)
 
+### 第十八批 v6.0.0(安全强化与并发互斥)— 已完成(commit 63b2064)
+- **驱动**:八路并行审查(wiki 01/02/03/04/06/07 对齐 + Rust + JS + 安全契约),先修文档与低风险项,再落地用户拍板的全部待决策项
+- **russh 0.46→0.60.3**(ring 后端,修 RUSTSEC-2026-0153/0154 两个 HIGH):API 适配 PublicKey 路径/PrivateKeyWithHashAlg/AuthResult/Handler 原生 impl Future(去 async_trait);测试密钥改 Ed25519Keypair::from_seed 确定性构造
+- **严格 CSP 启用**(csp:null → default-src 'self' 等):内联防闪白主题脚本外置 theme-init.js(加入 verify CHAIN)
+- **get_config 密文最小化**:密文哨兵 "*" 只读视图;新增 `save_server_entry` merge 命令(命令 94→95,+单测);servers.js 编辑保存改走新命令
+- **open_external cmd 注入修复**(explorer 直开 + 元字符校验);cleanup/sync_files/rollback 路径校验(+cleanup 单测)
+- **并发互斥**:06 页回滚接入部署互斥(共享锁 window.ddRemoteOp,双向);批量间隙锁族(tab/setMode/回滚钮/模态回滚/续传入口入 batchActive);关清理模态不误清 pruning;监控先订阅后 invoke + 订阅失败停后端
+- **功能修复 14 处**:版本说明从未写成功(deploy.js writeReleaseNotes 缺 req 包裹)、check 误报、整栈批量空指针、config-io id、rollback deploy-done 过滤+剥码、setBtnBusy 兜底、stats 码判定、migrate stop 吞错/tmp 残留、parse_du_output 空格、save_gzip 兜底、escHtml 引号等
+- **wiki 全量对齐**(01/02/03/04/06/07/README,30+ 处):补 errors/tray_status/probe 三模块章节;修正栈扫描深度/批量断点/续传复用条件/契约结构字段;各文件行数与命令计数
+- 验证:`cargo test` 315 passed(基线 313 + 2)/ clippy 零新增 / release build 通过 / 三 verify 全 PASS
+- 真机待确认:russh 0.60 连接回归(密码/私钥/口令+TOFU)、CSP 渲染、save_server_entry 编辑保存密文保留、托盘 tooltip
+
 ---
 
 ## 待完成
@@ -137,10 +149,12 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 
 ## 当前状态速览
 
-- 版本 v5.16.0;main = origin/main;基线 `cargo test` 313 passed / 13 ignored
-- 命令 94 个(lib.rs 注册;wiki/04 已同步);JS 15 文件(index.html 加载顺序见 wiki/03:13)
+- 版本 **v6.0.0**;main = origin/main;基线 `cargo test` **315 passed** / 13 ignored
+- 命令 **95** 个(lib.rs 注册;wiki/04 已同步,新增 `save_server_entry`);JS **16** 文件(含 theme-init.js;index.html 加载顺序见 wiki/03:13)
 - 前端结构:12 模态;commands/ 11 文件;三大 JS 主文件 2338/2013/2537 行
 - 表单体系(第十三批):5 处模态有真实 `<form novalidate>` 语义;失焦校验 + Enter 提交由 app.js 三助手统一承担
 - 批量部署(第十四批):失败/取消台可续传(单台 + 一键批量);「停止批量」步骤边界即时中止;批量恒落断点(与死代码 `deploy_batch` 的「不落断点」无关)
+- **安全(第十八批 v6.0.0)**:russh 0.60.3(ring 后端,RUSTSEC 修复);严格 CSP 启用;get_config 密文最小化(只读视图 + save_server_entry merge);open_external 注入修复;cleanup/sync_files/rollback 路径校验
+- **并发互斥(第十八批)**:部署/回滚跨页互斥(共享锁 `window.ddRemoteOp`);批量间隙锁族(tab/setMode/回滚钮/续传);关清理模态不误清 pruning;监控先订阅后 invoke
 - 本地校验脚本 `verify/`(零依赖 Node,不参与构建):`form-validation.js`(表单助手 54 断言)/ `bridge-integrity.js`(桥接完整性)/ `scope-integrity.js`(全链加载 + DOM 回调作用域完整性,v5.14.1 起);改动表单助手、拆出文件桥接或 JS 拆分时先跑这三个
 - dev 实例:target/debug/config(正式版数据拷贝);前端资源编译期内嵌,**改 JS 后必须重编译重启动才生效**

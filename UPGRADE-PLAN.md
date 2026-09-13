@@ -1574,3 +1574,108 @@ topMem: ≤3 }`,由纯函数 `aggregate_stats` 计算(解析 "12.34%" 数值降�
 - wiki/07 限制 3、17 改写为已实现;wiki/04 契约增补(aggregate / notUtf8+
   rawB64 / probeIntervalMins+onProbe);ROADMAP 候选池清空(五项全完成);
   三处版本号 → 5.16.0
+
+# 第十八批升级(v6.0.0)— 安全强化与并发互斥(全量代码/wiki 审查驱动)
+
+> 用户指令:「全面的审查代码与 wiki 对齐,顺便检查代码是否有问题」「都修上」「推送发布」。
+> 八路并行审查(wiki 01/02/03/04/06/07 对齐 + Rust 后端 + JS 前端 + 安全契约)驱动,
+> 先修文档与低风险代码,再逐项落地用户拍板的全部待决策项,统一 bump v6.0.0 发版。
+
+## 一、安全(russh 升级 + CSP + 密文最小化 + 注入/路径校验)
+
+- **russh 0.46 → 0.60.3**(修 RUSTSEC-2026-0153 / 0154 两个 HIGH;同步带 russh-cryptovec
+  过 0.58 门槛):改 **ring 后端**(`default-features=false, features=["ring","flate2"]`,
+  避开默认 aws-lc-rs 需 NASM 而环境没有的构建失败,与 rustls ring provider 一致)。
+  API 适配 4 类:`PublicKey` 路径(`keys::key::PublicKey` → `keys::PublicKey`)、
+  `authenticate_publickey` 收 `PrivateKeyWithHashAlg::new(.., None)`、认证返回
+  `AuthResult` 判 `.success()`、`Handler::check_server_key` 改原生 `-> impl Future`
+  (russh 未启 async-trait feature,去 `#[async_trait]` 解 E0195);`host_fingerprint`
+  改用 `fingerprint(HashAlg::Sha256)` 的 Display(自带 `SHA256:` 前缀)。测试密钥改
+  `Ed25519Keypair::from_seed` 确定性构造(避开 rand 0.8/rand_core 0.9 与 ssh-key
+  rand_core 0.6 的 trait 版本分歧)
+- **启用严格 CSP**(`tauri.conf.json` `csp: null` → `default-src 'self'; script-src
+  'self'; style-src 'self' 'unsafe-inline'; font-src/img-src 'self'; connect-src
+  ipc: http://ipc.localhost; object-src 'none'`):内联防闪白主题脚本挪到独立
+  `ui/theme-init.js`(已加入 verify/scope-integrity.js 加载链),全站资源自托管零外链
+- **get_config 密文最小化**:返回**密文哨兵 `"*"` 的只读视图**(真实 DPAPI 密文不出
+  后端,`Some("*")` 保留「已存」语义);新增 `save_server_entry` 命令(编辑/新增服务器,
+  `password_enc`/`key_pass_enc`/`host_key_sha256` 传 `null` → 按 `server.id` **merge
+  保留**现有值,非空 → 用新值);servers.js 编辑保存改走新命令(去掉 get_config 全量
+  拉取与密文透传);`save_config_cmd` 标注「须传含真实密文的完整配置,勿用只读视图回写」。
+  **命令 94 → 95**
+- **open_external cmd 注入修复**:`cmd /c start` 把 URL 中 `&` 当命令分隔符可本机注入 →
+  改 `explorer` 直开(参数数组不经 cmd 解析)+ 拒含 `&^><|"'` 元字符的 URL
+- **cleanup_execute 归档删除加前缀校验**(`is_valid_release_dir_target`,仅放行
+  `<root>/releases/<ts>` 形态,与 `rollback_delete_release` 同口径;+单测)
+- **rollback execute 补 `release_ts` 校验**(`/` `..` `\` 拒绝,两处 execute 入口此前
+  缺,`releases_dir`/`remote_join` 不拦截 `..`,可越出项目目录)
+- **sync_files 拒 `..` 段/绝对路径**(文件映射远端相对路径防逃逸出部署目录)
+
+## 二、并发互斥(JS 审查发现,跨页/跨模态锁族)
+
+- **06 页回滚中心接入部署互斥(高危 #2)**:新建跨页共享锁 `window.ddRemoteOp`(app.js
+  全局)——此前 deploy.js 的 `st.deploying` 只在 04 页可见,06 页回滚对此一无所知,
+  同一服务器上 compose up 与回滚重打标签/重载镜像可并发。现 deploy/rollback/模态回滚
+  **双向互斥**:发起置锁、deploy-done 复位、入口守卫查锁。
+- **批量间隙锁族(#4/#5)**:批量台间 `st.deploying=false` 但 `st.batch.active=true`
+  的窗口,模式 tab、`setMode`、历史「回滚」钮、模态回滚 `beginRbExecution`、续传入口
+  (单台 `onBatchResumeOne`/全部 `onBatchResumeAll`/断点 `onResumeStart`)全部并入
+  `batchActive` + `ddRemoteOp`(切模式会清批量日志/横幅并触发 parseStack 干扰批量;
+  间隙点回滚/续传会让批量把别台 deploy-done 记到错误服务器上)。
+- **关清理模态不误清 pruning(#8)**:关闭模态不再无条件清 `st.pruning`,改由
+  `cleanup_execute` 的 then/catch 收尾(含模态已切换的兜底复位)——堵死「永久卡 true
+  阻止后续清理」与「重开模态并发清理同一批资源」两个方向。
+- **监控先订阅后 invoke + 订阅失败停后端(#9)**:原「启动成功后才订阅事件」违项目
+  纪律,且 `AppBus.on` 失败时后端采样循环仍在跑无人调 stop;现先订阅后 invoke,catch
+  统一清订阅 + 调 `manage_stats_stop` + 复位 UI。
+
+## 三、功能 bug 修复(JS/Rust 审查)
+
+- **deploy.js `writeReleaseNotes` 缺 `req` 包裹(高危)**:第十一批「部署时预填版本
+  说明」**自发布起从未真正写成功过**——`rollback_set_release_notes(req: ..)` 需
+  `{ req: {...} }`,而此处传平铺参数,每次必走 catch 弹「写入失败(部署本身已成功)」。
+  已补包裹层(rollback.js:572 本就是正确写法)。
+- rollback.js deploy-done:**只处理本页发起的回滚**(`busy===true`,否则 04 页部署
+  完成会触发 06 页整页重扫+写日志)、取消/失败不重扫(归档/标签未变化)、`errStripCode`
+  剥码防控制符进日志面板、listen 失败 `.catch` 复位 `logBound`(原 unhandled rejection
+  永失重试)。
+- check.js 检测全过时误报「后端检测信息:未知错误」(`report.error=null` 时 `errText`
+  返回兜底串恒真)→ 先判空。整栈批量空指针(`st.stack` 为 null 时取 `.services`)→
+  先判 `st.stack`。config-io.js 字段错误贴到不存在的 id(`cio-export-pass-confirm`
+  → `cio-export-pass2`)。app.js `setBtnBusy` 未传 label 且未曾 busy 时写入字符串
+  "undefined" → 加兜底。
+- manage_stats.rs 传输失败 error_code 用 `err.contains("超时")` **文案匹配**判
+  Timeout/Transport(违第十六批「只认码不认文案」设计)→ 改按 `code_of` 码判定。
+- migrate.rs 取消/失败时清理远端 /tmp tar(原仅成功路径清);migrate_project.rs 卷搬运
+  开始先 `rm -rf` 临时目录(防失败残留堆积);migrate_project.rs 源 `compose stop` 失败
+  进 `warnings`+日志(卷热导出数据或不一致,不再静默)。
+- cleanup.rs `parse_du_output` 空格分隔分支保留含空格路径(+单测);docker.rs `save_gzip`
+  防御性死代码补 kill+删文件(与函数其余错误路径对齐);manage.rs 宿主机性能采样
+  `.unwrap_or` 吞错补 `log::warn!`(区分解析降级与传输失败);manage.js `escHtml` 补
+  `"`/`'` 转义(用于 `value="..."`/`data-...="..."` 双引号属性拼接)。
+- migrate.rs 两处取消文案陈旧注释(「迁移已取消」→「部署已取消」)、migrate_project.rs
+  头注释 ⑧「+ 健康检查」与实际不符(`health_wait_secs` 恒 0)。
+
+## 四、wiki 全量对齐(01/02/03/04/06/07/README,30+ 处)
+
+- **补 errors / tray_status / probe 三个模块章节**(wiki/02;第十五~十七批新功能此前
+  完全未进文档);命令计数 94→95(含 save_server_entry);文件数/行数全量复核。
+- **修正失实记载**:栈扫描深度 `maxdepth 2→4`(wiki/02、wiki/07 限制 16);批量断点
+  「批量路径不落断点」→ 第十四批已更正的「批量恒落断点 + 逐台续传」(wiki/01、wiki/03、
+  wiki/04);续传本地 tar 复用条件「大小匹配」失实 → 单/整栈真实语义(wiki/06);wiki/07
+  限制 2(部署预检已实现)划线、限制 7(残留目录非空)。
+- **契约结构补字段**(wiki/04、wiki/02):`NotifyEvents.on_probe`、`AppSettings.
+  probeIntervalMins`、`DeployDone.errorCode`、`StatsPayload.errorCode+aggregate`;
+  `augment_pull_error` 归属 stack.rs→deploy.rs;`image_id_by_ref` 签名修正。
+- **行数/计数**:wiki/01 架构图 92→95、15 个 JS、tray_status 目录树悬挂错位、模态数
+  10→12、目录树全行数;wiki/README 仓库路径 E:\→D:\、代码量;wiki/03 全部 JS 行数。
+
+## 五、验证
+
+- `cargo test` 显式确认 `test result: ok. 315 passed; 0 failed; 13 ignored`
+  (基线 313 + cleanup 前缀校验 + save_server_entry merge 两单测)
+- `cargo clippy --all-targets` 新代码零新增警告(存量 18 条与本批无关)
+- `cargo build --release` 成功(CSP 配置生效,产物 NSIS);改动 JS 全过 `node --check`;
+  verify 三脚本(form 54 断言 / bridge / scope)全 PASS
+- 真机待确认:russh 0.60 真实 SSH 连接回归(密码/私钥/加密私钥口令 + TOFU)、CSP 启用
+  后 WebView 渲染、save_server_entry 编辑保存后密码/指纹保留、托盘 tooltip 悬停
