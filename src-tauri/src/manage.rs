@@ -361,7 +361,11 @@ pub async fn manage_overview(
         exec_collect(&mut client, &host_metrics_cmd()),
     )
     .await
-    .unwrap_or((1, String::new()));
+    .unwrap_or_else(|e| {
+        // 失败时概览 CPU/内存降级为「—」,但需留日志以区分「解析降级」与「传输失败」
+        log::warn!("获取宿主机性能失败(概览该项显示为 —): {}", e);
+        (1, String::new())
+    });
     let host = parse_host_metrics(&host_out);
     let mem_percent = match (host.mem_used, host.mem_total) {
         (Some(used), Some(total)) if total > 0 => {

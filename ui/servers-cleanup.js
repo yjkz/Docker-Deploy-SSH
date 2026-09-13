@@ -18,8 +18,9 @@
       m.classList.add('hidden');
       window.modalFocusClose(m);
     }
-    // 模态关闭即解除卡片 busy(执行标志由关闭时统一复位)
-    st.pruning[st.cleanupServerId || ''] = false;
+    // 不在此处清 st.pruning:cleanup_execute 可能仍在服务器上跑,关模态即清会让
+    // 用户重开同一服务器的清理模态再次发起 → 两个清理任务并发删同一批资源。
+    // pruning 由 execute 的 then/catch 收尾(见下,含模态已切换的兜底复位)。
     st.cleanupServerId = null;
     if (!document.querySelector('.page.active[data-page="servers"]')) return;
     renderServers();
@@ -455,8 +456,9 @@
       refreshCleanupExecState(st.cleanupExecBtn);
       window.AppBus.invoke('cleanup_execute', { serverId: server.id, sections: selection })
         .then(function (results) {
-          if (st.cleanupServerId !== server.id) return;
+          // pruning 无论模态是否仍开着都要复位(模态已关也要解锁服务器卡片)
           st.pruning[server.id] = false;
+          if (st.cleanupServerId !== server.id) return;
           var list = Array.isArray(results) ? results : [];
           body.innerHTML = '';
           body.appendChild(el('div', 'cleanup-hint', '清理完成:'));
@@ -476,8 +478,9 @@
           refreshCleanupExecState(st.cleanupExecBtn);
         })
         .catch(function (err) {
-          if (st.cleanupServerId !== server.id) return;
+          // 同 then:pruning 先复位,模态已关也要解锁服务器卡片
           st.pruning[server.id] = false;
+          if (st.cleanupServerId !== server.id) return;
           body.innerHTML = '';
           body.appendChild(el('div', 'cleanup-error',
             '清理失败:' + (err && err.message ? err.message : err)));

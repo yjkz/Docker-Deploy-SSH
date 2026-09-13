@@ -72,20 +72,33 @@
   function bindLogEvents() {
     if (logBound) return;
     logBound = true;
+    // listen 返回 Promise:失败时复位 logBound 以便下次重试(否则永失监听);
+    // 逐个 .catch,try/catch 只拦同步异常拦不到 Promise rejection
+    var onListenFail = function (err) {
+      logBound = false;
+      if (window.console && console.warn) console.warn('[rollback] 事件监听失败:', err);
+    };
     try {
       window.__TAURI__.event.listen('deploy-log', function (e) {
         appendLog(typeof e.payload === 'string' ? e.payload : String(e.payload || ''));
-      });
+      }).catch(onListenFail);
       window.__TAURI__.event.listen('deploy-done', function (e) {
         var p = e.payload || {};
-        appendLog(p.success ? ('✔ ' + (p.message || '回滚完成')) : ('✘ ' + (p.message || '回滚失败')));
+        // 只处理本页发起的回滚(busy===true):04 页部署/批量完成也发 deploy-done,
+        // 不应触发 06 页整页重扫或写日志(来源过滤)
+        if (!busy) return;
+        window.ddRemoteOp = null; // 释放跨页互斥锁(本页回滚已收尾)
+        var msg = window.errStripCode ? window.errStripCode(p.message) : (p.message || '');
+        appendLog(p.success ? ('✔ ' + (msg || '回滚完成')) : ('✘ ' + (msg || '回滚失败')));
         setBusy(false);
-        // 结束后刷新明细(归档/标签可能已变化)与项目列表
-        if (selectedDir) loadDetail(selectedDir, true);
-        loadProjects(true);
-      });
+        // 取消/失败时归档与标签未变化,无需重扫;仅成功才刷新明细与项目列表
+        if (p.success) {
+          if (selectedDir) loadDetail(selectedDir, true);
+          loadProjects(true);
+        }
+      }).catch(onListenFail);
     } catch (err) {
-      if (window.console && console.warn) console.warn('[rollback] 事件监听失败:', err);
+      onListenFail(err);
     }
   }
 
@@ -636,6 +649,12 @@
       run: function () {
         var server = currentServer();
         if (!server) return Promise.resolve();
+        // 跨页互斥:04 页部署/批量进行中时不发起(共享锁,与 deploy.js 双向)
+        if (window.ddRemoteOp) {
+          window.toast('另一项远程操作进行中(部署/回滚),请等待完成', 'warn');
+          return Promise.resolve();
+        }
+        window.ddRemoteOp = 'rollback';
         clearLog();
         setBusy(true);
         appendLog('开始整栈回滚:' + dir + ' → ' + ts);
@@ -644,6 +663,7 @@
           dir: dir,
           releaseTs: ts
         }).catch(function (err) {
+          window.ddRemoteOp = null;
           setBusy(false);
           appendLog('✘ ' + errText(err));
           throw err;
@@ -685,6 +705,12 @@
         run: function (targetRef) {
           var server = currentServer();
           if (!server) return Promise.resolve();
+          // 跨页互斥:04 页部署/批量进行中时不发起(共享锁,与 deploy.js 双向)
+          if (window.ddRemoteOp) {
+            window.toast('另一项远程操作进行中(部署/回滚),请等待完成', 'warn');
+            return Promise.resolve();
+          }
+          window.ddRemoteOp = 'rollback';
           clearLog();
           setBusy(true);
           appendLog('开始镜像回滚:' + repository + ':' + dateTag + ' → ' + targetRef);
@@ -695,6 +721,7 @@
             dateTag: dateTag,
             targetRef: targetRef
           }).catch(function (err) {
+            window.ddRemoteOp = null;
             setBusy(false);
             appendLog('✘ ' + errText(err));
             throw err;

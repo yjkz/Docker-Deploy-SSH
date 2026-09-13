@@ -604,6 +604,17 @@ async fn sync_files(
         } else {
             mapping.remote.clone()
         };
+        // 路径逃逸校验(与同类入口一致):文件映射的远端相对路径必须是**相对**路径,
+        // 拒绝 `..` 段与绝对路径 —— 否则会把文件写到部署目录之外(remote_join 不拦截)
+        if remote_rel.starts_with('/')
+            || remote_rel.starts_with('\\')
+            || remote_rel.split(['/', '\\']).any(|seg| seg == "..")
+        {
+            return Err(format!(
+                "同步文件失败:远端相对路径越出部署目录(不允许绝对路径或 .. 段):{}",
+                mapping.remote
+            ));
+        }
         let full_remote = remote_join(&effective_remote_dir(server, project), &remote_rel);
         if mapping.is_dir {
             emit_log(app, &format!("同步目录: {} -> {}", mapping.local, full_remote));

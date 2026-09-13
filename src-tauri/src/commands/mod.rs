@@ -261,16 +261,65 @@ pub struct StackServiceChoice {
 
 // ===== 多服务器批量部署(UPGRADE-PLAN 阶段七)=====
 
-/// 读取全部配置(服务器 + 项目)。
+/// 读取全部配置(服务器 + 项目)——**密文已置空的只读视图**。
+///
+/// 最小化原则:`password_enc`/`key_pass_enc` 的真实 DPAPI 密文不回传前端——
+/// 前端展示只需「是否已存」,故已存的字段以哨兵值 `"*"`(非空、非真实密文、
+/// 不可解)替代,None 保持 None。WebView 被注入时攻击者拿不到真实密文去做混淆
+/// 或导出。写路径不经本命令回传密文:服务器编辑保存走 [`save_server_entry`]
+/// (merge 保留密文);整量 `save_config_cmd` 仅用于配置中心导入等**自带密文**的场景。
 #[tauri::command]
 pub fn get_config() -> Result<AppConfig, String> {
-    load_config().map_err(|e| format!("读取配置失败: {}", e))
+    let mut cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    for s in &mut cfg.servers {
+        // 哨兵 "*":已存密文 → Some("*")(truthy,保留「已存」语义);未存 → None
+        if s.auth.password_enc.is_some() {
+            s.auth.password_enc = Some("*".to_string());
+        }
+        if s.auth.key_pass_enc.is_some() {
+            s.auth.key_pass_enc = Some("*".to_string());
+        }
+    }
+    Ok(cfg)
 }
 
 /// 保存全部配置(原子写入)。
+///
+/// ⚠️ 调用方必须传入**含真实密文**的完整配置(配置中心导入等);用 get_config
+/// 的只读视图(密文已置空)整量回写会把密文冲掉。服务器编辑保存请用
+/// [`save_server_entry`]。
 #[tauri::command]
 pub fn save_config_cmd(cfg: AppConfig) -> Result<(), String> {
     save_config(&cfg).map_err(|e| format!("保存配置失败: {}", e))
+}
+
+/// 保存单个服务器(编辑/新增;**merge 保留密文与指纹**,配合 get_config 只读视图)。
+///
+/// 前端从只读视图组装的服务器对象密文为空。本命令按 `server.id` 定位现有项:
+/// - `password_enc`/`key_pass_enc` 为空 → 沿用现有密文(merge);非空 → 用新值(改密码场景);
+/// - `host_key_sha256` 为空 → 沿用现有指纹(前端不承载指纹,防整对象替换清空)。
+/// 不存在则按新增插入(密文/指纹以入参为准)。返回保存后的服务器 id。
+#[tauri::command]
+pub fn save_server_entry(mut server: crate::config::ServerConfig) -> Result<String, String> {
+    let mut cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    let id = server.id.clone();
+    if let Some(existing) = cfg.servers.iter().find(|s| s.id == id) {
+        if server.auth.password_enc.is_none() {
+            server.auth.password_enc = existing.auth.password_enc.clone();
+        }
+        if server.auth.key_pass_enc.is_none() {
+            server.auth.key_pass_enc = existing.auth.key_pass_enc.clone();
+        }
+        if server.host_key_sha256.is_none() {
+            server.host_key_sha256 = existing.host_key_sha256.clone();
+        }
+    }
+    match cfg.servers.iter_mut().find(|s| s.id == id) {
+        Some(slot) => *slot = server,
+        None => cfg.servers.push(server),
+    }
+    save_config(&cfg).map_err(|e| format!("保存配置失败: {}", e))?;
+    Ok(id)
 }
 
 /// 用 DPAPI 加密明文密码,返回 base64 密文(前端保存服务器配置时存回 password_enc)。

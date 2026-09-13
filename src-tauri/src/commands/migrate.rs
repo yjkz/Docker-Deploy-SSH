@@ -44,7 +44,7 @@ pub struct MigrateLogEvent {
 pub struct MigrateDoneEvent {
     pub migrate_id: u64,
     pub success: bool,
-    /// 结束说明(取消 = 「迁移已取消」;成功 = 汇总;失败 = 中文错误)。
+    /// 结束说明(取消 = 「部署已取消」(errors::cancelled);成功 = 汇总;失败 = 中文错误)。
     pub message: String,
     /// 逐镜像结果(顺序与请求 images 对齐):`true` = 已在目标服务器
     /// (含同 ID 自动跳过与本次成功装载两种情况)。
@@ -219,7 +219,7 @@ pub async fn migrate_status(
 
 /// 迁移主体:逐镜像串行执行四步,返回 `(结束说明, 逐镜像完成标记)`。
 /// 失败时返回 `Err((错误, 已完成部分))`;取消返回
-/// `Err(("迁移已取消", 已完成部分))`(与部署取消文案同风格)。
+/// `Err((errors::cancelled()("部署已取消"), 已完成部分))`。
 async fn run_migrate(
     app: &AppHandle,
     state: &MigrateStateInner,
@@ -340,15 +340,22 @@ async fn run_migrate(
 
         // ③ 目标 docker load(输出转发 migrate-log)
         if state.is_cancelled() {
+            // 取消时远端 /tmp tar 已上传完成:尽力清理,避免反复取消在目标堆积大文件
+            let remote_tar_cancel = format!("/tmp/{}", tar_name);
+            let rm_cancel = format!("rm -f {}", shell_single_quote(&remote_tar_cancel));
+            let _ = exec_collect(&mut dst, &rm_cancel).await;
             drop(guard);
             return Err((crate::errors::cancelled(), done));
         }
         let remote_tar = format!("/tmp/{}", tar_name);
         emit_line(&format!("({}/{}) 目标服务器装载: docker load -i {}", i + 1, total, remote_tar));
         let load_cmd = format!("docker load -i {}", shell_single_quote(&remote_tar));
-        exec_forwarded_migrate(&mut dst, &load_cmd, &emit_line)
-            .await
-            .map_err(|e| (e, done.clone()))?;
+        // load 失败同样清理远端 tar(尽力),不让失败镜像的包残留目标 /tmp
+        if let Err(e) = exec_forwarded_migrate(&mut dst, &load_cmd, &emit_line).await {
+            let rm_fail = format!("rm -f {}", shell_single_quote(&remote_tar));
+            let _ = exec_collect(&mut dst, &rm_fail).await;
+            return Err((e, done.clone()));
+        }
 
         // ④ 清理远端 /tmp tar(尽力而为)
         let rm_cmd = format!("rm -f {}", shell_single_quote(&remote_tar));

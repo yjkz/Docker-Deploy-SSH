@@ -399,6 +399,8 @@
   /** 「从步骤 N 继续」:复用 st.deploying 互斥,之后事件渲染与正常部署完全一致 */
   function onResumeStart() {
     if (st.deploying || st.checking) return; // 并发防护:部署 / 预检中不得再次发起
+    if (st.batch && st.batch.active) { window.toast('批量部署进行中,请等待完成', 'warn'); return; } // 批量间隙锁
+    if (window.ddRemoteOp) { window.toast('另一项远程操作进行中(部署/回滚),请等待完成', 'warn'); return; } // 06 页回滚互斥
     var cp = st.resume;
     if (!cp || !cp.key) return;
     var key = String(cp.key);
@@ -411,6 +413,7 @@
     resetRunView(); // 清横幅/错误框/预检条/日志,进度归零(续传开始即隐藏横幅)
 
     st.deploying = true;
+    window.ddRemoteOp = 'deploy'; // 跨页互斥锁(06 页回滚据此避让)
     refreshControls();
     renderProgress(0, '');
 
@@ -419,6 +422,7 @@
       .catch(function (err) {
         // invoke 级失败(断点已被清理/参数异常):续传未真正启动,立即还原控件
         st.deploying = false;
+        window.ddRemoteOp = null;
         refreshControls();
         showErrorBox(['发起续传失败:' + (errText(err) || '未知错误')], false);
         refreshResumeStatus(); // 断点仍在时重查恢复横幅
@@ -757,7 +761,9 @@
     }
 
     // 模式切换 tab 与整栈面板按钮同步禁用(与现有并发防护一致;解析/预览中锁对应按钮)
-    var locked = st.deploying || st.checking;
+    // 批量间隙(台间 st.deploying=false)也不得切模式:切模式会清批量日志/横幅并
+    // 触发 parseStack 干扰批量,故 locked 并入 batchActive(JS 审查 #4)
+    var locked = st.deploying || st.checking || batchActive;
     ['deploy-mode-single', 'deploy-mode-stack',
       'deploy-mode-tabs', 'deploy-stack-parse-btn', 'deploy-stack-save-btn',
       'deploy-stack-preview-btn']
@@ -966,7 +972,9 @@
    * 项目提示文案、进度节点集重建。部署 / 预检中禁止切换。
    */
   function setMode(mode) {
-    if (st.deploying || st.checking) {
+    // 批量间隙(台间 st.deploying=false 但 st.batch.active=true)同样禁止切模式,
+    // 否则 resetRunView 清掉批量日志/横幅、重建进度节点集与 st.batch.mode 不一致
+    if (st.deploying || st.checking || (st.batch && st.batch.active)) {
       window.toast('部署进行中,无法切换模式', 'warn');
       return;
     }
@@ -1383,6 +1391,7 @@
 
   function onStartDeploy() {
     if (st.deploying || st.checking) return; // 并发防护:部署 / 预检中不得再次发起
+    if (window.ddRemoteOp) { window.toast('另一项远程操作进行中(部署/回滚),请等待完成', 'warn'); return; } // 06 页回滚互斥
     if (st.mode === 'stack') {
       onStartStackDeploy();
       return;
@@ -1467,6 +1476,7 @@
     };
 
     st.deploying = true;
+    window.ddRemoteOp = 'deploy'; // 跨页互斥锁
     refreshControls();
     renderProgress(0, '');
 
@@ -1474,6 +1484,7 @@
       .catch(function (err) {
         // invoke 本身失败:部署未真正启动,立即还原控件
         st.deploying = false;
+        window.ddRemoteOp = null;
         refreshControls();
         // 批量模式:没有 deploy-done,必须就地收尾该台,否则批量循环挂起
         if (st.batch && st.batch.active && st.batch.deferred) {
@@ -1611,6 +1622,7 @@
     };
 
     st.deploying = true;
+    window.ddRemoteOp = 'deploy'; // 跨页互斥锁
     refreshControls();
     renderProgress(0, '');
 
@@ -1618,6 +1630,7 @@
       .catch(function (err) {
         // invoke 本身失败:部署未真正启动,立即还原控件
         st.deploying = false;
+        window.ddRemoteOp = null;
         refreshControls();
         // 批量模式:没有 deploy-done,必须就地收尾该台,否则批量循环挂起
         if (st.batch && st.batch.active && st.batch.deferred) {
@@ -1654,6 +1667,7 @@
       var doneDeferred = st.batch.deferred;
       st.batch.deferred = null;
       st.deploying = false;
+      window.ddRemoteOp = null;
       st.pendingReleaseNotes = null; // 批量无逐台说明,清防残留污染后续单发
       refreshControls();
       refreshHistory();
@@ -1662,6 +1676,7 @@
     }
 
     st.deploying = false;
+    window.ddRemoteOp = null;
     refreshControls();
 
     if (success) {
@@ -1722,11 +1737,13 @@
       var dir = releaseDir.slice(0, idx);
       var ts = releaseDir.slice(idx + marker.length);
       window.AppBus.invoke('rollback_set_release_notes', {
-        serverId: ctx.serverId,
-        dir: dir,
-        ts: ts,
-        title: ctx.title || '',
-        body: ctx.body || ''
+        req: {
+          serverId: ctx.serverId,
+          dir: dir,
+          ts: ts,
+          title: ctx.title || '',
+          body: ctx.body || ''
+        }
       }).then(function () {
         window.toast('版本说明已写入发布归档(' + ts + ')', 'ok');
       }).catch(function (err) {
@@ -1758,7 +1775,7 @@
       if (!img) { window.toast('请先选择镜像', 'warn'); return; }
     }
     if (st.mode === 'stack' &&
-        (!Array.isArray(st.stack.services) || st.stack.services.length === 0)) {
+        (!st.stack || !Array.isArray(st.stack.services) || st.stack.services.length === 0)) {
       window.toast('整栈批量需要先完成服务分类(解析 compose)', 'warn');
       return;
     }
@@ -2127,7 +2144,8 @@
 
   /** 单台续传:现查断点 → 组装成单项批量队列(进度/收尾口径与批量一致) */
   function onBatchResumeOne(entry) {
-    if (!entry || st.batchResumeBusy || st.deploying || st.checking) return;
+    if (!entry || st.batchResumeBusy || st.deploying || st.checking ||
+        (st.batch && st.batch.active) || window.ddRemoteOp) return;
     st.batchResumeBusy = true;
     refreshControls();
     queryResumeEntry(entry)
@@ -2146,7 +2164,8 @@
 
   /** 一键批量续传:并发现查全部待续传台的断点 → 串行续完有断点的那些 */
   function onBatchResumeAll() {
-    if (st.batchResumeBusy || st.deploying || st.checking) return;
+    if (st.batchResumeBusy || st.deploying || st.checking ||
+        (st.batch && st.batch.active) || window.ddRemoteOp) return;
     var entries = (st.batch && Array.isArray(st.batch.resumable))
       ? st.batch.resumable.slice() : [];
     if (entries.length === 0) { window.toast('没有可续传的服务器', 'warn'); return; }
@@ -2448,7 +2467,7 @@
         var rbBtn = el('button', 'btn btn-sm', '回滚');
         rbBtn.type = 'button';
         rbBtn.title = '读取该记录服务器/项目的历史留档,回滚到指定时点';
-        rbBtn.disabled = st.deploying || st.rbBusy;
+        rbBtn.disabled = st.deploying || st.rbBusy || !!(st.batch && st.batch.active);
         rbBtn.addEventListener('click', function () { openRollbackModal(r); });
         tdAct.appendChild(rbBtn);
       }

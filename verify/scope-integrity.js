@@ -48,8 +48,9 @@ global.__TAURI__ = {
 // window 上的 addEventListener(domListeners.window 已由 global.addEventListener 覆盖,
 // 因为 global.window === global)
 
-// ===== index.html 的真实加载顺序(自 app.js 起;首行内联主题脚本不涉及) =====
+// ===== index.html 的真实加载顺序(theme-init.js 在前,自 app.js 起的 15 个随后) =====
 const CHAIN = [
+  'theme-init.js',
   'app.js', 'check.js', 'images.js', 'servers.js', 'servers-cleanup.js',
   'deploy.js', 'deploy-rollback.js', 'deploy-migrate.js',
   'manage.js', 'manage-stacks.js', 'rollback.js', 'notify.js', 'help.js',

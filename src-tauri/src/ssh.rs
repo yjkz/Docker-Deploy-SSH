@@ -23,7 +23,6 @@ use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use async_trait::async_trait;
 use russh::client::{self, Handle};
 use russh::ChannelMsg;
 use russh_sftp::client::error::Error as SftpError;
@@ -54,11 +53,11 @@ struct ClientHandler {
 /// 计算 OpenSSH 风格的服务器主机密钥指纹:
 /// `SHA256:` + base64(nopad)(SHA-256(公钥 SSH wire blob))。
 ///
-/// russh 0.46 的 [`russh::keys::key::PublicKey::fingerprint`] 已实现
-/// blob(`public_key_bytes()`)→ SHA-256 → base64(nopad) 全流程,
-/// 仅缺 `SHA256:` 前缀,这里补齐为与 `ssh-keygen -lf` 一致的形态。
-fn host_fingerprint(key: &russh::keys::key::PublicKey) -> String {
-    format!("SHA256:{}", key.fingerprint())
+/// russh 0.60 的 [`russh::keys::PublicKey::fingerprint(HashAlg::Sha256)`] 返回
+/// `ssh_key::Fingerprint`,其 `Display` 直接产出与 `ssh-keygen -lf` 一致的
+/// `SHA256:base64(nopad)` 形态(blob → SHA-256 → base64(nopad) + 前缀)。
+fn host_fingerprint(key: &russh::keys::PublicKey) -> String {
+    key.fingerprint(russh::keys::HashAlg::Sha256).to_string()
 }
 
 /// 私钥加载错误的中文映射(纯函数,便于单测)。
@@ -103,23 +102,26 @@ fn map_key_load_error(key_path: &str, had_passphrase: bool, e: russh::keys::Erro
     }
 }
 
-#[async_trait]
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
 
-    async fn check_server_key(
+    // russh 0.60 的 Handler 用原生 `-> impl Future`(未启 async-trait feature),
+    // 与 #[async_trait] 冲突(E0195 生命周期不匹配);方法体无 await,直接同步计算
+    // 后包一层 async block。
+    fn check_server_key(
         &mut self,
-        server_public_key: &russh::keys::key::PublicKey,
-    ) -> Result<bool, Self::Error> {
+        server_public_key: &russh::keys::PublicKey,
+    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
         let fingerprint = host_fingerprint(server_public_key);
         // 无论接受与否都记录观察值(拒绝路径的错误信息也可引用,调用方可读)
         let _ = self.observed.set(fingerprint.clone());
-        match &self.expected {
+        let accept = match &self.expected {
             // 首次连接:接受并记录(TOFU;落盘由调用方完成)
-            None => Ok(true),
+            None => true,
             // 已有期望指纹:一致才接受,否则拒绝(russh 以 UnknownKey 错误中止建连)
-            Some(expected) => Ok(expected == &fingerprint),
-        }
+            Some(expected) => expected == &fingerprint,
+        };
+        async move { Ok(accept) }
     }
 }
 
@@ -178,8 +180,13 @@ impl SshClient {
                 })?;
                 let key = russh::keys::load_secret_key(key_path, key_passphrase)
                     .map_err(|e| map_key_load_error(key_path, key_passphrase.is_some(), e))?;
+                // russh 0.60:authenticate_publickey 收 PrivateKeyWithHashAlg
+                // (None = RSA 走默认 hash;非 RSA 忽略),返回 AuthResult(判 .success())
                 let ok = handle
-                    .authenticate_publickey(&cfg.username, Arc::new(key))
+                    .authenticate_publickey(
+                        &cfg.username,
+                        russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), None),
+                    )
                     .await
                     .map_err(|e| {
                         crate::errors::tagged(
@@ -187,7 +194,7 @@ impl SshClient {
                             format!("SSH 公钥认证失败 (用户 {}): {}", cfg.username, e),
                         )
                     })?;
-                if !ok {
+                if !ok.success() {
                     return Err(crate::errors::tagged(
                         crate::errors::ErrCode::Auth,
                         format!(
@@ -209,7 +216,7 @@ impl SshClient {
                             format!("SSH 密码认证失败 (用户 {}): {}", cfg.username, e),
                         )
                     })?;
-                if !ok {
+                if !ok.success() {
                     return Err(crate::errors::tagged(
                         crate::errors::ErrCode::Auth,
                         format!("SSH 密码认证失败: 密码错误或被拒绝 (用户 {})", cfg.username),
@@ -738,8 +745,8 @@ mod tests {
         use base64::engine::general_purpose::STANDARD_NO_PAD as B64_NOPAD;
         use base64::Engine as _;
 
-        let key = russh::keys::key::KeyPair::generate_ed25519();
-        let pk = key.clone_public_key().expect("clone_public_key 失败");
+        let key = russh::keys::PrivateKey::from(russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[1u8; 32]));
+        let pk = key.public_key().clone();
         let fp = host_fingerprint(&pk);
 
         assert!(fp.starts_with("SHA256:"), "指纹应有 SHA256: 前缀: {fp}");
@@ -756,9 +763,8 @@ mod tests {
         assert_eq!(host_fingerprint(&pk), fp);
 
         // 不同密钥指纹互异
-        let pk2 = russh::keys::key::KeyPair::generate_ed25519()
-            .clone_public_key()
-            .unwrap();
+        let pk2 = russh::keys::PrivateKey::from(russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[2u8; 32]))
+            .public_key().clone();
         assert_ne!(host_fingerprint(&pk2), fp);
     }
 
@@ -767,9 +773,8 @@ mod tests {
     async fn test_check_server_key_tofu() {
         use russh::client::Handler as _;
 
-        let pk = russh::keys::key::KeyPair::generate_ed25519()
-            .clone_public_key()
-            .expect("clone_public_key 失败");
+        let pk = russh::keys::PrivateKey::from(russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[3u8; 32]))
+            .public_key().clone();
         let fp = host_fingerprint(&pk);
 
         // 首次连接(expected=None):接受,且 observed 记录指纹
@@ -826,7 +831,7 @@ mod tests {
     /// 正确口令可解开,错误口令按 russh 实际错误被映射为「口令错误或已损坏」。
     #[test]
     fn test_load_encrypted_pem_key() {
-        let key = russh::keys::key::KeyPair::generate_ed25519();
+        let key = russh::keys::PrivateKey::from(russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[4u8; 32]));
         let path = std::env::temp_dir().join(format!("dd-enc-key-{}.pem", uuid::Uuid::new_v4()));
         let f = std::fs::File::create(&path).unwrap();
         russh::keys::encode_pkcs8_pem_encrypted(&key, b"correct-pass", 3, f).unwrap();

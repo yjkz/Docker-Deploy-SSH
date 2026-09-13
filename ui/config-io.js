@@ -115,7 +115,7 @@
     }
     if (pass !== pass2) {
       window.formFailLoud('cio-error', '两次输入的导出口令不一致');
-      window.setFieldError(document.getElementById('cio-export-pass-confirm'), '与上格口令不一致');
+      window.setFieldError(document.getElementById('cio-export-pass2'), '与上格口令不一致');
       return;
     }
     if (pass.length < 6) {

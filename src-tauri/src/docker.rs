@@ -421,10 +421,17 @@ pub fn save_gzip(image: &str, out_path: &Path, progress_cb: impl Fn(u64)) -> Res
         String::from_utf8_lossy(&buf).to_string()
     });
 
-    let stdout_pipe = child
-        .stdout
-        .take()
-        .ok_or_else(|| "无法读取 docker save 的标准输出".to_string())?;
+    let stdout_pipe = match child.stdout.take() {
+        Some(p) => p,
+        None => {
+            // 防御(实际不可达:Stdio::piped 下 take 恒为 Some;若未来改动 stdio
+            // 配置则变为真实泄漏路径):错误返回前 kill 子进程并清理已建空文件,
+            // 与本函数其余错误路径对齐
+            let _ = child.kill();
+            let _ = std::fs::remove_file(out_path);
+            return Err("无法读取 docker save 的标准输出".to_string());
+        }
+    };
 
     // docker save stdout → 8KB+ 缓冲循环读写 → GzEncoder → 计数层 → BufWriter → 文件
     let counter = Arc::new(AtomicU64::new(0));

@@ -308,6 +308,16 @@ async fn rollback_execute_stack_inner(
     // 每次回滚开始时重置取消标志(与部署管线一致)
     reset_cancelled(app);
 
+    // ts 校验(与 rollback_delete_release 同口径):防 `..`/路径分隔符逃逸出
+    // <dir>/releases/(releases_dir/remote_join 不拦截 `..`,execute 路径此前缺此校验)
+    if release_ts.contains('/')
+        || release_ts.contains("..")
+        || release_ts.contains('\\')
+        || release_ts.trim().is_empty()
+    {
+        return Err(format!("发布标识不合法:{}", release_ts));
+    }
+
     let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
     let server = find_server(&cfg, server_id)?.clone();
     let project = find_project(&cfg, project_id)?.clone();
@@ -1253,6 +1263,16 @@ async fn rollback_execute_stack_at_inner(
 ) -> Result<DeployRecord, String> {
     let started = std::time::Instant::now();
     reset_cancelled(app);
+
+    // ts 校验(与 rollback_delete_release 同口径):防 `..`/路径分隔符逃逸出
+    // <dir>/releases/(releases_dir/remote_join 不拦截 `..`,execute 路径此前缺此校验)
+    if release_ts.contains('/')
+        || release_ts.contains("..")
+        || release_ts.contains('\\')
+        || release_ts.trim().is_empty()
+    {
+        return Err(format!("发布标识不合法:{}", release_ts));
+    }
 
     let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
     let server = find_server(&cfg, server_id)?.clone();

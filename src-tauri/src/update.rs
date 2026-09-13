@@ -376,11 +376,18 @@ pub fn open_external(url: String) -> std::result::Result<(), String> {
     if !url.starts_with("https://") {
         return Err(format!("不允许打开非 https 链接: {url}"));
     }
+    // cmd 元字符校验:即便不经 cmd 解析,含这些字符的 URL 也非合法 https 链接,
+    // 提前拒绝(防御纵深;`&` 在 cmd /c start 下会被当作命令分隔符造成本机注入)
+    if url.contains(['&', '^', '>', '<', '|', '"', '\'']) {
+        return Err(format!("链接含非法字符: {url}"));
+    }
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        std::process::Command::new("cmd")
-            .args(["/c", "start", "", &url])
+        // 用 explorer 直开(参数数组,不经 cmd 字符串解析),避免 `cmd /c start` 把
+        // URL 中的 `&` 解释为命令分隔符导致本机命令注入
+        std::process::Command::new("explorer")
+            .arg(&url)
             .creation_flags(0x0800_0000) // CREATE_NO_WINDOW,防闪黑框
             .spawn()
             .map_err(|e| format!("打开浏览器失败: {e}"))?;

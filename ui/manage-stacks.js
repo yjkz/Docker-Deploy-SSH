@@ -554,17 +554,26 @@
     hideMonitorError();
     cState.mon.errShown = false;
 
-    AppBus.invoke('manage_stats_start', {
-      serverId: state.serverId,
-      intervalSecs: intervalSecs
-    }).then(function () {
-      // 启动成功后再订阅事件,避免残留订阅
-      return AppBus.on('manage-stats', onStatsEvent).then(function (unlisten) {
-        cState.mon.unlisten = unlisten;
+    // 先订阅后 invoke(项目纪律,防首帧丢失);订阅失败要在 catch 里停掉后端
+    // 采样循环,否则后端仍跑而前端显示「已停止」无人调 manage_stats_stop
+    AppBus.on('manage-stats', onStatsEvent).then(function (unlisten) {
+      cState.mon.unlisten = unlisten;
+      return AppBus.invoke('manage_stats_start', {
+        serverId: state.serverId,
+        intervalSecs: intervalSecs
+      }).then(function () {
         cState.mon.running = true;
         updateMonitorUi();
       });
     }).catch(function (err) {
+      // 任一环节失败:清订阅 + 停后端采样(后端可能已成功启动)
+      if (cState.mon.unlisten) {
+        try { cState.mon.unlisten(); } catch (e) { /* 忽略 */ }
+        cState.mon.unlisten = null;
+      }
+      AppBus.invoke('manage_stats_stop', {}).catch(function () { /* 后端未启动时忽略 */ });
+      cState.mon.running = false;
+      updateMonitorUi();
       var msg = err && err.message ? err.message : String(err);
       toast('启动监控失败: ' + msg, 'fail');
     });

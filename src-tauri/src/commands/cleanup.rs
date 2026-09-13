@@ -698,7 +698,9 @@ pub(crate) fn parse_du_output(out: &str) -> Vec<(String, String)> {
         if t.is_empty() {
             continue;
         }
-        // 以最后一个制表符切分;无制表符时退化为按首个空白切分
+        // 以最后一个制表符切分(GNU du);无制表符时(BusyBox du 空格分隔)按「首个
+        // 空白」切分:size 字段必无空格,其余整体为路径 —— 这样路径含空格也能保留
+        // (原实现对 split_once 只取后段,路径含空格会被截断)
         if let Some((size, path)) = t.rsplit_once('\t') {
             rows.push((path.trim().to_string(), size.trim().to_string()));
         } else if let Some((size, path)) = t.split_once(char::is_whitespace) {
@@ -1115,6 +1117,21 @@ pub(crate) fn rm_release_dirs_cmd(dirs: &[String]) -> String {
     format!("rm -rf {}", quoted.join(" "))
 }
 
+/// 归档删除目标的前缀校验(纵深防御,与 `rollback_delete_release` 同口径):
+/// 仅放行形如 `<root>/releases/<ts>` 的绝对路径(`<root>` 非空且不向根上逃逸,
+/// `<ts>` 为不含 `/`、`..`、`\` 的纯目录名)。前端回传的目标虽源自后端扫描,
+/// 但执行前再断言一次,防 WebView 注入/前端 bug 把任意路径喂进 `rm -rf`。
+pub(crate) fn is_valid_release_dir_target(dir: &str) -> bool {
+    if !dir.starts_with('/') || dir.contains("..") || dir.contains('\\') {
+        return false;
+    }
+    let (root, ts) = match dir.rsplit_once("/releases/") {
+        Some((r, t)) => (r, t),
+        None => return false,
+    };
+    !root.is_empty() && !ts.is_empty() && !ts.contains('/')
+}
+
 /// 定向执行勾选的清理项(逐节流式输出 server-log,与既有清理同通道)。
 /// 至少勾选一项;各节独立执行,单节失败不影响其余。
 ///
@@ -1174,6 +1191,17 @@ pub async fn cleanup_execute(
         .iter()
         .flat_map(|p| p.release_dirs.iter().cloned())
         .collect();
+    // 纵深防御:执行前逐条断言归档目标是合法的 <root>/releases/<ts> 形态
+    // (防 WebView 注入/前端 bug 把任意路径喂进 rm -rf;见 is_valid_release_dir_target)
+    if let Some(bad) = all_release_dirs
+        .iter()
+        .find(|d| !is_valid_release_dir_target(d))
+    {
+        return Err(format!(
+            "归档删除目标越出 releases 目录,已拒绝执行:{}",
+            bad
+        ));
+    }
     if !all_release_dirs.is_empty() {
         plan.push((
             format!("旧发布归档({} 个)", all_release_dirs.len()),

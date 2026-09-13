@@ -1987,10 +1987,12 @@
     if (el) el.classList.add('hidden');
   }
 
+  // textContent→innerHTML 只转义 & < >;本模块另有用它拼 value="..." / data-...="..."
+  // 双引号属性值,需补 " 与 ' 的转义,否则含引号的值会截断属性(理论注入点)
   function escHtml(s) {
     var div = document.createElement('div');
     div.textContent = String(s == null ? '' : s);
-    return div.innerHTML;
+    return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
   /* ============================================================

@@ -15,7 +15,7 @@
 //! ⑤ 【传输】镜像/text>卷包/归档:源 → 本机中转 → 目标
 //! ⑥ 【装载】目标: docker load + 卷导入(按目标侧卷名)
 //! ⑦ 【文件】目标: compose 三件套 + releases 归档落盘
-//! ⑧ 【启服】目标: compose up -d + 健康检查
+//! ⑧ 【启服】目标: compose up -d(不做健康检查,health_wait_secs 恒 0)
 //! ⑨ 清理两端临时产物
 //! ⑩ 改绑 default_server_id + 写迁移历史
 //! ```
@@ -790,6 +790,13 @@ async fn run_migrate_project(
         if movable.is_empty() {
             emit_line("未发现可搬运的数据卷(命名卷或项目内目录),跳过卷搬运");
         } else {
+            // 先清空临时目录再建:此前失败/取消的迁移可能在该目录残留 GB 级卷包
+            // (清理⑤只在成功路径执行),此处幂等清空防堆积(尽力而为,失败不阻断)
+            let _ = exec_collect(
+                &mut src,
+                &format!("rm -rf {}", shell_single_quote(MIGRATE_TMP_DIR)),
+            )
+            .await;
             let (code, out) = with_timeout(
                 SSH_EXEC_TIMEOUT_SECS,
                 "创建源临时目录超时",
@@ -819,6 +826,18 @@ async fn run_migrate_project(
             let stop_err = compose_simple_action(&mut src, &src_dir, "stop", &emit_line)
                 .await
                 .err();
+            // stop 失败不能静默:卷会在容器运行中被热导出,导出数据可能不一致,
+            // 必须让用户在 warnings 里看到(不中止——导出仍可进行,只是不保证一致)
+            if let Some(e) = &stop_err {
+                warnings.push(format!(
+                    "源服务器停止服务失败({}),数据卷在运行中被导出,导出数据可能不一致;建议目标侧启动前核对数据",
+                    e
+                ));
+                emit_line(&format!(
+                    "警告:源服务停止失败,卷将在运行中导出(数据可能不一致) —— {}",
+                    e
+                ));
+            }
 
             // 导出(无论成败都要尝试恢复源,故先取结果再统一恢复)
             let export_result = export_volumes(

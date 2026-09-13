@@ -560,11 +560,14 @@
    */
   function beginRbExecution(invokeName, args) {
     // 二次防线:确认到执行之间页面状态可能变化(预检/部署被键盘等途径触发)
-    if (st.deploying || st.checking || st.rbBusy) {
-      window.toast('部署进行中,无法执行回滚', 'warn');
+    // 批量间隙(台间 st.deploying=false)与 06 页回滚中心进行中同样要拦(共享锁)
+    if (st.deploying || st.checking || st.rbBusy ||
+        (st.batch && st.batch.active) || window.ddRemoteOp) {
+      window.toast('部署/回滚进行中,无法执行回滚', 'warn');
       return;
     }
     st.deploying = true;
+    window.ddRemoteOp = 'deploy'; // 跨页互斥锁(06 页回滚中心据此避让)
     st.rbBusy = true;
     st.rbLogs = [];
     refreshControls();
@@ -589,6 +592,7 @@
         if (!st.rbBusy) return; // deploy-done 已先行收尾
         st.rbBusy = false;
         st.deploying = false;
+        window.ddRemoteOp = null;
         refreshControls();
         setRbCloseDisabled(false);
         var status = document.getElementById('rb-modal-status');

@@ -402,11 +402,14 @@ pub async fn manage_stats_start(
                         aggregate: StatsAggregate::default(),
                         error: Some(err.clone()),
                         stopped: false,
+                        // 判定只认码不认文案(第十六批设计目标):exec_stats_collect
+                        // 产出的错误已挂码,按码分类;无码保守按 Transport
                         error_code: Some(
-                            if err.contains("超时") {
-                                crate::errors::ErrCode::Timeout
-                            } else {
-                                crate::errors::ErrCode::Transport
+                            match crate::errors::code_of(&err) {
+                                Some(crate::errors::ErrCode::Timeout) => {
+                                    crate::errors::ErrCode::Timeout
+                                }
+                                _ => crate::errors::ErrCode::Transport,
                             }
                             .as_str(),
                         ),

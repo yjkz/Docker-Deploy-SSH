@@ -16,7 +16,9 @@ pub enum AuthType {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthConfig {
     pub auth_type: AuthType,
+    #[serde(default)]
     pub key_path: Option<String>,
+    #[serde(default)]
     pub password_enc: Option<String>,
     /// DPAPI 加密后的私钥口令(base64 密文;仅加密私钥需要;旧版配置无此字段,
     /// serde default 兼容)。导出/导入时按明文随加密 blob 携带(见 config_io)。
@@ -27,11 +29,16 @@ pub struct AuthConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub id: String,
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub host: String,
+    #[serde(default)]
     pub port: u16,
+    #[serde(default)]
     pub username: String,
     pub auth: AuthConfig,
+    #[serde(default)]
     pub remote_dir: String,
     /// 首次连接(TOFU)时记录的服务器主机密钥 OpenSSH 风格指纹
     /// (`SHA256:` + base64(nopad)(SHA-256(公钥 SSH blob)));None = 尚未信任。

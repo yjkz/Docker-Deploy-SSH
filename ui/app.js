@@ -43,6 +43,13 @@
 
   // ===== 全局状态:hostOk 变更时自动镜像到 localStorage =====
   window.AppState = {};
+  // ===== 跨页远程操作互斥锁(deploy.js 与 rollback.js 共享)=====
+  // 部署/回滚/续传都是对同一台服务器执行 compose up / 重打标签 / 重载镜像的
+  // 操作,绝不允许两条管线并发。此前 deploy.js 的 st.deploying 只在 04 页可见,
+  // 06 页回滚中心对此一无所知(v5.x JS 审查 #2)。此锁挂在 window 上跨页共享:
+  // 任一管线发起时置位,deploy-done 时复位;两侧入口守卫都先查它。
+  // 值 = 操作来源('deploy' | 'rollback'),便于排查;判空即「无进行中操作」。
+  window.ddRemoteOp = null;
   Object.defineProperty(window.AppState, 'hostOk', {
     enumerable: true,
     get: function () { return this._hostOk === true; },
@@ -324,7 +331,9 @@
       btn.appendChild(bar);
     } else {
       btn.disabled = false;
-      btn.textContent = label || btn.dataset.idleText;
+      // label 未传且未曾 busy(无 idleText)时,保持现有文案不被写成 "undefined"
+      var restore = label || btn.dataset.idleText;
+      if (restore !== undefined) btn.textContent = restore;
       delete btn.dataset.idleText;
     }
     return btn;

@@ -181,7 +181,7 @@
   function renderErrorNote(report) {
     var note = document.getElementById('check-error');
     if (!note) return;
-    var msg = report ? errText(report.error) : '';
+    var msg = report && report.error ? errText(report.error) : '';
     if (msg) {
       note.textContent = '后端检测信息:' + msg;
       note.classList.remove('hidden');

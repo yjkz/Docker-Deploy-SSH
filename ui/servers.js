@@ -1960,26 +1960,14 @@
     var savedId = null;
     encPromise
       .then(function (enc) {
+        // 密文最小化(v5.x 安全审查):get_config 已只读化(密文置空),编辑保存
+        // 改走 save_server_entry——前端只发表单字段,密文/指纹传 null 由后端
+        // merge 保留现有值;仅「输入了新密码」时带上加密后的新密文。
         if (authType === 'Password' && enc) auth.password_enc = enc;
-        return window.AppBus.invoke('get_config');
-      })
-      .then(function (cfg) {
-        cfg = normalizeCfg(cfg);
+        // 未改密码/私钥口令时,密文传 null(后端 merge 沿用现有密文)
+        if (!(authType === 'Password' && enc)) auth.password_enc = null;
+        auth.key_pass_enc = null; // 私钥口令密文恒由后端保留(更新经 test_server)
         var pid = (prev && prev.id) ? prev.id : uuid();
-        var idx = -1;
-        for (var i = 0; i < cfg.servers.length; i++) {
-          if (cfg.servers[i].id === pid) { idx = i; break; }
-        }
-        // 字段保全(阶段三):编辑回写是「get_config 全量取 → 整对象替换」
-        // 模式,表单不承载的字段必须以配置现值为基底透传回去,否则整对象
-        // 替换会经 serde(default) 把它们清空——auth.key_pass_enc(私钥口令
-        // 密文)与 host_key_sha256(主机密钥指纹)
-        var base = idx >= 0 ? cfg.servers[idx] : prev;
-        if (base) {
-          auth.key_pass_enc = (base.auth && base.auth.key_pass_enc)
-            ? base.auth.key_pass_enc
-            : null;
-        }
         var server = {
           id: pid,
           name: name,
@@ -1988,12 +1976,10 @@
           username: username,
           auth: auth,
           remote_dir: remoteDir,
-          host_key_sha256: (base && base.host_key_sha256) ? base.host_key_sha256 : null
+          host_key_sha256: null // 指纹由后端 merge 保留(前端不承载)
         };
         savedId = pid;
-        if (idx >= 0) cfg.servers[idx] = server;
-        else cfg.servers.push(server);
-        return window.AppBus.invoke('save_config_cmd', { cfg: cfg });
+        return window.AppBus.invoke('save_server_entry', { server: server });
       })
       .then(function () {
         closeModal();

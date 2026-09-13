@@ -100,6 +100,9 @@ services:
         // 退化为空格分隔
         let rows2 = parse_du_output("12K /home/a/b");
         assert_eq!(rows2[0], ("/home/a/b".to_string(), "12K".to_string()));
+        // 空格分隔 + 路径含空格:size 必无空格,按首个空白切后其余整体为路径
+        let rows3 = parse_du_output("512M /home/a b/my proj");
+        assert_eq!(rows3[0], ("/home/a b/my proj".to_string(), "512M".to_string()));
         assert!(parse_du_output("").is_empty());
     }
 
@@ -125,6 +128,24 @@ services:
             rm_volume_names_cmd(&["vol1".to_string()]),
             "docker volume rm 'vol1'"
         );
+    }
+
+    #[test]
+    fn test_is_valid_release_dir_target() {
+        // 合法:<root>/releases/<ts>(root 非空、ts 为纯目录名)
+        assert!(is_valid_release_dir_target("/home/a/releases/20260905-101010"));
+        assert!(is_valid_release_dir_target("/srv/app b/releases/20260905-101010"));
+        assert!(is_valid_release_dir_target("/opt/x/releases/20260905-101010"));
+        // 拒绝:非绝对路径 / 缺 releases 段 / ts 含子路径 / 逃逸
+        assert!(!is_valid_release_dir_target("home/a/releases/2026"));
+        assert!(!is_valid_release_dir_target("/home/a/20260905-101010"));
+        assert!(!is_valid_release_dir_target("/home/a/releases/"));
+        assert!(!is_valid_release_dir_target("/releases/2026")); // root 为空
+        assert!(!is_valid_release_dir_target("/home/a/releases/x/y"));
+        assert!(!is_valid_release_dir_target("/home/a/releases/../../etc"));
+        assert!(!is_valid_release_dir_target("/home/a/releases/..\\x"));
+        assert!(!is_valid_release_dir_target("/etc"));
+        assert!(!is_valid_release_dir_target("/"));
     }
 
     #[test]
@@ -2314,6 +2335,59 @@ services:
         checkpoint_cleanup_on_success(&key, &[tar.clone(), dir.join("already-gone.tar.gz")]);
         assert!(crate::config::load_resume_map().get(&key).is_none(), "断点应被清除");
         assert!(!tar.exists(), "保留的本地 tar 应被删除");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ===== save_server_entry(密文 merge;get_config 只读视图配套)=====
+
+    fn server_entry(id: &str, pass: Option<&str>, key_pass: Option<&str>, fp: Option<&str>) -> crate::config::ServerConfig {
+        crate::config::ServerConfig {
+            id: id.into(),
+            name: "n".into(),
+            host: "1.2.3.4".into(),
+            port: 22,
+            username: "root".into(),
+            auth: crate::config::AuthConfig {
+                auth_type: crate::config::AuthType::Password,
+                key_path: None,
+                password_enc: pass.map(|s| s.to_string()),
+                key_pass_enc: key_pass.map(|s| s.to_string()),
+            },
+            remote_dir: "/opt/app".into(),
+            host_key_sha256: fp.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn test_save_server_entry_merges_ciphertext() {
+        let _guard = crate::config::TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ddtest-ssentry-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
+
+        // 新增:密文/指纹以入参为准
+        save_server_entry(server_entry("s1", Some("ENC-P"), Some("ENC-K"), Some("SHA256:fp"))).unwrap();
+        let cfg = load_config().unwrap();
+        assert_eq!(cfg.servers[0].auth.password_enc.as_deref(), Some("ENC-P"));
+        assert_eq!(cfg.servers[0].auth.key_pass_enc.as_deref(), Some("ENC-K"));
+        assert_eq!(cfg.servers[0].host_key_sha256.as_deref(), Some("SHA256:fp"));
+
+        // 编辑但密文/指纹传 None(只读视图回写场景)→ merge 保留现有密文与指纹
+        let mut edit = server_entry("s1", None, None, None);
+        edit.name = "改名".into();
+        save_server_entry(edit).unwrap();
+        let cfg = load_config().unwrap();
+        assert_eq!(cfg.servers[0].name, "改名");
+        assert_eq!(cfg.servers[0].auth.password_enc.as_deref(), Some("ENC-P"), "密文应被 merge 保留");
+        assert_eq!(cfg.servers[0].auth.key_pass_enc.as_deref(), Some("ENC-K"));
+        assert_eq!(cfg.servers[0].host_key_sha256.as_deref(), Some("SHA256:fp"), "指纹应被 merge 保留");
+
+        // 改密码:传入新密文 → 覆盖
+        save_server_entry(server_entry("s1", Some("ENC-NEW"), None, None)).unwrap();
+        let cfg = load_config().unwrap();
+        assert_eq!(cfg.servers[0].auth.password_enc.as_deref(), Some("ENC-NEW"), "新密码应覆盖");
+        assert_eq!(cfg.servers[0].auth.key_pass_enc.as_deref(), Some("ENC-K"), "私钥口令仍保留");
 
         std::fs::remove_dir_all(&dir).ok();
     }

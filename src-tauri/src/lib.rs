@@ -36,6 +36,7 @@ pub fn run() {
     .invoke_handler(tauri::generate_handler![
       commands::get_config,
       commands::save_config_cmd,
+      commands::save_server_entry,
       commands::retrust_host_key,
       config_io::config_export_file,
       config_io::config_import_file,
