@@ -206,6 +206,10 @@ pub struct NotifyEvents {
     /// 部署取消时通知(默认关)
     #[serde(default)]
     pub on_cancel: bool,
+    /// 服务器探活状态翻转时通知(第十七批;默认关)—— 仅在「在线→离线 /
+    /// 离线→恢复」翻转时发,不做每轮轰炸
+    #[serde(default)]
+    pub on_probe: bool,
 }
 
 impl Default for NotifyEvents {
@@ -214,6 +218,7 @@ impl Default for NotifyEvents {
             on_success: true,
             on_failure: true,
             on_cancel: false,
+            on_probe: false,
         }
     }
 }
@@ -435,6 +440,10 @@ pub struct AppSettings {
     pub proxy: String,
     /// 启动时自动比对源 compose 并更新项目(第三批;缺省 true = 默认开启)
     pub auto_update_from_source: bool,
+    /// 服务器定时探活间隔分钟(第十七批;0 = 关闭,默认关;>0 时每 N 分钟
+    /// TCP 探活全部已配置服务器,状态翻转经通知中心分发)
+    #[serde(default)]
+    pub probe_interval_mins: u32,
 }
 
 /// `AppSettings::default` 的手写实现:`auto_update_from_source` 缺省为 **true**
@@ -445,6 +454,7 @@ impl Default for AppSettings {
             close_to_tray: false,
             proxy: String::new(),
             auto_update_from_source: true,
+            probe_interval_mins: 0,
         }
     }
 }
@@ -500,10 +510,13 @@ pub fn app_settings_get() -> AppSettings {
     load_app_settings()
 }
 
-/// 保存应用设置(关闭到托盘 / 更新代理;托盘拦截在关闭事件时现读文件,保存即生效)。
+/// 保存应用设置(关闭到托盘 / 更新代理 / 定时探活间隔;托盘拦截在关闭事件
+/// 时现读文件,保存即生效)。探活间隔变更时同步(重)启/停后端探活任务。
 #[tauri::command]
-pub fn app_settings_set(settings: AppSettings) -> std::result::Result<(), String> {
-    save_app_settings(&settings).map_err(|e| format!("保存设置失败: {}", e))
+pub fn app_settings_set(app: tauri::AppHandle, settings: AppSettings) -> std::result::Result<(), String> {
+    save_app_settings(&settings).map_err(|e| format!("保存设置失败: {}", e))?;
+    crate::probe::sync_from_settings(&app);
+    Ok(())
 }
 
 /// 打开日志文件夹(设置中心「诊断」入口;日志由 tauri-plugin-log 写于
@@ -765,6 +778,7 @@ mod tests {
             on_success: false,
             on_failure: true,
             on_cancel: true,
+            on_probe: false,
         };
         std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
         save_config(&cfg).unwrap();
@@ -909,6 +923,7 @@ mod tests {
             close_to_tray: true,
             proxy: "socks5://127.0.0.1:1080".into(),
             auto_update_from_source: false,
+            probe_interval_mins: 5,
         };
         save_app_settings(&settings).unwrap();
         assert!(dir.join("config/settings.json").exists());
@@ -953,6 +968,7 @@ mod tests {
             close_to_tray: true,
             proxy: "http://127.0.0.1:7890".into(),
             auto_update_from_source: false,
+            probe_interval_mins: 0,
         };
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains("\"closeToTray\":true"));

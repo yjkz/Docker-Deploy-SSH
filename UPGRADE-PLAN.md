@@ -1507,3 +1507,70 @@ protocol/config/parse/fs/input/internal)
   「无码保守按命令层」用例;map_key_load_error 测试改断码+剥码文案)
 - 前端:三 verify(scope-integrity / bridge-integrity / form-validation 54)全 PASS;
   parseErrCode 行为断言(码解析/无码 null/防伪装误读/剥码/未知码降级)
+
+# 第十七批升级(v5.16.0)— 候选池清空:远程管理四件套 + 定时探活
+
+> 用户指令:「开始容器级指标,image_filter 消费 .env 非 UTF-8 Docker data-root
+> 探测 服务器定时探活+通知这一批搞定直接发版」—— 候选池剩余五项一次做完。
+
+## 1. image_filter 消费(wiki/07 限制 3 解除)
+
+配置字段 `ProjectConfig.image_filter` 自 v1 起存在但从未被消费。本批在部署页
+消费:选中项目 → `renderImageSelect()` 按关键字过滤镜像下拉(`repository:tag`
+子串匹配、不区分大小写;空 = 不过滤);提示条三态(过滤生效 N/M、无匹配、
+无可用镜像);项目切换即时重填(镜像下拉填充移到项目恢复之后,因过滤依赖
+当前选中项目)。镜像页「部署」带入的 `__pendingDeployImage` 不受影响
+(过滤后找不到时提示口径不变)。
+
+## 2. .env 非 UTF-8 无损往返(wiki/07 限制 17 解除)
+
+旧实现 lossy 读入 + 「直接保存会把替换符写回」仅靠警示条。本批:
+
+- `manage_stack_env_read`:`StackEnv` 增 `notUtf8` + `rawB64`(原始字节
+  base64);纯 UTF-8 路径行为不变
+- `manage_stack_env_save`:增可选入参 `rawB64` —— 非空时校验解码 + 256KB
+  后**跳过 content 直接落盘原始字节**
+- 前端分流:**未改动**(草稿 === 读取时展示值)→ 带 rawB64 保存,无损回写;
+  **改过** → 拒绝并 toast 指引(在服务器上以正确编码编辑)。UTF-8 文件的
+  确认弹窗路径不变
+- 设计取舍:**不做转码**(不引 encoding 依赖):GBK/GB18030/latin1 判不准,
+  转错比不转更糟;「未改动无损 + 改动拒绝」两态覆盖真实需求且零依赖
+
+## 3. Docker data-root 探测
+
+概览采样命令 `host_metrics_cmd` 增 `==DROOT` 段:`docker info | grep
+'Docker Root Dir:'` 探真实数据根;解析端按该路径匹配 df 挂载行(改过
+data-root 的部署此前恒误判为「与根分区同盘」);段缺失/无 docker 权限时
+回退默认 `/var/lib/docker`。新增单测覆盖自定义路径与回退两态。
+
+## 4. 容器级指标
+
+`manage_stats` 每轮成功时附 `aggregate`(camelCase):`{ count, topCpu: ≤3,
+topMem: ≤3 }`,由纯函数 `aggregate_stats` 计算(解析 "12.34%" 数值降序,
+解析失败排末尾不 panic;单测覆盖排序/少于 3 个/解析失败/空表四态)。
+前端监控页顶部聚合条:`N 个容器 · CPU 前列:名字 xx% / … · 内存前列:
+名字 x%(用量) / …`;失败轮/停止/旧版后端(无字段)隐藏 —— 版本错配安全。
+
+## 5. 服务器定时探活 + 通知
+
+- 新模块 `src-tauri/src/probe.rs`:按 `AppSettings.probe_interval_mins`
+  (0=关,默认 0)起 tokio interval 任务;每轮**TCP 连 host:port**(5s 超时,
+  不做 SSH 认证 —— 不碰密钥、不触发 TOFU);**状态翻转才通知**(在线→离线 /
+  离线→恢复),首轮建基线不通知;锁纪律:状态更新锁内不 await(翻转清单
+  锁外发通知)
+- 挂点:setup(启动按已存设置)+ `app_settings_set`(保存即启停,无需重启);
+  进程内单任务 JoinHandle 替换(同 manage_stats 会话模式)
+- 通知事件类型增 `probe`:`NotifyEvents.on_probe`(默认关,notify.json);
+  设置中心「通用」组新增「服务器探活间隔(分钟)」数字输入;
+  通知中心「事件订阅」组新增「服务器探活状态翻转」勾选
+- 探测结果不落盘(易变运行时观测,重启首轮重建基线)
+
+## 验证
+
+- `cargo test` 显式确认 `test result: ok. 313 passed; 0 failed; 13 ignored`
+  (基线 308 + aggregate 2 + data-root 1 + probe TCP 2)
+- 三 verify(scope / bridge / form 54)全 PASS;settings.js / notify.js /
+  deploy.js / manage-stacks.js 过 node --check
+- wiki/07 限制 3、17 改写为已实现;wiki/04 契约增补(aggregate / notUtf8+
+  rawB64 / probeIntervalMins+onProbe);ROADMAP 候选池清空(五项全完成);
+  三处版本号 → 5.16.0

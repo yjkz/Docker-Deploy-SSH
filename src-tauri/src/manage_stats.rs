@@ -125,11 +125,73 @@ pub struct StatsRow {
     pids: String,
 }
 
+/// 容器级聚合指标(第 N 批):由单轮 stats 全表计算,随事件推给前端在
+/// 监控页顶部展示「最吃资源的容器」;纯函数聚合,单测覆盖。
+/// 注意:本结构按契约使用 camelCase(前端直接消费),与文件内其他 snake_case
+/// 结构不同(同 StackEnv 先例)。
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerTop {
+    /// 容器名(展示口径)
+    name: String,
+    /// CPU%(docker stats 原样字符串,如 "12.34%")
+    cpu_percent: String,
+    /// 内存占用(docker stats 原样,如 "256MiB / 3.84GiB")
+    mem_usage: String,
+}
+
+/// 单轮容器聚合(第 N 批,camelCase)。
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct StatsAggregate {
+    /// 本轮样本容器总数
+    count: usize,
+    /// CPU% 最高的前 3 个容器(降序;样本 <3 时全列)
+    top_cpu: Vec<ContainerTop>,
+    /// 内存% 最高的前 3 个容器(降序)
+    top_mem: Vec<ContainerTop>,
+}
+
+/// 把 docker stats 的 "12.34%" 解析为 f64(原样/空串/非数字 → None)
+fn parse_percent(s: &str) -> Option<f64> {
+    s.trim().trim_end_matches('%').trim().parse().ok()
+}
+
+/// 由单轮全表计算聚合(纯函数,便于单测):Top CPU 按解析出的数值降序,
+/// 解析失败的行排在末尾(稳定排序保持 docker 输出序);Top 内存同口径。
+pub(crate) fn aggregate_stats(rows: &[StatsRow]) -> StatsAggregate {
+    let mut by_cpu: Vec<&StatsRow> = rows.iter().collect();
+    by_cpu.sort_by(|a, b| {
+        let av = parse_percent(&a.cpu_percent).unwrap_or(f64::MIN);
+        let bv = parse_percent(&b.cpu_percent).unwrap_or(f64::MIN);
+        bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut by_mem: Vec<&StatsRow> = rows.iter().collect();
+    by_mem.sort_by(|a, b| {
+        let av = parse_percent(&a.mem_percent).unwrap_or(f64::MIN);
+        let bv = parse_percent(&b.mem_percent).unwrap_or(f64::MIN);
+        bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let to_top = |r: &StatsRow| ContainerTop {
+        name: r.name.clone(),
+        cpu_percent: r.cpu_percent.clone(),
+        mem_usage: r.mem_usage.clone(),
+    };
+    StatsAggregate {
+        count: rows.len(),
+        top_cpu: by_cpu.iter().take(3).map(|r| to_top(r)).collect(),
+        top_mem: by_mem.iter().take(3).map(|r| to_top(r)).collect(),
+    }
+}
+
 /// `manage-stats` 事件 payload。
 #[derive(Debug, Clone, Serialize)]
 struct StatsPayload {
     server_id: String,
     stats: Vec<StatsRow>,
+    /// 容器级聚合(第 N 批,camelCase;失败轮为默认值 count=0)
+    #[serde(rename = "aggregate")]
+    aggregate: StatsAggregate,
     /// 单轮失败时的中文错误提示(第十六批起可带 `[dderr:*]` 码标记);成功轮为 None。
     error: Option<String>,
     /// true 表示后端监控循环已自行终止(权限拒绝 / 连续连接失败),
@@ -237,6 +299,7 @@ pub async fn manage_stats_start(
                         let payload = StatsPayload {
                             server_id: server_id.clone(),
                             stats: Vec::new(),
+                            aggregate: StatsAggregate::default(),
                             error: Some(err.clone()),
                             stopped: false,
                             error_code: Some(crate::errors::ErrCode::Transport.as_str()),
@@ -273,6 +336,7 @@ pub async fn manage_stats_start(
                     );
                     let payload = StatsPayload {
                         server_id: server_id.clone(),
+                        aggregate: aggregate_stats(&rows),
                         stats: rows,
                         error: None,
                         stopped: false,
@@ -286,6 +350,7 @@ pub async fn manage_stats_start(
                     let payload = StatsPayload {
                         server_id: server_id.clone(),
                         stats: Vec::new(),
+                        aggregate: StatsAggregate::default(),
                         error: Some(crate::errors::perm_denied()),
                         stopped: true,
                         error_code: Some(crate::errors::ErrCode::PermDenied.as_str()),
@@ -307,6 +372,7 @@ pub async fn manage_stats_start(
                     let payload = StatsPayload {
                         server_id: server_id.clone(),
                         stats: Vec::new(),
+                        aggregate: StatsAggregate::default(),
                         error: Some(err.clone()),
                         stopped: false,
                         // 命令层错误码:退出码非 0 → protocol,解析失败 → parse
@@ -333,6 +399,7 @@ pub async fn manage_stats_start(
                     let payload = StatsPayload {
                         server_id: server_id.clone(),
                         stats: Vec::new(),
+                        aggregate: StatsAggregate::default(),
                         error: Some(err.clone()),
                         stopped: false,
                         error_code: Some(
@@ -450,6 +517,7 @@ fn connect_failure_limit_reached(
     let payload = StatsPayload {
         server_id: server_id.to_string(),
         stats: Vec::new(),
+        aggregate: StatsAggregate::default(),
         // 熔断停止:连接类失败,挂 transport 码(第十六批);文案剥内层标记
         error: Some(format!(
             "连续 {} 轮连接失败,监控已停止:{}",
@@ -631,7 +699,6 @@ mod tests {
             "SSH 打开会话通道失败: x"
         )));
         assert!(is_transport_error(&tagged(ErrCode::Timeout, "获取容器统计超时")));
-        // 命令层失败(连接仍可用)
         assert!(!is_transport_error(&tagged(
             ErrCode::Protocol,
             "docker stats 失败(退出码 1): x"
@@ -639,6 +706,61 @@ mod tests {
         // 无码旧式错误保守按命令层(与旧行为一致:不重连)
         assert!(!is_transport_error("SSH 打开会话通道失败: x"));
         assert!(!is_transport_error("解析失败"));
+    }
+
+    fn row(name: &str, cpu: &str, mem_pct: &str, mem_usage: &str) -> StatsRow {
+        StatsRow {
+            container_id: format!("id-{name}"),
+            name: name.into(),
+            cpu_percent: cpu.into(),
+            mem_usage: mem_usage.into(),
+            mem_percent: mem_pct.into(),
+            net_io: String::new(),
+            block_io: String::new(),
+            pids: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_aggregate_stats_top_cpu_and_mem() {
+        // 5 容器:CPU 降序 Top3 = c9/c5/c1;内存降序 Top3 = m7/m2/m5
+        let rows = vec![
+            row("c1", "1.50%", "30.00%", "100MiB / 4GiB"),
+            row("c9", "99.00%", "10.00%", "50MiB / 4GiB"),
+            row("m7", "5.00%", "80.00%", "900MiB / 4GiB"),
+            row("m2", "3.00%", "60.00%", "600MiB / 4GiB"),
+            row("c5", "50.00%", "40.00%", "400MiB / 4GiB"),
+        ];
+        let agg = aggregate_stats(&rows);
+        assert_eq!(agg.count, 5);
+        let cpu_names: Vec<&str> = agg.top_cpu.iter().map(|t| t.name.as_str()).collect();
+        // CPU Top3 = 99 > 50 > 5(c9/c5/m7;c1 的 1.5% 落榜)
+        assert_eq!(cpu_names, vec!["c9", "c5", "m7"]);
+        assert_eq!(agg.top_cpu[0].cpu_percent, "99.00%");
+        let mem_names: Vec<&str> = agg.top_mem.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(mem_names, vec!["m7", "m2", "c5"]);
+        assert_eq!(agg.top_mem[0].mem_usage, "900MiB / 4GiB");
+    }
+
+    #[test]
+    fn test_aggregate_stats_empty_and_unparseable() {
+        // 空表:count=0,Top 均空
+        let agg = aggregate_stats(&[]);
+        assert_eq!(agg, StatsAggregate::default());
+        // 样本 < 3:全列(不截断补空)
+        let rows = vec![row("a", "0.10%", "1.00%", "x"), row("b", "0.20%", "2.00%", "y")];
+        let agg = aggregate_stats(&rows);
+        assert_eq!(agg.count, 2);
+        assert_eq!(agg.top_cpu.len(), 2);
+        assert_eq!(agg.top_cpu[0].name, "b");
+        // 解析失败("–" 空串等)排在可解析行之后,不 panic
+        let rows = vec![
+            row("bad", "", "n/a", "z"),
+            row("ok", "1.00%", "2.00%", "w"),
+        ];
+        let agg = aggregate_stats(&rows);
+        assert_eq!(agg.top_cpu[0].name, "ok");
+        assert_eq!(agg.top_cpu[1].name, "bad");
     }
 
     #[test]

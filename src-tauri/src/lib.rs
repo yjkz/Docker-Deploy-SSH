@@ -12,6 +12,7 @@ pub mod manage_stacks;
 pub mod manage_stats;
 pub mod migrate_project;
 pub mod notify;
+pub mod probe;
 pub mod ssh;
 pub mod stack;
 pub mod tray_status;
@@ -152,6 +153,9 @@ pub fn run() {
       // 桌面端附加能力(UPGRADE-PLAN 阶段四):系统托盘 + 主窗口关闭拦截
       #[cfg(desktop)]
       setup_desktop(app)?;
+      // 服务器定时探活(第十七批):按已存设置决定启动或保持关闭
+      // (probe_interval_mins > 0 时启动;设置中心保存时也会 sync)
+      crate::probe::sync_from_settings(app.handle());
       Ok(())
     })
     .run(tauri::generate_context!())

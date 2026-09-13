@@ -178,11 +178,12 @@
         from: String(email.from || ''),
         to: Array.isArray(email.to) ? email.to.map(String) : []
       },
-      // 事件订阅缺省口径与后端一致:成功/失败默认开,取消默认关
+      // 事件订阅缺省口径与后端一致:成功/失败默认开,取消/探活默认关
       events: {
         onSuccess: events.onSuccess !== false,
         onFailure: events.onFailure !== false,
-        onCancel: events.onCancel === true
+        onCancel: events.onCancel === true,
+        onProbe: events.onProbe === true
       }
     };
   }
@@ -307,6 +308,8 @@
     body.appendChild(checkboxRow('notify-event-success', '部署成功', true));
     body.appendChild(checkboxRow('notify-event-failure', '部署失败', true));
     body.appendChild(checkboxRow('notify-event-cancel', '部署取消', false));
+    // 探活翻转(第十七批):服务器在线→离线 / 离线→恢复时提醒(间隔在设置中心配)
+    body.appendChild(checkboxRow('notify-event-probe', '服务器探活状态翻转', false));
 
     // ── 测试结果行(行内回显,内容见 showResult)──
     var result = el('div', 'notify-test-result');
@@ -429,6 +432,7 @@
     setChecked('notify-event-success', c.events.onSuccess);
     setChecked('notify-event-failure', c.events.onFailure);
     setChecked('notify-event-cancel', c.events.onCancel);
+    setChecked('notify-event-probe', c.events.onProbe);
   }
 
   // ===== 收集与校验(保存 / 测试邮件共用)=====
@@ -493,7 +497,8 @@
       events: {
         onSuccess: isChecked('notify-event-success'),
         onFailure: isChecked('notify-event-failure'),
-        onCancel: isChecked('notify-event-cancel')
+        onCancel: isChecked('notify-event-cancel'),
+        onProbe: isChecked('notify-event-probe')
       }
     };
   }

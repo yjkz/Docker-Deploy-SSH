@@ -66,6 +66,7 @@ pub struct NotifyEventsView {
     pub on_success: bool,
     pub on_failure: bool,
     pub on_cancel: bool,
+    pub on_probe: bool,
 }
 
 /// `notify_get_config` 的返回(camelCase 序列化给前端)。
@@ -118,6 +119,8 @@ pub struct NotifyEventsInput {
     pub on_failure: bool,
     #[serde(default)]
     pub on_cancel: bool,
+    #[serde(default)]
+    pub on_probe: bool,
 }
 
 /// `notify_save_config` 的入参(camelCase)。
@@ -249,6 +252,7 @@ pub async fn notify_save_config(cfg: NotifyConfigInput) -> Result<(), String> {
             on_success: cfg.events.on_success,
             on_failure: cfg.events.on_failure,
             on_cancel: cfg.events.on_cancel,
+            on_probe: cfg.events.on_probe,
         },
     };
     // 用户显式保存通知配置 → 先清除读取异常标志,让本次保存能把新配置
@@ -484,8 +488,9 @@ pub(crate) async fn fire(app: AppHandle, kind: &str, title: String, body: String
             "success" => notify.events.on_success,
             "failure" => notify.events.on_failure,
             "cancel" => notify.events.on_cancel,
+            "probe" => notify.events.on_probe,
             other => {
-                log::warn!("部署通知跳过:未知事件类型「{}」", other);
+                log::warn!("通知跳过:未知事件类型「{}」", other);
                 return;
             }
         };
@@ -547,6 +552,7 @@ fn to_view(cfg: &NotifyConfig) -> NotifyConfigView {
             on_success: cfg.events.on_success,
             on_failure: cfg.events.on_failure,
             on_cancel: cfg.events.on_cancel,
+            on_probe: cfg.events.on_probe,
         },
     }
 }

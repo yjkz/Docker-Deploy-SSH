@@ -244,6 +244,12 @@
     main.appendChild(hint(
       '开启后打开软件会比对导入项目的源 compose(含 .env / override)与配置内副本,' +
       '发现变化即自动同步并重解析(保留已保存的服务分类);关闭后仍可在项目列表点「从源更新」手动执行'));
+    // 服务器定时探活(第十七批):间隔分钟数,0 = 关闭;保存即启停后端探活任务
+    main.appendChild(buildField('服务器探活间隔(分钟)', 'PROBE',
+      'settings-probe-interval-input', 'number', '0',
+      '0 = 关闭;例如 5 表示每 5 分钟探活一次',
+      '按间隔 TCP 探活全部已配置服务器;状态翻转(在线→离线 / 离线→恢复)时经通知中心提醒,' +
+      '订阅开关在通知中心的「事件」区;探活不触发 SSH 认证,不碰密钥'));
 
     // 诊断日志:此前设置中心没有日志入口,排障需手动定位应用目录 logs/。
     // 打开动作经 open_logs_dir 由系统资源管理器完成(后端确保目录存在)
@@ -531,7 +537,8 @@
       settings: {
         closeToTray: isChecked('settings-close-tray'),
         proxy: fieldVal('settings-proxy-input').trim(),
-        autoUpdateFromSource: isChecked('settings-auto-update-src')
+        autoUpdateFromSource: isChecked('settings-auto-update-src'),
+        probeIntervalMins: (parseInt(fieldVal('settings-probe-interval-input'), 10) || 0)
       }
     }).then(function () {
       // 过期会话(保存期间模态被关闭甚至重开)→ 静默丢弃,防旧 promise 回写新模态
@@ -539,7 +546,7 @@
       st.saving = false;
       setBusy('settings-save-btn', false, '保存设置');
       window.toast('设置已保存', 'ok');
-      showUpdateMessage('ok', '设置已保存,关闭到托盘与代理已立即生效');
+      showUpdateMessage('ok', '设置已保存,关闭到托盘、代理与探活间隔已立即生效');
     }).catch(function (err) {
       if (!sessionAlive(session)) return;
       st.saving = false;
@@ -626,6 +633,8 @@
         setChecked('settings-close-tray', s.closeToTray === true);
         // 缺省(旧 settings.json)视为开启 —— 与后端 serde default 同口径
         setChecked('settings-auto-update-src', s.autoUpdateFromSource !== false);
+        var probe = document.getElementById('settings-probe-interval-input');
+        if (probe && probe.value === '') probe.value = String(s.probeIntervalMins || 0);
         var proxy = document.getElementById('settings-proxy-input');
         if (proxy && proxy.value === '') proxy.value = String(s.proxy || '');
         showUpdateMessage('info', '');

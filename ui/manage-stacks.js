@@ -338,10 +338,12 @@
   // (与后端 STACK_ENV_MAX_BYTES 同口径)。busy 防重复提交;会话序号(每次打开
   // +1)丢弃模态重开前的旧异步回写(参照 notify.js 先例)。Esc/遮罩关闭由
   // #manage-modal 的既有处理器承担。
-  var envState = { session: 0, busy: false, loaded: '', known: false };
+  // rawB64/notUtf8(第 N 批):非 UTF-8 文件的原始字节 base64 与标志 ——
+  // 未改动保存时原样回传后端,原始字节无损落盘(消除 U+FFFD 回写乱码)
+  var envState = { session: 0, busy: false, loaded: '', known: false, rawB64: '', notUtf8: false };
   // 非 UTF-8 字节告警文案:读回内容含 U+FFFD(后端 from_utf8_lossy 替换所致)时
-  // 在提示区展示;允许继续编辑,但保存确认文案会追加同样说明,风险由用户自担
-  var ENV_FFFD_WARN = '文件包含非 UTF-8 字节(可能为 GBK 编码),显示为替换符;直接保存会把替换字符写入文件';
+  // 在提示区展示;未改动保存走原样回写无损落盘,改动后保存会被拒绝(见 doStackEnvSave)
+  var ENV_FFFD_WARN = '文件包含非 UTF-8 字节(可能为 GBK 编码),显示为替换符;未改动保存将按原始字节无损回写,改动后需在服务器上以正确编码编辑';
 
   function showStackEnv(st) {
     var session = ++envState.session; // 开启新会话:此前打开的旧 promise 收尾失效
@@ -399,10 +401,14 @@
         var exists = !!(res && res.exists);
         envState.loaded = exists ? String(res.content || '') : '';
         envState.known = true;
+        // 第 N 批:非 UTF-8 文件记录原始字节与标志(未改动保存 → 无损回写)
+        envState.notUtf8 = !!(res && res.notUtf8);
+        envState.rawB64 = envState.notUtf8 ? String(res.rawB64 || '') : '';
         if (ta2.readOnly) ta2.value = envState.loaded; // 用户已进编辑态则不打断草稿
         ta2.placeholder = '';
-        // 含 U+FFFD(如 GBK 内容):提示区警告但不阻断编辑;保存确认会再次提醒
-        if (exists && envState.loaded.indexOf('\uFFFD') !== -1) {
+        // 非 UTF-8:提示区警告(未改动保存无损回写,改动后拒绝);UTF-8 但
+        // 内容恰好含 U+FFFD 字面量的边缘情况也走同一条无损回写路径,安全
+        if (exists && envState.notUtf8) {
           setStackEnvHint(ENV_FFFD_WARN);
         } else {
           setStackEnvHint(exists ? '' : '该栈目录暂无 .env 文件,保存后将创建');
@@ -454,9 +460,19 @@
       toast('.env 内容过大(上限 256KB),请精简后再保存', 'warn');
       return;
     }
-    // 含 U+FFFD(如 GBK 内容被替换):风险句拆出,由确认框 risk 段承载
-    var risk = draft.indexOf('�') !== -1 ? ENV_FFFD_WARN + '。' : null;
-    openModal('保存 .env', buildStackEnvSaveConfirm(st, session, draft, risk));
+    // 第 N 批(非 UTF-8 无损往返):非 UTF-8 文件的两种保存走向 ——
+    // ① 未改动(草稿 === 读取时的 lossy 展示):原样回写原始字节,无损落盘;
+    // ② 改过:拒绝保存(替换符落盘会永久损坏原始字节),提示上服务器改
+    if (envState.notUtf8) {
+      if (draft === envState.loaded) {
+        doStackEnvSave(st, session, draft, envState.rawB64);
+        return;
+      }
+      toast('内容已修改但原文件含非 UTF-8 字节,保存会把替换字符写入文件;请在服务器上以正确编码编辑,或取消修改后原样保存', 'fail');
+      return;
+    }
+    // UTF-8 文件:内容恰好含 U+FFFD 字面量时仍走正常保存(用户显式输入的字符)
+    openModal('保存 .env', buildStackEnvSaveConfirm(st, session, draft, null));
   }
 
   // 保存确认弹窗主体:布局同 buildConfirmBody,但「取消」不能走默认的 closeModal
@@ -488,14 +504,18 @@
     return div;
   }
 
-  function doStackEnvSave(st, session, draft) {
+  function doStackEnvSave(st, session, draft, rawB64) {
     envState.busy = true;
     closeModal(); // 确认弹窗关闭,保存结果决定后续走向
-    AppBus.invoke('manage_stack_env_save', {
+    // rawB64 非空 = 非 UTF-8 文件未改动:原样回写原始字节(无损);
+    // 空 = 正常 UTF-8 保存(或后端拿不到 raw 时的兜底路径)
+    var payload = {
       serverId: state.serverId,
       composeFile: st.compose_file,
       content: draft
-    }).then(function (res) {
+    };
+    if (rawB64) payload.rawB64 = rawB64;
+    AppBus.invoke('manage_stack_env_save', payload).then(function (res) {
       envState.busy = false;
       if (session !== envState.session) return; // 期间模态已重开:丢弃旧回写
       if (res && res.success) {
@@ -503,7 +523,7 @@
         showStackEnv(st); // 重开只读态并回读服务器内容(顺带校验落盘结果)
       } else {
         toast('保存 .env 失败: ' + ((res && res.message) || '未知错误'), 'fail');
-        reopenStackEnvEdit(st, draft, session); // 带回草稿,编辑内容不丢
+        reopenStackEnvEdit(st, draft, session);
       }
     }).catch(function (err) {
       envState.busy = false;
@@ -560,6 +580,9 @@
     }
     AppBus.invoke('manage_stats_stop', {}).catch(function () { /* 后端已停止时忽略 */ });
     updateMonitorUi();
+    // 聚合条随停止隐藏(表内历史数据保留,与旧口径一致)
+    var agg = $('monitor-aggregate');
+    if (agg) agg.classList.add('hidden');
     if (!silent) toast('监控已停止', 'info');
   }
 
@@ -614,6 +637,7 @@
     hideMonitorError();
     cState.mon.errShown = false;
     renderStats(payload.stats || []);
+    renderMonitorAggregate(payload.aggregate);
     // 徽章带上最后更新时间:帧是否还在持续到达一目了然
     // (docker stats 采集本身可能每轮 2~10s 以上,慢不等于停)
     var badge = $('monitor-badge');
@@ -628,6 +652,36 @@
     // 渲染期滚动保护 + 切监控 Tab 后首帧恢复位置(见 withStageScrollGuard)
     withStageScrollGuard(function () { renderStatsInto(tbody, list); });
     consumePendingTabScroll('monitor');
+  }
+
+  /**
+   * 容器级聚合条(第十七批):「N 个容器 · CPU 前列:名字 xx% / … · 内存前列:名字 x% (占用) / …」。
+   * payload.aggregate 由后端每轮计算(count + Top3 CPU + Top3 内存);
+   * 旧版后端无此字段(版本错配)→ 隐藏聚合条,监控表不受影响。
+   */
+  function renderMonitorAggregate(agg) {
+    var el = $('monitor-aggregate');
+    if (!el) return;
+    if (!agg || !agg.count) {
+      el.classList.add('hidden');
+      return;
+    }
+    var fmtTop = function (list, unit) {
+      return list.map(function (t) {
+        var v = String(t.cpu_percent || '—');
+        return String(t.name || '—') + ' ' + v + (v === '—' ? '' : unit);
+      }).join(' / ');
+    };
+    var memTop = (agg.top_mem || []).map(function (t) {
+      return String(t.name || '—') + ' ' + String(t.mem_percent || '—') +
+        (t.mem_usage ? '(' + String(t.mem_usage).split(' / ')[0] + ')' : '');
+    }).join(' / ');
+    var parts = [];
+    parts.push(agg.count + ' 个容器');
+    if (agg.top_cpu && agg.top_cpu.length) parts.push('CPU 前列:' + fmtTop(agg.top_cpu, ''));
+    if (memTop) parts.push('内存前列:' + memTop);
+    el.textContent = parts.join(' · ');
+    el.classList.remove('hidden');
   }
 
   function renderStatsInto(tbody, list) {

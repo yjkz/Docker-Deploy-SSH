@@ -214,6 +214,27 @@
     });
   }
 
+  /**
+   * 当前选中项目的镜像过滤关键字(空串 = 不过滤)。
+   * 消费 ProjectConfig.image_filter(此前配置字段未被消费,wiki/07 限制 3)。
+   */
+  function currentImageFilter() {
+    if (!st.cfg) return '';
+    var prjSel = document.getElementById('deploy-project');
+    var prj = (prjSel && prjSel.value) ? findById(st.cfg.projects, prjSel.value) : null;
+    return prj && prj.image_filter ? String(prj.image_filter).trim() : '';
+  }
+
+  /** 按关键字过滤镜像(不区分大小写,子串匹配 `repository:tag` 整串) */
+  function filterImagesByKeyword(list, filter) {
+    if (!filter) return list;
+    var f = String(filter).toLowerCase();
+    return list.filter(function (img) {
+      var ref = (String(img.repository) + ':' + String(img.tag)).toLowerCase();
+      return ref.indexOf(f) !== -1;
+    });
+  }
+
   function findImageByRef(ref) {
     for (var i = 0; i < st.images.length; i++) {
       var img = st.images[i];
@@ -509,22 +530,8 @@
     var srvSel = document.getElementById('deploy-server');
     var prjSel = document.getElementById('deploy-project');
 
-    var noImages = st.images.length === 0;
-    fillSelect(imgSel, noImages ? '暂无可用镜像' : '请选择镜像',
-      st.images.map(function (img) {
-        return { value: String(img.repository) + ':' + String(img.tag), text: String(img.repository) + ':' + String(img.tag) };
-      }));
-
-    // 全部为悬空镜像时的提示文字(「下拉空 + 提示」)
-    var hint = document.getElementById('deploy-images-hint');
-    if (hint) {
-      hint.textContent = noImages
-        ? '未找到可用镜像(仓库名或标签为 <none> 的悬空镜像不可部署),请先构建或拉取镜像'
-        : '';
-      hint.classList.toggle('hidden', !noImages);
-    }
-
     // 服务器 / 项目下拉:恢复上次选择(localStorage),项目按当前服务器排序
+    // (先于镜像下拉填充 —— 镜像过滤依赖当前选中项目,见下)
     fillSelect(srvSel, '请选择服务器',
       (st.cfg ? st.cfg.servers : []).map(function (s) {
         return { value: String(s.id), text: String(s.name) };
@@ -537,7 +544,43 @@
     if (srvSel && !srvSel.value && prjSel && prjSel.value) {
       syncServerForProject(prjSel.value);
     }
+
+    renderImageSelect();
     updateProjectHint();
+  }
+
+  /**
+   * 填充镜像下拉(消费当前项目的 image_filter 关键字;第 N 批)。
+   * 关键字为空 → 全部可用镜像;非空 → 仅 `repository:tag` 含该子串的镜像
+   * (不区分大小写)。被过滤掉时的说明走 #deploy-images-hint。
+   */
+  function renderImageSelect() {
+    var imgSel = document.getElementById('deploy-image');
+    if (!imgSel) return;
+    var filter = currentImageFilter();
+    var usable = st.images;
+    var shown = filterImagesByKeyword(usable, filter);
+    var noUsable = usable.length === 0;
+
+    fillSelect(imgSel, noUsable ? '暂无可用镜像' : '请选择镜像',
+      shown.map(function (img) {
+        return { value: String(img.repository) + ':' + String(img.tag), text: String(img.repository) + ':' + String(img.tag) };
+      }));
+
+    // 提示文字优先级:无可用镜像 > 过滤后无匹配 > 过滤生效(隐藏其余)
+    var hint = document.getElementById('deploy-images-hint');
+    if (hint) {
+      var text = '';
+      if (noUsable) {
+        text = '未找到可用镜像(仓库名或标签为 <none> 的悬空镜像不可部署),请先构建或拉取镜像';
+      } else if (filter && shown.length === 0) {
+        text = '没有符合当前项目镜像过滤关键字「' + filter + '」的镜像(共 ' + usable.length + ' 个镜像被过滤)';
+      } else if (filter && shown.length < usable.length) {
+        text = '已按项目镜像过滤关键字「' + filter + '」筛选:显示 ' + shown.length + ' / ' + usable.length + ' 个镜像';
+      }
+      hint.textContent = text;
+      hint.classList.toggle('hidden', !text);
+    }
   }
 
   /**
@@ -2553,6 +2596,8 @@
             projectOptionsFor(srvSelNow ? srvSelNow.value : ''), prjSel.value);
         }
         updateProjectHint();
+        // 项目切换 → 按新项目的 image_filter 重填镜像下拉(过滤关键字存项目级)
+        renderImageSelect();
         refreshResumeStatus(); // 项目变化后按新键重查断点横幅
         if (st.mode === 'stack') parseStack(); // 整栈模式:选中即自动解析
         // 已选即清掉上一次「请选择部署项目」的字段级提示(与全站口径一致:

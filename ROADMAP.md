@@ -91,6 +91,14 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 - 细节:监控熔断自动退出也清态(否则前端不在线时托盘永远「监控中」);批量逐台是独立单发,台间 tooltip 瞬闪终态再回「部署中」(状态恒准确,间隔 <1s)
 - 验证:`cargo test` 302 passed(基线 292 + 10)/ clippy 零新增 / 真机冒烟进程存活;**tooltip 悬停效果待用户确认**(系统绘制,无自动化断言手段)
 
+### 第十七批 v5.16.0(候选池:远程管理四件套 + 探活)— 已完成
+- **image_filter 消费**(wiki/07 限制 3 解除):部署页选中项目 → 镜像下拉按「镜像过滤关键字」筛选(`repository:tag` 子串,不区分大小写);提示条区分 过滤生效/无匹配/无可用镜像;项目切换即时重填
+- **.env 非 UTF-8 无损往返**(限制 17 解除):`StackEnv` 增 `notUtf8` + `rawB64`;保存分两路 —— 未改动 → `rawB64` 原始字节回写(零损坏),改动 → 拒绝并提示在服务器上编辑(替换符落盘会永久损坏);UTF-8 文件路径不变
+- **Docker data-root 探测**:概览采样命令增 `==DROOT` 段(`docker info` 取 Docker Root Dir),Docker 盘按探测路径匹配 df 行(改过 data-root 的部署此前恒误判为与根分区同盘);段缺失回退 /var/lib/docker
+- **容器级指标**:manage_stats 每轮附 `aggregate`{count + Top3 CPU + Top3 内存}(纯函数聚合 + 单测);监控页顶部聚合条展示「N 个容器 · CPU 前列 · 内存前列」,停止/失败轮隐藏
+- **服务器定时探活 + 通知**:新模块 probe.rs(TCP 连 host:port 5s 超时,不做 SSH 认证);设置中心新增「探活间隔(分钟,0=关)」保存即启停任务;**状态翻转才通知**(在线→离线 / 离线→恢复),通知事件类型增 `probe`(订阅开关 onProbe,默认关);首轮建基线不通知
+- 验证:`cargo test` 313 passed(基线 308 + probe 2 + aggregate 2 + data-root 1)/ 三 verify 全 PASS
+
 ### 第十六批 v5.15.0(候选池:结构化错误码)— 已完成
 - 新模块 `src-tauri/src/errors.rs`:错误串头部 `[dderr:<code>]` 前缀旁路(US 控制字符开头,UI 不渲染),**零命令签名改动**;12 个错误类(canceled/transport/auth/perm_denied/timeout/network/protocol/config/parse/fs/input/internal),加类 = 枚举加变体两行,删类 = 编译器穷尽检查兜底;7 单测
 - 后端:取消链路(mod.rs/deploy.rs/rollback.rs/migrate)生产→`errors::cancelled()`、判定→`code_of`;ssh.rs 全域挂码(认证/传输/超时/Fs/Protocol);`with_timeout` 挂 timeout;`exec_json_list` 挂 protocol/transport;stats 传输判定 `is_transport_error` 改按码;`DeployDone`/`StatsPayload` 增 `errorCode` 字段(camelCase 可选)
@@ -113,12 +121,7 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 ### 候选池(任意批复节点可插入,无先后承诺)
 | 项 | 要点 |
 |---|---|
-| 容器级指标 | 概览只有宿主机维度;manage_stats 流扩展容器聚合 |
 | 部署前强制预览 | `preview_stack_changes` 已实现未接入部署流程(wiki/03 明示「独立功能」);做成部署前可选/强制预览 |
-| 服务器定时探活+通知 | notify 体系已有桌面/SMTP/webhook;定时探活失败推送 |
-| image_filter 消费 | 配置字段未被消费(项目下拉过滤,wiki/07 限制 3) |
-| .env 非 UTF-8 | lossy 替换会乱码(wiki/07 限制 17) |
-| Docker data-root 探测 | 概览磁盘按默认 /var/lib/docker 采样;可加 `docker info -f` 探真实数据根 |
 
 ### 遗留待真机验证(用户下次实机操作时顺手确认)
 1. 版本详情保存版本标题/说明(路径翻倍修复后)
@@ -134,7 +137,7 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 
 ## 当前状态速览
 
-- 版本 v5.15.0;main = origin/main;基线 `cargo test` 308 passed / 13 ignored
+- 版本 v5.16.0;main = origin/main;基线 `cargo test` 313 passed / 13 ignored
 - 命令 94 个(lib.rs 注册;wiki/04 已同步);JS 15 文件(index.html 加载顺序见 wiki/03:13)
 - 前端结构:12 模态;commands/ 11 文件;三大 JS 主文件 2338/2013/2537 行
 - 表单体系(第十三批):5 处模态有真实 `<form novalidate>` 语义;失焦校验 + Enter 提交由 app.js 三助手统一承担

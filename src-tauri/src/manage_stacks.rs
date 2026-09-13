@@ -245,6 +245,14 @@ pub struct StackEnv {
     exists: bool,
     /// .env 文件内容(UTF-8;不存在时为空串)
     content: String,
+    /// 文件含非 UTF-8 字节(如 GBK)时为 true:content 是 lossy 展示值(U+FFFD
+    /// 替换符),**不能直接保存回写**(替换符一旦落盘即永久损坏原始字节)
+    #[serde(default)]
+    not_utf8: bool,
+    /// 原始字节 base64(仅 not_utf8=true 时非空):前端在「未改动」时把它
+    /// 原样传回 → 原始字节无损回写(第 N 批,消除 lossy 回写乱码风险)
+    #[serde(default)]
+    raw_b64: String,
 }
 
 /// 内容是否超出 .env 大小上限(按字节,与字符数无关)
@@ -278,15 +286,15 @@ fn env_write_cmd(env_path: &str, b64: &str) -> String {
     )
 }
 
-/// 将远端 `base64` 命令输出解码为 UTF-8 字符串。
-/// GNU/BusyBox base64 默认按 76 列换行,解码前剔除全部 ASCII 空白;
-/// 非 UTF-8 字节(如 GBK 内容)经 from_utf8_lossy 替换为 U+FFFD,不因编码损坏整体失败。
-fn decode_remote_b64(out: &str) -> Result<String, String> {
+/// 将远端 `base64` 命令输出解码为**原始字节**:剔除 ASCII 空白(GNU/BusyBox
+/// base64 默认 76 列换行)后标准解码。UTF-8 与否的分流在 read 命令内完成
+/// (纯 UTF-8 → content;含非 UTF-8 → lossy 展示 + raw_b64 原始字节,见
+/// [`manage_stack_env_read`])。
+fn decode_remote_b64_bytes(out: &str) -> Result<Vec<u8>, String> {
     let cleaned: String = out.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-    let bytes = BASE64_STANDARD
+    BASE64_STANDARD
         .decode(cleaned.as_bytes())
-        .map_err(|e| format!(".env base64 解码失败: {}", e))?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+        .map_err(|e| format!(".env base64 解码失败: {}", e))
 }
 
 /// 解析远端 `wc -c <文件` 输出为字节数(输出可能带换行/前后空白)
@@ -323,6 +331,8 @@ pub async fn manage_stack_env_read(
         return Ok(StackEnv {
             exists: false,
             content: String::new(),
+            not_utf8: false,
+            raw_b64: String::new(),
         });
     }
 
@@ -360,26 +370,64 @@ pub async fn manage_stack_env_read(
     if code != 0 {
         return Err(format!("读取 .env 失败(退出码 {}): {}", code, out.trim()));
     }
-    Ok(StackEnv {
-        exists: true,
-        content: decode_remote_b64(&out)?,
-    })
+    // 第 N 批(非 UTF-8 无损往返):解码原始字节 → 纯 UTF-8 直接返回;
+    // 含非 UTF-8 字节(如 GBK)时 content 为 lossy 展示值,同时带回原始字节
+    // base64,前端「未改动」保存时原样回传 → 原始字节无损落盘(见 save)
+    let bytes = decode_remote_b64_bytes(&out)?;
+    match String::from_utf8(bytes) {
+        Ok(content) => Ok(StackEnv {
+            exists: true,
+            content,
+            not_utf8: false,
+            raw_b64: String::new(),
+        }),
+        Err(e) => {
+            let bytes = e.into_bytes();
+            Ok(StackEnv {
+                exists: true,
+                content: String::from_utf8_lossy(&bytes).into_owned(),
+                not_utf8: true,
+                raw_b64: BASE64_STANDARD.encode(&bytes),
+            })
+        }
+    }
 }
 
 /// 保存 compose 文件同目录的 .env(原子写:先写 `.env.ddtmp.$$` 再 mv 覆盖,可新建文件)。
+/// `raw_b64`(可选,第 N 批):非 UTF-8 文件「未改动」的原样回写 —— 前端在
+/// 编辑器内容与读取时的 lossy 展示完全一致时传回 `rawB64`(读取命令带回的
+/// 原始字节),后端跳过 content 直接落盘原始字节,消除 U+FFFD 回写乱码;
+/// 用户改过内容(或未传 raw_b64)时按 content 正常 UTF-8 写入。
 #[tauri::command]
 pub async fn manage_stack_env_save(
     server_id: String,
     password_plain: Option<String>,
     compose_file: String,
     content: String,
+    raw_b64: Option<String>,
 ) -> Result<ActionResult, String> {
-    // 大小上限校验(按字节):超出直接拒绝,不发往远端
-    if env_content_too_large(&content) {
-        return Err(".env 内容过大(上限 256KB)".to_string());
-    }
+    // 写入字节:优先 raw_b64 原样回写(校验合法 base64 且不超上限);
+    // 否则按 content(UTF-8 文本)编码
+    let bytes: Vec<u8> = match raw_b64.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(b64) => {
+            let decoded = BASE64_STANDARD
+                .decode(b64.as_bytes())
+                .map_err(|e| format!("rawB64 解码失败: {}", e))?;
+            if decoded.len() > STACK_ENV_MAX_BYTES {
+                return Err(".env 内容过大(上限 256KB)".to_string());
+            }
+            decoded
+        }
+        None => {
+            // 大小上限校验(按字节):超出直接拒绝,不发往远端
+            if env_content_too_large(&content) {
+                return Err(".env 内容过大(上限 256KB)".to_string());
+            }
+            content.into_bytes()
+        }
+    };
     let env_path = env_path_of(&parent_dir_of(&compose_file));
-    let cmd = env_write_cmd(&env_path, &BASE64_STANDARD.encode(content.as_bytes()));
+    let cmd = env_write_cmd(&env_path, &BASE64_STANDARD.encode(&bytes));
     let (_server, mut client) = connect_server(&server_id, password_plain.as_deref()).await?;
     let result = with_timeout(
         EXEC_TIMEOUT_SECS,
@@ -440,20 +488,26 @@ mod tests {
             .map(|c| std::str::from_utf8(c).unwrap().to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert_eq!(decode_remote_b64(&wrapped).unwrap(), content);
+        assert_eq!(decode_remote_b64_bytes(&wrapped).unwrap(), content.as_bytes());
         // 末尾换行(命令输出常见)同样不影响
-        assert_eq!(decode_remote_b64(&format!("{}\n", encoded)).unwrap(), content);
+        assert_eq!(
+            decode_remote_b64_bytes(&format!("{}\n", encoded)).unwrap(),
+            content.as_bytes()
+        );
     }
 
     #[test]
-    fn test_decode_remote_b64_empty_and_lossy() {
-        // 空文件 → 空串
-        assert_eq!(decode_remote_b64("\n").unwrap(), "");
-        // 非法 UTF-8 字节(如 GBK 内容)→ from_utf8_lossy 替换,不整体失败
-        let got = decode_remote_b64(&BASE64_STANDARD.encode([0xFF, 0xFE, b'a'])).unwrap();
-        assert_eq!(got, "\u{FFFD}\u{FFFD}a");
+    fn test_decode_remote_b64_empty_and_non_utf8() {
+        // 空文件 → 空字节
+        assert_eq!(decode_remote_b64_bytes("\n").unwrap(), Vec::<u8>::new());
+        // 非 UTF-8 字节(如 GBK 内容)→ 原样保留原始字节(read 命令据此分流
+        // lossy 展示与 raw_b64 回写,第 N 批无损往返的底座)
+        assert_eq!(
+            decode_remote_b64_bytes(&BASE64_STANDARD.encode([0xFF, 0xFE, b'a'])).unwrap(),
+            vec![0xFF, 0xFE, b'a']
+        );
         // 非 base64 字符 → 明确报错而非 panic
-        assert!(decode_remote_b64("!!!!").is_err());
+        assert!(decode_remote_b64_bytes("!!!!").is_err());
     }
 
     #[test]

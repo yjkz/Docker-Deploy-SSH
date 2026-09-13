@@ -421,14 +421,19 @@ pub async fn manage_overview(
 
 /// 拼宿主机性能采样命令:单次 exec 完成 —— /proc/stat 两次采样(间隔 1s)
 /// 差分算 CPU 占用,/proc/meminfo 取内存总量与可用量,nproc 取核心数,
-/// `df -kP` 取根分区与 /var/lib/docker 所在文件系统用量(-P POSIX 格式,
-/// 长设备名不折行;目录不存在时该行缺失,stdout 仍有根分区行)。
-/// 标记行 `==CPU1/==MEM/==NPROC/==DISK/==CPU2` 供解析切分;grep/df 全部
-/// `2>/dev/null`,/proc 缺失的系统输出为空段(解析为空 → 前端「—」)。
+/// `docker info` 探测 Docker 真实数据根目录(`Docker Root Dir`,data-root
+/// 改过的部署不在 /var/lib/docker),`df -kP` 取根分区与该数据根所在文件
+/// 系统用量(-P POSIX 格式,长设备名不折行;目录不存在时该行缺失,stdout
+/// 仍有根分区行)。标记行 `==CPU1/==MEM/==NPROC/==DROOT/==DISK/==CPU2`
+/// 供解析切分;grep/df/docker 全部 `2>/dev/null`,/proc 缺失的系统输出为
+/// 空段(解析为空 → 前端「—」)。
+/// `==DROOT` 输出 docker info 的 `Docker Root Dir:` 行(无权限/无 docker
+/// 时该段为空,解析端回退默认路径 /var/lib/docker 再按 df 行兜底)。
 pub(crate) fn host_metrics_cmd() -> String {
     "echo '==CPU1'; grep '^cpu ' /proc/stat 2>/dev/null; \
      echo '==MEM'; grep -E '^(MemTotal|MemAvailable|MemFree|Buffers|Cached):' /proc/meminfo 2>/dev/null; \
      echo '==NPROC'; nproc 2>/dev/null; \
+     echo '==DROOT'; docker info 2>/dev/null | grep '^ Docker Root Dir:'; \
      echo '==DISK'; df -kP / /var/lib/docker 2>/dev/null; \
      sleep 1; echo '==CPU2'; grep '^cpu ' /proc/stat 2>/dev/null"
         .to_string()
@@ -447,7 +452,8 @@ struct HostMetrics {
     mem_used: Option<u64>,
     /// 根分区(/)所在文件系统样本(KB 口径,来自 df -kP)
     root_disk: Option<DfSample>,
-    /// Docker 数据目录所在文件系统样本 —— 仅当 /var/lib/docker 本身是挂载点
+    /// Docker 数据目录所在文件系统样本 —— 仅当数据根(data-root,默认
+    /// /var/lib/docker,可被 ==DROOT 段的 `docker info` 覆盖)本身是挂载点
     /// (独立文件系统)时为 Some;与根分区同盘时 df 报告的挂载点是 /,归入 root
     docker_disk: Option<DfSample>,
 }
@@ -467,8 +473,9 @@ fn parse_host_metrics(out: &str) -> HostMetrics {
     const S_CPU1: u8 = 1;
     const S_MEM: u8 = 2;
     const S_NPROC: u8 = 3;
-    const S_DISK: u8 = 4;
-    const S_CPU2: u8 = 5;
+    const S_DROOT: u8 = 4;
+    const S_DISK: u8 = 5;
+    const S_CPU2: u8 = 6;
     let mut kind = S_NONE;
     let mut cpu1 = String::new();
     let mut cpu2 = String::new();
@@ -477,6 +484,9 @@ fn parse_host_metrics(out: &str) -> HostMetrics {
     let mut mem_free_kb = None::<u64>;
     let mut buffers_kb = None::<u64>;
     let mut cached_kb = None::<u64>;
+    // Docker 数据根路径(data-root):docker info 报告值优先,回退默认
+    // /var/lib/docker(无 docker 权限/无 docker 时 ==DROOT 段为空)
+    let mut docker_root = String::from("/var/lib/docker");
     for line in out.lines() {
         match line.trim() {
             "==CPU1" => {
@@ -489,6 +499,10 @@ fn parse_host_metrics(out: &str) -> HostMetrics {
             }
             "==NPROC" => {
                 kind = S_NPROC;
+                continue;
+            }
+            "==DROOT" => {
+                kind = S_DROOT;
                 continue;
             }
             "==DISK" => {
@@ -505,12 +519,22 @@ fn parse_host_metrics(out: &str) -> HostMetrics {
             S_CPU1 => cpu1 = line.trim().to_string(),
             S_CPU2 => cpu2 = line.trim().to_string(),
             S_NPROC => m.cores = line.trim().parse().ok(),
+            // `Docker Root Dir: /data/docker`(docker info 输出行,可能带前后空白)
+            S_DROOT => {
+                let t = line.trim();
+                if let Some(path) = t.strip_prefix("Docker Root Dir:") {
+                    let path = path.trim();
+                    if !path.is_empty() {
+                        docker_root = path.to_string();
+                    }
+                }
+            }
             S_DISK => {
                 if let Some(s) = split_df_line(line) {
-                    if s.mount == "/var/lib/docker" {
-                        // /var/lib/docker 自身是挂载点 = Docker 数据在独立文件系统
+                    if s.mount == docker_root {
+                        // 数据根自身是挂载点 = Docker 数据在独立文件系统
                         m.docker_disk = Some(s);
-                    } else if m.root_disk.is_none() {
+                    } else if s.mount == "/" && m.root_disk.is_none() {
                         // df 对每个参数各输出一行;同盘时两行挂载点都是 /,首行即根分区
                         m.root_disk = Some(s);
                     }
@@ -1233,6 +1257,29 @@ mod tests {
         let m = parse_host_metrics("==NPROC\n2\n");
         assert_eq!(m.root_disk, None);
         assert_eq!(m.docker_disk, None);
+    }
+
+    #[test]
+    fn test_parse_host_metrics_custom_data_root() {
+        // docker info 报告自定义 data-root(/data/docker):挂载点为该路径的
+        // df 行归 Docker 盘;/var/lib/docker 默认路径的挂载行不再匹配
+        // (典型:改过 data-root 的部署,/var/lib/docker 可能不存在)
+        let out = "==DROOT\n\
+                   Docker Root Dir: /data/docker\n\
+                   ==DISK\n\
+                   /dev/sda1 40203644 8372440 29787180 21% /\n\
+                   /dev/vdc1 66065048 30011200 32690688 48% /data/docker\n";
+        let m = parse_host_metrics(out);
+        let docker = m.docker_disk.unwrap();
+        assert_eq!(docker.mount, "/data/docker");
+        assert_eq!(docker.total_kb, 66065048);
+        assert_eq!(m.root_disk.unwrap().mount, "/");
+        // ==DROOT 段为空(无 docker 权限/无 docker):回退默认 /var/lib/docker
+        let out2 = "==DROOT\n==DISK\n\
+                    /dev/sda1 40203644 8372440 29787180 21% /\n\
+                    /dev/vdb1 82067888 12400000 65483544 16% /var/lib/docker\n";
+        let m2 = parse_host_metrics(out2);
+        assert_eq!(m2.docker_disk.unwrap().mount, "/var/lib/docker");
     }
 
     #[test]
