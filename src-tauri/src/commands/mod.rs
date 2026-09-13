@@ -75,9 +75,9 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::config::{
-    checkpoint_key, load_config, load_resume_map, remove_checkpoint, save_config, save_checkpoint,
-    AppConfig, AuthType, ProjectConfig, ResumeCheckpoint, ServerConfig, ServiceOverride,
-    TransferMode,
+    checkpoint_key, load_config, load_resume_map, remove_checkpoint, save_checkpoint,
+    update_config, AppConfig, AuthType, ProjectConfig, ResumeCheckpoint, ServerConfig,
+    ServiceOverride, TransferMode,
 };
 use crate::crypto::{dpapi_protect, dpapi_unprotect};
 use crate::docker::{
@@ -312,47 +312,36 @@ fn restore_sentinel(incoming: Option<String>, existing: Option<&String>) -> Opti
 /// 回写会把全部密文静默清空(与 v6.1.1「绝不丢密文」的意图相反)。
 ///
 /// 不含哨兵的入参(配置中心导入等自带真实密文的场景)在磁盘不可读时按原样放行。
-fn restore_sentinels(mut cfg: AppConfig) -> Result<AppConfig, String> {
-    let has_sentinel = cfg
-        .servers
-        .iter()
-        .any(|s| {
-            s.auth.password_enc.as_deref() == Some(CIPHER_SENTINEL)
-                || s.auth.key_pass_enc.as_deref() == Some(CIPHER_SENTINEL)
-        })
-        || cfg.notify.email.password_enc.as_deref() == Some(CIPHER_SENTINEL);
-    let existing = match load_config() {
-        Ok(c) => Some(c),
-        Err(e) if has_sentinel => {
-            return Err(format!(
-                "读取现有配置失败({}),且本次保存含只读视图占位符;已取消保存以免丢失已存密码。请稍后重试",
-                e
-            ));
+///
+/// v6.1.3(第二十批 P2-4):还原的「读磁盘现值」与「落盘」改为同一把
+/// CONFIG_LOCK 临界区内完成(经 [`update_config`])—— 与并发的 save_server_entry /
+/// notify_save_config 串行,避免「还原时读到的现值 → 落盘前被其它保存改写」
+/// 的窗口(该窗口内本命令会用过期现值覆盖他人的新写入)。
+fn restore_sentinels_and_save(mut cfg: AppConfig) -> Result<(), String> {
+    update_config(|current| {
+        for s in &mut cfg.servers {
+            let prev_auth = current
+                .servers
+                .iter()
+                .find(|e| e.id == s.id)
+                .map(|p| &p.auth);
+            s.auth.password_enc = restore_sentinel(
+                s.auth.password_enc.take(),
+                prev_auth.and_then(|a| a.password_enc.as_ref()),
+            );
+            s.auth.key_pass_enc = restore_sentinel(
+                s.auth.key_pass_enc.take(),
+                prev_auth.and_then(|a| a.key_pass_enc.as_ref()),
+            );
         }
-        Err(_) => None, // 无哨兵:导入等场景不受影响
-    };
-    for s in &mut cfg.servers {
-        let prev_auth = existing
-            .as_ref()
-            .and_then(|c| c.servers.iter().find(|e| e.id == s.id))
-            .map(|p| &p.auth);
-        s.auth.password_enc = restore_sentinel(
-            s.auth.password_enc.take(),
-            prev_auth.and_then(|a| a.password_enc.as_ref()),
+        // notify SMTP 密码:哨兵 → 磁盘现值;无现值(新增/未配)→ None
+        cfg.notify.email.password_enc = restore_sentinel(
+            cfg.notify.email.password_enc.take(),
+            current.notify.email.password_enc.as_ref(),
         );
-        s.auth.key_pass_enc = restore_sentinel(
-            s.auth.key_pass_enc.take(),
-            prev_auth.and_then(|a| a.key_pass_enc.as_ref()),
-        );
-    }
-    // notify SMTP 密码:哨兵 → 磁盘现值;无现值(新增/未配)→ None
-    cfg.notify.email.password_enc = restore_sentinel(
-        cfg.notify.email.password_enc.take(),
-        existing
-            .as_ref()
-            .and_then(|c| c.notify.email.password_enc.as_ref()),
-    );
-    Ok(cfg)
+        *current = cfg;
+        Ok(())
+    })
 }
 
 /// 保存全部配置(原子写入)。
@@ -364,8 +353,7 @@ fn restore_sentinels(mut cfg: AppConfig) -> Result<AppConfig, String> {
 /// (不降级,防静默清空)。配置中心导入等自带真实密文的场景不受影响。
 #[tauri::command]
 pub fn save_config_cmd(cfg: AppConfig) -> Result<(), String> {
-    let cfg = restore_sentinels(cfg)?;
-    save_config(&cfg).map_err(|e| format!("保存配置失败: {}", e))
+    restore_sentinels_and_save(cfg)
 }
 
 /// 保存单个服务器(编辑/新增;**merge 保留密文与指纹**,配合 get_config 只读视图)。
@@ -377,45 +365,61 @@ pub fn save_config_cmd(cfg: AppConfig) -> Result<(), String> {
 /// 不存在则按新增插入(密文/指纹以入参为准;哨兵落为 None)。返回保存后的服务器 id。
 #[tauri::command]
 pub fn save_server_entry(mut server: crate::config::ServerConfig) -> Result<String, String> {
-    let mut cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    // update_config 收口(第二十批 P2-4):「取现值 merge → 落盘」整体持锁,
+    // 与并发的其它配置保存命令串行,后写不再覆盖先写
     let id = server.id.clone();
-    if let Some(existing) = cfg.servers.iter().find(|s| s.id == id) {
-        // 哨兵视同 None(见 restore_sentinel 注释):不会把 "*" 落盘
-        if server.auth.password_enc.as_deref() == Some(CIPHER_SENTINEL) {
-            server.auth.password_enc = None;
+    update_config(|cfg| {
+        if let Some(existing) = cfg.servers.iter().find(|s| s.id == id) {
+            // 哨兵视同 None(见 restore_sentinel 注释):不会把 "*" 落盘
+            if server.auth.password_enc.as_deref() == Some(CIPHER_SENTINEL) {
+                server.auth.password_enc = None;
+            }
+            if server.auth.key_pass_enc.as_deref() == Some(CIPHER_SENTINEL) {
+                server.auth.key_pass_enc = None;
+            }
+            if server.auth.password_enc.is_none() {
+                server.auth.password_enc = existing.auth.password_enc.clone();
+            }
+            if server.auth.key_pass_enc.is_none() {
+                server.auth.key_pass_enc = existing.auth.key_pass_enc.clone();
+            }
+            if server.host_key_sha256.is_none() {
+                server.host_key_sha256 = existing.host_key_sha256.clone();
+            }
+        } else {
+            // 新增:哨兵无现值可沿用,落为 None(绝不把 "*" 写盘)
+            if server.auth.password_enc.as_deref() == Some(CIPHER_SENTINEL) {
+                server.auth.password_enc = None;
+            }
+            if server.auth.key_pass_enc.as_deref() == Some(CIPHER_SENTINEL) {
+                server.auth.key_pass_enc = None;
+            }
         }
-        if server.auth.key_pass_enc.as_deref() == Some(CIPHER_SENTINEL) {
-            server.auth.key_pass_enc = None;
+        match cfg.servers.iter_mut().find(|s| s.id == id) {
+            Some(slot) => *slot = server,
+            None => cfg.servers.push(server),
         }
-        if server.auth.password_enc.is_none() {
-            server.auth.password_enc = existing.auth.password_enc.clone();
-        }
-        if server.auth.key_pass_enc.is_none() {
-            server.auth.key_pass_enc = existing.auth.key_pass_enc.clone();
-        }
-        if server.host_key_sha256.is_none() {
-            server.host_key_sha256 = existing.host_key_sha256.clone();
-        }
-    } else {
-        // 新增:哨兵无现值可沿用,落为 None(绝不把 "*" 写盘)
-        if server.auth.password_enc.as_deref() == Some(CIPHER_SENTINEL) {
-            server.auth.password_enc = None;
-        }
-        if server.auth.key_pass_enc.as_deref() == Some(CIPHER_SENTINEL) {
-            server.auth.key_pass_enc = None;
-        }
-    }
-    match cfg.servers.iter_mut().find(|s| s.id == id) {
-        Some(slot) => *slot = server,
-        None => cfg.servers.push(server),
-    }
-    save_config(&cfg).map_err(|e| format!("保存配置失败: {}", e))?;
+        Ok(())
+    })
+    .map_err(|e| format!("保存配置失败: {}", e))?;
     Ok(id)
 }
 
 /// 用 DPAPI 加密明文密码,返回 base64 密文(前端保存服务器配置时存回 password_enc)。
+///
+/// 纵深防御(第二十批 P2-5):拒收只读视图哨兵 `"*"` —— 若前端误把
+/// get_config 返回的占位符当「新密码明文」传入,会得到 `DPAPI("*")` 密文;
+/// 它不等于哨兵本身,后端 `restore_sentinel` 不还原,真实密文会被静默覆盖
+/// (v6.1.1 同类事故的预防性封堵)。当前前端无此调用路径,本拦截是后端
+/// 不变量层。
 #[tauri::command]
 pub fn encrypt_password(plain: String) -> Result<String, String> {
+    if plain == CIPHER_SENTINEL {
+        return Err(crate::errors::tagged(
+            crate::errors::ErrCode::Input,
+            "不能把占位符当密码保存:检测到只读视图哨兵值,请输入真实密码或留空以沿用已存密码",
+        ));
+    }
     crate::crypto::dpapi_protect(&plain)
 }
 
@@ -816,7 +820,12 @@ async fn exec_forwarded_inner(
     let code = match tokio::time::timeout(Duration::from_secs(timeout_secs), fut).await {
         Ok(res) => res.map_err(|e| format!("SSH 执行命令失败: {}", e))?,
         Err(_) => {
-            return Err(format!("远端命令执行超时({} 秒): {}", timeout_secs, cmd));
+            // 第二十批 P2-6:超时错误挂 timeout 码(第十六批「判定一律按码」
+            // 的漏网点;前端/通知据 errorCode 归类,不再依赖文案匹配)
+            return Err(crate::errors::tagged(
+                crate::errors::ErrCode::Timeout,
+                format!("远端命令执行超时({} 秒): {}", timeout_secs, cmd),
+            ));
         }
     };
     if saw_cancel.load(Ordering::SeqCst) {
@@ -1286,14 +1295,18 @@ fn remember_key_passphrase(server_id: &str, key_passphrase: Option<String>) -> R
     let Some(pass) = key_passphrase.filter(|p| !p.trim().is_empty()) else {
         return Ok(());
     };
-    let mut cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
-    let server = cfg
-        .servers
-        .iter_mut()
-        .find(|s| s.id == server_id)
-        .ok_or_else(|| format!("未找到 ID 为「{}」的服务器配置", server_id))?;
-    server.auth.key_pass_enc = Some(dpapi_protect(&pass)?);
-    save_config(&cfg).map_err(|e| format!("保存私钥口令失败: {}", e))
+    // DPAPI 加密在锁外完成(纯 CPU,不碰配置;锁内只做内存修改 + 落盘)
+    let enc = dpapi_protect(&pass)?;
+    update_config(|cfg| {
+        let server = cfg
+            .servers
+            .iter_mut()
+            .find(|s| s.id == server_id)
+            .ok_or_else(|| format!("未找到 ID 为「{}」的服务器配置", server_id))?;
+        server.auth.key_pass_enc = Some(enc.clone());
+        Ok(())
+    })
+    .map_err(|e| format!("保存私钥口令失败: {}", e))
 }
 
 /// 主机密钥 TOFU 首次落盘(commands.rs 与 manage.rs 的 connect_server 共用)。
@@ -1309,23 +1322,24 @@ pub(crate) fn persist_host_key_if_needed(server: &ServerConfig, observed: &Optio
     if server.host_key_sha256.is_some() {
         return; // 已有信任记录(TOFU 已完成;变更拒绝由 ssh 层负责)
     }
-    let mut cfg = match load_config() {
-        Ok(c) => c,
-        Err(e) => {
-            log::warn!("保存主机密钥指纹前读取配置失败: {}", e);
-            return;
-        }
-    };
-    match cfg.servers.iter_mut().find(|s| s.id == server.id) {
-        Some(s) if s.host_key_sha256.is_none() => {
-            s.host_key_sha256 = Some(fingerprint.to_string());
-            if let Err(e) = save_config(&cfg) {
-                log::warn!("保存主机密钥指纹失败 (服务器 {}): {}", server.name, e);
-            } else {
-                log::info!("已记录服务器「{}」的主机密钥指纹 (TOFU)", server.name);
+    // update_config 收口(第二十批 P2-4):TOFU 落盘与并发保存串行。
+    // 落盘失败仅告警不报错:连接已成功,持久化失败不应让本次操作整体失败。
+    let result = update_config(|cfg| {
+        match cfg.servers.iter_mut().find(|s| s.id == server.id) {
+            Some(s) if s.host_key_sha256.is_none() => {
+                s.host_key_sha256 = Some(fingerprint.to_string());
+                Ok(())
             }
+            _ => Ok(()), // 已有记录(他人先落)或服务器不存在:不动
         }
-        _ => {}
+    });
+    match result {
+        Ok(()) => {
+            log::info!("已记录服务器「{}」的主机密钥指纹 (TOFU)", server.name);
+        }
+        Err(e) => {
+            log::warn!("保存主机密钥指纹失败 (服务器 {}): {}", server.name, e);
+        }
     }
 }
 
@@ -1333,14 +1347,16 @@ pub(crate) fn persist_host_key_if_needed(server: &ServerConfig, observed: &Optio
 /// 下次连接将重新接受并记录当前指纹(服务器重装/换 IP 后由用户显式调用)。
 #[tauri::command]
 pub fn retrust_host_key(server_id: String) -> Result<(), String> {
-    let mut cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
-    let server = cfg
-        .servers
-        .iter_mut()
-        .find(|s| s.id == server_id)
-        .ok_or_else(|| format!("未找到 ID 为「{}」的服务器配置", server_id))?;
-    server.host_key_sha256 = None;
-    save_config(&cfg).map_err(|e| format!("保存配置失败: {}", e))
+    update_config(|cfg| {
+        let server = cfg
+            .servers
+            .iter_mut()
+            .find(|s| s.id == server_id)
+            .ok_or_else(|| format!("未找到 ID 为「{}」的服务器配置", server_id))?;
+        server.host_key_sha256 = None;
+        Ok(())
+    })
+    .map_err(|e| format!("保存配置失败: {}", e))
 }
 
 /// 该项目实际使用的远程部署目录(第四批,纯函数便于单测)。

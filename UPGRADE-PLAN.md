@@ -1879,3 +1879,38 @@ ASCII 42 = `*`,即 v6.0.0 密文最小化引入的只读视图哨兵值,被**写
 - `cargo clippy --all-targets` 新代码零新增;改动 JS 全过 `node --check`;
   verify 三脚本全 PASS
 - 真机待确认:tencent.pem RSA 私钥连接、哨兵清理后的重录密码、cargo build --release 通过
+
+# 第二十批修复批收尾(v6.1.4)— 2026-09-13 审查修复批第二轮
+
+> 背景:五路并行审查(wiki/Rust/JS/契约/发布链)+ 主代理复核发现 P0×1 / P1×3 / P2×7,
+> 逐条清单与修复提示词沉淀于 `2026-09-13-待修复bug.md`。第一轮(P0/P1-1/P1-2/
+> P2-1/P2-2/P2-3 + P2-6①)已随另一会话的 v6.1.3(5917753)推送;本批在其上完成
+> 剩余四项,两轮逐 hunk 对比零冲突。P1-3(跨机导入 SMTP)已由 v6.1.3 完成
+> notify 脱敏成对 + 导出预检,`config_import_preview` 命令留给第二十批功能阶段。
+
+## 一、P2-4 save_config 族读改写收口(本批最大改动)
+
+- `config.rs` 新增 `CONFIG_LOCK` + `update_config<T,F>(mutate) -> Result<T,String>`:
+  锁内 load → 闭包改 → save;闭包 Err 不落盘(整体放弃);注释写明「不可嵌套 /
+  锁内只做内存修改」约束。另设 `RESUME_LOCK` 给断点表(与主配置三件互不相干,
+  合用会让部署写断点阻塞配置保存)
+- **11 个生产写点全部迁移**:save_server_entry / save_config_cmd(重构为
+  `restore_sentinels_and_save`,哨兵还原的「读现值」与「落盘」同锁,消除
+  「还原读到现值 → 落盘前被并发保存改写」窗口)/ notify_save_config(DPAPI 锁外,
+  notify 替换进闭包)/ remember_key_passphrase / persist_host_key_if_needed /
+  retrust_host_key / import_compose / bind_project_source / update_project_from_source
+  (文件复制锁外、配置合并进闭包)/ bind_project_to_target / save+remove_checkpoint
+- 测试 +2:8 线程×5 条并发零丢写;Err 闭包不落盘
+
+## 二、P2-5/P2-6②/P2-7
+
+- `encrypt_password` 拒收哨兵 `"*"`(挂 input 码);+1 单测
+- app.js 新增 `window.errCodeOf(payload)`(errorCode 字段优先,回退 parseErrCode
+  message —— 落地 wiki/04「字段优先」契约);deploy.js 三处 deploy-done 消费点接线
+- package.json version → 6.1.4;rollback.js 两处裸 `__TAURI__.event.listen` 改
+  `AppBus.on`(全站唯一绕过例外消除)
+
+## 三、验证
+
+- `cargo test` 显式 **328 passed / 0 failed / 13 ignored**(基线 325 + 本批 3)
+- clippy --all-targets 零新增;node --check 16 个 JS 全过;verify 三脚本全 PASS

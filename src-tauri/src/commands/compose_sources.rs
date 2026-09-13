@@ -66,9 +66,12 @@ pub fn import_compose(source_path: String, name: String) -> Result<ProjectConfig
         // 归档保留数留空 = 默认 5 个(与历史行为一致)
         release_keep: None,
     };
-    let mut cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
-    cfg.projects.push(project.clone());
-    save_config(&cfg).map_err(|e| format!("保存配置失败: {}", e))?;
+    // update_config 收口(第二十批 P2-4):push 与落盘整体持锁,并发保存不丢
+    update_config(|cfg| {
+        cfg.projects.push(project.clone());
+        Ok(())
+    })
+    .map_err(|e| format!("保存配置失败: {}", e))?;
     Ok(project)
 }
 
@@ -326,19 +329,18 @@ pub fn bind_project_source(
     parse_compose_file(&path, &[])?;
     let hash = source_content_hash(&path)?;
 
-    let mut cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
-    let idx = cfg
-        .projects
-        .iter()
-        .position(|p| p.id == project_id)
-        .ok_or_else(|| format!("项目不存在:{}", project_id))?;
-    {
-        let p = &mut cfg.projects[idx];
+    // update_config 收口(第二十批 P2-4):定位 + 改字段 + 落盘整体持锁
+    let updated = update_config(|cfg| {
+        let p = cfg
+            .projects
+            .iter_mut()
+            .find(|p| p.id == project_id)
+            .ok_or_else(|| format!("项目不存在:{}", project_id))?;
         p.source_compose_path = Some(path_str);
-        p.source_hash = Some(hash);
-    }
-    let updated = cfg.projects[idx].clone();
-    save_config(&cfg).map_err(|e| format!("保存配置失败: {}", e))?;
+        p.source_hash = Some(hash.clone());
+        Ok(p.clone())
+    })
+    .map_err(|e| format!("保存配置失败: {}", e))?;
     Ok(project_source_status(&updated))
 }
 
@@ -359,7 +361,7 @@ pub fn bind_project_source(
 /// 「无改动」,用户无法判断是否生效)。
 #[tauri::command]
 pub fn update_project_from_source(project_id: String) -> Result<ProjectSourceStatus, String> {
-    let mut cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
     let idx = cfg
         .projects
         .iter()
@@ -426,12 +428,23 @@ pub fn update_project_from_source(project_id: String) -> Result<ProjectSourceSta
         }
     }
 
-    let p = &mut cfg.projects[idx];
-    p.compose_file = new_dest.to_string_lossy().to_string();
-    p.service_overrides = merged;
-    p.source_hash = source_content_hash(&source).ok();
-    let updated = p.clone();
-    save_config(&cfg).map_err(|e| format!("保存配置失败: {}", e))?;
+    // update_config 收口(第二十批 P2-4):定位 + 改三字段 + 落盘整体持锁;
+    // 上方的文件复制(.bak/copy_compose_bundle)在锁外完成(耗时 IO),
+    // 配置合并只动内存字段
+    let new_compose = new_dest.to_string_lossy().to_string();
+    let new_hash = source_content_hash(&source).ok();
+    let updated = update_config(|cfg| {
+        let p = cfg
+            .projects
+            .iter_mut()
+            .find(|p| p.id == project_id)
+            .ok_or_else(|| format!("项目不存在:{}", project_id))?;
+        p.compose_file = new_compose.clone();
+        p.service_overrides = merged.clone();
+        p.source_hash = new_hash.clone();
+        Ok(p.clone())
+    })
+    .map_err(|e| format!("保存配置失败: {}", e))?;
 
     // 状态按**更新前**的比对结果给出;`source_hash` 现已是最新基准,故直接
     // 组装状态而不复用 project_source_status(那会拿新基准复核,恒 unchanged)。

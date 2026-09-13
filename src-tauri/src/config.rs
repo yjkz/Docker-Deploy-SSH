@@ -422,6 +422,41 @@ pub fn save_config(cfg: &AppConfig) -> Result<()> {
     Ok(())
 }
 
+// ===== 配置读改写收口(第二十批 P2-4)=====
+
+/// 进程级配置写互斥:所有「load → 改 → save」三步必须整体持锁,否则两个
+/// 并发命令(如服务器编辑 + 通知中心保存)后写覆盖先写,合法地丢掉先到的
+/// 修改(与 v6.1.1 哨兵事故同为「合法写坏数据」形态,UNHEALTHY 机制不覆盖)。
+static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 断点表(resume-deploy.json)的 RMW 互斥:批量 + 单发并发部署时
+/// save_checkpoint/remove_checkpoint 不互踩(与 CONFIG_LOCK 分离 —— 断点
+/// 旁路数据与主配置三件互不相干,合用一把锁会让部署写断点阻塞配置保存)。
+static RESUME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 在同一把进程锁内执行「load → 改 → save」(`F` 负责改,可返回任意值)。
+///
+/// **锁保「读-改-写」原子性**:闭包拿到的必是持锁瞬间磁盘上的最新配置,
+/// 闭包返回后立即落盘 —— 并发调用天然串行,后写不再覆盖先写。
+/// 错误统一为 `String`(与全后端 `Result<T, String>` 命令口径一致;
+/// 调用点自行格式化「读取/保存配置失败」上下文)。
+///
+/// 约束(违反会死锁/失去保护):
+/// - `F` 内**不得**再调用任何会取 `CONFIG_LOCK` 的函数(`update_config`
+///   不可嵌套);
+/// - `F` 内只做内存修改,不要做耗时 IO(锁窗口内串行);
+/// - `F` 返回 `Err` 时**不落盘**(本次修改整体放弃,磁盘保持闭包前状态)。
+pub fn update_config<T, F>(mutate: F) -> std::result::Result<T, String>
+where
+    F: FnOnce(&mut AppConfig) -> std::result::Result<T, String>,
+{
+    let _guard = CONFIG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    let out = mutate(&mut cfg)?;
+    save_config(&cfg).map_err(|e| format!("保存配置失败: {}", e))?;
+    Ok(out)
+}
+
 fn load_json_list<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
     match std::fs::read(path) {
         Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
@@ -634,7 +669,11 @@ pub fn load_resume_map() -> HashMap<String, ResumeCheckpoint> {
 /// 被裁剪掉的条目**只从表里移除**;其断点期保留的本地临时 tar 由调用方
 /// ([`crate::commands::checkpoint_save`]) 按 `commands` 层的产物口径清理
 /// —— 本层不解析 `artifacts`(分层约定见 wiki/07 限制 40)。
+///
+/// v6.1.3(第二十批 P2-4):RMW 整体持 [`RESUME_LOCK`] —— 批量 + 单发
+/// 并发部署时两个 save_checkpoint 不再互踩丢条目。
 pub fn save_checkpoint(cp: &ResumeCheckpoint) -> Result<Vec<ResumeCheckpoint>> {
+    let _guard = RESUME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut map = load_resume_map();
     map.insert(cp.key.clone(), cp.clone());
     let dropped = trim_checkpoints(&mut map);
@@ -644,6 +683,7 @@ pub fn save_checkpoint(cp: &ResumeCheckpoint) -> Result<Vec<ResumeCheckpoint>> {
 
 /// 删除一条断点,返回被删的条目(供调用方清理其临时产物;无则 `None`)。
 pub fn remove_checkpoint(key: &str) -> Result<Option<ResumeCheckpoint>> {
+    let _guard = RESUME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut map = load_resume_map();
     let removed = map.remove(key);
     if removed.is_some() {
@@ -1130,5 +1170,111 @@ mod tests {
         assert!(json.contains("\"serverId\""), "实际: {}", json);
         assert!(json.contains("\"serverName\""), "实际: {}", json);
         assert!(json.contains("\"projectId\""), "实际: {}", json);
+    }
+
+    #[test]
+    fn test_update_config_concurrent_no_lost_write() {
+        // 第二十批 P2-4 回归:并发 update_config 不得丢写 —— 旧实现「load →
+        // 改 → save」三步无锁,两个线程同时进入时后写覆盖先写,先到的修改
+        // 被合法数据静默冲掉。收口后整个 RMW 持 CONFIG_LOCK,串行执行。
+        let _guard = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ddtest-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
+
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 5;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    for i in 0..PER_THREAD {
+                        let id = format!("srv-{}-{}", t, i);
+                        let server = ServerConfig {
+                            id: id.clone(),
+                            name: id.clone(),
+                            host: "1.2.3.4".into(),
+                            port: 22,
+                            username: "root".into(),
+                            auth: AuthConfig {
+                                auth_type: AuthType::Password,
+                                key_path: None,
+                                password_enc: None,
+                                key_pass_enc: None,
+                            },
+                            remote_dir: "/opt/app".into(),
+                            host_key_sha256: None,
+                        };
+                        update_config(|cfg| {
+                            cfg.servers.push(server.clone());
+                            Ok(())
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let final_cfg = load_config().unwrap();
+        assert_eq!(
+            final_cfg.servers.len(),
+            THREADS * PER_THREAD,
+            "并发 {} 线程 × {} 条,最终应有全部条目(丢写 = 收口失效)",
+            THREADS,
+            PER_THREAD
+        );
+
+        std::env::remove_var("DD_CONFIG_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_update_config_error_aborts_write() {
+        // 闭包返回 Err 时整体放弃:磁盘保持闭包前状态,不落半截修改
+        let _guard = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ddtest-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
+
+        // 先写基线:一条服务器
+        update_config(|cfg| {
+            cfg.servers.push(ServerConfig {
+                id: "base".into(),
+                name: "base".into(),
+                host: "1.2.3.4".into(),
+                port: 22,
+                username: "root".into(),
+                auth: AuthConfig { auth_type: AuthType::Password, key_path: None, password_enc: None, key_pass_enc: None },
+                remote_dir: "/opt/app".into(),
+                host_key_sha256: None,
+            });
+            Ok(())
+        })
+        .unwrap();
+
+        // 再跑一个「先加一条再报错」的闭包:修改必须整体回滚
+        let err: std::result::Result<(), String> = update_config(|cfg| {
+            cfg.servers.push(ServerConfig {
+                id: "ghost".into(),
+                name: "ghost".into(),
+                host: "1.2.3.4".into(),
+                port: 22,
+                username: "root".into(),
+                auth: AuthConfig { auth_type: AuthType::Password, key_path: None, password_enc: None, key_pass_enc: None },
+                remote_dir: "/opt/app".into(),
+                host_key_sha256: None,
+            });
+            Err("业务校验失败".to_string())
+        });
+        assert!(err.is_err());
+
+        let final_cfg = load_config().unwrap();
+        assert_eq!(final_cfg.servers.len(), 1, "Err 闭包不落盘:ghost 不得出现在磁盘");
+        assert_eq!(final_cfg.servers[0].id, "base");
+
+        std::env::remove_var("DD_CONFIG_DIR");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

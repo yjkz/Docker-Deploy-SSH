@@ -260,6 +260,17 @@
   };
   window.errStripCode = function (err) { return window.errText(err); };
 
+  // deploy-done/StatsPayload 等事件 payload 的错误码取码(第二十批 P2-6):
+  // 按 wiki/04 契约「优先读 errorCode 字段,缺失时回退对 message 做
+  // parseErrCode」—— 此前消费方只 parse message,errorCode 字段从未被读;
+  // 若后端未来把 message 改为剥码文本,取消判定会静默退化为文案匹配。
+  // 不认识的码原样返回(调用方按码名判定,未知码走默认分支)。
+  window.errCodeOf = function (payload) {
+    var p = (payload && typeof payload === 'object') ? payload : null;
+    if (p && typeof p.errorCode === 'string' && p.errorCode) return p.errorCode;
+    return window.parseErrCode(payload);
+  };
+
   // ===== Esc 最上层模态仲裁(第二十批 P1 修复)=====
   // 各模块的 document 级 Esc 监听只判断「自己可见」,叠模态场景(如清理分析
   // 叠在服务器编辑表单上、帮助叠在任意模态上)一次 Esc 会触发全部监听、

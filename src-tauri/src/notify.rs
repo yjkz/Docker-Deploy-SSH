@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 use tauri_plugin_notification::NotificationExt;
 
-use crate::config::{load_config, normalize_security, save_config, EmailNotify, NotifyConfig};
+use crate::config::{load_config, normalize_security, EmailNotify, NotifyConfig};
 use crate::crypto::{dpapi_protect, dpapi_unprotect};
 
 /// 桌面测试通知标题(固定)。
@@ -221,15 +221,18 @@ pub async fn notify_get_config() -> Result<NotifyConfigView, String> {
 pub async fn notify_save_config(cfg: NotifyConfigInput) -> Result<(), String> {
     // 保存校验(仅邮件启用时;不满足直接返回错误,不落任何盘)
     validate_email_save(cfg.email.enabled, &cfg.email.smtp_host, &cfg.email.to)?;
-    let mut app_cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
-    // 密码:表单输入了非空明文 → 重新 DPAPI 加密;否则保留已存密文(可能为 None)
+    // 加密在锁外完成(DPAPI 纯 CPU,不碰配置;密码留空时需先读已存密文 ——
+    // 这一读仅决定「本次提交是否换密文」,真正的合并发生在锁内)
+    let existing_enc = load_config()
+        .ok()
+        .and_then(|c| c.notify.email.password_enc.clone());
     let password_enc = match cfg.email.password.as_deref().map(str::trim) {
         Some(p) if !p.is_empty() => Some(dpapi_protect(p)?),
-        _ => app_cfg.notify.email.password_enc.clone(),
+        _ => existing_enc,
     };
     // 加密方式先归一化:端口 0(空输入)的兜底默认值按归一化结果映射
     let security = normalize_security(&cfg.email.security).to_string();
-    app_cfg.notify = NotifyConfig {
+    let notify = NotifyConfig {
         desktop: crate::config::DesktopNotify {
             enabled: cfg.desktop.enabled,
         },
@@ -255,10 +258,17 @@ pub async fn notify_save_config(cfg: NotifyConfigInput) -> Result<(), String> {
             on_probe: cfg.events.on_probe,
         },
     };
-    // 用户显式保存通知配置 → 先清除读取异常标志,让本次保存能把新配置
-    // (含新密文)写回 notify.json
+    // update_config 收口(第二十批 P2-4):与并发保存串行;锁内只替换 notify
+    // 字段(servers/projects 系闭包内拿到的磁盘最新值,不再被本函数的旧快照冲掉)
+    crate::config::update_config(|app_cfg| {
+        app_cfg.notify = notify.clone();
+        Ok(())
+    })
+    .map_err(|e| format!("保存配置失败: {}", e))?;
+    // 用户显式保存通知配置 → 保存成功后清除读取异常标志(下次保存可写回;
+    // 本次保存因 UNHEALTHY 跳过 notify.json 的场景,标志清除后重试即恢复)
     crate::config::clear_notify_unhealthy();
-    save_config(&app_cfg).map_err(|e| format!("保存配置失败: {}", e))
+    Ok(())
 }
 
 /// 发送一条本地系统测试通知(标题/正文固定)。

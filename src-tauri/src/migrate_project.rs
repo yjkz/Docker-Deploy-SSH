@@ -1360,12 +1360,14 @@ async fn compose_simple_action(
 
 /// 改绑项目的默认服务器到目标。
 fn bind_project_to_target(project_id: &str, target_server_id: &str) -> Result<(), String> {
-    let mut cfg = config::load_config().map_err(|e| format!("读取配置失败: {}", e))?;
-    let Some(project) = cfg.projects.iter_mut().find(|p| p.id == project_id) else {
-        return Err(format!("未找到项目配置:{}", project_id));
-    };
-    project.default_server_id = Some(target_server_id.to_string());
-    config::save_config(&cfg).map_err(|e| format!("保存配置失败: {}", e))
+    // update_config 收口(第二十批 P2-4):改绑与落盘整体持锁,并发保存不丢
+    config::update_config(|cfg| {
+        let Some(project) = cfg.projects.iter_mut().find(|p| p.id == project_id) else {
+            return Err(format!("未找到项目配置:{}", project_id));
+        };
+        project.default_server_id = Some(target_server_id.to_string());
+        Ok(())
+    })
 }
 
 /// 本地中转目录的 Drop 守卫(整个目录递归删除)。

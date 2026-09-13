@@ -148,7 +148,16 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 - **RSA 私钥修复**(用户真机 tencent.pem):russh 0.60 features 补 "rsa"(v6.0.0 升级漏项);同源隐患 PrivateKeyWithHashAlg None → SHA-1 被现代 OpenSSH 拒 → 改 best_supported_rsa_hash 探测
 - **四路审查**(密文链路/russh 彻底性/CSP/体验):密文 P1-P4 全修(notify 脱敏/拒绝保存/导出预检/邮件预检);russh 无新增故障(顺带修 MSRV 1.85 + OpenSSH 错口令映射);CSP 0 问题
 - **体验审查 5 高 3 中全修**:badge-exited/created hover 豁免、window.confirm 改内联确认、06 页扫描反馈、`'badge ok'` 类名错、清理并发防护、下拉加载占位、重检/操作按钮 busy 等
+- **随批并入 2026-09-13 审查修复批第一轮**(P0/P1-1/P1-2/P2-1/P2-2/P2-3 + P2-6① 后端挂码,细节见 `2026-09-13-待修复bug.md`):批量续传互斥置位 / 探活回填 / Esc 逐层关模态(isTopModal 全局仲裁,11 处)/ 单镜像建连超时 / manage_logs 顶替自清理+stop 竞态 / DD_CONFIG_DIR debug 守卫
 - 验证:325 passed(+3 单测)/ clippy 零新增 / 三 verify PASS
+
+### 第二十批修复批收尾 v6.1.4(2026-09-13 审查修复批第二轮)— 已完成
+- **P2-4 save_config 族互斥**(本批最大改动):config.rs 新增 `update_config<T,F>`(CONFIG_LOCK 锁内 load→闭包改→save,Err 不落盘)+ RESUME_LOCK(断点表独立);**11 个生产写点全部迁移**(save_server_entry / save_config_cmd(哨兵还原并入锁段,消除「还原读到现值→落盘前被改」窗口)/ notify_save_config / remember_key_passphrase / persist_host_key_if_needed / retrust_host_key / import_compose / bind+update_project_from_source / bind_project_to_target / save+remove_checkpoint);DPAPI 加密、文件复制在锁外;+3 单测(8 线程×5 并发零丢写 / Err 不落盘 / 哨兵拒绝)
+- **P2-5 哨兵纵深防御**:`encrypt_password` 拒收 `"*"`(挂 input 码,文案指向重输/留空沿用);+1 单测
+- **P2-6② errorCode 字段消费**:app.js 新增 `window.errCodeOf(payload)`(字段优先,回退 parse message——落地 wiki/04:644 契约);deploy.js 三处 deploy-done 消费点接线(①后端挂码已随 v6.1.3)
+- **P2-7 杂项**:package.json version 1.0.0→6.1.4 对齐(「三处版本号」外第 4 处,发版链不消费、纯一致);rollback.js 两处裸 `__TAURI__.event.listen` → `AppBus.on`(全站唯一绕过例外消除,失败复位守卫保留)
+- 版本:v6.1.3(5917753)之上顺延 v6.1.4;两轮逐 hunk 对比零冲突
+- 验证:328 passed(基线 325 + 3)/ clippy 零新增 / node --check 16 JS / 三 verify PASS
 
 ---
 
@@ -189,14 +198,14 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 | 终端多标签+命令广播+输出落盘 | manage_exec 后端本就是多会话表,纯前端放开多 tab;同一条命令广播到多台同栈容器;会话结束写 logs/term-<ts>.log 供审计 |
 | 配置版本历史 | `save_config` 写前快照到 `config/.history/`(留 20 份)+ `config_history_list/restore`;部署有回滚中心,配置没有;对竞态覆盖与误导入兜底 |
 
-**修复批(待批复,建议紧随第一梯队)** — 审查发现的 P0/P1 真实 bug:
+**修复批 ✅ 已完成(v6.1.3 随批 + v6.1.4 收尾)** — 审查发现的 P0/P1/P2 真实 bug 全部修复:
 | 项 | 要点 |
 |---|---|
-| P0 批量续传脱离互斥 | `runBatchNext` 的 resumeKey 分支未设 `st.deploying`/`ddRemoteOp` → 「停止批量」「取消部署」对续传台失效、回滚可并发同机 releases;补置位即可(deploy.js:1964-1986) |
-| P1 探活间隔不回显 | settings.js:637 回填守卫 `probe.value === ''` 恒假(input 预填 '0')→ 保存值永不回显,重存 0 静默关探活;去守卫 |
-| P1 Esc 连带关模态 | servers.js:2565-2572 一次 Esc 关两层,清理模态叠服务器编辑表单时表单被丢弃;照抄 settings.js:648-654 逐层转发 |
-| P1 跨机导入 SMTP 损坏 | 旧机 DPAPI 密文被当明文二次加密(config_io.rs import_notify);预览/导入流程明示失效 + 导入后 clear_notify_unhealthy |
-| P2 级(随批附议) | 单镜像管线两处建连无 15s 超时(deploy.rs:246/347);日志流被顶替不退出(manage_logs.rs);`DD_CONFIG_DIR` 生产守卫;save_config 族互斥;encrypt_password 拒收 `"*"`;exec 超时挂 timeout 码;前端读 deploy-done.errorCode 字段;package.json version 对齐 |
+| ~~P0 批量续传脱离互斥~~ | ✅ v6.1.3:resumeKey 分支置位 `st.deploying`/`ddRemoteOp`,invoke 失败同步还原 |
+| ~~P1 探活间隔不回显~~ | ✅ v6.1.3:回填去恒假守卫改无条件 |
+| ~~P1 Esc 连带关模态~~ | ✅ v6.1.3:`isTopModal` 全局仲裁,11 处监听接入,一次 Esc 只关一层 |
+| P1 跨机导入 SMTP 损坏 | 部分完成(v6.1.3 已做 notify 脱敏成对 + 导出预检);跨机明示与 `config_import_preview` 命令待第二十批「配置导入预览」阶段根治 |
+| ~~P2 级~~ | ✅ v6.1.3(建连超时 3 处/日志流顶替自清理+stop 竞态/DD_CONFIG_DIR debug 守卫/exec 超时挂码)+ v6.1.4(`update_config` 11 写点收口互斥/encrypt_password 拒哨兵/前端 errCodeOf 消费 errorCode 字段/package.json 版本对齐/rollback.js AppBus.on);细节与逐条证据见 `2026-09-13-待修复bug.md` |
 
 **文档/治理批(待批复)** — 本次审查 90% 文档问题同根(版本戳靠人工同步):
 | 项 | 要点 |
@@ -223,13 +232,14 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 
 ## 当前状态速览
 
-- 版本 **v6.1.3**;main = origin/main;基线 `cargo test` **325 passed** / 13 ignored
+- 版本 **v6.1.4**;main = origin/main;基线 `cargo test` **328 passed** / 13 ignored
 - 命令 **95** 个(lib.rs 注册;wiki/04 已同步);JS **16** 文件(含 theme-init.js;index.html 加载顺序见 wiki/03:13)
 - 前端结构:12 模态;commands/ 11 文件;三大 JS 主文件 2338/2013/2537 行
 - 表单体系(第十三批):5 处模态有真实 `<form novalidate>` 语义;失焦校验 + Enter 提交由 app.js 三助手统一承担
 - 批量部署(第十四批):失败/取消台可续传(单台 + 一键批量);「停止批量」步骤边界即时中止;批量恒落断点(与死代码 `deploy_batch` 的「不落断点」无关)
-- **安全(第十八批 v6.0.0)**:russh 0.60.3(ring 后端,RUSTSEC 修复);严格 CSP 启用;get_config 密文最小化(只读视图 + save_server_entry merge);open_external 注入修复;cleanup/sync_files/rollback 路径校验
-- **并发互斥(第十八批)**:部署/回滚跨页互斥(共享锁 `window.ddRemoteOp`);批量间隙锁族(tab/setMode/回滚钮/续传);关清理模态不误清 pruning;监控先订阅后 invoke
+- **安全(第十八批 v6.0.0)**:russh 0.60.3(ring+rsa 后端,RUSTSEC 修复);严格 CSP 启用;get_config 密文最小化(只读视图 + save_server_entry merge;v6.1.3 起含 notify);open_external 注入修复;cleanup/sync_files/rollback 路径校验;encrypt_password 拒哨兵(v6.1.4)
+- **并发互斥(第十八批 + v6.1.4)**:部署/回滚跨页互斥(共享锁 `window.ddRemoteOp`);批量间隙锁族(续传台置位 v6.1.3 起);配置写互斥 `update_config`(CONFIG_LOCK,11 写点收口;RESUME_LOCK 断点独立,v6.1.4)
 - **候选池清空(第十九批 v6.1.0)**:部署前自动预览(勾选才自动);BusyBox df -k 通用口径;compose 服务级 env_file;hover 反白 badge 豁免
+- **Esc 逐层关模态(v6.1.3)**:全局仲裁 `window.isTopModal`,全站 11 处监听接入;**errorCode 字段消费(v6.1.4)**:`window.errCodeOf`(字段优先,回退 parse message)
 - 本地校验脚本 `verify/`(零依赖 Node,不参与构建):`form-validation.js`(表单助手 54 断言)/ `bridge-integrity.js`(桥接完整性)/ `scope-integrity.js`(全链加载 + DOM 回调作用域完整性,v5.14.1 起);改动表单助手、拆出文件桥接或 JS 拆分时先跑这三个
 - dev 实例:target/debug/config(正式版数据拷贝);前端资源编译期内嵌,**改 JS 后必须重编译重启动才生效**

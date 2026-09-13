@@ -75,34 +75,32 @@
   function bindLogEvents() {
     if (logBound) return;
     logBound = true;
-    // listen 返回 Promise:失败时复位 logBound 以便下次重试(否则永失监听);
-    // 逐个 .catch,try/catch 只拦同步异常拦不到 Promise rejection
+    // AppBus.on 返回 Promise:失败时复位 logBound 以便下次重试(否则永失监听);
+    // 逐个 .catch 拦 Promise rejection(第二十批 P2-7:改走 AppBus.on ——
+    // 与其它 7 个模块同口径,带 __TAURI__ 缺失防护;此前本模块是全站唯一
+    // 裸用 __TAURI__.event.listen 的例外,违反 wiki/03「前端一律经 AppBus」纪律)
     var onListenFail = function (err) {
       logBound = false;
       if (window.console && console.warn) console.warn('[rollback] 事件监听失败:', err);
     };
-    try {
-      window.__TAURI__.event.listen('deploy-log', function (e) {
-        appendLog(typeof e.payload === 'string' ? e.payload : String(e.payload || ''));
-      }).catch(onListenFail);
-      window.__TAURI__.event.listen('deploy-done', function (e) {
-        var p = e.payload || {};
-        // 只处理本页发起的回滚(busy===true):04 页部署/批量完成也发 deploy-done,
-        // 不应触发 06 页整页重扫或写日志(来源过滤)
-        if (!busy) return;
-        window.ddRemoteOp = null; // 释放跨页互斥锁(本页回滚已收尾)
-        var msg = window.errStripCode ? window.errStripCode(p.message) : (p.message || '');
-        appendLog(p.success ? ('✔ ' + (msg || '回滚完成')) : ('✘ ' + (msg || '回滚失败')));
-        setBusy(false);
-        // 取消/失败时归档与标签未变化,无需重扫;仅成功才刷新明细与项目列表
-        if (p.success) {
-          if (selectedDir) loadDetail(selectedDir, true);
-          loadProjects(true);
-        }
-      }).catch(onListenFail);
-    } catch (err) {
-      onListenFail(err);
-    }
+    window.AppBus.on('deploy-log', function (e) {
+      appendLog(typeof e.payload === 'string' ? e.payload : String(e.payload || ''));
+    }).catch(onListenFail);
+    window.AppBus.on('deploy-done', function (e) {
+      var p = e.payload || {};
+      // 只处理本页发起的回滚(busy===true):04 页部署/批量完成也发 deploy-done,
+      // 不应触发 06 页整页重扫或写日志(来源过滤)
+      if (!busy) return;
+      window.ddRemoteOp = null; // 释放跨页互斥锁(本页回滚已收尾)
+      var msg = window.errStripCode ? window.errStripCode(p.message) : (p.message || '');
+      appendLog(p.success ? ('✔ ' + (msg || '回滚完成')) : ('✘ ' + (msg || '回滚失败')));
+      setBusy(false);
+      // 取消/失败时归档与标签未变化,无需重扫;仅成功才刷新明细与项目列表
+      if (p.success) {
+        if (selectedDir) loadDetail(selectedDir, true);
+        loadProjects(true);
+      }
+    }).catch(onListenFail);
   }
 
   function appendLog(line) {

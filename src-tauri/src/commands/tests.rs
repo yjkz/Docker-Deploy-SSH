@@ -1,5 +1,5 @@
     use super::*;
-    use crate::config::{AuthConfig, TransferMode};
+    use crate::config::{save_config, AuthConfig, TransferMode};
 
     // ===== 清理分析纯函数(第三批)=====
 
@@ -2480,4 +2480,25 @@ services:
         assert_eq!(load_config().unwrap().notify.email.password_enc.as_deref(), Some("SMTP-NEW"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_encrypt_password_rejects_sentinel() {
+        // 第二十批 P2-5 回归:只读视图哨兵 "*" 不得被当「新密码明文」加密 ——
+        // DPAPI("*") 不等于哨兵本身,restore_sentinel 不还原,真实密文会被
+        // 静默覆盖(v6.1.1 同类事故的纵深防御)。
+        let err = encrypt_password("*".to_string());
+        assert!(err.is_err(), "哨兵明文必须被拒绝");
+        let msg = err.unwrap_err();
+        assert_eq!(
+            crate::errors::code_of(&msg),
+            Some(crate::errors::ErrCode::Input),
+            "错误串应挂 input 码,实际: {}",
+            msg
+        );
+        assert!(crate::errors::strip(&msg).contains("占位符"), "文案应说明占位符问题");
+
+        // 对照:正常明文不受影响(DPAPI 同机往返)
+        let enc = encrypt_password("正常密码123".to_string()).unwrap();
+        assert!(!enc.is_empty() && enc != "*", "正常明文照常加密");
     }

@@ -1763,8 +1763,10 @@
       renderProgress(stepCount() + 1, ''); // step > total:当前模式全部节点置为完成态
       showBanner('ok', isRollback ? '回滚完成' : '部署完成');
       window.toast(isRollback ? '回滚完成' : '部署完成', 'ok');
-    } else if (window.parseErrCode(p) === 'canceled' || message === '部署已取消') {
-      // 第十六批:优先按错误码判定;码缺失(旧式错误/版本错配)回退文案匹配
+    } else if (window.errCodeOf(p) === 'canceled' || message === '部署已取消') {
+      // 第十六批:优先按错误码判定(第二十批 P2-6 起经 errCodeOf:
+      // errorCode 字段优先,回退 parse message);码缺失(旧式错误/版本
+      // 错配)回退文案匹配
       showBanner('warn', '已取消');
     } else {
       showBanner('fail', (isRollback ? '回滚失败:' : '部署失败:') + (window.errStripCode(message) || '未知错误'));
@@ -2008,9 +2010,10 @@
       rDeferred.promise.then(function (payload) {
         if (!st.batch || !st.batch.active) return;
         var p = payload || {};
+        // 取码经 errCodeOf(errorCode 字段优先,回退 parse message —— P2-6)
         var state = p.success === true ? 'success'
-          : (window.parseErrCode(p) === 'canceled' || p.message === '部署已取消' ? 'skipped' : 'failed');
-        if (window.parseErrCode(p) === 'canceled' || p.message === '部署已取消') st.batch.aborted = true;
+          : (window.errCodeOf(p) === 'canceled' || p.message === '部署已取消' ? 'skipped' : 'failed');
+        if (window.errCodeOf(p) === 'canceled' || p.message === '部署已取消') st.batch.aborted = true;
         batchItemResult(state, window.errStripCode(p.message) || '');
       });
       window.AppBus.invoke('deploy_resume_start', { key: item.resumeKey })
@@ -2049,7 +2052,7 @@
           if (!st.batch || !st.batch.active) return;
           var p = payload || {};
           var state;
-          var canceled = window.parseErrCode(p) === 'canceled' || p.message === '部署已取消';
+          var canceled = window.errCodeOf(p) === 'canceled' || p.message === '部署已取消';
           if (p.success === true) state = 'success';
           else if (canceled) { state = 'skipped'; st.batch.aborted = true; }
           else state = 'failed';
