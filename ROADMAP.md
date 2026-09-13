@@ -132,6 +132,13 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 - **限制 14 终端 ANSI 复杂 TUI:保留为限制**(完整 xterm 仿真需引入 xterm.js 级依赖并重写渲染模型,与低耦合硬约束冲突)
 - 验证:`cargo test` 318 passed(基线 315 + env_file 3)/ clippy 我改文件零警告 / 三 verify 全 PASS / 浏览器桩 badge hover 对比度验证
 
+### 第十九批补丁 v6.1.1(修复密文哨兵落盘)— 已完成
+- **用户真机报错**「密码密文 base64 解码失败:Invalid symbol 42」:ASCII 42 = `*`,即 v6.0.0 密文最小化哨兵被**写进磁盘**冲掉 4 台服务器全部真实密文
+- **根因(v6.0.0 回归)**:get_config 返回哨兵只读视图后,4 条「get_config 全量取 → save_config_cmd 全量写回」路径(删服务器/删项目/保存项目/导入 compose/保存分类)不经过 save_server_entry,把哨兵原样写回磁盘;v6.0.0 只改了服务器编辑保存一条路径,漏封整量写回通道
+- **修复(后端不变量)**:`CIPHER_SENTINEL` + `restore_sentinel`;save_config_cmd/save_server_entry 均按 id 与磁盘现值合并,哨兵一律还原现值(读不到降级 None,绝不写 `*`);resolve_password/key_passphrase 对哨兵提前给可操作报错;2 单测(还原四态 + 拒绝)
+- **现场处置**:用户 servers.json 7 处哨兵已清理为 null(备份 .corrupted-bak);真实 DPAPI 密文不可从 `*` 恢复,需逐台重录登录密码
+- 验证:`cargo test` 320 passed(基线 318 + 2)/ clippy 新代码零警告
+
 ---
 
 ## 待完成
@@ -159,7 +166,7 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 
 ## 当前状态速览
 
-- 版本 **v6.1.0**;main = origin/main;基线 `cargo test` **318 passed** / 13 ignored
+- 版本 **v6.1.1**;main = origin/main;基线 `cargo test` **320 passed** / 13 ignored
 - 命令 **95** 个(lib.rs 注册;wiki/04 已同步);JS **16** 文件(含 theme-init.js;index.html 加载顺序见 wiki/03:13)
 - 前端结构:12 模态;commands/ 11 文件;三大 JS 主文件 2338/2013/2537 行
 - 表单体系(第十三批):5 处模态有真实 `<form novalidate>` 语义;失焦校验 + Enter 提交由 app.js 三助手统一承担

@@ -266,44 +266,82 @@ pub struct StackServiceChoice {
 /// 最小化原则:`password_enc`/`key_pass_enc` 的真实 DPAPI 密文不回传前端——
 /// 前端展示只需「是否已存」,故已存的字段以哨兵值 `"*"`(非空、非真实密文、
 /// 不可解)替代,None 保持 None。WebView 被注入时攻击者拿不到真实密文去做混淆
-/// 或导出。写路径不经本命令回传密文:服务器编辑保存走 [`save_server_entry`]
-/// (merge 保留密文);整量 `save_config_cmd` 仅用于配置中心导入等**自带密文**的场景。
+/// 或导出。**哨兵绝不可落盘**:所有写路径(整量 `save_config_cmd` / 单项
+/// [`save_server_entry`])都在后端把 `"*"` 还原为磁盘现值(v6.1.1 起),
+/// 即便某个前端路径原样回写也只读视图也冲不掉真实密文。
 #[tauri::command]
 pub fn get_config() -> Result<AppConfig, String> {
     let mut cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
     for s in &mut cfg.servers {
         // 哨兵 "*":已存密文 → Some("*")(truthy,保留「已存」语义);未存 → None
         if s.auth.password_enc.is_some() {
-            s.auth.password_enc = Some("*".to_string());
+            s.auth.password_enc = Some(CIPHER_SENTINEL.to_string());
         }
         if s.auth.key_pass_enc.is_some() {
-            s.auth.key_pass_enc = Some("*".to_string());
+            s.auth.key_pass_enc = Some(CIPHER_SENTINEL.to_string());
         }
     }
     Ok(cfg)
 }
 
+/// 密文只读视图的哨兵值:`"*"` 不是合法 base64,与任何真实 DPAPI 密文不可能撞车。
+pub(crate) const CIPHER_SENTINEL: &str = "*";
+
+/// 把入参中的哨兵还原为 `existing`(磁盘现值):哨兵 → 沿用现值,真实值/None 原样。
+/// `"*"` 无现有值可沿用时落为 None(绝不把哨兵写进磁盘)。
+fn restore_sentinel(incoming: Option<String>, existing: Option<&String>) -> Option<String> {
+    match incoming.as_deref() {
+        Some(CIPHER_SENTINEL) => existing.cloned(),
+        _ => incoming,
+    }
+}
+
 /// 保存全部配置(原子写入)。
 ///
-/// ⚠️ 调用方必须传入**含真实密文**的完整配置(配置中心导入等);用 get_config
-/// 的只读视图(密文已置空)整量回写会把密文冲掉。服务器编辑保存请用
-/// [`save_server_entry`]。
+/// **哨兵防护(v6.1.1)**:按 `id` 与磁盘现值合并——`password_enc`/`key_pass_enc`
+/// 为哨兵 `"*"` 的服务器沿用磁盘真实密文(防「get_config 全量取 → 改一处 →
+/// 全量写回」路径把只读视图哨兵写进磁盘;v6.1.0 曾因此冲掉真实密文)。
+/// 其余字段与新增项原样写入;配置中心导入等自带真实密文的场景不受影响。
 #[tauri::command]
-pub fn save_config_cmd(cfg: AppConfig) -> Result<(), String> {
+pub fn save_config_cmd(mut cfg: AppConfig) -> Result<(), String> {
+    // 磁盘现值可读时做哨兵还原;读不到(极端)也绝不能把 "*" 写盘 → 降级为 None
+    let existing = load_config().ok();
+    for s in &mut cfg.servers {
+        let prev = existing
+            .as_ref()
+            .and_then(|c| c.servers.iter().find(|e| e.id == s.id));
+        let prev_auth = prev.map(|p| &p.auth);
+        s.auth.password_enc = restore_sentinel(
+            s.auth.password_enc.take(),
+            prev_auth.and_then(|a| a.password_enc.as_ref()),
+        );
+        s.auth.key_pass_enc = restore_sentinel(
+            s.auth.key_pass_enc.take(),
+            prev_auth.and_then(|a| a.key_pass_enc.as_ref()),
+        );
+    }
     save_config(&cfg).map_err(|e| format!("保存配置失败: {}", e))
 }
 
 /// 保存单个服务器(编辑/新增;**merge 保留密文与指纹**,配合 get_config 只读视图)。
 ///
 /// 前端从只读视图组装的服务器对象密文为空。本命令按 `server.id` 定位现有项:
-/// - `password_enc`/`key_pass_enc` 为空 → 沿用现有密文(merge);非空 → 用新值(改密码场景);
+/// - `password_enc`/`key_pass_enc` 为空或哨兵 `"*"` → 沿用现有密文(merge);
+///   非空真实值 → 用新值(改密码场景);
 /// - `host_key_sha256` 为空 → 沿用现有指纹(前端不承载指纹,防整对象替换清空)。
-/// 不存在则按新增插入(密文/指纹以入参为准)。返回保存后的服务器 id。
+/// 不存在则按新增插入(密文/指纹以入参为准;哨兵落为 None)。返回保存后的服务器 id。
 #[tauri::command]
 pub fn save_server_entry(mut server: crate::config::ServerConfig) -> Result<String, String> {
     let mut cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
     let id = server.id.clone();
     if let Some(existing) = cfg.servers.iter().find(|s| s.id == id) {
+        // 哨兵视同 None(见 restore_sentinel 注释):不会把 "*" 落盘
+        if server.auth.password_enc.as_deref() == Some(CIPHER_SENTINEL) {
+            server.auth.password_enc = None;
+        }
+        if server.auth.key_pass_enc.as_deref() == Some(CIPHER_SENTINEL) {
+            server.auth.key_pass_enc = None;
+        }
         if server.auth.password_enc.is_none() {
             server.auth.password_enc = existing.auth.password_enc.clone();
         }
@@ -312,6 +350,14 @@ pub fn save_server_entry(mut server: crate::config::ServerConfig) -> Result<Stri
         }
         if server.host_key_sha256.is_none() {
             server.host_key_sha256 = existing.host_key_sha256.clone();
+        }
+    } else {
+        // 新增:哨兵无现值可沿用,落为 None(绝不把 "*" 写盘)
+        if server.auth.password_enc.as_deref() == Some(CIPHER_SENTINEL) {
+            server.auth.password_enc = None;
+        }
+        if server.auth.key_pass_enc.as_deref() == Some(CIPHER_SENTINEL) {
+            server.auth.key_pass_enc = None;
         }
     }
     match cfg.servers.iter_mut().find(|s| s.id == id) {
@@ -1152,6 +1198,11 @@ pub fn resolve_password(
         AuthType::Password => match password_plain.filter(|p| !p.is_empty()) {
             Some(p) => Ok(Some(p.to_string())),
             None => match password_enc.filter(|e| !e.is_empty()) {
+                // 只读视图哨兵(或历史损坏值)出现在磁盘:给出明确可操作的提示
+                // (v6.1.0 曾把 "*" 写盘;重录一次密码即可恢复,见 v6.1.1 修复)
+                Some(e) if e == CIPHER_SENTINEL || !e.bytes().all(is_b64_char) => Err(
+                    "服务器密码未有效保存(密文占位符或损坏)。请到服务器管理页编辑该服务器并重新输入登录密码保存".to_string(),
+                ),
                 Some(enc) => Ok(Some(dpapi_unprotect(enc)?)),
                 None => Err(
                     "密码认证需要输入密码,或先在服务器设置中保存密码".to_string(),
@@ -1161,6 +1212,11 @@ pub fn resolve_password(
     }
 }
 
+/// base64 标准字母表字符判定(用于提前拦截哨兵/损坏密文,报错比解码失败更可读)。
+fn is_b64_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='
+}
+
 /// 解析 SSH 认证所需的明文私钥口令(纯函数,便于测试;阶段三「加密私钥口令」)。
 ///
 /// `AuthConfig.key_pass_enc` 有值 → DPAPI 解密返回 `Some(明文)`;
@@ -1168,6 +1224,10 @@ pub fn resolve_password(
 /// (加载加密私钥时会得到「私钥已加密,请输入私钥口令」的明确报错)。
 pub(crate) fn resolve_key_passphrase(cfg: &ServerConfig) -> Result<Option<String>, String> {
     match cfg.auth.key_pass_enc.as_deref().filter(|e| !e.is_empty()) {
+        // 哨兵/损坏密文:明确可操作提示(与 resolve_password 同口径)
+        Some(e) if e == CIPHER_SENTINEL || !e.bytes().all(is_b64_char) => Err(
+            "私钥口令未有效保存(密文占位符或损坏)。请到服务器管理页编辑该服务器并重新输入私钥口令保存".to_string(),
+        ),
         Some(enc) => Ok(Some(dpapi_unprotect(enc)?)),
         None => Ok(None),
     }

@@ -2394,3 +2394,60 @@ services:
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    // ===== 哨兵防护(v6.1.1:防只读视图 "*" 落盘)=====
+
+    #[test]
+    fn test_save_config_cmd_restores_sentinel() {
+        let _guard = crate::config::TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ddtest-sentinel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
+
+        // 磁盘落真实密文
+        save_server_entry(server_entry("s1", Some("REAL-B64"), Some("REAL-KEY"), Some("SHA256:fp"))).unwrap();
+
+        // 场景 A:get_config 只读视图(哨兵)整量回写 → 磁盘密文不被冲掉
+        let mut view = get_config().unwrap();
+        assert_eq!(view.servers[0].auth.password_enc.as_deref(), Some("*"), "视图应为哨兵");
+        // 模拟前端改一处(改项目列表)后全量回写
+        view.servers[0].name = "改名后".into();
+        save_config_cmd(view).unwrap();
+        let cfg = load_config().unwrap();
+        assert_eq!(cfg.servers[0].name, "改名后");
+        assert_eq!(cfg.servers[0].auth.password_enc.as_deref(), Some("REAL-B64"), "哨兵不得落盘,真实密文应保留");
+        assert_eq!(cfg.servers[0].auth.key_pass_enc.as_deref(), Some("REAL-KEY"));
+
+        // 场景 B:真实新密文(改密码)→ 正常覆盖
+        let mut cfg2 = load_config().unwrap();
+        cfg2.servers[0].auth.password_enc = Some("NEW-B64".into());
+        save_config_cmd(cfg2).unwrap();
+        assert_eq!(load_config().unwrap().servers[0].auth.password_enc.as_deref(), Some("NEW-B64"));
+
+        // 场景 C:save_server_entry 收到哨兵 → 视同未改,沿用现值
+        let mut edit = server_entry("s1", Some("*"), Some("*"), None);
+        edit.name = "再改名".into();
+        save_server_entry(edit).unwrap();
+        let cfg3 = load_config().unwrap();
+        assert_eq!(cfg3.servers[0].name, "再改名");
+        assert_eq!(cfg3.servers[0].auth.password_enc.as_deref(), Some("NEW-B64"), "哨兵不得覆盖真实密文");
+
+        // 场景 D:新增服务器带哨兵 → 落为 None(绝不写 "*")
+        save_server_entry(server_entry("s2", Some("*"), None, None)).unwrap();
+        let cfg4 = load_config().unwrap();
+        let s2 = cfg4.servers.iter().find(|s| s.id == "s2").unwrap();
+        assert_eq!(s2.auth.password_enc, None, "新增项的哨兵应落为 None");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_resolve_password_rejects_sentinel() {
+        // 哨兵/损坏密文 → 明确可操作报错(而非晦涩的 base64 解码失败)
+        let err = resolve_password(&AuthType::Password, None, Some("*")).unwrap_err();
+        assert!(err.contains("重新输入登录密码"), "实际: {err}");
+        let err2 = resolve_password(&AuthType::Password, None, Some("不是base64!!")).unwrap_err();
+        assert!(err2.contains("重新输入登录密码"), "实际: {err2}");
+        // 正常 base64 且明文优先时不受影响
+        assert_eq!(resolve_password(&AuthType::Password, Some("plain"), Some("*")).unwrap(), Some("plain".to_string()));
+    }
