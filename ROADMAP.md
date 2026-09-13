@@ -91,6 +91,12 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 - 细节:监控熔断自动退出也清态(否则前端不在线时托盘永远「监控中」);批量逐台是独立单发,台间 tooltip 瞬闪终态再回「部署中」(状态恒准确,间隔 <1s)
 - 验证:`cargo test` 302 passed(基线 292 + 10)/ clippy 零新增 / 真机冒烟进程存活;**tooltip 悬停效果待用户确认**(系统绘制,无自动化断言手段)
 
+### 第十五批补丁 v5.14.1(修复 05 远程管理页监听全断)— 已完成
+- 根因:第十二批拆分把 manage.js 的 IIFE 局部助手 `$` 留在宿主,manage-stacks.js 40+ 处裸 `$(...)` 在 DOMContentLoaded 即抛 `ReferenceError` → **栈/监控/终端/日志跟随按钮监听全断**(点击无反应、invoke 不发出、后端日志零记录),潜伏 v5.11.0 → v5.14.0 三个版本;「容器/镜像/卷/网络还能用」的边界恰好等于拆分边界
+- 修复(4 行):manage-stacks.js 补 `$` 定义;**新守护 `verify/scope-integrity.js`**(全链加载 + 触发 DOM 回调,专抓初始化回调里的自由标识符断裂,TDD 先红后绿 + 行为级验证点击发出 `manage_stats_start`)
+- 排查中排除 v5.14.0 托盘挂钩(`set_tooltip` 同步等主线程,常驻时毫秒级返回,非根因)
+- 验证:三 verify 脚本全 PASS / `cargo test` 302 passed 与基线一致(纯前端修复)
+
 ---
 
 ## 待完成
@@ -122,10 +128,10 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 
 ## 当前状态速览
 
-- 版本 v5.14.0;main = origin/main;基线 `cargo test` 302 passed / 13 ignored
+- 版本 v5.14.1;main = origin/main;基线 `cargo test` 302 passed / 13 ignored
 - 命令 94 个(lib.rs 注册;wiki/04 已同步);JS 15 文件(index.html 加载顺序见 wiki/03:13)
 - 前端结构:12 模态;commands/ 11 文件;三大 JS 主文件 2338/2013/2537 行
 - 表单体系(第十三批):5 处模态有真实 `<form novalidate>` 语义;失焦校验 + Enter 提交由 app.js 三助手统一承担
 - 批量部署(第十四批):失败/取消台可续传(单台 + 一键批量);「停止批量」步骤边界即时中止;批量恒落断点(与死代码 `deploy_batch` 的「不落断点」无关)
-- 本地校验脚本 `verify/`(零依赖 Node,不参与构建):`form-validation.js`(表单助手 54 断言)/ `bridge-integrity.js`(桥接完整性);改动表单助手或拆出文件桥接时先跑这两个
+- 本地校验脚本 `verify/`(零依赖 Node,不参与构建):`form-validation.js`(表单助手 54 断言)/ `bridge-integrity.js`(桥接完整性)/ `scope-integrity.js`(全链加载 + DOM 回调作用域完整性,v5.14.1 起);改动表单助手、拆出文件桥接或 JS 拆分时先跑这三个
 - dev 实例:target/debug/config(正式版数据拷贝);前端资源编译期内嵌,**改 JS 后必须重编译重启动才生效**

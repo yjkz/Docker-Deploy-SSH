@@ -4,6 +4,10 @@
 (function () {
   'use strict';
   var K = window.ManageKit;
+  // `$` 是 manage.js 的 IIFE 局部助手,拆分时不随迁(它不在 ManageKit 桥上);
+  // 本文件 40+ 处裸 `$(...)` 依赖此定义,缺失则 bindEventsC 一执行就抛
+  // ReferenceError,监控/栈/终端/日志跟随的按钮监听全部注册不上(v5.14.0 真实回归)
+  var $ = function (id) { return document.getElementById(id); };
   var state = K.state;
   var buildConfirmBody = K.buildConfirmBody;
   var closeModal = K.closeModal;

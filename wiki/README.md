@@ -46,8 +46,8 @@
 构建:npm run tauri dev / npm run tauri build(产物 NSIS 安装包 ~8.2MB)
 配置:安装目录 config/ 下 servers.json + projects.json + notify.json + settings.json +
       deployments.json + resume-deploy.json(便携式;原子写);日志 logs/app.log
-测试:cargo test(纯函数单测 290 passed;真机测试 #[ignore] 13 个)
-当前版本:v5.14.0(tauri.conf.json / Cargo.toml;第十五批:托盘 tooltip 动态态——部署/回滚/监控状态实时反映在托盘悬停提示(窗口隐藏到托盘时的唯一状态面),纯后端维护。第十四批补丁:修复检查更新「未能获取更新说明」。第十四批:批量部署增强——失败/取消台的单台与一键批量续传(文档「批量不落断点」经核实为误,批量恒落断点)、「停止批量」可在步骤边界即时中止当前台、断点裁剪回收泄漏的临时 tar;顺带修复批量第二台永久卡死的 deferred 调用形态错配 bug)
+测试:cargo test(纯函数单测 302 passed;真机测试 #[ignore] 13 个)
+当前版本:v5.14.1(tauri.conf.json / Cargo.toml;第十五批补丁:修复 05 远程管理页监听全断——第十二批拆分丢 `$` 助手,栈/监控/终端/日志跟随按钮监听全断,潜伏三个版本;新守护 verify/scope-integrity.js 全链加载 + DOM 回调作用域校验。第十五批:托盘 tooltip 动态态——部署/回滚/监控状态实时反映在托盘悬停提示(窗口隐藏到托盘时的唯一状态面),纯后端维护。第十四批补丁:修复检查更新「未能获取更新说明」。第十四批:批量部署增强——失败/取消台的单台与一键批量续传(文档「批量不落断点」经核实为误,批量恒落断点)、「停止批量」可在步骤边界即时中止当前台、断点裁剪回收泄漏的临时 tar;顺带修复批量第二台永久卡死的 deferred 调用形态错配 bug)
 ```
 
 ## 权威计划/完成记录(仓库根目录)

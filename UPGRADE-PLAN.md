@@ -1375,3 +1375,51 @@ wiki/07 新增限制 63(记录端点契约、静默降级的取舍与「必须�
   消除 private_interfaces 警告
 - 真机冒烟:`cargo build` + 启动 app.exe 确认进程存活与正常退出(tooltip 实际
   悬停效果待用户确认)
+
+## 第十五批补丁(v5.14.1)— 修复 05 远程管理页监听全断(拆分丢 `$` 助手)
+
+> 用户反馈:远程管理「只有容器还在线能看,其余基本都不行了,监控点击开始没有反应」。
+
+### 根因
+
+第十二批 JS 大拆分(6cee803)把 manage.js 拆出 manage-stacks.js 时,**宿主 IIFE 局部
+助手 `$`(`var $ = id => document.getElementById(id)`)既没随迁、也没进 ManageKit 桥**。
+manage-stacks.js 里 40+ 处裸 `$(...)` 全是自由标识符,`bindEventsC` 在 DOMContentLoaded
+一触发就抛 `ReferenceError: $ is not defined` —— **05 页栈/监控/终端/日志跟随的按钮
+监听全部没注册上**:点击无反应、invoke 不发出、后端日志零记录。
+
+潜伏三个版本(v5.11.0 → v5.14.0)的原因:
+
+- 同文件裸引用的 `toast` / `fillBadge` 恰好是 `window` 全局(app.js 挂载),strict 模式
+  下可解析,**全局/局部的静默差异让静态扫查看不出差别**;
+- `node --check` 只查语法,运行时 ReferenceError 查不出;
+- 浏览器桩截图验证的是静态界面,没点过监控按钮。
+
+「容器/镜像/卷/网络还能用」与「栈/监控/终端/日志跟随全断」的边界,精确等于
+manage.js 域与 manage-stacks.js 域的拆分边界 —— 症状与根因完全吻合。
+
+### 排查中排除的假设
+
+v5.14.0 托盘挂钩(`tray.set_tooltip`)在时间上最可疑,已完整读链排除:
+tauri 的 `set_tooltip` = `run_item_main_thread!`(投递主线程 + `rx.recv()` 同步等待),
+主线程事件循环常驻时毫秒级返回;仅 Explorer 挂起才会阻塞 tokio 线程,非本次根因,
+代码未改动(风险已知、可接受)。
+
+### 修复与守护
+
+- **修复(4 行)**:manage-stacks.js IIFE 顶部补 `var $ = function (id) { return
+  document.getElementById(id); };`(附缺陷说明注释)。
+- **新回归守护 `verify/scope-integrity.js`**:按 index.html 真实顺序加载全部 15 个
+  脚本并**触发 DOMContentLoaded 回调**,专抓「只在初始化回调里第一次求值」的自由
+  标识符断裂;另含哨兵断言(监控/栈按钮接线回调必须存在)。与 bridge-integrity
+  互补:桥查 `K.*` 显式桥接,本脚本查隐式作用域。
+- TDD 流程:先跑新脚本看红(精确报出 `bindEventsC` 的 `$ is not defined`),
+  修复后转绿;行为级验证确认修复后点击「开始监控」真实发出
+  `manage_stats_start` invoke。
+- 文档:verify/README 补第三节;wiki/03 桥接纪律旁补「作用域纪律」段。
+
+### 验证
+
+- `verify/scope-integrity.js` / `verify/bridge-integrity.js` / `verify/form-validation.js`
+  (54 断言)全 PASS;`cargo test` 显式确认 `test result: ok. 302 passed; 0 failed;
+  13 ignored`(与 v5.14.0 基线一致,纯前端修复)。
