@@ -1773,3 +1773,41 @@ ASCII 42 = `*`,即 v6.0.0 密文最小化引入的只读视图哨兵值,被**写
 全部密文被冲。哨兵值应设计为「写路径可识别并还原」而非「仅靠消费方自觉」——
 本次改为后端统一兜底(任何写路径都还原),把纪律从「调用方约定」升级为
 「后端不变量」。
+
+# 第十九批补丁2(v6.1.2)— 05 页加载提示 + hover 反白补漏
+
+## 一、远程管理页「选择服务器后加载」反直觉(用户反馈)
+
+**问题**:进入 05 页会自动选中服务器并立即发起数据请求(SSH 建连需数秒),
+但期间表格仍是静态占位「选择服务器后加载」——用户以为要先手动选服务器,
+而实际早已选中、正在取数。
+
+**修复**(manage.js):
+- 新增 `setTablePlaceholdersLoading()`:把仍是初始占位的表体改为「加载中…」
+  (已有数据的表体不动,防刷新时列表整片闪成占位)
+- 新增 `setTablePlaceholdersNoServer(tab)`:确实未选服务器时改为「请先在上方选择服务器」
+- 接入三处:onEnter(自动选中后立即转加载中)/ onServerChange(切换服务器)/
+  onTabChange(切 tab 首次加载;无服务器分支给明确提示)
+- 概览区「连接中…」状态徽章原有(不在本次)
+
+## 二、hover 反白不可见补漏(续 v6.1.1 第 12 条)
+
+上一轮只豁免了 badge 4 变体;本轮全站扫描(data-table 行内所有带背景/彩色类)
+又发现 3 类未覆盖:
+
+- `.port-badge`(端口 +N 徽章,琥珀底墨字):行级 color 会盖文字色 → 固定回自身配色
+- `.badge-running`(容器运行中,青底)/ `.badge-paused`(已暂停,琥珀底):同上豁免
+- `.stat-warm` / `.stat-hot`(监控 CPU 阈值状态文字):亮主题的暗琥珀/暗红在
+  hover 墨底上不可读 → **新增 scheme 翻转 token** `--ark-stat-warm-hover` /
+  `--ark-stat-hot-hover`(亮主题取暗主题的亮色值、反之亦然,两主题 hover 行
+  底色翻转后均有足够对比)
+
+排查同时确认:`.stack-warn-row`(透明底显式声明)、`.container-detail-row`
+(自身豁免)、`.mapping-table`(非 data-table 无反白)均无问题。
+
+## 三、验证
+
+- 对比度实测(纯 CSS 计算):stat-warm-hover 亮/暗主题 199/152、
+  stat-hot-hover 亮/暗 154/175、port-badge 字 199,全部远超阈值
+- `node --check` manage.js/manage-stacks.js 通过;verify 三脚本全 PASS
+- `cargo test` 320 passed(纯前端改动,基线不变)

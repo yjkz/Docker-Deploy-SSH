@@ -164,7 +164,12 @@
   function onEnter() {
     loadServers().then(function () {
       if (state.serverId) {
+        // 已自动选中(恢复上次或默认第一台):表格立即转「加载中…」,
+        // 明确告知正在连接取数(SSH 建连需数秒,原占位文案易被误读为要手动选)
+        setTablePlaceholdersLoading();
         refreshAll();
+      } else {
+        setTablePlaceholdersNoServer(state.tab);
       }
     });
     startTimerIfEnabled();
@@ -223,6 +228,7 @@
     state.expandedPorts = {};
     state.inspectCache = {};
     hideError();
+    if (state.serverId) setTablePlaceholdersLoading();
     refreshAll();
     resetTimer();
   }
@@ -332,26 +338,67 @@
     applyPendingTabScrollNow();
     // 切到对应 Tab 时若尚未加载过则加载
     if (state.serverId) {
-      if (tab === 'containers') refreshContainers();
-      else if (tab === 'images') refreshImages();
-      else if (tab === 'volumes') refreshVolumes();
-      else if (tab === 'networks') refreshNetworks();
-      else if (tab === 'stacks') refreshStacks(); // C 阶段追加
+      // 尚未取过数据的表体仍是占位 → 转「加载中…」(已有数据的表体不动)
+      if (tab === 'containers') { setTablePlaceholdersLoading(); refreshContainers(); }
+      else if (tab === 'images') { setTablePlaceholdersLoading(); refreshImages(); }
+      else if (tab === 'volumes') { setTablePlaceholdersLoading(); refreshVolumes(); }
+      else if (tab === 'networks') { setTablePlaceholdersLoading(); refreshNetworks(); }
+      else if (tab === 'stacks') { setTablePlaceholdersLoading(); refreshStacks(); } // C 阶段追加
     } else {
       pendingTabScroll = null; // 无服务器不会触发渲染,丢弃记忆
+      setTablePlaceholdersNoServer(tab); // 明确提示(而非停留在旧占位文案)
     }
     resetTimer();
+  }
+
+  /**
+   * 未选择服务器时(tab 切换进入)把该 Tab 的表体占位改为明确提示。
+   * 与 [`setTablePlaceholdersLoading`] 分工:本函数用于「确实没选服务器」,
+   * 后者用于「已选中、正在取数」。
+   */
+  function setTablePlaceholdersNoServer(tab) {
+    var idByTab = {
+      containers: 'manage-containers-tbody',
+      images: 'manage-images-tbody',
+      volumes: 'manage-volumes-tbody',
+      networks: 'manage-networks-tbody',
+      stacks: 'manage-stacks-tbody'
+    };
+    var tbody = $(idByTab[tab] || '');
+    if (!tbody) return;
+    var cell = tbody.querySelector('.empty-cell');
+    if (cell) cell.textContent = '请先在上方选择服务器';
   }
 
   // ===== 刷新总入口 =====
   function refreshAll() {
     if (!state.serverId) return;
+    setTablePlaceholdersLoading();
     refreshOverview();
     if (state.tab === 'containers') refreshContainers();
     else if (state.tab === 'images') refreshImages();
     else if (state.tab === 'volumes') refreshVolumes();
     else if (state.tab === 'networks') refreshNetworks();
     else if (state.tab === 'stacks') refreshStacks(); // C 阶段追加
+  }
+
+  /**
+   * 把仍处于初始占位(「选择服务器后加载」)的表体改为「加载中…」。
+   * 反直觉场景:进入 05 页会自动选中服务器并发起请求,但 SSH 连接需数秒,
+   * 期间表格仍是静态占位文案,用户以为要自己先选服务器。加载态文案让其
+   * 明确「已选中、正在取数」。仅替换仍是占位的表体,已有数据的表体不动
+   * (避免刷新时把列表整片闪成占位)。
+   */
+  function setTablePlaceholdersLoading() {
+    ['manage-containers-tbody', 'manage-images-tbody', 'manage-volumes-tbody',
+      'manage-networks-tbody', 'manage-stacks-tbody'].forEach(function (id) {
+        var tbody = $(id);
+        if (!tbody) return;
+        var cell = tbody.querySelector('.empty-cell');
+        if (cell && /选择服务器后加载/.test(cell.textContent || '')) {
+          cell.textContent = '加载中…';
+        }
+      });
   }
 
   // ===== 概览 =====

@@ -139,6 +139,11 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 - **现场处置**:用户 servers.json 7 处哨兵已清理为 null(备份 .corrupted-bak);真实 DPAPI 密文不可从 `*` 恢复,需逐台重录登录密码
 - 验证:`cargo test` 320 passed(基线 318 + 2)/ clippy 新代码零警告
 
+### 第十九批补丁2 v6.1.2(05 页加载提示 + hover 补漏)— 已完成
+- **05 页「选择服务器后加载」反直觉**(用户反馈):进入页/切服务器/切 tab 三处表格占位改为「加载中…」(已自动选中、正在 SSH 取数);确实未选时改「请先在上方选择服务器」
+- **hover 反白补漏**:上轮只豁免 badge 4 变体,本轮全站扫描补 `.port-badge` / `.badge-running` / `.badge-paused` 固定自身配色,`.stat-warm/hot` 新增 scheme 翻转 token(亮暗主题 hover 行底色翻转后对比均足够,实测 152-199)
+- 验证:对比度计算全过 / node --check / verify 三脚本 PASS / cargo test 320 不变
+
 ---
 
 ## 待完成
@@ -166,7 +171,7 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 
 ## 当前状态速览
 
-- 版本 **v6.1.1**;main = origin/main;基线 `cargo test` **320 passed** / 13 ignored
+- 版本 **v6.1.2**;main = origin/main;基线 `cargo test` **320 passed** / 13 ignored
 - 命令 **95** 个(lib.rs 注册;wiki/04 已同步);JS **16** 文件(含 theme-init.js;index.html 加载顺序见 wiki/03:13)
 - 前端结构:12 模态;commands/ 11 文件;三大 JS 主文件 2338/2013/2537 行
 - 表单体系(第十三批):5 处模态有真实 `<form novalidate>` 语义;失焦校验 + Enter 提交由 app.js 三助手统一承担

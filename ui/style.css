@@ -105,6 +105,9 @@
   --ark-on-warn: #080a0b;              /* 琥珀底上的文字(琥珀恒亮,两主题固定墨色) */
   --ark-stat-warm: #7a5f00;            /* 预警状态文字(亮):纸面上的暗琥珀,过 AA */
   --ark-stat-hot: #9c3400;             /* 过热状态文字(亮):纸面上的暗红,过 AA */
+  /* 行 hover 反白(亮主题→墨底)时的状态文字:取暗色主题的亮色值(墨底上可读) */
+  --ark-stat-warm-hover: #ffd23f;
+  --ark-stat-hot-hover: #ff8a94;
   --ark-warn-text: #7a5f00;            /* 琥珀系警示文字(亮):纸面上替代裸琥珀(#ffd23f 在纸面 ≈1.4:1 不可读) */
   --ark-on-signal-dim: var(--ark-ink); /* 青淡底上的文字(暗色翻为青字) */
   --ark-on-ink-55: rgba(244, 246, 246, .55); /* 墨底(含反转行)上的弱化文字,随墨纸翻转(暗色 .6 以过 AA) */
@@ -184,6 +187,9 @@
   --ark-shadow: rgba(0, 0, 0, .5);
   --ark-stat-warm: #ffd23f;           /* 预警状态文字(暗):= --ark-warn 值(琥珀恒亮,黑壳上可读) */
   --ark-stat-hot: #ff8a94;            /* 过热状态文字(暗):柔和红,近黑表面上过 AA */
+  /* 行 hover 反白(暗主题→纸白底)时的状态文字:取亮色主题的暗色值(纸白底上可读) */
+  --ark-stat-warm-hover: #7a5f00;
+  --ark-stat-hot-hover: #9c3400;
   --ark-warn-text: #ffd23f;           /* 琥珀系警示文字(暗):= --ark-warn 值 */
 }
 
@@ -838,6 +844,15 @@ select.text-input option,
 /* ok/warn 自身底与行墨底对比尚可,但行级 color 会盖文字色,一并固定回原配色 */
 .data-table tbody tr:hover .badge-ok { background: var(--ark-signal-dim); color: var(--ark-on-signal-dim); }
 .data-table tbody tr:hover .badge-warn { background: var(--ark-warn); color: var(--ark-on-warn); }
+/* 端口 +N 徽章(琥珀底墨字):自身配色不依赖行级反白,固定维持(两主题下均清晰) */
+.data-table tbody tr:hover .port-badge { background: var(--ark-warn); color: var(--ark-on-warn); }
+/* 容器状态徽章(青底/琥珀底):同上,固定回自身配色防行级 color 盖字 */
+.data-table tbody tr:hover .badge-running { background: var(--ark-signal); color: var(--ark-on-signal); }
+.data-table tbody tr:hover .badge-paused { background: var(--ark-warn); color: var(--ark-on-warn); }
+/* 监控阈值状态文字(stat-warm/hot):行反白后底色翻转(亮主题→墨底/暗主题→纸白底),
+   原状态色对比不足 → 用「翻转态」token(亮主题取暗色主题的亮色值,反之亦然) */
+.data-table tbody tr:hover .stat-warm { color: var(--ark-stat-warm-hover); }
+.data-table tbody tr:hover .stat-hot { color: var(--ark-stat-hot-hover); }
 
 .data-table .col-action { text-align: right; white-space: nowrap; }
 /* 审计 P2-15:原 .data-table .mono 规则已并入 05 段的 .mono 工具类(渲染不变)。 */
