@@ -12,8 +12,10 @@
 //! eof 收尾。
 //!
 //! 会话模型:全局单流。`LogsState`(generation 代号)语义与
-//! [`crate::manage_stats::StatsState`] 一致 —— 再次 start 自动替换旧流
-//! (旧任务发现代号过期即退出并 emit eof,输出回调直接静默)。
+//! [`crate::manage_stats::StatsState`] 一致 —— 再次 start 自动替换旧流:
+//! start 先给**旧代号**的取消句柄发信号(旧任务立即走取消路径关通道返回,
+//! 不再持有 SSH 连接与远端 `docker logs -f` 等到 3600s 兜底),输出回调
+//! 里代号过期的旧流也已静默。
 //!
 //! 低耦合:复用 `crate::manage` 的 `connect_server` / `shell_quote`;
 //! 零新增依赖(取消通道用 tokio mpsc)。
@@ -79,12 +81,8 @@ impl LogsState {
         inner.generation
     }
 
-    /// 结束当前流(递增代号使旧任务退出,清除 running 标记)。
-    fn end(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.generation += 1;
-        inner.running = false;
-    }
+    // 注:原 `end()` 已并入 manage_log_stream_stop 的锁段(第二十批 P2 修复,
+    // 推进代号 + 清 running 需与取句柄在同一临界区完成),独立方法随之移除。
 }
 
 // ===== 数据结构 =====
@@ -170,11 +168,26 @@ pub async fn manage_log_stream_start(
         other => return Err(format!("未知的日志流类型: {}", other)),
     };
 
-    // 递增代号:旧流任务发现代号过期即自清理;注册本代取消句柄
-    let generation = logs_state.begin();
+    // 递增代号:旧流任务发现代号过期即自清理;注册本代取消句柄。
+    // 第二十批 P2 修复:先给旧代号的取消句柄发信号再注册新句柄 ——
+    // 被顶替的旧流立即走 exec_streaming 的取消路径(关通道返回),不再持有
+    // SSH 连接与远端 docker logs -f 等到 3600s 兜底;此前旧流只能靠输出行
+    // 回调里的 is_current 静默,主体永不退出。try_send 不阻塞(容量 1,旧流
+    // 已在等/已退出的两种情况都安全)。锁内完成「信号旧流 + begin + 注册」,
+    // 与 stop 的锁段互斥,见 stop 处注释。
+    let (generation, cancel_tx, mut cancel_rx) = {
+        let mut sm = logs_state.streams.lock().unwrap();
+        for old_tx in sm.values() {
+            let _ = old_tx.try_send(());
+        }
+        let generation = logs_state.begin();
+        let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
+        // clone 入表(sender 双持有:表内供 stop/顶替取用,本地随本函数结束 drop)
+        sm.insert(generation, cancel_tx.clone());
+        (generation, cancel_tx, cancel_rx)
+    };
     log::info!("日志流启动: server={} generation={}", server_id, generation);
-    let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(1);
-    logs_state.streams.lock().unwrap().insert(generation, cancel_tx);
+    drop(cancel_tx); // 本地 sender 立即 drop:取消只经表内句柄发生,语义单一
 
     let state = Arc::clone(&logs_state.inner);
     let streams = Arc::clone(&logs_state.streams);
@@ -294,20 +307,29 @@ async fn run_log_stream(
 /// eof 事件由流任务统一 emit。
 #[tauri::command]
 pub async fn manage_log_stream_stop(logs_state: tauri::State<'_, LogsState>) -> Result<(), String> {
-    // 先记代号再 end:stop 与新流 start 并发时,旧句柄仍能被送达
-    let gen = {
-        let inner = logs_state.inner.lock().unwrap();
+    // 第二十批 P2 修复:stop 与 start 是两个独立 invoke,原实现「读代号 → 取
+    // 句柄 → end」三步间无锁,快速「停旧开新」时可能读到 begin() 之后的新
+    // 代号,把取消信号发给**新流**(新流刚启动就被停,旧流反而漏网)。
+    // 现改为:锁内一次性完成「快照代号 + 取句柄 + 推进状态」,锁外发信号 ——
+    // 与 start 的「信号旧流 + begin + 注册」锁段互斥后,两命令交错只有两种
+    // 全序(stop 全先于 start / start 全先于 stop),各自语义都正确。
+    let tx = {
+        let mut inner = logs_state.inner.lock().unwrap();
         if !inner.running {
             return Ok(()); // 幂等:无运行中流
         }
-        inner.generation
+        let gen = inner.generation;
+        // end 语义:递增代号使旧任务退出判定生效,清 running
+        inner.generation += 1;
+        inner.running = false;
+        let tx = logs_state.streams.lock().unwrap().get(&gen).cloned();
+        log::info!("日志流停止: generation={}", gen);
+        tx
     };
-    let tx = logs_state.streams.lock().unwrap().get(&gen).cloned();
     if let Some(tx) = tx {
+        // 锁外发信号(mpsc 容量 1;接收端已退出时 send 失败,安全忽略)
         let _ = tx.send(()).await;
     }
-    logs_state.end();
-    log::info!("日志流停止: generation={}", gen);
     Ok(())
 }
 
@@ -341,8 +363,65 @@ mod tests {
         // 重复 start 自动替换旧流:代号严格递增
         let g2 = st.begin();
         assert!(g2 > g1);
-        st.end();
+        // stop 并入锁段后(第二十批 P2),begin 之间无需显式 end —— 代号
+        // 严格递增由 begin 自身保证
         let g3 = st.begin();
         assert!(g3 > g2);
+    }
+
+    #[test]
+    fn test_start_signals_old_stream_cancel() {
+        // 第二十批 P2 修复回归:新流 start 时旧代号的取消句柄必须收到信号 ——
+        // 被顶替的旧流立即走取消路径退出,不再持有连接等到 3600s 兜底;
+        // 且新流的句柄不得被误伤。receiver 全程保活(模拟流任务持有)。
+        use tokio::sync::mpsc::error::TryRecvError;
+        let st = LogsState::default();
+        // 第一代流:begin + 注册句柄(receiver 模拟流任务,跨块保活)
+        let (mut rx1, g1) = {
+            let mut sm = st.streams.lock().unwrap();
+            let g = st.begin();
+            let (tx, rx) = mpsc::channel::<()>(1);
+            sm.insert(g, tx);
+            drop(sm);
+            (rx, g)
+        };
+        // 第二次 start(与命令层同款锁段):信号旧流 → begin → 注册新句柄
+        let (mut rx2, g2) = {
+            let mut sm = st.streams.lock().unwrap();
+            for old_tx in sm.values() {
+                let _ = old_tx.try_send(());
+            }
+            let g = st.begin();
+            let (tx, rx) = mpsc::channel::<()>(1);
+            sm.insert(g, tx);
+            drop(sm);
+            (rx, g)
+        };
+        assert!(g2 > g1, "代号严格递增");
+        // 旧流收到了恰好一次取消信号(唤醒退出)
+        assert_eq!(rx1.try_recv(), Ok(()), "被顶替的旧流应收到取消信号");
+        assert_eq!(rx1.try_recv(), Err(TryRecvError::Empty), "旧流只收到一次信号");
+        // 新流未收到任何信号,且句柄仍可用
+        assert_eq!(rx2.try_recv(), Err(TryRecvError::Empty), "新流不得被旧流的取消信号误伤");
+        let new_tx = st.streams.lock().unwrap().get(&g2).cloned();
+        assert!(new_tx.is_some(), "新代号句柄已注册");
+        assert!(new_tx.unwrap().try_send(()).is_ok(), "新流句柄仍可发送(stop 路径可用)");
+    }
+
+    #[test]
+    fn test_stream_handle_registry_cleanup() {
+        // 流任务退出路径:仅当表中该代号仍是自己时移除(防误删新流句柄)
+        let st = LogsState::default();
+        let mut sm = st.streams.lock().unwrap();
+        let (tx1, _rx1) = mpsc::channel::<()>(1);
+        let (tx2, _rx2) = mpsc::channel::<()>(1);
+        sm.insert(1, tx1);
+        sm.insert(2, tx2);
+        // 旧流(代号 1)退出:remove 自己
+        if sm.get(&1).is_some() {
+            sm.remove(&1);
+        }
+        assert!(sm.get(&1).is_none(), "旧代号句柄已移除");
+        assert!(sm.get(&2).is_some(), "新代号句柄不受影响");
     }
 }

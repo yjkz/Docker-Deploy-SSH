@@ -113,9 +113,10 @@
       overlay.addEventListener('click', function (e) {
         if (e.target === overlay) closeModal();
       });
-      // Esc 关闭(仅管理模态可见时,避免误伤其他模态;参照 help.js 先例)
+      // Esc 关闭(仅当自己是顶层模态;第二十批 P1 修复:全局仲裁
+      // window.isTopModal 见 app.js,叠模态一次 Esc 只关一层)
       document.addEventListener('keydown', function (e) {
-        if (e.key === 'Escape' && !overlay.classList.contains('hidden')) closeModal();
+        if (e.key === 'Escape' && window.isTopModal('manage-modal')) closeModal();
       });
     }
 
@@ -362,7 +363,10 @@
       images: 'manage-images-tbody',
       volumes: 'manage-volumes-tbody',
       networks: 'manage-networks-tbody',
-      stacks: 'manage-stacks-tbody'
+      stacks: 'manage-stacks-tbody',
+      // 监控表(体验审查 5-3):空态原是「点击「开始监控」获取实时数据」,
+      // 未选服务器时点了才 toast,先把占位纠正为选择提示
+      monitor: 'monitor-tbody'
     };
     var tbody = $(idByTab[tab] || '');
     if (!tbody) return;
@@ -715,12 +719,16 @@
     if (!state.serverId) return;
     state.opInProgress = true;
     stopTimer();
+    // 忙碌反馈(体验审查 5-2):SSH 往返数秒,期间按钮转忙防连点/误判未生效。
+    // 按 data-cid 定位该行操作按钮组(整组禁用,setBtnBusy 只管单个)
+    setRowActionsBusy(containerId, true);
     AppBus.invoke('manage_container_action', {
       serverId: state.serverId,
       containerId: containerId,
       action: action
     }).then(function (res) {
       state.opInProgress = false;
+      setRowActionsBusy(containerId, false);
       if (res.success) {
         toast(label + '成功', 'ok');
         refreshContainers();
@@ -731,10 +739,19 @@
       startTimerIfEnabled();
     }).catch(function (err) {
       state.opInProgress = false;
+      setRowActionsBusy(containerId, false);
       var msg = err && err.message ? err.message : String(err);
       toast(label + '失败: ' + msg, 'fail');
       startTimerIfEnabled();
     });
+  }
+
+  /** 按 data-cid 定位行内操作按钮组并整体启停(行可能已被刷新移除 → 静默跳过) */
+  function setRowActionsBusy(containerId, busy) {
+    var row = document.querySelector('tr[data-cid="' + containerId + '"]');
+    if (!row) return;
+    var btns = row.querySelectorAll('.action-btn-group .btn');
+    for (var i = 0; i < btns.length; i++) btns[i].disabled = busy;
   }
 
   function confirmRemoveContainer(containerId) {

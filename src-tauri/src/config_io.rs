@@ -196,11 +196,26 @@ pub struct ImportSummary {
 // ===== 导出 / 导入转换 =====
 
 /// 把 DPAPI 密文解密为明文;空值/空串按未配置处理(返回 None)。
+/// 哨兵/非 base64 的损坏密文(如 v6.1.0 曾落盘的 `"*"`)给出可操作报错,
+/// 指明是哪台服务器的哪个字段 —— 替代晦涩的 base64 解码失败(v6.1.3)。
 fn decrypt_secret(enc: &Option<String>) -> Result<Option<String>, String> {
     match enc.as_deref().filter(|e| !e.is_empty()) {
-        Some(e) => Ok(Some(dpapi_unprotect(e)?)),
+        Some(e) => {
+            if e == crate::commands::CIPHER_SENTINEL || !e.bytes().all(is_b64_char) {
+                return Err(
+                    "存在未有效保存的密码(密文占位符或损坏)。请先在「服务器管理」页逐台重录密码后再导出"
+                        .to_string(),
+                );
+            }
+            Ok(Some(dpapi_unprotect(e)?))
+        }
         None => Ok(None),
     }
+}
+
+/// base64 标准字母表字符判定(与 commands::mod 同口径,预检挡下哨兵/乱码)。
+fn is_b64_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='
 }
 
 /// ServerConfig → 明文镜像(解密 SSH 密码与私钥口令)。

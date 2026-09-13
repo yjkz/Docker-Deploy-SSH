@@ -263,15 +263,27 @@ pub struct StackServiceChoice {
 
 /// 读取全部配置(服务器 + 项目)——**密文已置空的只读视图**。
 ///
-/// 最小化原则:`password_enc`/`key_pass_enc` 的真实 DPAPI 密文不回传前端——
-/// 前端展示只需「是否已存」,故已存的字段以哨兵值 `"*"`(非空、非真实密文、
-/// 不可解)替代,None 保持 None。WebView 被注入时攻击者拿不到真实密文去做混淆
-/// 或导出。**哨兵绝不可落盘**:所有写路径(整量 `save_config_cmd` / 单项
-/// [`save_server_entry`])都在后端把 `"*"` 还原为磁盘现值(v6.1.1 起),
-/// 即便某个前端路径原样回写也只读视图也冲不掉真实密文。
+/// 最小化原则:`password_enc`/`key_pass_enc`(servers 与 notify 的 SMTP 密码)
+/// 的真实 DPAPI 密文不回传前端——前端展示只需「是否已存」,故已存的字段以
+/// 哨兵值 `"*"`(非空、非真实密文、不可解)替代,None 保持 None。WebView 被注入
+/// 时攻击者拿不到真实密文去做混淆或导出。**哨兵绝不可落盘**:所有写路径
+/// (整量 `save_config_cmd` / 单项 [`save_server_entry`])都在后端把 `"*"` 还原为
+/// 磁盘现值(v6.1.1 起 servers,v6.1.3 起含 notify),即便某个前端路径原样回写
+/// 只读视图也冲不掉真实密文。
 #[tauri::command]
 pub fn get_config() -> Result<AppConfig, String> {
     let mut cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    mask_ciphers(&mut cfg);
+    Ok(cfg)
+}
+
+/// 密文只读视图的哨兵值:`"*"` 不是合法 base64,与任何真实 DPAPI 密文不可能撞车。
+pub(crate) const CIPHER_SENTINEL: &str = "*";
+
+/// 把配置中的全部真实密文替换为哨兵(只读视图出口唯一实现)。
+/// 覆盖 servers(登录密码/私钥口令)与 notify(SMTP 密码)两处;
+/// **新增脱敏字段必须加在这里**,与 [`restore_sentinels`] 成对维护。
+fn mask_ciphers(cfg: &mut AppConfig) {
     for s in &mut cfg.servers {
         // 哨兵 "*":已存密文 → Some("*")(truthy,保留「已存」语义);未存 → None
         if s.auth.password_enc.is_some() {
@@ -281,11 +293,10 @@ pub fn get_config() -> Result<AppConfig, String> {
             s.auth.key_pass_enc = Some(CIPHER_SENTINEL.to_string());
         }
     }
-    Ok(cfg)
+    if cfg.notify.email.password_enc.is_some() {
+        cfg.notify.email.password_enc = Some(CIPHER_SENTINEL.to_string());
+    }
 }
-
-/// 密文只读视图的哨兵值:`"*"` 不是合法 base64,与任何真实 DPAPI 密文不可能撞车。
-pub(crate) const CIPHER_SENTINEL: &str = "*";
 
 /// 把入参中的哨兵还原为 `existing`(磁盘现值):哨兵 → 沿用现值,真实值/None 原样。
 /// `"*"` 无现有值可沿用时落为 None(绝不把哨兵写进磁盘)。
@@ -296,21 +307,35 @@ fn restore_sentinel(incoming: Option<String>, existing: Option<&String>) -> Opti
     }
 }
 
-/// 保存全部配置(原子写入)。
+/// 对整份配置做哨兵还原(与 [`mask_ciphers`] 成对):若入参含任何哨兵而磁盘现值
+/// 不可读,返回 Err 拒绝保存——「读不到」与「没有现值」必须区分,否则一次全量
+/// 回写会把全部密文静默清空(与 v6.1.1「绝不丢密文」的意图相反)。
 ///
-/// **哨兵防护(v6.1.1)**:按 `id` 与磁盘现值合并——`password_enc`/`key_pass_enc`
-/// 为哨兵 `"*"` 的服务器沿用磁盘真实密文(防「get_config 全量取 → 改一处 →
-/// 全量写回」路径把只读视图哨兵写进磁盘;v6.1.0 曾因此冲掉真实密文)。
-/// 其余字段与新增项原样写入;配置中心导入等自带真实密文的场景不受影响。
-#[tauri::command]
-pub fn save_config_cmd(mut cfg: AppConfig) -> Result<(), String> {
-    // 磁盘现值可读时做哨兵还原;读不到(极端)也绝不能把 "*" 写盘 → 降级为 None
-    let existing = load_config().ok();
+/// 不含哨兵的入参(配置中心导入等自带真实密文的场景)在磁盘不可读时按原样放行。
+fn restore_sentinels(mut cfg: AppConfig) -> Result<AppConfig, String> {
+    let has_sentinel = cfg
+        .servers
+        .iter()
+        .any(|s| {
+            s.auth.password_enc.as_deref() == Some(CIPHER_SENTINEL)
+                || s.auth.key_pass_enc.as_deref() == Some(CIPHER_SENTINEL)
+        })
+        || cfg.notify.email.password_enc.as_deref() == Some(CIPHER_SENTINEL);
+    let existing = match load_config() {
+        Ok(c) => Some(c),
+        Err(e) if has_sentinel => {
+            return Err(format!(
+                "读取现有配置失败({}),且本次保存含只读视图占位符;已取消保存以免丢失已存密码。请稍后重试",
+                e
+            ));
+        }
+        Err(_) => None, // 无哨兵:导入等场景不受影响
+    };
     for s in &mut cfg.servers {
-        let prev = existing
+        let prev_auth = existing
             .as_ref()
-            .and_then(|c| c.servers.iter().find(|e| e.id == s.id));
-        let prev_auth = prev.map(|p| &p.auth);
+            .and_then(|c| c.servers.iter().find(|e| e.id == s.id))
+            .map(|p| &p.auth);
         s.auth.password_enc = restore_sentinel(
             s.auth.password_enc.take(),
             prev_auth.and_then(|a| a.password_enc.as_ref()),
@@ -320,6 +345,26 @@ pub fn save_config_cmd(mut cfg: AppConfig) -> Result<(), String> {
             prev_auth.and_then(|a| a.key_pass_enc.as_ref()),
         );
     }
+    // notify SMTP 密码:哨兵 → 磁盘现值;无现值(新增/未配)→ None
+    cfg.notify.email.password_enc = restore_sentinel(
+        cfg.notify.email.password_enc.take(),
+        existing
+            .as_ref()
+            .and_then(|c| c.notify.email.password_enc.as_ref()),
+    );
+    Ok(cfg)
+}
+
+/// 保存全部配置(原子写入)。
+///
+/// **哨兵防护(v6.1.1,扩展至 notify v6.1.3)**:按 `id` 与磁盘现值合并——
+/// `password_enc`/`key_pass_enc`(servers 与 notify)为哨兵 `"*"` 的沿用磁盘
+/// 真实密文(防「get_config 全量取 → 改一处 → 全量写回」路径把只读视图哨兵写进
+/// 磁盘;v6.1.0 曾因此冲掉真实密文)。磁盘不可读且入参含哨兵时直接拒绝保存
+/// (不降级,防静默清空)。配置中心导入等自带真实密文的场景不受影响。
+#[tauri::command]
+pub fn save_config_cmd(cfg: AppConfig) -> Result<(), String> {
+    let cfg = restore_sentinels(cfg)?;
     save_config(&cfg).map_err(|e| format!("保存配置失败: {}", e))
 }
 

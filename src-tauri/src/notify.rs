@@ -325,12 +325,25 @@ fn show_desktop_notification(app: &AppHandle, title: &str, body: &str) -> Result
 // ===== 邮件通知(测试命令与 fire 共用的发送路径)=====
 
 /// 解析邮件密码(纯逻辑,便于单测):表单非空明文优先;否则 DPAPI 解密已存
-/// 密文;两者都没有 → Err(中文提示)。
+/// 密文;两者都没有 → Err(中文提示)。哨兵/非 base64 的损坏密文给出可操作报错
+/// (与 resolve_password 同口径,v6.1.3)。
 fn resolve_email_password(plain: Option<&str>, enc: Option<&str>) -> Result<String, String> {
     match plain.map(str::trim).filter(|p| !p.is_empty()) {
         Some(p) => Ok(p.to_string()),
         None => match enc.map(str::trim).filter(|e| !e.is_empty()) {
-            Some(enc) => dpapi_unprotect(enc),
+            Some(enc) => {
+                if enc == crate::commands::CIPHER_SENTINEL
+                    || !enc.bytes().all(|b| {
+                        b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='
+                    })
+                {
+                    return Err(
+                        "SMTP 密码未有效保存(密文占位符或损坏),请在通知中心重新填写 SMTP 密码保存"
+                            .to_string(),
+                    );
+                }
+                dpapi_unprotect(enc)
+            }
             None => Err("请先填写 SMTP 密码或先保存配置".to_string()),
         },
     }

@@ -1811,3 +1811,71 @@ ASCII 42 = `*`,即 v6.0.0 密文最小化引入的只读视图哨兵值,被**写
   stat-hot-hover 亮/暗 154/175、port-badge 字 199,全部远超阈值
 - `node --check` manage.js/manage-stacks.js 通过;verify 三脚本全 PASS
 - `cargo test` 320 passed(纯前端改动,基线不变)
+
+# 第十九批补丁3(v6.1.3)— 真机反馈修复 + 全量体验审查
+
+> 用户真机反馈两条 + 指令「对我们前面的升级和修复进行一次体验审查,是否还有我
+> 刚刚挑出的这种毛病」。四路并行审查(russh 升级彻底性 / 密文链路 / CSP / 全站
+> 体验)驱动,全部修复一轮清。
+
+## 一、真机反馈修复(用户报告)
+
+- **RSA 私钥无法加载**(`Unsupported key type RSA`):v6.0.0 russh 升级时
+  `default-features = false` 只启 `ring`+`flate2`,**漏掉默认集的 `rsa` feature**
+  → `ssh-key/rsa` 未编译,RSA 私钥(用户 `tencent.pem`)报 Unsupported。
+  修复:Cargo.toml features 补 `"rsa"`;内嵌测试 RSA 私钥回归单测
+  (`test_load_rsa_key_supported`)
+- **同源隐患(自查发现)**:`PrivateKeyWithHashAlg::new(key, None)` 对 RSA 退化为
+  遗留 SHA-1 签名(`ssh-rsa`),现代 OpenSSH(8.8+)默认拒绝 → 就算能加载也认证失败。
+  修复:改用官方推荐的 `handle.best_supported_rsa_hash().await` 先问服务器
+  (sha2-512/256 优先,老服务器回退 sha-rsa;非 RSA 忽略)
+
+## 二、全量体验审查(四路并行)与修复
+
+### 2.1 密文链路审查(4 项,全修)
+- **P1 get_config 只脱敏 servers,notify SMTP 密文仍回传**:`mask_ciphers`/
+  `restore_sentinels` 重构为 AppConfig 级统一函数(servers + notify),出口入口
+  成对维护;+notify 哨兵往返单测
+- **P2 save_config_cmd 读盘失败+含哨兵 → 静默降级 None 清空密文**:改为直接拒绝
+  保存(「已取消保存以免丢失已存密码」),仅无哨兵(导入场景)才放行
+- **P3 config_io 导出遇哨兵整包硬失败**:`decrypt_secret` 加哨兵/非 base64 预检,
+  给「请先逐台重录密码后再导出」可操作报错
+- **P4 notify resolve_email_password 无预检**:与 resolve_password 同口径,给
+  「请重新填写 SMTP 密码」提示
+
+### 2.2 russh 0.60 彻底性审查(结论:无新增运行期故障)
+- 逐项核对 exec/PTY/ChannelMsg/SFTP/KEX/host key/Config 两版语义:通道背压、
+  close 语义、`into_stream` 增强、SFTP 无耦合(2.4.0 不依赖 russh 类型)、
+  指纹字符串完全同构(已落盘 TOFU 不会误报)、KEX 只扩不收
+- **顺带修**:① Cargo.toml `rust-version` 1.77.2 → **1.85**(russh 0.60 要求,
+  升级时漏改);② OpenSSH 格式加密私钥错口令在 0.60 表现为 `SshKey(...)`,
+  旧映射落 fs 兜底报「加载私钥失败」语义错误 → 归入「口令错误或已损坏」
+  (+内嵌 OpenSSH 加密私钥测试);③ `Pad/Unpad` 解密失败类同归口令错误分支
+
+### 2.3 CSP 审查(结论:0 问题,当前无需改动)
+- 8 检查点全过:script-src 无 eval/内联;style 全走 CSSOM;字体/图片全自托管;
+  connect-src 精确命中 `http://ipc.localhost`(useHttpsScheme 默认 false);
+  form-action 全 preventDefault;无内联事件属性。watchlist 3 条(未来加图片
+  预览配 blob:、开 HTTPS scheme 配 https、用资产协议配 asset:)已记档
+
+### 2.4 全站体验审查(5 高 3 中若干低,全修)
+- **高 #1**:`badge-exited`/`badge-created`(透明底 65% 墨字)未纳 hover 豁免 →
+  墨底上不可见;补两条豁免(与 badge-info 同口径)
+- **高 #2**:自动预览确认误用 `window.confirm`(全站唯一系统对话框,违自绘纪律)
+  → 改内联确认区(复用 #deploy-error,继续/取消两按钮)
+- **高 #3**:06 页切换服务器/扫描期间右侧明细与按钮无加载反馈 → setBusy 加
+  「扫描中…」文案;无服务器时左列改「请先在上方选择服务器」(区分「扫描无结果」)
+- **高 #4**:`rollback.js` 手写类 `'badge ok ...'` 中 `ok` 不存在(正确类名
+  `badge-ok`)→ 「运行中 N」徽章零配色;改 fillBadge(el,'ok',...) + classList
+- 中:清理模态并发防护(执行中重开提示「仍在执行中」)+ 扫描失败补 toast 与
+  重试按钮;04 页三下拉进页即插「加载中…」占位;01 页重检按钮 busy;
+  05 页容器操作按钮整组禁用防连点;部署历史首载「正在加载…」占位
+- 低:monitor 空态纳入无服务器提示
+
+## 三、验证
+
+- `cargo test` 显式确认 `test result: ok. 325 passed; 0 failed; 13 ignored`
+  (v6.1.2 的 322 + RSA 支持 + OpenSSH 错口令映射 + notify 哨兵 3 个新单测)
+- `cargo clippy --all-targets` 新代码零新增;改动 JS 全过 `node --check`;
+  verify 三脚本全 PASS
+- 真机待确认:tencent.pem RSA 私钥连接、哨兵清理后的重录密码、cargo build --release 通过

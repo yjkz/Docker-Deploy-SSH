@@ -2564,10 +2564,15 @@
     }
     document.addEventListener('keydown', function (e) {
       if (e.key === 'Escape') {
-        closeModal();
-        if (cleanupModal() && !cleanupModal().classList.contains('hidden')) {
+        // 逐层关闭(第二十批 P1 修复):cleanup-modal 叠在 servers-modal 上时
+        // 一次 Esc 只关最上层 —— 原实现先无条件 closeModal() 会连带丢弃
+        // 编辑中的服务器/项目表单。判顶层用全局仲裁 window.isTopModal
+        // (app.js,DOM 序最后 = 视觉最上层,与 Tab 圈禁同款)。
+        if (window.isTopModal('cleanup-modal')) {
           closeCleanupModal();
+          return;
         }
+        if (window.isTopModal('servers-modal')) closeModal();
       }
     });
   }

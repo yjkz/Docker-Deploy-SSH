@@ -149,8 +149,15 @@ pub async fn install_server_docker(
         server.auth.password_enc.as_deref(),
     )?;
     let key_pass = resolve_key_passphrase(&server)?;
-    let mut client = SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default())
-        .await?;
+    // 建连超时兜底(第二十批 P2 修复):与 connect_server 同款 15s 包裹
+    // (安装 Docker 全流程另有 1800s 整体超时,但建连挂起会先耗在这里)
+    let mut client = with_timeout(
+        SSH_CONNECT_TIMEOUT_SECS,
+        "连接超时",
+        "请检查服务器地址与网络",
+        SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default()),
+    )
+    .await?;
 
     let mut on_output = |line: &str| {
         let _ = app.emit("server-log", line.trim_end().to_string());

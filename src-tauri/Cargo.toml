@@ -1,12 +1,12 @@
 [package]
 name = "app"
-version = "6.1.2"
+version = "6.1.3"
 description = "A Tauri App"
 authors = ["you"]
 license = ""
 repository = ""
 edition = "2021"
-rust-version = "1.77.2"
+rust-version = "1.85"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -31,8 +31,11 @@ tauri-plugin-dialog = "2"
 flate2 = "1"
 chrono = "0.4"
 # Task 3: SSH/SFTP(russh 0.46 起 re-export russh_keys 为 russh::keys)
+# v6.1.3:default-features=false 时必须显式带 "rsa" —— 默认集为
+# [flate2, aws-lc-rs, rsa];我们换 ring 避 aws-lc-rs(需 NASM),但漏了 rsa 会让
+# RSA 私钥加载报 Unsupported key type RSA(ssh-key/rsa 未编译,rsa feature 联动)
 tokio = { version = "1", features = ["full"] }
-russh = { version = "0.60.3", default-features = false, features = ["ring", "flate2"] }
+russh = { version = "0.60.3", default-features = false, features = ["ring", "flate2", "rsa"] }
 russh-sftp = "2"
 async-trait = "0.1"
 # Task 4: base64 编码(DPAPI 密文存入 JSON 配置用)

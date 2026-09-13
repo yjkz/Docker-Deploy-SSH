@@ -144,6 +144,12 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 - **hover 反白补漏**:上轮只豁免 badge 4 变体,本轮全站扫描补 `.port-badge` / `.badge-running` / `.badge-paused` 固定自身配色,`.stat-warm/hot` 新增 scheme 翻转 token(亮暗主题 hover 行底色翻转后对比均足够,实测 152-199)
 - 验证:对比度计算全过 / node --check / verify 三脚本 PASS / cargo test 320 不变
 
+### 第十九批补丁3 v6.1.3(真机反馈 + 全量体验审查)— 已完成
+- **RSA 私钥修复**(用户真机 tencent.pem):russh 0.60 features 补 "rsa"(v6.0.0 升级漏项);同源隐患 PrivateKeyWithHashAlg None → SHA-1 被现代 OpenSSH 拒 → 改 best_supported_rsa_hash 探测
+- **四路审查**(密文链路/russh 彻底性/CSP/体验):密文 P1-P4 全修(notify 脱敏/拒绝保存/导出预检/邮件预检);russh 无新增故障(顺带修 MSRV 1.85 + OpenSSH 错口令映射);CSP 0 问题
+- **体验审查 5 高 3 中全修**:badge-exited/created hover 豁免、window.confirm 改内联确认、06 页扫描反馈、`'badge ok'` 类名错、清理并发防护、下拉加载占位、重检/操作按钮 busy 等
+- 验证:325 passed(+3 单测)/ clippy 零新增 / 三 verify PASS
+
 ---
 
 ## 待完成
@@ -151,9 +157,55 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 ### 阶段六(第十四批):批量部署增强 ✅ 已完成(见「已完成」节第十四批)
 
 ### 候选池(任意批复节点可插入,无先后承诺)
+> 2026-09-13 全量审查(五路并行 + 主代理复核)后入库;来源细节见当次审查报告。
+> 顺序约定:第一梯队(第二十批,见下)→ 第二梯队 → 第三梯队 → P0/P1 修复批 → 文档/治理批。
+
 | 项 | 要点 |
 |---|---|
 | ~~部署前强制预览~~ | ✅ 第十九批已实现为「部署前自动预览」勾选(用户自行勾选,不勾不自动);候选池清空 |
+
+**第一梯队(第二十批,本次执行)** — 低成本高价值:
+| 项 | 要点 |
+|---|---|
+| 部署历史筛选/搜索 | 04 页:模式(全部/单镜像/整栈/回滚/迁移)+ 结果(全部/成功/失败)+ 项目名关键字,纯前端过滤,零后端改动 |
+| 配置导入预览 | `config_import_preview(path, password)` 解密后返回「覆盖 N 台/新增 M 台/项目 K 个/SMTP 将失效」摘要不落盘;确认后才真导入(顺带封堵跨机 SMTP 二次加密缺陷:导入预览与正式导入都明示) |
+| 服务器一键诊断 | `server_diagnose(serverId)` 分层红绿灯:TCP→SSH banner→TOFU→认证→docker 可用;复用 connect/check 分层,终结「密码错/网络错/密钥错」盲猜 |
+| 部署模板/预设 | 「服务器+项目+日期标签/智能传输/强制留档+版本说明」固化为命名模板,部署页一键套用;批量模态按模板发起;落 `deploy-profiles.json`(serde default,不碰既有配置) |
+| 通知耗时阈值 | notify 配置增 `min_duration_secs`(默认 0=恒通知);成功且耗时 < 阈值不通知,失败/取消恒通知;`DeployRecord.duration_secs` 已在历史,后端 fire 处一个 if |
+
+**第二梯队(待批复)** — 中等成本、闭环体验:
+| 项 | 要点 |
+|---|---|
+| 批量部署报告导出 | 批量结束后导出 Markdown/JSON 报告(每台:结果/耗时/失败原因/断点键/发布目录);另加「整台重跑失败台(不续传)」入口;`finishBatch` 数据现成,关页即失 |
+| 回滚两版本对比 | 06 页勾选两个归档 → 并排 diff 服务清单/镜像 tag/版本说明;数据在 `rollback_project_detail` 单次往返内,纯前端 |
+| 启动时自动检查更新(可关) | 设置项默认开;启动静默查一次,dock 版本号旁加徽点,不弹窗打扰 |
+| 更新失败回执 | `update-pending.json` 比对不一致(安装失败回滚)时 toast 明示「自动更新失败,已回到旧版」,不再静默丢弃 |
+| 托盘闭环 | 托盘菜单加「上次部署:<终态 时间>」只读项 + 部署中「停止当前部署」动态项(复用 cancel_deploy + tray_status) |
+
+**第三梯队(待批复)** — 较大工程,后端多已就位:
+| 项 | 要点 |
+|---|---|
+| 定时/延迟部署 | 项目级「每天 HH:MM」或「延迟 N 分钟」;复用 probe.rs tokio interval 模式 + 托盘状态面;到点走单发管线(断点天然支持) |
+| 终端多标签+命令广播+输出落盘 | manage_exec 后端本就是多会话表,纯前端放开多 tab;同一条命令广播到多台同栈容器;会话结束写 logs/term-<ts>.log 供审计 |
+| 配置版本历史 | `save_config` 写前快照到 `config/.history/`(留 20 份)+ `config_history_list/restore`;部署有回滚中心,配置没有;对竞态覆盖与误导入兜底 |
+
+**修复批(待批复,建议紧随第一梯队)** — 审查发现的 P0/P1 真实 bug:
+| 项 | 要点 |
+|---|---|
+| P0 批量续传脱离互斥 | `runBatchNext` 的 resumeKey 分支未设 `st.deploying`/`ddRemoteOp` → 「停止批量」「取消部署」对续传台失效、回滚可并发同机 releases;补置位即可(deploy.js:1964-1986) |
+| P1 探活间隔不回显 | settings.js:637 回填守卫 `probe.value === ''` 恒假(input 预填 '0')→ 保存值永不回显,重存 0 静默关探活;去守卫 |
+| P1 Esc 连带关模态 | servers.js:2565-2572 一次 Esc 关两层,清理模态叠服务器编辑表单时表单被丢弃;照抄 settings.js:648-654 逐层转发 |
+| P1 跨机导入 SMTP 损坏 | 旧机 DPAPI 密文被当明文二次加密(config_io.rs import_notify);预览/导入流程明示失效 + 导入后 clear_notify_unhealthy |
+| P2 级(随批附议) | 单镜像管线两处建连无 15s 超时(deploy.rs:246/347);日志流被顶替不退出(manage_logs.rs);`DD_CONFIG_DIR` 生产守卫;save_config 族互斥;encrypt_password 拒收 `"*"`;exec 超时挂 timeout 码;前端读 deploy-done.errorCode 字段;package.json version 对齐 |
+
+**文档/治理批(待批复)** — 本次审查 90% 文档问题同根(版本戳靠人工同步):
+| 项 | 要点 |
+|---|---|
+| 文档不符清扫 | russh 0.46→0.60.3(wiki/01:9、07:93);wiki/03:73「批量不落断点」残句;测试基线 290/269→320(wiki/02:487、07:229);wiki/02:145 断点复用口径、02:282/04:363 open_external、04:51 prune_server 死命令标注、01:35 94→95;README 补「密文不出后端」与密码重录流程 |
+| verify/doc-consistency.js | 零依赖脚本:版本号(tauri.conf/Cargo.toml/ROADMAP/wiki)/ 测试数 / 命令数 不一致即非零退出,入 verify/ 族 |
+| wiki 页首版本戳 | 7 篇页首统一「对齐版本:vX.Y.Z(测试基线 N)」;「三处版本号」纪律扩为七处 |
+| 契约 smoke 测试 | verify 断言前端 invoke 集合 ↔ lib.rs 注册集合、前端 listen ↔ 后端 emit 集合严格相等(硬约束 6 自动化) |
+| 编排层补测试 | commands/deploy.rs 2100 行、rollback.rs 1513 行 0 个 in-file 测试;ssh.rs 安全核心有效测试仅 12 个,逐步补模块内测试 |
 
 ### 遗留待真机验证(用户下次实机操作时顺手确认)
 1. 版本详情保存版本标题/说明(路径翻倍修复后)
@@ -171,7 +223,7 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 
 ## 当前状态速览
 
-- 版本 **v6.1.2**;main = origin/main;基线 `cargo test` **320 passed** / 13 ignored
+- 版本 **v6.1.3**;main = origin/main;基线 `cargo test` **325 passed** / 13 ignored
 - 命令 **95** 个(lib.rs 注册;wiki/04 已同步);JS **16** 文件(含 theme-init.js;index.html 加载顺序见 wiki/03:13)
 - 前端结构:12 模态;commands/ 11 文件;三大 JS 主文件 2338/2013/2537 行
 - 表单体系(第十三批):5 处模态有真实 `<form novalidate>` 语义;失焦校验 + Enter 提交由 app.js 三助手统一承担

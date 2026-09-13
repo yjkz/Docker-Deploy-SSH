@@ -57,14 +57,17 @@
     box.classList.toggle('hidden', !msg);
   }
 
-  // 刷新/重扫是一对组按钮(同时禁用),同 config-io 的理由不接 setBtnBusy 的
-  // 步进条(两条同跑无意义);禁用防重复即可。
+  // 刷新/重扫是一对组按钮(同时禁用 + 「扫描中…」文案变化),同 config-io 的理由
+  // 不接 setBtnBusy 的步进条(两条同跑无意义);busy 期间文案反馈告知已生效。
   function setBusy(v) {
     busy = v;
     var btn = $('rollback-refresh-btn');
     if (btn) btn.disabled = v;
     var rescan = $('rollback-rescan-btn');
-    if (rescan) rescan.disabled = v;
+    if (rescan) {
+      rescan.disabled = v;
+      rescan.textContent = v ? '扫描中…' : '重新扫描';
+    }
   }
 
   // ===== 日志面板 =====
@@ -172,7 +175,8 @@
   function loadProjects(keepSelection) {
     var server = currentServer();
     if (!server) {
-      renderProjects([], keepSelection);
+      // 无服务器 ≠ 扫描无结果:给明确文案(与 05 页同口径),避免误读为「项目为空」
+      renderProjectsNoServer();
       return Promise.resolve();
     }
     showError('');
@@ -201,6 +205,15 @@
     box.appendChild(el('div', 'rollback-empty', '正在扫描服务器项目…'));
   }
 
+  /** 未选择服务器时的左列空态(与「扫描无结果」区分的明确文案) */
+  function renderProjectsNoServer() {
+    var box = $('rollback-projects');
+    if (!box) return;
+    box.textContent = '';
+    box.appendChild(el('div', 'rollback-empty', '请先在上方选择服务器'));
+    renderDetailEmpty();
+  }
+
   function renderProjects(projects, keepSelection) {
     var box = $('rollback-projects');
     if (!box) return;
@@ -218,7 +231,12 @@
       var head = el('div', 'rollback-item-head');
       head.appendChild(el('span', 'rollback-item-name mono', p.dir));
       if (p.runningContainers > 0) {
-        head.appendChild(el('span', 'badge ok rollback-item-badge', '运行中 ' + p.runningContainers));
+        // v6.1.3 修复:原手写类 'badge ok ...' 里的 ok 不存在(正确类名 badge-ok)
+        // → 徽章零配色。改用 fillBadge 生成后补自定义类(与 338 行「已备注」同模式;
+        // fillBadge 会整体重写 className,自定义类只能后加)
+        var runBadge = window.fillBadge(el('span'), 'ok', '运行中 ' + p.runningContainers);
+        runBadge.classList.add('rollback-item-badge');
+        head.appendChild(runBadge);
       }
       item.appendChild(head);
 
@@ -834,8 +852,10 @@
       rdOverlay.addEventListener('click', function (e) {
         if (e.target === rdOverlay) closeReleaseDetail();
       });
+      // Esc 关闭(仅当自己是顶层模态;第二十批 P1 修复:全局仲裁
+      // window.isTopModal 见 app.js,叠模态一次 Esc 只关一层)
       document.addEventListener('keydown', function (e) {
-        if (e.key === 'Escape' && !rdOverlay.classList.contains('hidden')) {
+        if (e.key === 'Escape' && window.isTopModal('release-detail-modal')) {
           closeReleaseDetail();
         }
       });

@@ -242,9 +242,15 @@ async fn run_deploy_steps(
         } else {
             ensure_not_cancelled(app)?;
             emit_log(app, "智能传输:正在对比本地与远端镜像 ID…");
-            let mut probe_client =
-                SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default())
-                    .await?;
+            // 建连超时兜底(第二十批 P2 修复):与整栈管线/manage 同款 15s 包裹,
+            // 不可达主机不再挂到 OS TCP 超时(分钟级,期间取消标志无从生效)
+            let mut probe_client = with_timeout(
+                SSH_CONNECT_TIMEOUT_SECS,
+                "连接超时",
+                "请检查服务器地址与网络",
+                SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default()),
+            )
+            .await?;
             let remote_ids = query_remote_image_id_map(&mut probe_client).await?;
             let (repo, tag) = split_image_ref(&image_ref);
             let full_ref = format!("{}:{}", repo, tag);
@@ -344,9 +350,15 @@ async fn run_deploy_steps(
         let (tar_name, out_path, _, image_bytes) = packed
             .as_ref()
             .expect("未跳过传输时导出产物必然存在");
-        let mut client =
-            SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default())
-                .await?;
+        // 建连超时兜底(第二十批 P2 修复):与整栈管线/manage 同款 15s 包裹
+        // (上方 skip_transfer 分支复用 probe 连接,不经此建连,无需包裹)
+        let mut client = with_timeout(
+            SSH_CONNECT_TIMEOUT_SECS,
+            "连接超时",
+            "请检查服务器地址与网络",
+            SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default()),
+        )
+        .await?;
         if resume_step > 3 {
             // 断点续传:上次已完成上传 → 仅建连(后续步骤复用连接),不重复上传
             // (远端 tar 仍由步骤 5.6 在装载后清理,行为不变)

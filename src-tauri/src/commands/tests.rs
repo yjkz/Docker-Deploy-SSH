@@ -2451,3 +2451,33 @@ services:
         // 正常 base64 且明文优先时不受影响
         assert_eq!(resolve_password(&AuthType::Password, Some("plain"), Some("*")).unwrap(), Some("plain".to_string()));
     }
+
+    #[test]
+    fn test_notify_cipher_masked_and_restored() {
+        let _guard = crate::config::TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ddtest-nsentinel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
+
+        // 磁盘落真实 SMTP 密文
+        let mut cfg = load_config().unwrap();
+        cfg.notify.email.password_enc = Some("SMTP-B64".into());
+        save_config(&cfg).unwrap();
+
+        // get_config 只读视图:notify 密文也应为哨兵(与 servers 同口径)
+        let view = get_config().unwrap();
+        assert_eq!(view.notify.email.password_enc.as_deref(), Some("*"), "notify 密文应脱敏");
+
+        // 全量回写:哨兵还原为磁盘现值(不被冲掉)
+        save_config_cmd(view).unwrap();
+        let after = load_config().unwrap();
+        assert_eq!(after.notify.email.password_enc.as_deref(), Some("SMTP-B64"), "notify 哨兵不得落盘");
+
+        // 真实新值可覆盖
+        let mut cfg2 = load_config().unwrap();
+        cfg2.notify.email.password_enc = Some("SMTP-NEW".into());
+        save_config_cmd(cfg2).unwrap();
+        assert_eq!(load_config().unwrap().notify.email.password_enc.as_deref(), Some("SMTP-NEW"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }

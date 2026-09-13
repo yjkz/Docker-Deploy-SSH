@@ -260,6 +260,21 @@
   };
   window.errStripCode = function (err) { return window.errText(err); };
 
+  // ===== Esc 最上层模态仲裁(第二十批 P1 修复)=====
+  // 各模块的 document 级 Esc 监听只判断「自己可见」,叠模态场景(如清理分析
+  // 叠在服务器编辑表单上、帮助叠在任意模态上)一次 Esc 会触发全部监听、
+  // 连带关闭被压的表单。Tab 圈禁(见下方 keydown)已有「DOM 序最后 = 视觉
+  // 最上层」的全局仲裁,Esc 补同款:各模块关模态前先判 isTopModal(自己),
+  // 只有自己是顶层时才响应,一次 Esc 只关一层。
+  // modalId 传模态 overlay 的元素 id;该模态未开启时返回 false(不可见就
+  // 不该响应 Esc);无任何开启模态时返回 false(由各自监听的存在性守卫兜)。
+  window.isTopModal = function (modalId) {
+    var overlay = document.getElementById(modalId);
+    if (!overlay || overlay.classList.contains('hidden')) return false;
+    var open = document.querySelectorAll('.modal-overlay:not(.hidden)');
+    return open.length > 0 && open[open.length - 1] === overlay;
+  };
+
   // ===== 呈现辅助:内联 SVG 图标 + 状态徽章(供各页面脚本构造 DOM)=====
   var SVG_NS = 'http://www.w3.org/2000/svg';
 

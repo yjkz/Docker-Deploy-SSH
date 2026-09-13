@@ -706,6 +706,9 @@ select.text-input option,
 }
 .servers-error-text { overflow-wrap: anywhere; display: block; }
 .check-error .btn { margin-left: 10px; }
+/* 自动预览确认的内联操作行(继续部署/取消;自绘,替代 window.confirm) */
+.deploy-confirm-actions { margin-top: 10px; }
+.deploy-confirm-actions .btn:first-child { margin-left: 0; }
 .images-error {
   display: flex;
   align-items: center;
@@ -849,6 +852,10 @@ select.text-input option,
 /* 容器状态徽章(青底/琥珀底):同上,固定回自身配色防行级 color 盖字 */
 .data-table tbody tr:hover .badge-running { background: var(--ark-signal); color: var(--ark-on-signal); }
 .data-table tbody tr:hover .badge-paused { background: var(--ark-warn); color: var(--ark-on-warn); }
+/* 已停止/已创建(透明底 + 65% 墨字):hover 行反白后字色几乎与墨底同色而不可见
+   → 与 badge-info 同口径反回纸底墨字 */
+.data-table tbody tr:hover .badge-exited,
+.data-table tbody tr:hover .badge-created { background: var(--ark-paper); color: var(--ark-ink); border-color: var(--ark-paper); }
 /* 监控阈值状态文字(stat-warm/hot):行反白后底色翻转(亮主题→墨底/暗主题→纸白底),
    原状态色对比不足 → 用「翻转态」token(亮主题取暗色主题的亮色值,反之亦然) */
 .data-table tbody tr:hover .stat-warm { color: var(--ark-stat-warm-hover); }

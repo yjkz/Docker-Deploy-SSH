@@ -305,23 +305,33 @@ impl From<serde_json::Error> for ConfigError {
 /// Returns the portable application folder that hosts the `config/` (and
 /// `logs/`) subdirectories: the directory of the running executable, or the
 /// path given by `DD_CONFIG_DIR` (test injection / portable override).
+///
+/// 第二十批 P2 修复:环境变量分支仅在 debug 断言(开发/测试构建)生效 ——
+/// release 构建中任何外部注入的 `DD_CONFIG_DIR` 都不再重定向配置根(此前
+/// 无守卫,启动脚本/快捷方式可把 `config/` 指向攻击者可控目录,伪造
+/// `host_key_sha256` 跳过 TOFU 告警;更现实的危害是用户环境残留该变量导致
+/// 「配置神秘丢失」假象)。测试依赖该注入(`cargo test` 默认 dev profile,
+/// `cfg(test)` 与 `debug_assertions` 均为真,32 处使用点不受影响;CI 跑的
+/// 也是默认 dev profile,见 .github/workflows/ci.yml)。
 pub fn app_dir() -> PathBuf {
-    match std::env::var("DD_CONFIG_DIR") {
-        Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => {
-            let mut exe = std::env::current_exe().expect("failed to locate current executable");
-            exe.pop();
-            exe
+    // #[cfg] 是编译期裁剪:release 构建整条环境变量分支被剔除
+    #[cfg(debug_assertions)]
+    if let Ok(dir) = std::env::var("DD_CONFIG_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
         }
     }
+    let mut exe = std::env::current_exe().expect("failed to locate current executable");
+    exe.pop();
+    exe
 }
 
 /// Returns the directory that holds `servers.json` / `projects.json`.
 ///
 /// When the `DD_CONFIG_DIR` environment variable is set (test injection /
-/// portable override) it points at the application folder and `config/` is
-/// appended; otherwise the `config/` subdirectory next to the running
-/// executable is used.
+/// portable override; debug 构建专属,见 [`app_dir`]) it points at the
+/// application folder and `config/` is appended; otherwise the `config/`
+/// subdirectory next to the running executable is used.
 pub fn config_dir() -> PathBuf {
     app_dir().join("config")
 }

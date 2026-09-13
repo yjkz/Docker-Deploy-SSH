@@ -64,7 +64,8 @@ fn host_fingerprint(key: &russh::keys::PublicKey) -> String {
 ///
 /// - 私钥已加密但未提供口令(OpenSSH 格式)→ 提示输入口令;
 /// - 提供了口令仍解不开(PEM 解密失败:PKCS#8 → `Pkcs8`,OpenSSH →
-///   `KeyIsCorrupt`)→ 「私钥口令错误或私钥已损坏」;
+///   `SshKey(解密失败)`,遗留格式 → `KeyIsCorrupt`/`Pad`/`Unpad`)
+///   → 「私钥口令错误或私钥已损坏」;
 /// - 无口令且解析失败(PKCS#8 加密格式无口令时解析即失败,`Pkcs8`/`Der`)
 ///   → 提示「可能已加密需口令」或文件损坏;
 /// - 其余(路径不存在、格式不支持等)→ 通用「加载私钥失败」并附原始错误。
@@ -78,8 +79,14 @@ fn map_key_load_error(key_path: &str, had_passphrase: bool, e: russh::keys::Erro
                 key_path
             ),
         ),
-        russh::keys::Error::KeyIsCorrupt | russh::keys::Error::CouldNotReadKey
+        // 已提供口令仍解密失败:所有「解密/解填充失败」类错误都归此(OpenSSH 格式
+        // 的错口令在 russh 0.60 表现为 SshKey(ssh_key::Error),v6.1.3 补上)
+        russh::keys::Error::KeyIsCorrupt
+        | russh::keys::Error::CouldNotReadKey
+        | russh::keys::Error::SshKey(_)
         | russh::keys::Error::Pkcs8(_)
+        | russh::keys::Error::Pad(_)
+        | russh::keys::Error::Unpad(_)
             if had_passphrase =>
         {
             tagged(
@@ -87,7 +94,9 @@ fn map_key_load_error(key_path: &str, had_passphrase: bool, e: russh::keys::Erro
                 format!("私钥口令错误或私钥已损坏 ({})", key_path),
             )
         }
-        russh::keys::Error::Pkcs8(_) | russh::keys::Error::Der(_) => tagged(
+        russh::keys::Error::Pkcs8(_)
+        | russh::keys::Error::Der(_)
+        | russh::keys::Error::SshKey(_) => tagged(
             ErrCode::Auth,
             format!(
                 "加载私钥失败 ({}): 私钥可能已加密(需提供口令)或文件已损坏",
@@ -180,12 +189,23 @@ impl SshClient {
                 })?;
                 let key = russh::keys::load_secret_key(key_path, key_passphrase)
                     .map_err(|e| map_key_load_error(key_path, key_passphrase.is_some(), e))?;
-                // russh 0.60:authenticate_publickey 收 PrivateKeyWithHashAlg
-                // (None = RSA 走默认 hash;非 RSA 忽略),返回 AuthResult(判 .success())
+                // russh 0.60:authenticate_publickey 收 PrivateKeyWithHashAlg。
+                // RSA 密钥的 hash 必须**先问服务器**(best_supported_rsa_hash):
+                // 传 None 会退化为遗留 SHA-1(`ssh-rsa`),现代 OpenSSH(8.8+)默认
+                // 拒绝该签名算法 → 认证失败;非 RSA 密钥该值被忽略。
+                // 服务端未宣告 server-sig-algs(极老版本)时回退 None(=sha-rsa)。
+                let rsa_hash = match handle.best_supported_rsa_hash().await {
+                    Ok(Some(h)) => h, // Some(Some(Sha512/Sha256)) / Some(None)
+                    Ok(None) => None,  // 服务器不支持 RSA(非 RSA 密钥不受影响)
+                    Err(e) => {
+                        log::warn!("查询服务器 RSA 签名算法失败(回退默认): {}", e);
+                        None
+                    }
+                };
                 let ok = handle
                     .authenticate_publickey(
                         &cfg.username,
-                        russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), None),
+                        russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), rsa_hash),
                     )
                     .await
                     .map_err(|e| {
@@ -855,6 +875,98 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// OpenSSH 格式加密私钥的错口令映射回归(v6.1.3):russh 0.60 下错口令表现为
+    /// `SshKey(ssh_key::Error)`(而非旧版 KeyIsCorrupt),此前落进 fs 兜底分支
+    /// 报「加载私钥失败」语义错误;本测试固化「口令错误 → 可操作提示」。
+    #[test]
+    fn test_load_openssh_encrypted_key_wrong_pass() {
+        use crate::errors::{code_of, strip, ErrCode};
+        // 测试专用 ed25519 加密私钥(ssh-keygen -N testpass123,仅用于本单测)
+        let pem = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABBLMRrBE8\n\
+19GJ0b0ywMA4hbAAAAGAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIF83UzTSJfcWUyQ2\n\
+Qh6gucIsQNn5d1r8/mHreyig9H4FAAAAoLNJJ55vOLyuYUQ1EIZwipN174ojZRjRPmuL9Z\n\
+EgANE11mVoUvh6rF6hYwgusUPtLJkWPHLr1v01iWCdhZ7aleBpO8QL6faPb6ZbZGFk/LpY\n\
+3FiGGm+Ry/6Xub9eA9DMdZ138s7ak1Ut+H6N1LKTU/gfV5Hhuh6aiZoD26DXVUbNILVseD\n\
+oVumCneaqWxPAiR8nXp/W2PmrSCKZH0pc1gVQ=\n\
+-----END OPENSSH PRIVATE KEY-----\n";
+        let path = std::env::temp_dir().join(format!("dd-enc-oss-{}.pem", uuid::Uuid::new_v4()));
+        std::fs::write(&path, pem).unwrap();
+
+        // 正确口令 → 解开
+        assert!(russh::keys::load_secret_key(&path, Some("testpass123")).is_ok());
+        // 错口令 → 映射为「口令错误或已损坏」,且不落 fs 兜底
+        let err = russh::keys::load_secret_key(&path, Some("wrong")).unwrap_err();
+        let mapped = map_key_load_error(&path.to_string_lossy(), true, err);
+        assert!(
+            strip(&mapped).contains("私钥口令错误或私钥已损坏"),
+            "错口令应给可操作提示,实际: {}",
+            strip(&mapped)
+        );
+        assert_eq!(code_of(&mapped), Some(ErrCode::Auth), "不应落 fs 兜底");
+        // 无口令 → 提示已加密需口令
+        let err2 = russh::keys::load_secret_key(&path, None).unwrap_err();
+        let mapped2 = map_key_load_error("x", false, err2);
+        assert!(strip(&mapped2).contains("私钥已加密") || strip(&mapped2).contains("可能已加密"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 会丢掉默认集里的 `rsa` feature → RSA 私钥报「Unsupported key type RSA」
+    /// (用户真机反馈 tencent.pem)。本测试用内嵌测试 RSA 私钥固化
+    /// 「rsa feature 必须启用、RSA 私钥可被解析」——再犯此错本测试即红。
+    #[test]
+    fn test_load_rsa_key_supported() {
+        // 测试专用 RSA 2048 私钥(ssh-keygen 生成,无口令,仅用于本单测)
+        let pem = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn\n\
+NhAAAAAwEAAQAAAQEApUESd71F013QuSyBHasR9HLdz9u9k2RzQ+XaEkI//IiCPIKsawc9\n\
+8OkWfe2H17wggPWporQdoneF2nLAieR6k/kQvyMEfumLzYVkwC+x9mbf1OnRkB9VF0p0uO\n\
+5RszBGJhQpooKVsJp7C42XVbdXTU0Gva9G4XpZujBi+ivM+aNU2Spa5WrDNvKPOB+Ms3fb\n\
+tJTW+UUn7jxd0bRKAyo41Uw3q7tUVrZ5SiFcorY9776mvv+RVghvg49iiuA44IHMhsjA4F\n\
+59knfVfqawKYErY+8Wn4Q2MYxt+YeQKkpB2G6rr2Luemu+w8Qhaan3jWKfUTFzpRrBGb6w\n\
+jYKo5GDl4wAAA9An6hdXJ+oXVwAAAAdzc2gtcnNhAAABAQClQRJ3vUXTXdC5LIEdqxH0ct\n\
+3P272TZHND5doSQj/8iII8gqxrBz3w6RZ97YfXvCCA9amitB2id4XacsCJ5HqT+RC/IwR+\n\
+6YvNhWTAL7H2Zt/U6dGQH1UXSnS47lGzMEYmFCmigpWwmnsLjZdVt1dNTQa9r0bhelm6MG\n\
+L6K8z5o1TZKlrlasM28o84H4yzd9u0lNb5RSfuPF3RtEoDKjjVTDeru1RWtnlKIVyitj3v\n\
+vqa+/5FWCG+Dj2KK4DjggcyGyMDgXn2Sd9V+prApgStj7xafhDYxjG35h5AqSkHYbquvYu\n\
+56a77DxCFpqfeNYp9RMXOlGsEZvrCNgqjkYOXjAAAAAwEAAQAAAQAYwCdGRyiRy2el5F7Y\n\
+6l9VD8MzDO6sMwukgWTo/oKGOI0xB5f6q79WOW2Z93KKGEN8rSP2xNKkxmaw3NEDlh8vJy\n\
+BKpbGtrx22RCKz5NuFqSDLIH4M/58HTv/ZFttRDYuOy870kmmzEArFJIl5rW0Q8dbESt/r\n\
+M3UEPZewGnv9GNYR+Z0Ih0kxJ3H44F8dfOkbj7nlmZlWYVodMU1VXSyRU/ZCKLrV/E/Xwx\n\
+y0+LTEE8rAJZ3XU2qmwDxdeMc7ePtjrSL5S0+YzsyX4r5l2Amy03cJLkBdUuw5pJa4ZSL8\n\
+yXnH8cq1dw3DHoJ4NFMNI12n+xKsgfVnDdlUnIKeO3YZAAAAgQC/tST8yC5faWuWmGuE+L\n\
+8b8hLKmjf5sqQ3vur7PETO2oS6y4LKghwYTybPAe6+rS6tVJhiYbqETlVuPTcwu+KJe+1o\n\
+b9dl1iPMoRJhG/dC9nrmVGnyvA6nskssi9qZMZ5Vqg9OMjSVfhed7lMvWRZo2/4HdKyH4w\n\
+jXDn539m3pRwAAAIEA2IOwxqz7BCRWW6FqW7xdju6Dv5i8vrHDTmJw8AzElynnXI6QDEJR\n\
+Qeq+fWcMQReOrekbqvU+l3CzIulEgMZ2WgtxAKduqEyf5iw742TUBMeZ8R1CvzNn/IalxY\n\
+APJhChvmURglPAXehIWzVZqDHMjW09d8aHJK6pHICkBNVHkPcAAACBAMNkOAMB/2XUjCQj\n\
++DXYlDHLPC6h8qX4W6m/uo+/7VlO8zB7VpoRTigdCbc7UG7mudSnhsZIaeKE3L22mXviKC\n\
+GEx2ufYiFofF0RvKAM7021kxMUNqlvcDgyCF99qaD32vGMQueO+Prk/Lgyn7Orb0Il74zq\n\
+W3hdnIKXGhKqXUN1AAAAFTE5OTMzQExBUFRPUC00SlVPMUwxMwECAwQF\n\
+-----END OPENSSH PRIVATE KEY-----\n";
+        let path = std::env::temp_dir().join(format!("dd-rsa-key-{}.pem", uuid::Uuid::new_v4()));
+        std::fs::write(&path, pem).unwrap();
+        let loaded = russh::keys::load_secret_key(&path, None);
+        std::fs::remove_file(&path).ok();
+        match loaded {
+            Ok(k) => {
+                use russh::keys::ssh_key::Algorithm;
+                assert!(
+                    matches!(k.algorithm(), Algorithm::Rsa { .. }),
+                    "应为 RSA 密钥,实际: {:?}",
+                    k.algorithm()
+                );
+            }
+            Err(russh::keys::Error::UnsupportedKeyType { key_type_string, .. }) => {
+                panic!(
+                    "RSA feature 未启用(UnsupportedKeyType: {}),检查 Cargo.toml 的 russh features 必须含 \"rsa\"",
+                    key_type_string
+                );
+            }
+            Err(e) => panic!("测试 RSA 私钥应可加载,实际错误: {:?}", e),
+        }
     }
 
     // ===== 可选真机测试:需要可连通的 SSH 服务器,默认 #[ignore] =====

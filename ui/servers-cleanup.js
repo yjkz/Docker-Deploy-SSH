@@ -48,6 +48,14 @@
   function loadCleanupPreview(server) {
     var body = cleanupBody();
     if (!body) return;
+    // 执行中防护(体验审查 3-1):cleanup_execute 可能仍在服务器上跑(模态被关后
+    // 重开走本函数),此时再预览/重扫会诱发第二个并发清理 → 明确提示并就地展示
+    if (st.pruning[server.id] === true) {
+      body.innerHTML = '';
+      body.appendChild(el('div', 'cleanup-hint',
+        '该服务器的清理仍在执行中,请等待完成后再操作(输出见底部「运行日志」)'));
+      return;
+    }
     body.innerHTML = '';
     body.appendChild(el('div', 'cleanup-hint', '正在扫描可清理项…'));
     window.AppBus.invoke('cleanup_preview', {
@@ -62,8 +70,18 @@
       .catch(function (err) {
         if (st.cleanupServerId !== server.id) return;
         body.innerHTML = '';
-        body.appendChild(el('div', 'cleanup-hint',
-          '扫描失败:' + (err && err.message ? err.message : err)));
+        var msg = err && err.message ? err.message : err;
+        body.appendChild(el('div', 'cleanup-hint', '扫描失败:' + msg));
+        // 补 toast(模态可滚动,失败信息可能在视口外;体验审查 3-2)
+        window.toast('清理分析扫描失败:' + window.errText(err), 'fail');
+        // 就地重试入口(免关闭重开)
+        var retry = el('button', 'btn btn-sm', '重试');
+        retry.type = 'button';
+        retry.addEventListener('click', function () {
+          if (st.cleanupServerId !== server.id) return;
+          loadCleanupPreview(server);
+        });
+        body.appendChild(retry);
       });
   }
 

@@ -718,9 +718,10 @@
       overlay.addEventListener('click', function (e) {
         if (e.target === overlay) closeNotifyModal();
       });
-      // Esc 关闭(仅本模态可见时生效,避免误伤其他模态各自的 Esc 监听)
+      // Esc 关闭(仅当自己是顶层模态;第二十批 P1 修复:全局仲裁
+      // window.isTopModal 见 app.js,叠模态一次 Esc 只关一层)
       document.addEventListener('keydown', function (e) {
-        if (e.key === 'Escape' && !overlay.classList.contains('hidden')) {
+        if (e.key === 'Escape' && window.isTopModal('notify-modal')) {
           closeNotifyModal();
         }
       });

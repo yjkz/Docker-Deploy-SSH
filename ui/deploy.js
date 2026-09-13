@@ -643,6 +643,18 @@
     st.loading = true;
     hideErrorBox();
 
+    // 三个下拉先插「加载中…」占位(体验审查 4-2):loadPageData 需等 list_images +
+    // get_config 返回(数秒级),期间空 <select> 点开全空白,易被误读为故障;
+    // 数据到达后 renderSelects 会整体重填覆盖本占位
+    ['deploy-image', 'deploy-server', 'deploy-project'].forEach(function (id) {
+      var sel = document.getElementById(id);
+      if (!sel || sel.options.length > 0) return;
+      var opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = '加载中…';
+      sel.appendChild(opt);
+    });
+
     var errs = [];
 
     var imgReq = window.AppBus.invoke('list_images')
@@ -1613,10 +1625,27 @@
             var entries = (pv && Array.isArray(pv.entries)) ? pv.entries : [];
             var summary = '预览完成:' + entries.length + ' 项服务变更';
             if (errors.length > 0) summary += ',' + errors.length + ' 条提示';
-            var go = window.confirm(
-              summary + '(详见下方预览表)。\n\n是否继续部署到「' + server.name + '」?');
-            if (go) startStackDeploy(server, project);
-            else window.toast('已取消部署(预览结果保留在下方)', 'info');
+            // 内联确认区(自绘,替代 window.confirm —— 全站唯一系统对话框,风格割裂;
+            // 见体验审查 4-1)。复用 #deploy-error 容器,带继续/取消两按钮
+            showErrorBox([summary + '(详见下方预览表)。是否继续部署到「' + server.name + '」?']);
+            var box = document.getElementById('deploy-error');
+            if (!box) return;
+            var actions = el('div', 'deploy-confirm-actions');
+            var goBtn = el('button', 'btn btn-primary btn-sm', '继续部署');
+            goBtn.type = 'button';
+            var cancelBtn = el('button', 'btn btn-sm', '取消');
+            cancelBtn.type = 'button';
+            goBtn.addEventListener('click', function () {
+              hideErrorBox();
+              startStackDeploy(server, project);
+            });
+            cancelBtn.addEventListener('click', function () {
+              hideErrorBox();
+              window.toast('已取消部署(预览结果保留在下方)', 'info');
+            });
+            actions.appendChild(goBtn);
+            actions.appendChild(cancelBtn);
+            box.appendChild(actions);
           });
           return;
         }
@@ -1967,6 +1996,15 @@
       st.batch.deferred = rDeferred;
       // 断点模式可能与当前页签不同:先切模式,让进度步骤号按对应节点集渲染
       if (st.mode !== item.resumeMode) setMode(item.resumeMode);
+      // 互斥与可取消(第二十批 P0 修复):续传台与普通部署台同款置位——
+      // 否则「停止批量」(判 st.deploying 才发 cancel_deploy)与「取消部署」
+      // 对续传台失效,且 06 页回滚不被 ddRemoteOp 拦阻、可与续传并发操作
+      // 同一服务器的 releases 目录。复位由 handleDone 的批量分支收尾
+      // (st.deploying/ddRemoteOp 本就随单台 deploy-done 落地复位)。
+      st.deploying = true;
+      window.ddRemoteOp = 'deploy'; // 跨页互斥锁(06 页回滚据此避让)
+      refreshControls();
+      renderProgress(0, '');
       rDeferred.promise.then(function (payload) {
         if (!st.batch || !st.batch.active) return;
         var p = payload || {};
@@ -1977,8 +2015,12 @@
       });
       window.AppBus.invoke('deploy_resume_start', { key: item.resumeKey })
         .catch(function (err) {
-          // invoke 级失败:该台不会有 deploy-done,就地收尾防队列挂起
+          // invoke 级失败:该台不会有 deploy-done,就地收尾防队列挂起;
+          // 互斥锁随本台失败一并还原(与 onResumeStart 的 invoke 失败分支同款)
           if (!st.batch || !st.batch.active) return;
+          st.deploying = false;
+          window.ddRemoteOp = null;
+          refreshControls();
           var d = st.batch.deferred;
           st.batch.deferred = null;
           if (d) d.resolve({ success: false, message: '发起续传失败:' + (errText(err) || '未知错误') });
@@ -2379,6 +2421,19 @@
     st.historyLoading = true;
     var btn = document.getElementById('deploy-history-refresh-btn');
     if (btn) btn.disabled = true;
+    // 首载占位(体验审查 4-5):此前首次加载期间表体停留在「尚未加载」,
+    // 与 02 页「正在加载…」口径不一;已有数据时不动(刷新不闪列表)
+    if (!st.historyLoaded) {
+      var tbody = document.getElementById('deploy-history-tbody');
+      if (tbody) {
+        tbody.textContent = '';
+        var tr = document.createElement('tr');
+        var td = el('td', 'empty-cell', '正在加载部署历史…');
+        td.colSpan = 7;
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+      }
+    }
 
     window.AppBus.invoke('get_history')
       .then(function (records) {
@@ -2558,7 +2613,8 @@
     }).catch(function (err) { warn('deploy-done', err); });
 
     // 回滚模态:关闭钮 / 遮罩点击 / Esc(执行中统一被 closeRollbackModal 拦截;
-    // 仅本模态可见时生效,不影响其他模态各自的 Esc 监听)
+    // 第二十批 P1 修复:Esc 判顶层模态 —— window.isTopModal 全局仲裁见 app.js,
+    // 叠模态一次 Esc 只关一层,不影响其他模态各自的 Esc 监听)
     var rbClose = document.getElementById('deploy-modal-close');
     if (rbClose) rbClose.addEventListener('click', closeRollbackModal);
     var rbOverlayNode = document.getElementById('deploy-modal');
@@ -2567,13 +2623,14 @@
         if (e.target === rbOverlayNode) closeRollbackModal();
       });
       document.addEventListener('keydown', function (e) {
-        if (e.key === 'Escape' && !rbOverlayNode.classList.contains('hidden')) {
+        if (e.key === 'Escape' && window.isTopModal('deploy-modal')) {
           closeRollbackModal();
         }
       });
     }
 
-    // 批量部署:入口按钮 + 配置模态关闭(关闭钮/遮罩/Esc,仅本模态可见时生效)
+    // 批量部署:入口按钮 + 配置模态关闭(关闭钮/遮罩/Esc;第二十批 P1 修复:
+    // Esc 判顶层模态 window.isTopModal,叠模态一次 Esc 只关一层)
     var batchBtn = document.getElementById('deploy-batch-btn');
     if (batchBtn) batchBtn.addEventListener('click', openBatchModal);
     var batchClose = document.getElementById('deploy-batch-modal-close');
@@ -2584,14 +2641,14 @@
         if (e.target === batchOverlay) closeBatchModalSafe();
       });
       document.addEventListener('keydown', function (e) {
-        if (e.key === 'Escape' && !batchOverlay.classList.contains('hidden')) {
+        if (e.key === 'Escape' && window.isTopModal('deploy-batch-modal')) {
           closeBatchModalSafe();
         }
       });
     }
 
     // 项目迁移:入口按钮 + 模态关闭(关闭钮/遮罩/Esc;执行中拦截由
-    // closeMigrateProjectModal 统一负责)
+    // closeMigrateProjectModal 统一负责;第二十批 P1 修复:Esc 判顶层模态)
     var migEntry = document.getElementById('deploy-migrate-project-btn');
     if (migEntry) migEntry.addEventListener('click', openMigrateProjectModal);
     var migClose = document.getElementById('migrate-project-modal-close');
@@ -2602,7 +2659,7 @@
         if (e.target === migOverlay) closeMigrateProjectModal();
       });
       document.addEventListener('keydown', function (e) {
-        if (e.key === 'Escape' && !migOverlay.classList.contains('hidden')) {
+        if (e.key === 'Escape' && window.isTopModal('migrate-project-modal')) {
           closeMigrateProjectModal();
         }
       });

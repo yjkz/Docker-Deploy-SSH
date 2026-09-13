@@ -634,7 +634,11 @@
         // 缺省(旧 settings.json)视为开启 —— 与后端 serde default 同口径
         setChecked('settings-auto-update-src', s.autoUpdateFromSource !== false);
         var probe = document.getElementById('settings-probe-interval-input');
-        if (probe && probe.value === '') probe.value = String(s.probeIntervalMins || 0);
+        // 无条件回填(第二十批 P1 修复):该 input 构建时预填默认值 '0',
+        // 若保留 value === '' 守卫则恒假 —— 保存值(如 5)永不回显,用户误以为
+        // 未保存而重存 0,经 probe.rs「按设置启停」联动即静默关闭探活。
+        if (probe) probe.value = String(s.probeIntervalMins || 0);
+        // 代理字段预填 ''(非 '0'),保留 === '' 守卫即可满足「未改动不覆盖」
         var proxy = document.getElementById('settings-proxy-input');
         if (proxy && proxy.value === '') proxy.value = String(s.proxy || '');
         showUpdateMessage('info', '');
@@ -678,9 +682,11 @@
       overlay.addEventListener('click', function (e) {
         if (e.target === overlay) closeSettingsModal();
       });
-      // Esc 关闭(仅本模态可见时生效,避免误伤其他模态各自的 Esc 监听)
+      // Esc 关闭(第二十批 P1 修复:判顶层模态 window.isTopModal,全局仲裁见
+      // app.js;更新确认模态叠上面时它自己是顶层,本监听不响应,由其自身
+      // 监听关闭 —— closeSettingsModal 内的转发逻辑保留作为双保险)
       document.addEventListener('keydown', function (e) {
-        if (e.key === 'Escape' && !overlay.classList.contains('hidden')) {
+        if (e.key === 'Escape' && window.isTopModal('settings-modal')) {
           closeSettingsModal();
         }
       });
@@ -696,7 +702,7 @@
         if (e.target === ucOverlay) closeUpdateConfirmModal();
       });
       document.addEventListener('keydown', function (e) {
-        if (e.key === 'Escape' && !ucOverlay.classList.contains('hidden')) {
+        if (e.key === 'Escape' && window.isTopModal('update-confirm-modal')) {
           closeUpdateConfirmModal();
         }
       });

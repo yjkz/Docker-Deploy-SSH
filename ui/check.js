@@ -324,13 +324,20 @@
   /** 执行一次 host_check 并渲染;返回 Promise<report|null> */
   function runCheck() {
     stopPoll();
+    // 重检按钮 busy 态(体验审查 1-1):检测含本机 docker 命令调用,约 1-3 秒,
+    // 期间无反馈会诱发连点;用共享 setBtnBusy(零新样式),结束/失败均复位
+    var btn = document.getElementById('recheck-btn');
+    if (btn) window.setBtnBusy(btn, true, '检测中…');
+    var done = function () { if (btn) window.setBtnBusy(btn, false, '重新检测'); };
     return window.AppBus.invoke('host_check')
       .then(function (report) {
         render(report);
+        done();
         return report;
       })
       .catch(function (err) {
         renderCheckError(err);
+        done();
         return null;
       });
   }
