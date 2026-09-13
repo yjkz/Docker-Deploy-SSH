@@ -826,6 +826,19 @@ select.text-input option,
 }
 .data-table tbody tr:hover .btn::before { background: var(--ark-signal); }
 
+/* 行 hover 反白(墨底纸字)时的徽章豁免:徽章保持自身身份配色,不被行级
+   color/背景吞掉 —— 否则 badge-info(透明底+墨字墨线)与 badge-fail(墨底纸字)
+   的文字/边框会融进墨底不可见(wiki/07 限制 12)。各变体反回自身背景/文字: */
+.data-table tbody tr:hover .badge-info {
+  background: var(--ark-paper); color: var(--ark-ink); border-color: var(--ark-paper);
+}
+.data-table tbody tr:hover .badge-fail {
+  background: var(--ark-paper); color: var(--ark-ink); border-color: var(--ark-paper);
+}
+/* ok/warn 自身底与行墨底对比尚可,但行级 color 会盖文字色,一并固定回原配色 */
+.data-table tbody tr:hover .badge-ok { background: var(--ark-signal-dim); color: var(--ark-on-signal-dim); }
+.data-table tbody tr:hover .badge-warn { background: var(--ark-warn); color: var(--ark-on-warn); }
+
 .data-table .col-action { text-align: right; white-space: nowrap; }
 /* 审计 P2-15:原 .data-table .mono 规则已并入 05 段的 .mono 工具类(渲染不变)。 */
 /* 仓库名列:15px 墨粗 */

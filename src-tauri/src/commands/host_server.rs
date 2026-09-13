@@ -324,25 +324,30 @@ pub fn docker_root_cmd() -> String {
     "docker info -f '{{.DockerRootDir}}'".to_string()
 }
 
-/// 拼装查询 `path` 所在文件系统剩余空间(GB)的命令。
-/// 与 [`check_server_env`] 的 df 口径一致:`-P` POSIX 单行格式 + `-BG` 以 GB 为块
-/// 单位,`tail -1` 取数据行,`awk` 取第 4 列(Available);路径单引号包裹防注入。
+/// 拼装查询 `path` 所在文件系统剩余空间(KB)的命令。
+/// 用 `df -k`(1K 块)—— 所有 df(GNU coreutils 与 BusyBox)都支持的最通用口径;
+/// 此前用 `-PBG`(以 GB 为块 + POSIX 单行),BusyBox 的 df 不支持 `-B` 会报错拿不到数据
+/// (wiki/07 限制 4)。`tail -1` 取数据行,`awk` 取第 4 列(Available,KB);路径单引号包裹防注入。
 pub fn df_free_gb_cmd(path: &str) -> String {
     format!(
-        "df -PBG {} | tail -1 | awk '{{print $4}}'",
+        "df -k {} | tail -1 | awk '{{print $4}}'",
         shell_single_quote(path)
     )
 }
 
-/// 解析 `df -PBG` 第 4 列的 Available 值(如 `30G` / `30` / `0.5`)为 GB 数;
-/// 空输出或非数字(BusyBox 等口径不一致的环境)返回 `None`。
-/// 解析口径与 [`check_server_env`] 一致(trim 后去掉尾部 `G` 再按 f64 解析)。
+/// 解析 `df -k` 第 4 列的 Available 值(1K 块数)为 GB 数;
+/// 空输出或非数字返回 `None`。兼容传入已带 `G` 后缀的旧口径(去后缀按 GB 直读)。
 pub fn parse_df_gb(raw: &str) -> Option<f64> {
-    let trimmed = raw.trim().trim_end_matches('G').trim();
+    let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
     }
-    trimmed.parse::<f64>().ok()
+    // 旧口径带 G 后缀 → 已是 GB
+    if let Some(g) = trimmed.strip_suffix('G') {
+        return g.trim().parse::<f64>().ok();
+    }
+    // 新口径:1K 块数 → GB(1024^2)
+    trimmed.parse::<f64>().ok().map(|kb| kb / 1024.0 / 1024.0)
 }
 
 /// 远端磁盘预检判定(纯函数):剩余空间(GB)小于 `need_bytes`(已含余量)换算的

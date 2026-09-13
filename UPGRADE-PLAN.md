@@ -1679,3 +1679,45 @@ topMem: ≤3 }`,由纯函数 `aggregate_stats` 计算(解析 "12.34%" 数值降�
   verify 三脚本(form 54 断言 / bridge / scope)全 PASS
 - 真机待确认:russh 0.60 真实 SSH 连接回归(密码/私钥/加密私钥口令 + TOFU)、CSP 启用
   后 WebView 渲染、save_server_entry 编辑保存后密码/指纹保留、托盘 tooltip 悬停
+
+# 第十九批升级(v6.1.0)— 候选池清空 + 限制修复
+
+> 用户指令:「部署前强制预览改成用户自行勾选自动预览,不勾就不自动」「07 全部修复」
+> 「hover 反白时有几处文字也是不可见都检查一下」「注意保留部署预览按钮,只是增加一个
+> 勾选自动预览的框」。候选池唯一剩余项 + wiki/07 可修限制一批清空。
+
+## 一、部署前自动预览(候选池清空)
+
+- 整栈选项区新增「部署前自动预览」勾选(`#deploy-auto-preview`;localStorage
+  `dd_deploy_auto_preview` 记忆,默认关;`deploy-stack-options` 区与智能传输选项同排)
+- 勾选后点「开始部署」:环境检测通过 → **先自动跑一次变更预览**(`previewStackOnce`
+  Promise 版,与「部署预览」按钮同 `preview_stack_changes` dry-run)→ 预览表就地展示
+  → `confirm()` 确认后才 `startStackDeploy`;取消则预览结果保留供查看
+- **「部署预览」手动按钮保留不变**(独立 dry-run 路径未动);不勾则不自动预览
+- 勾选入部署锁族(refreshControls 禁用清单,部署/预检/批量中禁用)
+
+## 二、wiki/07 限制修复
+
+- **限制 4(BusyBox df)**:磁盘预检命令 `df -PBG` → `df -k`(1K 块)—— 所有 df(GNU
+  coreutils 与 BusyBox)都支持的最通用口径,替代 BusyBox 不支持的 `-BG`;`parse_df_gb`
+  改按 1K 块换算 GB(兼容旧 `G` 后缀口径);单测更新(df -k 形态 + KB→GB 换算 + 兼容 G)
+- **限制 6(compose env_file)**:新增服务级 `env_file` 支持(compose 语义)——
+  `load_env_path` 抽出单文件解析,`collect_service_env` 归一化字符串/数组/长语法
+  `- path:` 三种形态,多项依序合并(后者覆盖前者)且整体覆盖默认 `.env` 同名字段;
+  缺失文件容错回退默认 .env;3 单测(覆盖默认/字符串+长语法/缺失容错)。仍不支持
+  shell 环境变量插值(仅文件来源)
+- **限制 12(hover 反白 badge 不可见)**:行 hover 反白(墨底纸字)时徽章 4 变体
+  (info/fail/ok/warn)全部豁免——info/fail 反回纸底墨字、ok/warn 固定回自身配色,
+  不被行级 color/背景吞掉;全站排查确认行内除徽章外无其他带背景元素会被墨底吞掉
+  (纯文字已被行级反白覆盖);浏览器实测 4 变体 hover 对比度 199-236(远超 WCAG 阈值)
+- **限制 14(终端 ANSI 复杂 TUI):保留为限制** —— 完整 xterm 仿真需引入 xterm.js 级
+  依赖并重写渲染模型,与本批低耦合硬约束冲突,维持行式终端简易剥除的既定取舍
+
+## 三、验证
+
+- `cargo test` 显式确认 `test result: ok. 318 passed; 0 failed; 13 ignored`
+  (基线 315 + env_file 3);`cargo clippy --all-targets` 我改文件零新增警告
+- 改动 JS 全过 `node --check`;verify 三脚本(form 54 断言 / bridge / scope)全 PASS
+- 浏览器桩渲染验证:自动预览勾选框存在、手动预览按钮保留;注入等效 hover 选择器
+  实测 4 个徽章变体对比度(info/fail 236 / ok 229 / warn 199)全部远超阈值
+- wiki/07 限制 4/6/12 标注已修复;ROADMAP 候选池清空、状态速览 → v6.1.0

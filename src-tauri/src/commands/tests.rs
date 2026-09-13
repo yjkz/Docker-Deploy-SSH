@@ -1369,7 +1369,7 @@ services:
     fn test_df_free_gb_cmd() {
         assert_eq!(
             df_free_gb_cmd("/var/lib/docker"),
-            "df -PBG '/var/lib/docker' | tail -1 | awk '{print $4}'"
+            "df -k '/var/lib/docker' | tail -1 | awk '{print $4}'"
         );
     }
 
@@ -1378,16 +1378,19 @@ services:
         // 路径内嵌单引号被 '\'' 转义,无法逃出引号注入额外命令
         assert_eq!(
             df_free_gb_cmd("/var/li'b"),
-            "df -PBG '/var/li'\\''b' | tail -1 | awk '{print $4}'"
+            "df -k '/var/li'\\''b' | tail -1 | awk '{print $4}'"
         );
     }
 
     #[test]
     fn test_parse_df_gb() {
+        // 新口径 df -k(1K 块数)→ GB:30G = 31457280 KB
+        assert_eq!(parse_df_gb("31457280\n"), Some(30.0));
+        assert_eq!(parse_df_gb("  1048576 "), Some(1.0)); // 1G
+        assert_eq!(parse_df_gb("524288"), Some(0.5)); // 0.5G
+        // 兼容旧口径带 G 后缀(去后缀按 GB 直读)
         assert_eq!(parse_df_gb("30G\n"), Some(30.0));
-        assert_eq!(parse_df_gb("  12 "), Some(12.0));
-        assert_eq!(parse_df_gb("0.5"), Some(0.5));
-        // 空输出 / 非数字(BusyBox 等口径不一致)→ None,调用方跳过预检
+        // 空输出 / 非数字 → None,调用方跳过预检
         assert_eq!(parse_df_gb(""), None);
         assert_eq!(parse_df_gb("   \n"), None);
         assert_eq!(parse_df_gb("N/A"), None);

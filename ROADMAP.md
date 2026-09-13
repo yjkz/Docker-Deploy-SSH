@@ -124,6 +124,14 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 - 验证:`cargo test` 315 passed(基线 313 + 2)/ clippy 零新增 / release build 通过 / 三 verify 全 PASS
 - 真机待确认:russh 0.60 连接回归(密码/私钥/口令+TOFU)、CSP 渲染、save_server_entry 编辑保存密文保留、托盘 tooltip
 
+### 第十九批 v6.1.0(候选池清空 + 限制修复)— 已完成
+- **部署前自动预览**(候选池唯一剩余项,用户定案「勾选才自动」):整栈选项区新增「部署前自动预览」勾选(`#deploy-auto-preview`,localStorage `dd_deploy_auto_preview` 记忆,默认关);勾选后点「开始部署」在环境检测通过后**先自动跑一次变更预览**(`previewStackOnce` Promise 版,与「部署预览」按钮同 `preview_stack_changes`),展示预览表并经 `confirm()` 确认后才真正部署,取消则预览结果保留;不勾则不自动预览。**「部署预览」手动按钮保留不变**;勾选入部署锁族(refreshControls 禁用清单)
+- **限制 4 BusyBox df**:磁盘预检命令 `df -PBG` → `df -k`(1K 块,GNU/BusyBox 通用的最宽口径);`parse_df_gb` 改按 1K 块换算 GB(兼容旧 G 后缀);单测更新
+- **限制 6 compose env_file**:新增服务级 `env_file` 支持(字符串/数组/长语法 `- path:`,多项依序合并后者覆盖前者,整体覆盖默认 `.env`;缺失容错),`load_env_path` 抽出单文件解析 + `collect_service_env` 服务级合并;3 单测
+- **限制 12 hover 反白 badge 不可见**:行 hover 反白(墨底纸字)时徽章 4 变体(info/fail/ok/warn)全部豁免——info/fail 反回纸底墨字、ok/warn 固定回自身配色;全站排查确认行内无其他带背景元素会被吞;浏览器实测 4 变体 hover 对比度 199-236
+- **限制 14 终端 ANSI 复杂 TUI:保留为限制**(完整 xterm 仿真需引入 xterm.js 级依赖并重写渲染模型,与低耦合硬约束冲突)
+- 验证:`cargo test` 318 passed(基线 315 + env_file 3)/ clippy 我改文件零警告 / 三 verify 全 PASS / 浏览器桩 badge hover 对比度验证
+
 ---
 
 ## 待完成
@@ -133,7 +141,7 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 ### 候选池(任意批复节点可插入,无先后承诺)
 | 项 | 要点 |
 |---|---|
-| 部署前强制预览 | `preview_stack_changes` 已实现未接入部署流程(wiki/03 明示「独立功能」);做成部署前可选/强制预览 |
+| ~~部署前强制预览~~ | ✅ 第十九批已实现为「部署前自动预览」勾选(用户自行勾选,不勾不自动);候选池清空 |
 
 ### 遗留待真机验证(用户下次实机操作时顺手确认)
 1. 版本详情保存版本标题/说明(路径翻倍修复后)
@@ -144,17 +152,20 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 6. 各表单失焦校验手感(服务器/项目/通知/迁移/回滚/清理)+ Enter 提交是否符合直觉
 7. **批量部署的失败续传**:真实服务器上批量中途失败 → 面板「续传此台」/「续传未完成服务器」是否按断点正确续上
 8. **「停止批量」的即时中止**:当前台是否在步骤边界及时停住、中断台是否出现在待续传列表
+9. **部署前自动预览**:勾选后整栈部署先自动预览再 confirm 确认的手感(第十九批)
+10. **部署时填版本说明能真正写入归档**(第十八批 writeReleaseNotes req 包裹修复,需一次真实整栈部署)
 
 ---
 
 ## 当前状态速览
 
-- 版本 **v6.0.0**;main = origin/main;基线 `cargo test` **315 passed** / 13 ignored
-- 命令 **95** 个(lib.rs 注册;wiki/04 已同步,新增 `save_server_entry`);JS **16** 文件(含 theme-init.js;index.html 加载顺序见 wiki/03:13)
+- 版本 **v6.1.0**;main = origin/main;基线 `cargo test` **318 passed** / 13 ignored
+- 命令 **95** 个(lib.rs 注册;wiki/04 已同步);JS **16** 文件(含 theme-init.js;index.html 加载顺序见 wiki/03:13)
 - 前端结构:12 模态;commands/ 11 文件;三大 JS 主文件 2338/2013/2537 行
 - 表单体系(第十三批):5 处模态有真实 `<form novalidate>` 语义;失焦校验 + Enter 提交由 app.js 三助手统一承担
 - 批量部署(第十四批):失败/取消台可续传(单台 + 一键批量);「停止批量」步骤边界即时中止;批量恒落断点(与死代码 `deploy_batch` 的「不落断点」无关)
 - **安全(第十八批 v6.0.0)**:russh 0.60.3(ring 后端,RUSTSEC 修复);严格 CSP 启用;get_config 密文最小化(只读视图 + save_server_entry merge);open_external 注入修复;cleanup/sync_files/rollback 路径校验
 - **并发互斥(第十八批)**:部署/回滚跨页互斥(共享锁 `window.ddRemoteOp`);批量间隙锁族(tab/setMode/回滚钮/续传);关清理模态不误清 pruning;监控先订阅后 invoke
+- **候选池清空(第十九批 v6.1.0)**:部署前自动预览(勾选才自动);BusyBox df -k 通用口径;compose 服务级 env_file;hover 反白 badge 豁免
 - 本地校验脚本 `verify/`(零依赖 Node,不参与构建):`form-validation.js`(表单助手 54 断言)/ `bridge-integrity.js`(桥接完整性)/ `scope-integrity.js`(全链加载 + DOM 回调作用域完整性,v5.14.1 起);改动表单助手、拆出文件桥接或 JS 拆分时先跑这三个
 - dev 实例:target/debug/config(正式版数据拷贝);前端资源编译期内嵌,**改 JS 后必须重编译重启动才生效**

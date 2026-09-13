@@ -115,6 +115,7 @@
    */
   var PREF_SERVER_KEY = 'dd_deploy_server';
   var PREF_PROJECT_KEY = 'dd_deploy_project';
+  var PREF_AUTO_PREVIEW_KEY = 'dd_deploy_auto_preview'; // 「部署前自动预览」勾选记忆(整栈)
 
   /**
    * 两组进度节点(与后端 deploy-progress 步骤一一对应):
@@ -549,6 +550,10 @@
       syncServerForProject(prjSel.value);
     }
 
+    // 「部署前自动预览」勾选:恢复上次勾选状态(localStorage)
+    var autoPreviewChk = document.getElementById('deploy-auto-preview');
+    if (autoPreviewChk) autoPreviewChk.checked = readPref(PREF_AUTO_PREVIEW_KEY) === '1';
+
     renderImageSelect();
     updateProjectHint();
   }
@@ -725,7 +730,8 @@
 
     // 部署 / 预检 / 批量进行期间锁定选择区,避免中途改动造成误解
     ['deploy-image', 'deploy-server', 'deploy-project', 'deploy-date-tag',
-      'deploy-skip-unchanged', 'deploy-stack-skip', 'deploy-stack-archive']
+      'deploy-skip-unchanged', 'deploy-stack-skip', 'deploy-stack-archive',
+      'deploy-auto-preview']
       .forEach(function (id) {
         var node = document.getElementById(id);
         if (node) node.disabled = st.deploying || st.checking || batchActive;
@@ -1374,6 +1380,34 @@
       });
   }
 
+  /**
+   * Promise 版预览(自动预览用):执行 dry-run 并把结果渲染到预览区,
+   * resolve 预览结果(entries/errors),invoke 级错误同样渲染后 resolve(不 reject,
+   * 由调用方据 errors 决定是否继续)。
+   */
+  function previewStackOnce(serverId, projectId) {
+    st.previewing = true;
+    refreshControls();
+    hidePreviewBox();
+    return window.AppBus.invoke('preview_stack_changes',
+        { serverId: serverId, projectId: projectId })
+      .then(function (preview) {
+        var pv = preview || { entries: [], errors: [] };
+        renderStackPreview(pv);
+        return pv;
+      })
+      .catch(function (err) {
+        var pv = { entries: [], errors: ['预览失败:' + (errText(err) || '未知错误')] };
+        renderStackPreview(pv);
+        return pv;
+      })
+      .then(function (pv) {
+        st.previewing = false;
+        refreshControls();
+        return pv;
+      });
+  }
+
   // ===== 部署流程 =====
 
   /** 每次点击「开始部署」:清空横幅 / 错误框 / 预检条 / 日志,进度重置 */
@@ -1567,6 +1601,23 @@
           showErrorBox([
             '服务器环境未通过检测(未通过:' + fails.join('、') + '),请先到服务器管理页处理'
           ], true);
+          return;
+        }
+        // 「部署前自动预览」勾选:先自动跑一次变更预览(与「部署预览」按钮相同),
+        // 展示结果并经确认后才真正部署;不勾则不自动预览
+        var autoPreviewChk = document.getElementById('deploy-auto-preview');
+        if (autoPreviewChk && autoPreviewChk.checked) {
+          window.toast('环境检测通过,正在自动预览…', 'ok');
+          previewStackOnce(serverId, projectId).then(function (pv) {
+            var errors = (pv && Array.isArray(pv.errors)) ? pv.errors : [];
+            var entries = (pv && Array.isArray(pv.entries)) ? pv.entries : [];
+            var summary = '预览完成:' + entries.length + ' 项服务变更';
+            if (errors.length > 0) summary += ',' + errors.length + ' 条提示';
+            var go = window.confirm(
+              summary + '(详见下方预览表)。\n\n是否继续部署到「' + server.name + '」?');
+            if (go) startStackDeploy(server, project);
+            else window.toast('已取消部署(预览结果保留在下方)', 'info');
+          });
           return;
         }
         window.toast('环境检测通过,开始整栈部署', 'ok');
@@ -2644,6 +2695,14 @@
     var dateTagChk = document.getElementById('deploy-date-tag');
     if (dateTagChk) {
       dateTagChk.addEventListener('change', refreshControls);
+    }
+
+    // 「部署前自动预览」勾选:变化即写入记忆(localStorage)
+    var autoPreviewChkBind = document.getElementById('deploy-auto-preview');
+    if (autoPreviewChkBind) {
+      autoPreviewChkBind.addEventListener('change', function () {
+        savePref(PREF_AUTO_PREVIEW_KEY, autoPreviewChkBind.checked ? '1' : '');
+      });
     }
 
     // 部署历史:折叠开关 + 手动刷新

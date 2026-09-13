@@ -158,11 +158,13 @@ pub fn parse_compose_file(
         // build 字段存在即可(字符串或映射都算 has_build),null 视为未设置
         let has_build = matches!(entry_map.get("build"), Some(v) if !v.is_null());
 
-        // env 插值只作用于 image 字段
+        // env 插值只作用于 image 字段;服务级 `env_file` 覆盖默认 .env(compose 语义)
+        let compose_dir = compose_path.parent().unwrap_or_else(|| Path::new(""));
+        let service_env = collect_service_env(&env_map, compose_dir, entry_map);
         let mut warnings: Vec<String> = Vec::new();
         let mut image = image_raw
             .map(|raw| {
-                let interpolated = interpolate_env_inner(&raw, &env_map, &mut warnings);
+                let interpolated = interpolate_env_inner(&raw, &service_env, &mut warnings);
                 let trimmed = interpolated.trim().to_string();
                 if trimmed.is_empty() {
                     None // 插值后为空(如未定义变量)按未设置处理
@@ -1021,13 +1023,18 @@ fn push_var_value(
 /// 逐行 `KEY=VALUE`;忽略 `#` 注释行、空行与无 `=` 的行;
 /// 键值两端空白剔除,成对包裹的单/双引号剥除。
 fn load_env_file(dir: &Path) -> HashMap<String, String> {
+    load_env_path(&dir.join(".env"))
+}
+
+/// 读取单个 env 文件(`.env` / 服务级 `env_file` 项)为 KEY→VALUE 表;
+/// 文件不存在返回空表,读取失败记日志并返回空表(与 [`load_env_file`] 同容错口径)。
+fn load_env_path(path: &Path) -> HashMap<String, String> {
     let mut map = HashMap::new();
-    let path = dir.join(".env");
-    let text = match std::fs::read_to_string(&path) {
+    let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return map,
         Err(e) => {
-            log::warn!("读取 .env 失败 ({}): {}", path.display(), e);
+            log::warn!("读取 env 文件失败 ({}): {}", path.display(), e);
             return map;
         }
     };
@@ -1046,6 +1053,45 @@ fn load_env_file(dir: &Path) -> HashMap<String, String> {
         map.insert(key.to_string(), unquote(value.trim()));
     }
     map
+}
+
+/// 收集某服务的 `env_file` 条目(compose 语义,wiki/07 限制 6 修复):
+/// 服务级 `env_file` 可为字符串或字符串数组;每项相对 compose 目录解析,
+/// **依序合并**(后者覆盖前者),且整体覆盖默认 `.env` 同名字段。
+/// 返回该服务实际参与插值的 KEY→VALUE 表(默认 .env 为底,env_file 逐项叠加)。
+fn collect_service_env(base: &HashMap<String, String>, compose_dir: &Path, entry_map: &serde_yaml::Mapping) -> HashMap<String, String> {
+    let mut merged = base.clone();
+    let Some(env_file_val) = entry_map.get("env_file") else {
+        return merged;
+    };
+    // 归一化为路径字符串列表(字符串 | 数组 | 含 path 字段的映射项)
+    let mut items: Vec<String> = Vec::new();
+    match env_file_val {
+        serde_yaml::Value::String(s) => items.push(s.clone()),
+        serde_yaml::Value::Sequence(seq) => {
+            for it in seq {
+                match it {
+                    serde_yaml::Value::String(s) => items.push(s.clone()),
+                    // compose 支持 `env_file: - path: ./x.env`(长语法)
+                    serde_yaml::Value::Mapping(m) => {
+                        if let Some(serde_yaml::Value::String(p)) = m.get("path") {
+                            items.push(p.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    for item in items {
+        let p = Path::new(&item);
+        let full = if p.is_absolute() { p.to_path_buf() } else { compose_dir.join(p) };
+        for (k, v) in load_env_path(&full) {
+            merged.insert(k, v); // env_file 覆盖默认 .env 同名字段
+        }
+    }
+    merged
 }
 
 /// 剥除成对包裹的单/双引号(compose 对 .env 值的处理方式)。
@@ -1793,6 +1839,63 @@ mod tests {
         //(${export X} 无法引用,无副作用)
         assert!(!map.contains_key("NOEQ_LINE"));
         assert_eq!(map.len(), 4, "实际: {:?}", map);
+    }
+
+    // ===== env_file(限制 6 修复):服务级多文件合并、覆盖默认 .env =====
+
+    #[test]
+    fn test_env_file_service_level_override_default_env() {
+        let dir = temp_fixture_dir();
+        // 默认 .env:IMAGE=default,v1
+        std::fs::write(dir.join(".env"), "IMAGE=default\nTAG=v1\n").unwrap();
+        // 服务级 env/a.env 覆盖 IMAGE;b.env 再覆盖 TAG(后者覆盖前者)
+        std::fs::write(dir.join("a.env"), "IMAGE=from-a\n").unwrap();
+        std::fs::write(dir.join("b.env"), "TAG=v2\n").unwrap();
+        let path = dir.join("stack.yml");
+        std::fs::write(
+            &path,
+            "services:\n  web:\n    image: ${IMAGE}:${TAG}\n    env_file:\n      - a.env\n      - b.env\n",
+        )
+        .unwrap();
+        let local = vec![];
+        let stack = parse_compose_file(&path, &local).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let web = find_svc(&stack, "web");
+        assert_eq!(web.image.as_deref(), Some("from-a:v2"), "env_file 应覆盖默认 .env 且后者覆盖前者,实际: {:?}", web.image);
+    }
+
+    #[test]
+    fn test_env_file_string_and_long_form() {
+        let dir = temp_fixture_dir();
+        std::fs::write(dir.join("one.env"), "IMAGE=one\n").unwrap();
+        std::fs::write(dir.join("two.env"), "IMAGE=two\n").unwrap();
+        let path = dir.join("stack.yml");
+        // 字符串形态(单文件)+ 长语法 - path:
+        std::fs::write(
+            &path,
+            "services:\n  a:\n    image: ${IMAGE}:x\n    env_file: one.env\n  b:\n    image: ${IMAGE}:y\n    env_file:\n      - path: two.env\n",
+        )
+        .unwrap();
+        let stack = parse_compose_file(&path, &[]).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(find_svc(&stack, "a").image.as_deref(), Some("one:x"));
+        assert_eq!(find_svc(&stack, "b").image.as_deref(), Some("two:y"));
+    }
+
+    #[test]
+    fn test_env_file_missing_tolerated() {
+        let dir = temp_fixture_dir();
+        std::fs::write(dir.join(".env"), "IMAGE=base\n").unwrap();
+        let path = dir.join("stack.yml");
+        // env_file 指向不存在的文件 → 容错(回退默认 .env)
+        std::fs::write(
+            &path,
+            "services:\n  web:\n    image: ${IMAGE}:v1\n    env_file: nope.env\n",
+        )
+        .unwrap();
+        let stack = parse_compose_file(&path, &[]).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(find_svc(&stack, "web").image.as_deref(), Some("base:v1"));
     }
 
     // ===== find_override_files:按序检测、缺失跳过 =====
