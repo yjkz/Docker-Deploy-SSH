@@ -2067,3 +2067,44 @@ ASCII 42 = `*`,即 v6.0.0 密文最小化引入的只读视图哨兵值,被**写
   (form 54 / bridge / scope / **doc-consistency**)全 PASS
 - 真机待确认:托盘菜单四项(停止当前部署实停)、dock 徽点出现与点击、
   批量报告导出落盘、两版本对比模态渲染
+
+# 第二十一批补丁(v6.3.1)— 修复一键诊断对加密私钥服务器误报
+
+> 用户真机反馈:「一键诊断时,使用私钥的服务器可以通过 ssh 检查,但密钥就不行;
+> 并且使用密钥的测试连接是正常的,到了诊断就错了」。
+
+## 缺陷
+
+`server_diagnose`(第二十批阶段三,`commands/host_server.rs`)的 SSH 层直传
+`SshClient::connect(&server, None, None, ..)` —— **未经 `resolve_password` /
+`resolve_key_passphrase` 解析已存凭据**。后果:
+
+- 加密私钥的服务器:诊断路径 `load_secret_key(path, None)` → `KeyIsEncrypted`
+  → 报「私钥已加密,请输入私钥口令」;而「测试连接」经 `resolve_key_passphrase`
+  解密口令后正常 —— 症状即「测试连接通过、一键诊断失败」;
+- 密码认证的服务器:同理报「需要密码」(Input 码),只是用户当前没测到。
+
+## 修复
+
+- 诊断的 SSH 层改为与全仓所有连接点同款:先 `resolve_password`(AuthType 判定
+  + 已存密文解密)与 `resolve_key_passphrase`(私钥口令解密),失败时该步标 fail
+  并附可读原因(走 `errors::strip` 剥码),后续步骤 skipped
+- `resolve_password` 返回的 Input 错误(密码未保存)与 resolve 失败场景一并
+  呈现为「凭据解析失败:…」——比笼统「SSH 连接失败」可操作
+
+## 守护(第二次同类漏项的固化)
+
+这是第二条「连接路径漏项」(前有 v6.1.3 RSA hash 退化):
+新增源码级断言 `test_all_connect_sites_resolve_credentials` —— 扫描
+host_server/deploy/rollback/cleanup/resume/manage 六文件的全部
+`SshClient::connect(` 调用(含跨行参数),必须同时出现
+`password.as_deref()` 与 `key_pass.as_deref()`,否则列出违规点并失败。
+**先红后绿验证**:临时把诊断改回 None → 测试精确报 `host_server.rs:139`;
+恢复修复 → 转绿。「新增连接点必须解析凭据」从此是编译+测试双兜底。
+
+## 验证
+
+- `cargo test` 显式确认 `test result: ok. 333 passed; 0 failed; 13 ignored`
+  (基线 332 + 守护测试 1);守护测试先红后绿已证真;clippy 零新增
+- doc-consistency 四类断言全 PASS(版本 6.3.1 / 命令 101 / 测试 333)
+- 真机待确认:加密私钥服务器的「一键诊断」全绿(与测试连接行为一致)

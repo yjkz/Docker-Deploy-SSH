@@ -2502,3 +2502,53 @@ services:
         let enc = encrypt_password("正常密码123".to_string()).unwrap();
         assert!(!enc.is_empty() && enc != "*", "正常明文照常加密");
     }
+
+    // ===== 连接路径凭据纪律守护(v6.3.1)=====
+
+    /// 守护:生产代码中所有 `SshClient::connect` 调用必须传入**解析后的凭据**,
+    /// 不得直传 `None, None`。
+    ///
+    /// 背景(v6.3.1 用户真机报告):`server_diagnose` 曾以 `connect(&server, None,
+    /// None, ..)` 直连——加密私钥的服务器在诊断里 `load_secret_key(path, None)`
+    /// 报「私钥已加密」,而「测试连接」经 `resolve_key_passphrase` 解析口令后正常,
+    /// 症状即「测试连接通过、一键诊断失败」。这是第二条同类漏项(前有 RSA hash),
+    /// 故把纪律固化为源码级断言:任何新增连接点直传 None 本测试即红。
+    #[test]
+    fn test_all_connect_sites_resolve_credentials() {
+        let files = [
+            ("src/commands/host_server.rs", include_str!("host_server.rs")),
+            ("src/commands/deploy.rs", include_str!("deploy.rs")),
+            ("src/commands/rollback.rs", include_str!("rollback.rs")),
+            ("src/commands/cleanup.rs", include_str!("cleanup.rs")),
+            ("src/commands/resume.rs", include_str!("resume.rs")),
+            ("src/manage.rs", include_str!("../manage.rs")),
+        ];
+        let mut bad: Vec<String> = Vec::new();
+        for (name, src) in files {
+            for (i, line) in src.lines().enumerate() {
+                if !line.contains("SshClient::connect(") {
+                    continue;
+                }
+                // 合并续行(调用常跨行:connect(\n &server,\n password...,\n ...))
+                let mut window = String::from(line);
+                for l in src.lines().skip(i + 1).take(4) {
+                    window.push(' ');
+                    window.push_str(l);
+                    if window.contains("Arc::") {
+                        break; // 参数列表到 Arc 参数即完整
+                    }
+                }
+                // 白名单:必须出现已解析凭据变量(as_deref 形式)
+                if !window.contains("password.as_deref()") || !window.contains("key_pass.as_deref()") {
+                    bad.push(format!("{}:{}", name, i + 1));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "以下 SshClient::connect 调用未传解析后的凭据(password/key_pass 的 as_deref);\
+             诊断/部署等连接点必须先经 resolve_password + resolve_key_passphrase,直传 None 会导致:\
+             密码服务器缺密码、加密私钥服务器缺口令。违规点: {:?}",
+            bad
+        );
+    }

@@ -98,11 +98,45 @@ pub async fn server_diagnose(server_id: String) -> Result<DiagnoseReport, String
     });
 
     // 层 2:SSH 连接(错误码分类:auth = 密码/私钥/口令/TOFU 问题,transport = 网络层)
+    //
+    // 凭据解析(v6.3.1 修复):诊断必须与其他所有连接点同款,先经
+    // resolve_password / resolve_key_passphrase 解密已存凭据 —— 此前直传
+    // `None, None`,加密私钥的服务器在诊断里 load_secret_key(path, None)
+    // 报「私钥已加密,需提供口令」,而「测试连接」正常(它解析了口令),
+    // 症状即「测试连接通过、一键诊断失败」。
+    let password = match resolve_password(
+        &server.auth.auth_type,
+        None,
+        server.auth.password_enc.as_deref(),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            steps.push(DiagnoseStep {
+                step: "ssh".into(),
+                state: "fail".into(),
+                detail: format!("凭据解析失败:{}", crate::errors::strip(&e)),
+            });
+            steps.push(DiagnoseStep { step: "docker".into(), state: "skipped".into(), detail: "SSH 未连接,未尝试".into() });
+            return Ok(DiagnoseReport { steps, all_ok: false });
+        }
+    };
+    let key_pass = match resolve_key_passphrase(&server) {
+        Ok(k) => k,
+        Err(e) => {
+            steps.push(DiagnoseStep {
+                step: "ssh".into(),
+                state: "fail".into(),
+                detail: format!("凭据解析失败:{}", crate::errors::strip(&e)),
+            });
+            steps.push(DiagnoseStep { step: "docker".into(), state: "skipped".into(), detail: "SSH 未连接,未尝试".into() });
+            return Ok(DiagnoseReport { steps, all_ok: false });
+        }
+    };
     let ssh_result = with_timeout(
         SSH_CONNECT_TIMEOUT_SECS,
         "连接超时",
         "请检查服务器地址与网络",
-        SshClient::connect(&server, None, None, Arc::default()),
+        SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default()),
     )
     .await;
     match ssh_result {

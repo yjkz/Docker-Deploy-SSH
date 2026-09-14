@@ -248,12 +248,18 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 - **verify/doc-consistency.js**:版本号/命令数/测试数三断言;上线当天抓到 wiki/README 测试数失准(325→332)并修复;〇清扫 ROADMAP 矛盾行与待修复清单 P1-3 终态
 - 验证:332 passed / clippy 零新增 / release build 通过 / verify 四脚本 PASS
 
+### 第二十一批补丁 v6.3.1(诊断凭据修复)— 已完成
+- **真机反馈**:加密私钥服务器「测试连接正常、一键诊断报私钥已加密」——`server_diagnose` 的 SSH 层直传 `None, None`,未走 resolve_password/resolve_key_passphrase(全仓唯一漏点)
+- **修复**:诊断同款解析已存凭据(密码 + 私钥口令),解析失败给可操作文案;密码认证服务器同场景一并修复
+- **守护**:新源码级测试 `test_all_connect_sites_resolve_credentials` 扫描六文件全部 connect 调用必须传解析后凭据(先红后绿验证精确命中 `host_server.rs:139`)
+- 验证:333 passed(+1)/ clippy 零新增 / doc-consistency 全 PASS
+
 
 ---
 
 ## 当前状态速览
 
-- 版本 **v6.3.0**;main = origin/main;基线 `cargo test` **332 passed** / 13 ignored
+- 版本 **v6.3.1**;main = origin/main;基线 `cargo test` **333 passed** / 13 ignored
 - 命令 **101** 个(generate_handler 实测;第二十批 +5,第二十一批 +1 `write_text_file`)
 - JS **16** 文件(含 theme-init.js;index.html 加载顺序见 wiki/03:13)
 - 前端结构:12 模态;commands/ 11 文件;三大 JS 主文件 2338/2013/2537 行

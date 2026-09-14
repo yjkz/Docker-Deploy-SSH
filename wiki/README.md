@@ -46,8 +46,8 @@
 构建:npm run tauri dev / npm run tauri build(产物 NSIS 安装包 ~8.2MB)
 配置:安装目录 config/ 下 servers.json + projects.json + notify.json + settings.json +
       deployments.json + resume-deploy.json(便携式;原子写);日志 logs/app.log
-测试:cargo test(纯函数单测 332 passed;真机测试 #[ignore] 13 个)
-当前版本:v6.3.0(tauri.conf.json / Cargo.toml;**第二十一批:第二梯队五项 + 文档治理**——批量报告导出(追加批量面板「导出报告」/「重跑失败台」,新命令 write_text_file)、回滚两版本对比(勾选两归档 diff 服务/镜像,纯前端)、启动静默检查更新(autoCheckUpdate 缺省开,dock 徽点不弹窗)、更新失败回执(标记版本不一致明示「已回到旧版」)、托盘闭环(停止当前部署 + 上次部署状态菜单项)、verify/doc-consistency.js(版本号/命令数/测试数三断言,上线即抓到 README 测试数失准)。第二十批:v6.2.0 第一梯队五项(历史筛选/导入预览/一键诊断/部署模板/通知阈值)。第十九批补丁3:v6.1.3 RSA 私钥修复 + 四路全量审查。第十八批:v6.0.0 安全强化与并发互斥。
+测试:cargo test(纯函数单测 333 passed;真机测试 #[ignore] 13 个)
+当前版本:v6.3.1(第二十一批补丁:修复一键诊断对加密私钥服务器误报——诊断连接点曾直传 None 凭据,未经 resolve_password/resolve_key_passphrase 解析,加密私钥报「私钥已加密」而「测试连接」正常;现与全仓连接点同款解析凭据,并新增源码级守护测试固化「连接点必须传解析后凭据」纪律(先红后绿验证精确命中)。tauri.conf.json / Cargo.toml;**第二十一批:第二梯队五项 + 文档治理**——批量报告导出(追加批量面板「导出报告」/「重跑失败台」,新命令 write_text_file)、回滚两版本对比(勾选两归档 diff 服务/镜像,纯前端)、启动静默检查更新(autoCheckUpdate 缺省开,dock 徽点不弹窗)、更新失败回执(标记版本不一致明示「已回到旧版」)、托盘闭环(停止当前部署 + 上次部署状态菜单项)、verify/doc-consistency.js(版本号/命令数/测试数三断言,上线即抓到 README 测试数失准)。第二十批:v6.2.0 第一梯队五项(历史筛选/导入预览/一键诊断/部署模板/通知阈值)。第十九批补丁3:v6.1.3 RSA 私钥修复 + 四路全量审查。第十八批:v6.0.0 安全强化与并发互斥。
 ```
 
 ## 权威计划/完成记录(仓库根目录)
