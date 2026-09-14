@@ -1914,3 +1914,92 @@ ASCII 42 = `*`,即 v6.0.0 密文最小化引入的只读视图哨兵值,被**写
 
 - `cargo test` 显式 **328 passed / 0 failed / 13 ignored**(基线 325 + 本批 3)
 - clippy --all-targets 零新增;node --check 16 个 JS 全过;verify 三脚本全 PASS
+
+# 第二十批升级(v6.2.0)— 候选池第一梯队五项
+
+> 2026-09-13 全量审查产出候选池;用户选定第一梯队先做。五项:部署历史筛选 /
+> 配置导入预览 / 服务器一键诊断 / 部署模板 / 通知耗时阈值。
+
+## 一、部署历史筛选/搜索(纯前端)
+
+- 04 页折叠面板展开态新增筛选条:模式下拉(全部/单镜像/整栈/回滚/迁移)、
+  结果下拉(全部/成功/失败/取消;取消判定与 historyResultBadge 同口径:
+  码优先回退文案)、关键字 input(项目/服务器名子串,不区分大小写;
+  IME 组合中不触发)
+- renderHistory 渲染前经 `historyMatchesFilter` 过滤;计数行区分
+  「筛选后 N / 共 M 条」;无匹配时独立空态「无符合筛选条件的记录」
+  (区别于全空的「暂无部署记录」)
+
+## 二、配置导入预览(根治 P1-3 跨机 SMTP 损坏)
+
+- 后端:`parse_export_file` 抽出共用(读→校验信封→解密→解析);
+  新命令 `config_import_preview(path, password)` **不落盘**,返回
+  `ImportPreview { servers, projects, currentServers, currentProjects,
+  smtpPasswordPresent }`(camelCase);当前配置读不到按 0 不阻断
+- 前端两段式:runImport 先 preview → confirmBlock 三段式确认区
+  (标题「确认导入并覆盖当前配置?」+ 事实清单「备份 N 台 / 当前 M 台
+  (导入后将全部替换)」+ 风险行)→ 用户点「导入并覆盖」才真调
+  config_import_file;备份含 SMTP 密码时风险行特别提示跨机重录
+- 单测:错误口令同口径 / 摘要五字段 / **预览前后配置文件字节不变**
+
+## 三、服务器一键诊断
+
+- 后端:`server_diagnose` 命令(host_server.rs),逐层短路:
+  TCP(5s 超时,probe 同口径)→ SSH(15s with_timeout;错误按
+  `code_of` 分类:auth/timeout 给定向提示)→ docker(`--version`
+  退出码;非 0 再探 `docker info` 退出码区分「无权限」与「未安装」);
+  前置失败则后续步骤标 skipped 不再尝试
+- 前端:服务器卡片新增「一键诊断」按钮;模态红绿灯(通过/失败/跳过
+  三态徽章 + 步骤名 + 详情);全部通过给绿色 summary;失败时「复制
+  全部结果」按钮(window.copyText)
+- 诊断用已存凭据(不收明文密码;改密码走「测试连接」)
+
+## 四、部署模板/预设
+
+- 后端:新模块 `profiles.rs`;`DeployProfile`(camelCase,serde default
+  全字段:mode/imageRef/serverId/projectId/useDateTag/skipUnchanged/
+  forceArchive/autoPreview/releaseTitle/releaseNotes/createdAt);
+  独立 `config/deploy-profiles.json`(与三件套互不相干,损坏回退空表);
+  `MAX_PROFILES=20` 超上限按 created_at 裁旧;三命令
+  `deploy_profiles_list`(新→旧排序)/ `save`(按 id 替换或追加,
+  名称/模式校验)/ `delete`(幂等)
+- 前端:04 部署页顶部「模板」条(下拉含 [整栈]/[单镜像] 前缀 + 三按钮);
+  **套用只填表单不自动开跑**(模式/镜像/服务器/项目/四勾选/标题说明
+  全量回填,已不存在的项放弃并在 toast 标注);**存为模板**用行内展开
+  输入框(Enter 保存 Esc 取消,10s 超时收起;零新模态);**删除**两步
+  确认(3s 超时还原,servers.js armDeleteConfirm 同款交互本文件自带)
+- 与批量部署的关系:批量模态勾选服务器后走既有循环,模板套用先把
+  表单调好再开批量(模板不直接驱动批量,避免引入第二套批量编排)
+
+## 五、通知耗时阈值
+
+- `NotifyConfig.min_duration_secs`(serde default 0=恒通知;上限夹
+  `MIN_DURATION_SECS_MAX=3600`);`notify_save_config` 保存、
+  `notify_get_config` 视图、`config_io` 导出/导入 blob 全链路携带
+- `fire` 保持签名(委托),新增 `fire_with_duration(..., Option<u64>)`:
+  成功且耗时 < 阈值时 log+跳过(夜间批量短平快成功不轰炸);
+  失败/取消/探活恒通知;deploy/rollback 收尾传 `record.duration_secs`
+- 前端:通知模态事件订阅组新增「成功通知最小耗时(秒)」number 字段
+  (0-3600;回填无条件——避开探活间隔 P1-1 的恒假守卫教训);采集
+  空值按 0;+纯函数单测(阈值判定四态 + 上限常量)
+
+## 验证
+
+- `cargo test` 332 passed / 13 ignored(+8:import preview 摘要+不落盘;
+  profiles roundtrip+cap 裁剪;notify 阈值纯函数;此前 v6.1.4 的 3 个)
+- clippy --all-targets 零新增;node --check 17 个 JS;verify 三脚本 PASS
+- **浏览器桩逐项功能验证**(http.server + _tauri-stub,用完已删):
+  历史筛选三轴交互(2/5→0/5→空态)、模板套用六字段回填(模式/服务器/
+  项目/autoPreview/skip/标题)、诊断模态红绿灯三行+summary、导入预览
+  两段式(facts/risk/双按钮,SMTP 跨机提示文案)、通知阈值字段保存
+  载荷 minDurationSecs=300
+- judge 4 张截图验收 pass(部署页模板条/整页/诊断模态/导入确认区)
+- 命令数:HEAD 96 → 101(实测;此前文档 95 与实际差 1)
+
+## 遗留与取舍
+
+- 通知阈值只作用于部署/回滚 success(probe/migrate 未接 —— migrate
+  无 duration 字段,probe 语义不适用)
+- 模板不驱动批量(见四;若反响好再考虑「按模板批量」)
+- `server_diagnose` 的 docker 权限降级探测用 `docker info` 退出码近似,
+  与 manage.rs 的 perm_denied 判定同粒度(非精确匹配 stderr)

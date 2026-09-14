@@ -175,6 +175,9 @@ struct ExportNotify {
     email: ExportEmail,
     #[serde(default)]
     events: NotifyEvents,
+    /// 成功通知最小部署耗时(秒;第二十批阶段五;旧导出文件缺失 → 0 恒通知)
+    #[serde(default)]
+    min_duration_secs: u32,
 }
 
 /// blob 内的完整配置载荷(projects 无敏感字段,原样携带)。
@@ -191,6 +194,23 @@ struct ExportPayload {
 pub struct ImportSummary {
     pub servers: usize,
     pub projects: usize,
+}
+
+/// 导入预览摘要(camelCase;第二十批阶段二):**不落盘**的试运行结果 ——
+/// 前端据此弹「将覆盖 X 台 / 新增 N 台」确认,用户确认后才调
+/// [`config_import_file`] 真导入。跨机场景 `smtp_password_present = true`
+/// 时前端明示「导入后需在新机重录 SMTP 密码」(DPAPI 密文不可跨机)。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportPreview {
+    /// 备份内服务器/项目数量
+    pub servers: usize,
+    pub projects: usize,
+    /// 当前配置中的服务器/项目数量(将被整体替换)
+    pub current_servers: usize,
+    pub current_projects: usize,
+    /// 备份内 SMTP 密码非空 → true(跨机导入后失效,需重录)
+    pub smtp_password_present: bool,
 }
 
 // ===== 导出 / 导入转换 =====
@@ -277,6 +297,7 @@ fn export_notify(n: &NotifyConfig) -> Result<ExportNotify, String> {
             to: n.email.to.clone(),
         },
         events: n.events.clone(),
+        min_duration_secs: n.min_duration_secs,
     })
 }
 
@@ -299,6 +320,7 @@ fn import_notify(n: ExportNotify) -> Result<NotifyConfig, String> {
             to: n.email.to,
         },
         events: n.events,
+        min_duration_secs: n.min_duration_secs.min(crate::notify::MIN_DURATION_SECS_MAX),
     })
 }
 
@@ -339,15 +361,54 @@ pub fn config_export_file(password: String, path: String) -> Result<(), String> 
 /// 读文件 → 校验信封 → AES-256-GCM 解密(口令错误/损坏统一报错)→
 /// 解析校验 servers/projects/notify 结构 → 逐字段 DPAPI 重加密 →
 /// 三个配置文件原子覆盖写。内存状态不自动重载(前端导入成功后自行刷新)。
-#[tauri::command]
-pub fn config_import_file(path: String, password: String) -> Result<ImportSummary, String> {
+/// 「读文件 → 校验信封 → 解密 → 解析」的共用实现(导入预览与正式导入同源,
+/// DRY;第二十批阶段二抽出)。
+fn parse_export_file(path: &str, password: &str) -> Result<ExportPayload, String> {
     let raw =
-        std::fs::read(&path).map_err(|e| format!("读取导出文件失败 ({}): {}", path, e))?;
+        std::fs::read(path).map_err(|e| format!("读取导出文件失败 ({}): {}", path, e))?;
     let envelope: ExportEnvelope = serde_json::from_slice(&raw)
         .map_err(|e| format!("导出文件格式不正确: {}", e))?;
-    let payload_json = open_blob(&password, &envelope)?;
+    let payload_json = open_blob(password, &envelope)?;
     let payload: ExportPayload = serde_json::from_str(&payload_json)
         .map_err(|e| format!("导出文件内容损坏(结构解析失败): {}", e))?;
+    Ok(payload)
+}
+
+/// 导入预览(第二十批阶段二,不落盘):解密解析备份 + 读取当前配置,
+/// 返回「将覆盖/新增」摘要;口令错误/文件损坏与正式导入同口径报错,
+/// 但**绝不写任何文件** —— 确认后才由 [`config_import_file`] 落盘。
+#[tauri::command]
+pub fn config_import_preview(path: String, password: String) -> Result<ImportPreview, String> {
+    let payload = parse_export_file(&path, &password)?;
+    let smtp_password_present = payload
+        .notify
+        .email
+        .password_enc
+        .as_deref()
+        .map(|p| !p.trim().is_empty())
+        .unwrap_or(false);
+    let (current_servers, current_projects) = match crate::config::load_config() {
+        Ok(cfg) => (cfg.servers.len(), cfg.projects.len()),
+        // 当前配置读不到(首次运行/损坏):按 0 计,不阻断预览
+        Err(_) => (0, 0),
+    };
+    Ok(ImportPreview {
+        servers: payload.servers.len(),
+        projects: payload.projects.len(),
+        current_servers,
+        current_projects,
+        smtp_password_present,
+    })
+}
+
+/// 从加密文件导入配置(覆盖 servers.json / projects.json / notify.json)。
+///
+/// 读文件 → 校验信封 → AES-256-GCM 解密(口令错误/损坏统一报错)→
+/// 解析校验 servers/projects/notify 结构 → 逐字段 DPAPI 重加密 →
+/// 三个配置文件原子覆盖写。内存状态不自动重载(前端导入成功后自行刷新)。
+#[tauri::command]
+pub fn config_import_file(path: String, password: String) -> Result<ImportSummary, String> {
+    let payload = parse_export_file(&path, &password)?;
 
     // 逐字段 DPAPI 重加密(SSH 密码 / 私钥口令 / SMTP 密码)
     let servers: Vec<ServerConfig> = payload
@@ -565,6 +626,146 @@ mod tests {
             "smtp-pw"
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 导入预览(第二十批阶段二):摘要字段正确;口令错误与导入同口径;
+    /// **预览不落盘**(当前配置文件字节不变)。
+    #[test]
+    fn test_import_preview_summary_and_no_write() {
+        let _guard = crate::config::TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ddtest-preview-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
+
+        // 当前配置:1 台服务器 / 1 个项目 / SMTP 密码已存
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.servers.push(ServerConfig {
+            id: "cur".into(),
+            name: "当前".into(),
+            host: "5.6.7.8".into(),
+            port: 22,
+            username: "root".into(),
+            auth: AuthConfig { auth_type: AuthType::Password, key_path: None, password_enc: None, key_pass_enc: None },
+            remote_dir: "/opt/cur".into(),
+            host_key_sha256: None,
+        });
+        cfg.projects.push(ProjectConfig {
+            id: "p-cur".into(),
+            name: "当前项目".into(),
+            image_filter: String::new(),
+            compose_file: "C:/cur/docker-compose.yml".into(),
+            file_mappings: Vec::new(),
+            service_overrides: Vec::new(),
+            health_wait_secs: 0,
+            pre_deploy_cmd: None,
+            post_deploy_cmd: None,
+            notify_webhook: None,
+            source_compose_path: None,
+            source_hash: None,
+            remote_dir: None,
+            default_server_id: None,
+            release_keep: None,
+        });
+        cfg.notify.email = EmailNotify {
+            enabled: true,
+            smtp_host: "smtp.example.com".into(),
+            port: 465,
+            username: "bot@example.com".into(),
+            password_enc: Some(dpapi_protect("smtp-pw").unwrap()),
+            security: "ssl".into(),
+            from: "bot@example.com".into(),
+            to: Vec::new(),
+        };
+        crate::config::save_config(&cfg).unwrap();
+
+        // 备份:含 2 台服务器 / 3 个项目 / SMTP 密码明文(blob 内)
+        let payload = ExportPayload {
+            servers: vec![
+                ExportServer {
+                    id: "b1".into(), name: "备份1".into(), host: "1.1.1.1".into(), port: 22,
+                    username: "root".into(),
+                    auth: ExportAuth { auth_type: AuthType::Password, key_path: None, password_enc: None, key_pass_enc: None },
+                    remote_dir: "/opt/b1".into(), host_key_sha256: None,
+                },
+                ExportServer {
+                    id: "b2".into(), name: "备份2".into(), host: "2.2.2.2".into(), port: 22,
+                    username: "root".into(),
+                    auth: ExportAuth { auth_type: AuthType::Password, key_path: None, password_enc: None, key_pass_enc: None },
+                    remote_dir: "/opt/b2".into(), host_key_sha256: None,
+                },
+            ],
+            projects: (0..3)
+                .map(|i| ProjectConfig {
+                    id: format!("bp{}", i),
+                    name: format!("备份项目{}", i),
+                    image_filter: String::new(),
+                    compose_file: "C:/b/docker-compose.yml".into(),
+                    file_mappings: Vec::new(),
+                    service_overrides: Vec::new(),
+                    health_wait_secs: 0,
+                    pre_deploy_cmd: None,
+                    post_deploy_cmd: None,
+                    notify_webhook: None,
+                    source_compose_path: None,
+                    source_hash: None,
+                    remote_dir: None,
+                    default_server_id: None,
+                    release_keep: None,
+                })
+                .collect(),
+            notify: ExportNotify {
+                desktop: Default::default(),
+                email: ExportEmail {
+                    enabled: false,
+                    smtp_host: String::new(),
+                    port: 0,
+                    username: String::new(),
+                    // blob 内 SMTP 密码是明文(导出口径)
+                    password_enc: Some("smtp-plain-in-blob".into()),
+                    security: String::new(),
+                    from: String::new(),
+                    to: Vec::new(),
+                },
+                events: Default::default(),
+                min_duration_secs: 0,
+            },
+        };
+        let payload_json = serde_json::to_string(&payload).unwrap();
+        let envelope = seal_blob("pv-pass", &payload_json).unwrap();
+        let export_path = dir.join("export.json");
+        std::fs::write(
+            &export_path,
+            serde_json::to_string_pretty(&envelope).unwrap(),
+        )
+        .unwrap();
+
+        // 预览前抓当前配置字节(断言不落盘用)
+        let before = std::fs::read(dir.join("config/servers.json")).unwrap();
+
+        // 错误口令:与导入同口径报错
+        assert_eq!(
+            config_import_preview(export_path.to_str().unwrap().into(), "bad".into())
+                .unwrap_err(),
+            "导出口令错误或文件已损坏"
+        );
+
+        // 正确口令:摘要正确
+        let pv = config_import_preview(export_path.to_str().unwrap().into(), "pv-pass".into())
+            .unwrap();
+        assert_eq!(pv.servers, 2, "备份内服务器数");
+        assert_eq!(pv.projects, 3, "备份内项目数");
+        assert_eq!(pv.current_servers, 1, "当前服务器数(将被覆盖)");
+        assert_eq!(pv.current_projects, 1, "当前项目数(将被覆盖)");
+        assert!(pv.smtp_password_present, "备份含 SMTP 密码 → 跨机需重录提示");
+
+        // 预览不落盘:配置文件字节不变
+        let after = std::fs::read(dir.join("config/servers.json")).unwrap();
+        assert_eq!(before, after, "预览不得写任何配置文件");
+        let loaded = crate::config::load_config().unwrap();
+        assert_eq!(loaded.servers.len(), 1, "当前配置仍是 1 台(未被替换)");
+
+        std::env::remove_var("DD_CONFIG_DIR");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

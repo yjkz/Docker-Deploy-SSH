@@ -709,6 +709,61 @@ select.text-input option,
 /* 自动预览确认的内联操作行(继续部署/取消;自绘,替代 window.confirm) */
 .deploy-confirm-actions { margin-top: 10px; }
 .deploy-confirm-actions .btn:first-child { margin-left: 0; }
+/* 导入预览确认区按钮行(第二十批阶段二,与 deploy-confirm-actions 同语言) */
+.cio-confirm-actions { margin-top: 10px; }
+.cio-confirm-actions .btn:first-child { margin-left: 0; }
+
+/* 部署模板条(第二十批阶段四):模式 tab 上方一行;label 中文走 CJK 轨 */
+.deploy-profile-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 10px;
+}
+.deploy-profile-label {
+  font-family: var(--font-cjk);
+  font-size: 12.5px;
+  color: var(--ark-paper-dim-ink);
+  flex: none;
+}
+.deploy-profile-bar .form-input-sm { width: auto; min-width: 160px; }
+.deploy-profile-bar .btn { flex: none; }
+.deploy-profile-name { width: 200px; }
+
+/* 一键诊断(第二十批阶段三):逐行 [徽章 步骤名 详情],flex 纪律:
+   文字列 min-width:0 + overflow 换行;徽章/步骤名 flex:none */
+.diagnose-box { display: flex; flex-direction: column; gap: 8px; }
+.diagnose-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+.diagnose-row > .badge { flex: none; }
+.diagnose-name {
+  flex: none;
+  font-family: var(--font-cjk);
+  font-size: 12.5px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.diagnose-detail {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-cjk);
+  font-size: 12.5px;
+  color: var(--ark-paper-dim-ink);
+  overflow-wrap: anywhere;
+}
+.diagnose-summary-ok,
+.diagnose-summary-fail {
+  font-family: var(--font-cjk);
+  font-size: 12.5px;
+  margin-top: 4px;
+}
+.diagnose-summary-ok { color: var(--ark-signal-dim); }
+.diagnose-summary-fail { color: var(--ark-warn-text, inherit); }
 .images-error {
   display: flex;
   align-items: center;
@@ -1468,6 +1523,31 @@ select.text-input option,
   font-size: 11px;
   letter-spacing: .12em;
   color: var(--ark-paper-dim-ink);
+}
+
+/* 历史筛选条(第二十批阶段一):模式/结果下拉 + 关键字,横排紧凑;
+   label 文字含中文走 --font-cjk(字体轨道纪律) */
+.deploy-history-filters {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 10px;
+}
+.deploy-history-filters label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-cjk);
+  font-size: 12.5px;
+  color: var(--ark-paper-dim-ink);
+}
+.deploy-history-filters .form-input-sm {
+  width: auto;
+  min-width: 0;
+}
+.deploy-history-filter-search .form-input-sm {
+  width: 180px;
 }
 
 /* 选择区:四控件横排 action strip,下衬 1px 墨线 */

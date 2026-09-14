@@ -242,6 +242,11 @@ pub struct NotifyConfig {
     /// 事件订阅开关
     #[serde(default)]
     pub events: NotifyEvents,
+    /// 成功通知的最小部署耗时(秒,第二十批阶段五;0 = 恒通知)——
+    /// 成功且耗时 < 阈值时跳过通知(夜间批量不再逐台轰炸);失败/取消
+    /// 恒通知(它们需要人看,阈值只作用于 success)。上限夹到 3600。
+    #[serde(default)]
+    pub min_duration_secs: u32,
 }
 
 /// 归一化 `security` 字段(纯函数,便于单测):trim + 转小写后仅接受

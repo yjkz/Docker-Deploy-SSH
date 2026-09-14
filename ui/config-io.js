@@ -177,24 +177,88 @@
       return;
     }
 
+    // 两段式(第二十批阶段二):先 config_import_preview 解密读摘要(不落盘)
+    // → 内联确认区展示「将覆盖 X 台 / 新增 N 台 / SMTP 跨机提示」→ 用户确认
+    // 才调 config_import_file 真导入。此前是「选错文件即静默覆盖当前全部配置」。
     setBusy(true);
-    showResult('正在导入…', 'cio-result-ok');
-    window.AppBus.invoke('config_import_file', { path: st.importPath, password: pass })
-      .then(function (summary) {
-        var s = summary || {};
-        var servers = Number(s.servers) || 0;
-        var projects = Number(s.projects) || 0;
-        showResult('已导入 ' + servers + ' 台服务器 / ' + projects +
-          ' 个项目,将刷新应用…', 'cio-result-ok');
-        window.toast('导入成功,将刷新应用', 'ok');
-        // 摘要停留一拍再刷新,让内存中的新配置随页面重建重新加载
-        window.setTimeout(function () { window.location.reload(); }, 1600);
-      })
+    showResult('正在读取备份摘要(不改动当前配置)…', 'cio-result-ok');
+    window.AppBus.invoke('config_import_preview', { path: st.importPath, password: pass })
+      .then(function (pv) { showImportConfirm(pv || {}, pass); })
       .catch(function (err) {
-        showResult('导入失败:' + (errText(err) || '未知错误'), 'cio-result-fail');
-        window.formFailLoud('cio-error', '导入失败:' + (errText(err) || '未知错误'));
+        showResult('读取备份失败:' + (errText(err) || '未知错误'), 'cio-result-fail');
+        window.formFailLoud('cio-error', '读取备份失败:' + (errText(err) || '未知错误'));
         setBusy(false);
       });
+  }
+
+  /** 预览摘要 → 内联确认区(继续导入 / 取消);确认后才真正落盘 */
+  function showImportConfirm(pv, pass) {
+    var result = document.getElementById('cio-import-result');
+    if (!result) { setBusy(false); return; }
+    var servers = Number(pv.servers) || 0;
+    var projects = Number(pv.projects) || 0;
+    var curServers = Number(pv.currentServers) || 0;
+    var curProjects = Number(pv.currentProjects) || 0;
+    var sameCount = servers === curServers && projects === curProjects;
+
+    result.textContent = '';
+    result.className = 'cio-result';
+
+    var block = window.confirmBlock({
+      title: '确认导入并覆盖当前配置?',
+      facts: [
+        ['备份内容', servers + ' 台服务器 / ' + projects + ' 个项目'],
+        ['当前配置', curServers + ' 台服务器 / ' + curProjects + ' 个项目' +
+          (sameCount ? '(数量相同)' : '(导入后将全部替换)')]
+      ],
+      risk: pv.smtpPasswordPresent === true
+        ? '备份包含 SMTP 密码:跨电脑导入后原密文在新机不可用,需在通知中心重录 SMTP 密码'
+        : '导入是整体替换:当前的服务器 / 项目 / 通知配置将全部被备份内容覆盖'
+      });
+    result.appendChild(block);
+
+    var actions = el('div', 'cio-confirm-actions');
+    var goBtn = el('button', 'btn btn-primary btn-sm', '导入并覆盖');
+    goBtn.type = 'button';
+    var cancelBtn = el('button', 'btn btn-sm', '取消');
+    cancelBtn.type = 'button';
+    actions.appendChild(goBtn);
+    actions.appendChild(cancelBtn);
+    result.appendChild(actions);
+
+    goBtn.addEventListener('click', function () {
+      result.textContent = '';
+      setBusy(true);
+      showResultIf(result, '正在导入…');
+      window.AppBus.invoke('config_import_file', { path: st.importPath, password: pass })
+        .then(function (summary) {
+          var s = summary || {};
+          showResultIf(result, '已导入 ' + (Number(s.servers) || 0) + ' 台服务器 / ' +
+            (Number(s.projects) || 0) + ' 个项目,将刷新应用…');
+          window.toast('导入成功,将刷新应用', 'ok');
+          // 摘要停留一拍再刷新,让内存中的新配置随页面重建重新加载
+          window.setTimeout(function () { window.location.reload(); }, 1600);
+        })
+        .catch(function (err) {
+          showResultIf(result, '导入失败:' + (errText(err) || '未知错误'), 'cio-result-fail');
+          window.formFailLoud('cio-error', '导入失败:' + (errText(err) || '未知错误'));
+          setBusy(false);
+        });
+    });
+    cancelBtn.addEventListener('click', function () {
+      result.textContent = '';
+      result.className = 'cio-result';
+      setBusy(false);
+    });
+    // 预览后按钮解禁(等待用户决定),确认按钮自身防重(setBusy 在点击后再锁)
+    setBusy(false);
+  }
+
+  /** showImportConfirm 内部的结果行写法(不依赖外部闭包变量) */
+  function showResultIf(node, text, cls) {
+    if (!node) return;
+    node.textContent = text;
+    node.className = 'cio-result' + (cls ? ' ' + cls : '');
   }
 
   // ===== 危险区:清除数据 =====

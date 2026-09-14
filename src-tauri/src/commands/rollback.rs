@@ -1473,8 +1473,11 @@ where
                     error_code: None,
                 },
             );
-            // 通知中心:回滚成功(emit deploy-done 之后异步分发,不阻塞收尾)
-            crate::notify::fire(app.clone(), "success", title, body).await;
+            // 通知中心:回滚成功(emit deploy-done 之后异步分发,不阻塞收尾);
+            // 第二十批阶段五:带耗时(低于 notify.min_duration_secs 阈值时跳过)
+            let dur = record.duration_secs;
+            crate::notify::fire_with_duration(app.clone(), "success", title, body, Some(dur))
+                .await;
             append_record(record);
             Ok(())
         }

@@ -347,6 +347,13 @@
 
     var actions = el('div', 'server-actions');
 
+    // 一键诊断(第二十批阶段三):TCP→SSH→docker 逐层红绿灯,失败可复制详情
+    var diagBtn = el('button', 'btn btn-sm', '一键诊断');
+    diagBtn.type = 'button';
+    diagBtn.title = 'TCP / SSH / Docker 逐层排查,失败时给每一层的具体原因';
+    diagBtn.addEventListener('click', function () { runDiagnose(server.id); });
+    actions.appendChild(diagBtn);
+
     var testBtn = el('button', 'btn btn-sm', checking ? '检测中…' : '测试连接');
     testBtn.type = 'button';
     testBtn.disabled = checking;
@@ -503,6 +510,70 @@
   /** 「清理优化」:打开清理分析模态(预览 → 勾选 → 定向执行) */
   function showPruneConfirm(card, server) {
     openCleanupModal(server);
+  }
+
+  // ===== 一键诊断(第二十批阶段三):TCP → SSH → Docker 逐层红绿灯 =====
+
+  /** 诊断步骤的展示文案与徽章色(ok/fail/skipped → 绿/红/灰) */
+  function diagnoseStepLabel(key) {
+    if (key === 'tcp') return 'TCP 端口可达';
+    if (key === 'ssh') return 'SSH 连接认证';
+    if (key === 'docker') return 'Docker 可用';
+    return key;
+  }
+
+  /**
+   * 发起诊断并在模态里呈现逐层结果:进行中显示「诊断中…」,完成后
+   * 每步一行 [徽章 + 步骤名 + 详情];全部通过给绿色横幅,否则给
+   * 「复制全部结果」按钮(贴给同事/issue)。
+   */
+  function runDiagnose(serverId) {
+    var server = findServer(serverId);
+    var name = server ? server.name : serverId;
+    openModal('一键诊断 — ' + name, function (body) {
+      var box = el('div', 'diagnose-box');
+      box.appendChild(el('div', 'server-check-hint', '正在逐层排查:TCP → SSH → Docker…'));
+      body.appendChild(box);
+
+      window.AppBus.invoke('server_diagnose', { serverId: serverId })
+        .then(function (report) {
+          box.textContent = '';
+          var steps = (report && Array.isArray(report.steps)) ? report.steps : [];
+          var allOk = report && report.allOk === true;
+          steps.forEach(function (st) {
+            var row = el('div', 'diagnose-row');
+            var state = String(st.state || 'skipped');
+            var badge = window.fillBadge(el('span'),
+              state === 'ok' ? 'ok' : (state === 'fail' ? 'fail' : 'info'),
+              state === 'ok' ? '通过' : (state === 'fail' ? '失败' : '跳过'));
+            row.appendChild(badge);
+            row.appendChild(el('span', 'diagnose-name', diagnoseStepLabel(String(st.step || ''))));
+            row.appendChild(el('span', 'diagnose-detail', String(st.detail || '')));
+            box.appendChild(row);
+          });
+          var banner = el('div', allOk ? 'diagnose-summary-ok' : 'diagnose-summary-fail',
+            allOk ? '全部通过:可正常部署(环境细节用「环境检测」查看)'
+              : '存在未通过项:按上述失败层处理后再试');
+          box.appendChild(banner);
+          if (!allOk) {
+            var copyBtn = el('button', 'btn btn-sm', '复制全部结果');
+            copyBtn.type = 'button';
+            copyBtn.addEventListener('click', function () {
+              var text = steps.map(function (st) {
+                return '[' + (st.state || '') + '] ' + diagnoseStepLabel(String(st.step || '')) +
+                  ': ' + String(st.detail || '');
+              }).join('\n');
+              window.copyText(text);
+            });
+            box.appendChild(copyBtn);
+          }
+        })
+        .catch(function (err) {
+          box.textContent = '';
+          box.appendChild(el('div', 'server-check-hint',
+            '诊断发起失败:' + (errText(err) || '未知错误')));
+        });
+    });
   }
 
   function runEnvCheck(server, mode, extras) {

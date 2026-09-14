@@ -578,7 +578,15 @@ where
             }
             // 通知中心:部署成功(按 notify 配置的事件订阅与渠道开关异步分发)
             let (title, body) = deploy_notify_text(true, "部署完成", &record);
-            crate::notify::fire(app.clone(), "success", title, body).await;
+            // 第二十批阶段五:成功通知带耗时(低于 notify.min_duration_secs 阈值时跳过)
+            crate::notify::fire_with_duration(
+                app.clone(),
+                "success",
+                title,
+                body,
+                record.as_ref().map(|r| r.duration_secs),
+            )
+            .await;
         }
         Err(e) => {
             emit_log(&app, &format!("部署失败: {}", crate::errors::strip(e)));

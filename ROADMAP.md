@@ -230,9 +230,23 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 
 ---
 
+## 
+### 第二十批 v6.2.0(候选池第一梯队五项)— 已完成
+- **部署历史筛选/搜索**:04 页折叠面板展开态新增模式/结果/关键字三轴筛选条(纯前端,已加载记录过滤);计数行区分「筛选后 N / 共 M」;无匹配时给独立空态
+- **配置导入预览**:抽取共用 `parse_export_file`,新增 `config_import_preview` 命令(不落盘,只读解密+摘要);前端两段式——预览显示「备份 N 台 / 当前 M 台(将全部替换)/ SMTP 跨机提示」+ 复用的 `confirmBlock` 三段式确认区;若 SMTP 跨机,风险行特别提示需在通知中心重录(顺带根治 P1-3)
+- **服务器一键诊断**:新模块 `server_diagnose` 命令(TCP 5s → SSH 15s + 错误码分类 auth/timeout → docker `--version` 退出码 + 权限降级);逐层短路:前置失败则后续 skipped;前端红绿灯模态(通过/失败/跳过 三种徽章,失败时显示「复制全部结果」按钮);服务器卡片新增「一键诊断」入口(贴「测试连接」前)
+- **部署模板/预设**:新模块 `profiles.rs`(`DeployProfile` camelCase,`config/deploy-profiles.json` 独立存储,`MAX_PROFILES=20` 超上限裁旧,`update_config`/`save_checkpoint` 外的读改写收口);三命令 `deploy_profiles_list/save/delete`(id 由前端生成,`# deploy-profiles-list/save/delete` 注册);04 部署页顶部新增「模板」条(下拉 + 套用/存为模板/删除三按钮);**套用只填表单不自动开跑**(保留用户确认权,避免误触发);**存为模板**用 row 内展开输入框(零新模态,不用系统对话框);删除两步确认(2s 超时还原,armDeleteConfirm 同款交互)
+- **通知耗时阈值**:`NotifyConfig.min_duration_secs`(0=恒通知,上限夹 3600);`fire_with_duration` 替 `fire`(可选耗时),成功且耗时 < 阈值时跳过通知(夜间批量短平快成功不轰炸),失败/取消/探活恒通知;deploy/rollback 收尾传 `record.duration_secs`;前端通知模态新增「成功通知最小耗时(秒)」字段(填表 + 采集都按 camelCase)
+- 验证:`cargo test` 332 passed(+4:并表 cap+并发/err 闭包零落盘/哨兵拒绝/import preview 摘要+不落盘;+3:profiles save_roundtrip+cap 裁剪/notify 阈值纯函数);clippy 零新增;node --check 17 个 JS;verify 三脚本 PASS;**5 项功能均经浏览器桩(本机 http.server + Tauri-stub)逐项验证**(历史筛选三轴、模板套用回填表单六字段、诊断模态红绿灯、导入预览两段式确认区、通知阈值字段保存载荷 minDurationSecs=300);judge 4 张截图全部 pass
+- 命令数:HEAD 基线 96 → 101(config_import_preview / server_diagnose / deploy_profiles_list+save+delete;此前文档记载 95 与实际差 1,本批以 awk 实测为准)
+
+
+---
+
 ## 当前状态速览
 
-- 版本 **v6.1.4**;main = origin/main;基线 `cargo test` **328 passed** / 13 ignored
+- 版本 **v6.2.0**;main = origin/main;基线 `cargo test` **332 passed** / 13 ignored
+- 命令 **101** 个(lib.rs awk 实测;wiki/04 待同步)
 - 命令 **95** 个(lib.rs 注册;wiki/04 已同步);JS **16** 文件(含 theme-init.js;index.html 加载顺序见 wiki/03:13)
 - 前端结构:12 模态;commands/ 11 文件;三大 JS 主文件 2338/2013/2537 行
 - 表单体系(第十三批):5 处模态有真实 `<form novalidate>` 语义;失焦校验 + Enter 提交由 app.js 三助手统一承担

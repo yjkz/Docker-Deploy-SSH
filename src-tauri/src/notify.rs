@@ -35,6 +35,9 @@ const EMAIL_TEST_SUBJECT: &str = "DockerDeploy SSH 测试邮件";
 /// SMTP 命令/连接整体超时(秒)。
 const SMTP_TIMEOUT_SECS: u64 = 30;
 
+/// `min_duration_secs` 上限(第二十批阶段五):防手改配置写入离谱值。
+pub(crate) const MIN_DURATION_SECS_MAX: u32 = 3600;
+
 // ===== 前端视图与入参(camelCase)=====
 
 /// 桌面通知配置视图。
@@ -76,6 +79,8 @@ pub struct NotifyConfigView {
     pub desktop: DesktopNotifyView,
     pub email: EmailNotifyView,
     pub events: NotifyEventsView,
+    /// 成功通知的最小部署耗时(秒;0 = 恒通知;第二十批阶段五)
+    pub min_duration_secs: u32,
 }
 
 /// `notify_save_config` / `notify_test_email` 的桌面部分入参。
@@ -133,6 +138,9 @@ pub struct NotifyConfigInput {
     pub email: EmailNotifyInput,
     #[serde(default)]
     pub events: NotifyEventsInput,
+    /// 成功通知最小部署耗时(秒;0 = 恒通知;上限夹取)
+    #[serde(default)]
+    pub min_duration_secs: u32,
 }
 
 /// `notify_test_email` 的入参:表单当前值(不要求先保存配置)。
@@ -257,6 +265,8 @@ pub async fn notify_save_config(cfg: NotifyConfigInput) -> Result<(), String> {
             on_cancel: cfg.events.on_cancel,
             on_probe: cfg.events.on_probe,
         },
+        // 第二十批阶段五:成功通知的最小部署耗时(0 = 恒通知;上限夹取)
+        min_duration_secs: cfg.min_duration_secs.min(MIN_DURATION_SECS_MAX),
     };
     // update_config 收口(第二十批 P2-4):与并发保存串行;锁内只替换 notify
     // 字段(servers/projects 系闭包内拿到的磁盘最新值,不再被本函数的旧快照冲掉)
@@ -496,7 +506,21 @@ fn smtp_error_message(e: &lettre::transport::smtp::Error) -> String {
 /// - 内部 `tauri::async_runtime::spawn` 异步执行,不阻塞调用方(部署收尾路径);
 /// - 读配置失败、事件未订阅、渠道未启用或发送失败一律仅 `log::warn!`,
 ///   不上抛、不影响部署结果与 history。
+/// - **成功耗时阈值(第二十批阶段五)**:`fire_with_duration` 传入耗时后,
+///   成功且耗时 < `min_duration_secs` 时跳过本次通知(夜间批量的短平快成功
+///   不轰炸);失败/取消/探活恒通知;`fire`(无耗时)不过滤。
 pub(crate) async fn fire(app: AppHandle, kind: &str, title: String, body: String) {
+    fire_with_duration(app, kind, title, body, None).await
+}
+
+/// [`fire`] 的带耗时版本:部署/回滚收尾传 `DeployRecord.duration_secs`。
+pub(crate) async fn fire_with_duration(
+    app: AppHandle,
+    kind: &str,
+    title: String,
+    body: String,
+    duration_secs: Option<u64>,
+) {
     let kind = kind.to_string();
     tauri::async_runtime::spawn(async move {
         // 事件订阅判断:未知事件类型直接跳过
@@ -519,6 +543,15 @@ pub(crate) async fn fire(app: AppHandle, kind: &str, title: String, body: String
         };
         if !subscribed {
             return;
+        }
+        // 成功耗时阈值(第二十批阶段五):成功且耗时 < 配置阈值 → 跳过本次通知
+        if kind == "success" {
+            if let (Some(secs), min) = (duration_secs, notify.min_duration_secs) {
+                if min > 0 && secs < min as u64 {
+                    log::info!("成功通知跳过:耗时 {} 秒 < 阈值 {} 秒", secs, min);
+                    return;
+                }
+            }
         }
         // 渠道 1:桌面系统通知
         if notify.desktop.enabled {
@@ -577,12 +610,32 @@ fn to_view(cfg: &NotifyConfig) -> NotifyConfigView {
             on_cancel: cfg.events.on_cancel,
             on_probe: cfg.events.on_probe,
         },
+        min_duration_secs: cfg.min_duration_secs.min(MIN_DURATION_SECS_MAX),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 成功耗时阈值的纯判定(第二十批阶段五):返回 true = 跳过通知。
+    /// 提取为纯函数便于单测(fire 内联同一逻辑)。
+    #[test]
+    fn test_success_duration_gate() {
+        // (duration_secs, min_secs) → 跳过?
+        let gate = |secs: u64, min: u32| -> bool {
+            min > 0 && secs < min as u64
+        };
+        // 0 阈值 = 恒通知
+        assert!(!gate(0, 0));
+        assert!(!gate(5, 0));
+        // 耗时低于阈值 → 跳过;达到/超过 → 通知
+        assert!(gate(299, 300));
+        assert!(!gate(300, 300));
+        assert!(!gate(301, 300));
+        // 阈值上限夹取由保存路径保证(MIN_DURATION_SECS_MAX = 3600)
+        assert_eq!(MIN_DURATION_SECS_MAX, 3600);
+    }
 
     /// 表单明文优先于已存密文,且 trim 生效。
     #[test]

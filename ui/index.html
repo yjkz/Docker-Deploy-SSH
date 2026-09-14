@@ -236,6 +236,20 @@
           <h2 class="section-title">部署配置<span class="section-en">CONFIG</span></h2>
         </div>
         <div class="deploy-form" id="deploy-form">
+          <!-- 部署模板(第二十批阶段四):下拉套用 / 存为模板 / 删除;
+               套用只填表单,发起部署仍走既有按钮(不自动开跑) -->
+          <div class="deploy-profile-bar" id="deploy-profile-bar">
+            <label class="deploy-profile-label" for="deploy-profile-select">模板</label>
+            <select id="deploy-profile-select" class="form-input form-input-sm">
+              <option value="">选择模板套用…</option>
+            </select>
+            <button id="deploy-profile-apply-btn" class="btn btn-sm" type="button"
+                    title="把所选模板填入下方表单(不自动开始部署)">套用</button>
+            <button id="deploy-profile-save-btn" class="btn btn-sm" type="button"
+                    title="把当前模式/镜像/服务器/项目/传输选项/版本说明存为模板">存为模板</button>
+            <button id="deploy-profile-delete-btn" class="btn btn-sm" type="button"
+                    title="删除所选模板">删除</button>
+          </div>
           <!-- 模式切换:单镜像 / 整栈部署(compose);激活 tab 墨底纸白字 + 青色下条 -->
           <div class="deploy-mode-tabs" id="deploy-mode-tabs" role="tablist" aria-label="部署模式">
             <button id="deploy-mode-single" class="mode-tab active" type="button" role="tab" aria-selected="true">单镜像</button>
@@ -368,6 +382,30 @@
             <div class="deploy-history-bar">
               <span id="deploy-history-count" class="deploy-history-count"></span>
               <button id="deploy-history-refresh-btn" class="btn btn-sm" type="button">刷新</button>
+            </div>
+            <!-- 筛选条(第二十批阶段一):模式/结果下拉 + 项目关键字;纯前端过滤已加载的记录 -->
+            <div class="deploy-history-filters" role="group" aria-label="部署历史筛选">
+              <label>模式
+                <select id="deploy-history-filter-mode" class="form-input form-input-sm">
+                  <option value="">全部</option>
+                  <option value="single">单镜像</option>
+                  <option value="stack">整栈</option>
+                  <option value="rollback">回滚</option>
+                  <option value="migrate">迁移</option>
+                </select>
+              </label>
+              <label>结果
+                <select id="deploy-history-filter-result" class="form-input form-input-sm">
+                  <option value="">全部</option>
+                  <option value="success">成功</option>
+                  <option value="fail">失败</option>
+                  <option value="canceled">取消</option>
+                </select>
+              </label>
+              <label class="deploy-history-filter-search">
+                <input id="deploy-history-filter-search" class="form-input form-input-sm"
+                       type="search" placeholder="项目 / 服务器名…" maxlength="64" autocomplete="off">
+              </label>
             </div>
             <div class="table-wrap">
               <table class="data-table">

@@ -147,6 +147,12 @@
     history: [],       // get_history 结果(DeployRecord[],倒序 = 最新在前)
     historyLoaded: false, // 是否已成功拉取过部署历史
     historyLoading: false, // 部署历史加载中(防重复请求)
+    // 历史筛选(第二十批阶段一):mode('' 全部/single/stack/rollback/migrate)、
+    // result('' 全部/success/fail/canceled)、search(项目/服务器名子串,不区分大小写)
+    historyFilter: { mode: '', result: '', search: '' },
+    // 部署模板(第二十批阶段四):deploy_profiles_list 结果(新→旧)
+    profiles: [],
+    profilesLoading: false,
     rbKind: '',        // 回滚模态类型:'stack' | 'single'(空串 = 模态未打开)
     rbRecord: null,    // 触发回滚的部署历史记录
     rbIds: null,       // 按记录名称反查出的 { serverId, projectId }
@@ -691,7 +697,237 @@
         var projectId = prjSel ? String(prjSel.value) : '';
         if (projectId && st.stackProjectId !== projectId) parseStack();
       }
+      // 部署模板(第二十批阶段四):与页面数据同批刷新
+      refreshProfiles();
     });
+  }
+
+  // ===== 部署模板(第二十批阶段四):列表 / 套用 / 保存 / 删除 =====
+
+  /** 拉取模板列表并重填下拉(失败静默空表:模板非关键数据) */
+  function refreshProfiles() {
+    if (st.profilesLoading) return;
+    st.profilesLoading = true;
+    window.AppBus.invoke('deploy_profiles_list')
+      .then(function (list) {
+        st.profiles = Array.isArray(list) ? list : [];
+        renderProfileSelect();
+      })
+      .catch(function () {
+        st.profiles = [];
+        renderProfileSelect();
+      })
+      .then(function () { st.profilesLoading = false; });
+  }
+
+  function renderProfileSelect() {
+    var sel = document.getElementById('deploy-profile-select');
+    if (!sel) return;
+    var prev = String(sel.value || '');
+    sel.textContent = '';
+    var head = document.createElement('option');
+    head.value = '';
+    head.textContent = st.profiles.length > 0
+      ? '选择模板套用…(' + st.profiles.length + ')' : '暂无模板';
+    sel.appendChild(head);
+    st.profiles.forEach(function (pf) {
+      var opt = document.createElement('option');
+      opt.value = String(pf.id || '');
+      var modeTag = pf.mode === 'stack' ? '整栈' : '单镜像';
+      opt.textContent = '[' + modeTag + '] ' + String(pf.name || '未命名');
+      sel.appendChild(opt);
+    });
+    if (prev && st.profiles.some(function (pf) { return String(pf.id) === prev; })) {
+      sel.value = prev;
+    }
+    var delBtn = document.getElementById('deploy-profile-delete-btn');
+    if (delBtn) delBtn.disabled = !String(sel.value || '');
+  }
+
+  /** select 按值选中(不存在则不动,返回是否命中) */
+  function setSelectValue(id, value) {
+    var sel = document.getElementById(id);
+    if (!sel) return false;
+    var v = String(value || '');
+    for (var i = 0; i < sel.options.length; i++) {
+      if (String(sel.options[i].value) === v) { sel.value = v; return true; }
+    }
+    return false;
+  }
+
+  /** 套用模板:全量回填表单;只填表单不自动开跑(套用不等于发起,保留确认权) */
+  function onProfileApply() {
+    var sel = document.getElementById('deploy-profile-select');
+    var id = sel ? String(sel.value || '') : '';
+    if (!id) { window.toast('请先在下拉中选择一个模板', 'warn'); return; }
+    var pf = st.profiles.find(function (p) { return String(p.id) === id; });
+    if (!pf) { window.toast('模板已不存在,请刷新页面', 'warn'); return; }
+    if (st.deploying || st.checking) {
+      window.toast('部署/检测进行中,不能套用模板', 'warn');
+      return;
+    }
+    var wantMode = pf.mode === 'stack' ? 'stack' : 'single';
+    if (st.mode !== wantMode) setMode(wantMode);
+    var missed = [];
+    if (!setSelectValue('deploy-server', pf.serverId)) missed.push('服务器');
+    if (!setSelectValue('deploy-project', pf.projectId)) missed.push('项目');
+    if (wantMode === 'single' && !setSelectValue('deploy-image', pf.imageRef)) missed.push('镜像');
+    setCheckedById('deploy-date-tag', pf.useDateTag === true);
+    setCheckedById('deploy-skip-unchanged', pf.skipUnchanged !== false);
+    setCheckedById('deploy-stack-skip', pf.skipUnchanged !== false);
+    setCheckedById('deploy-stack-archive', pf.forceArchive === true);
+    setCheckedById('deploy-auto-preview', pf.autoPreview === true);
+    setAreaValue('deploy-release-title', pf.releaseTitle);
+    setAreaValue('deploy-release-notes', pf.releaseNotes);
+    if (wantMode === 'stack') {
+      var prjSel = document.getElementById('deploy-project');
+      var pid = prjSel ? String(prjSel.value) : '';
+      if (pid && st.stackProjectId !== pid) parseStack();
+    }
+    refreshControls();
+    window.toast('已套用模板「' + (pf.name || '未命名') + '」' +
+      (missed.length > 0 ? '(' + missed.join('/') + ' 已不存在,未填)' : '') +
+      ',确认后点「开始部署」', 'ok');
+  }
+
+  function setCheckedById(id, checked) {
+    var node = document.getElementById(id);
+    if (node) node.checked = checked === true;
+  }
+
+  function setAreaValue(id, value) {
+    var node = document.getElementById(id);
+    if (node) node.value = String(value || '');
+  }
+
+  /** 存为模板:按钮行内展开输入框(复用 deploy-profile-bar,零新模态;
+   *  不用系统对话框 —— 全站纪律) */
+  function onProfileSave() {
+    if (st.deploying || st.checking) return;
+    var bar = document.getElementById('deploy-profile-bar');
+    var saveBtn = document.getElementById('deploy-profile-save-btn');
+    if (!bar || !saveBtn) return;
+    if (saveBtn.__pfInput) return; // 已展开
+
+    var input = document.createElement('input');
+    input.className = 'form-input form-input-sm deploy-profile-name';
+    input.type = 'text';
+    input.maxLength = 40;
+    input.placeholder = '模板名(回车保存,Esc 取消)';
+    saveBtn.__pfInput = input;
+
+    var okBtn = el('button', 'btn btn-primary btn-sm', '保存');
+    okBtn.type = 'button';
+    var cancelBtn = el('button', 'btn btn-sm', '取消');
+    cancelBtn.type = 'button';
+
+    function collapse() {
+      if (saveBtn.__pfTimer) { window.clearTimeout(saveBtn.__pfTimer); saveBtn.__pfTimer = null; }
+      saveBtn.__pfInput = null;
+      input.remove(); okBtn.remove(); cancelBtn.remove();
+    }
+    function save() {
+      var name = input.value.trim();
+      if (!name) { window.setFieldError(input, '请输入模板名'); input.focus(); return; }
+      window.setFieldError(input, null);
+      window.AppBus.invoke('deploy_profiles_save', { profile: collectCurrentProfile(name) })
+        .then(function () {
+          collapse();
+          window.toast('已保存模板「' + name + '」', 'ok');
+          refreshProfiles();
+        })
+        .catch(function (err) {
+          window.toast('保存模板失败:' + (errText(err) || '未知错误'), 'fail');
+        });
+    }
+    okBtn.addEventListener('click', save);
+    cancelBtn.addEventListener('click', collapse);
+    input.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' && !(e.isComposing || e.keyCode === 229)) { e.preventDefault(); save(); }
+      else if (e.key === 'Escape') collapse();
+    });
+    bar.appendChild(input);
+    bar.appendChild(okBtn);
+    bar.appendChild(cancelBtn);
+    // 10s 无操作自动收起(防误展开常驻)
+    saveBtn.__pfTimer = window.setTimeout(collapse, 10000);
+    try { input.focus(); } catch (_) {}
+  }
+
+  /** 抓当前表单组装 DeployProfile(camelCase 契约) */
+  function collectCurrentProfile(name) {
+    var srvSel = document.getElementById('deploy-server');
+    var prjSel = document.getElementById('deploy-project');
+    var imgSel = document.getElementById('deploy-image');
+    var dateTag = document.getElementById('deploy-date-tag');
+    var skipS = document.getElementById('deploy-skip-unchanged');
+    var skipT = document.getElementById('deploy-stack-skip');
+    var arch = document.getElementById('deploy-stack-archive');
+    var ap = document.getElementById('deploy-auto-preview');
+    var titleEl = document.getElementById('deploy-release-title');
+    var notesEl = document.getElementById('deploy-release-notes');
+    return {
+      id: 'pf-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8),
+      name: name,
+      mode: st.mode === 'stack' ? 'stack' : 'single',
+      imageRef: st.mode === 'stack' ? '' : String((imgSel && imgSel.value) || ''),
+      serverId: String((srvSel && srvSel.value) || ''),
+      projectId: String((prjSel && prjSel.value) || ''),
+      useDateTag: !!(dateTag && dateTag.checked),
+      skipUnchanged: st.mode === 'stack' ? !!(skipT && skipT.checked) : !!(skipS && skipS.checked),
+      forceArchive: !!(arch && arch.checked),
+      autoPreview: !!(ap && ap.checked),
+      releaseTitle: titleEl ? String(titleEl.value).trim() : '',
+      releaseNotes: notesEl ? String(notesEl.value).trim() : '',
+      createdAt: formatNowForProfile()
+    };
+  }
+
+  /** %F %T 当前时间(与 DeployRecord.ts 同形态,排序用) */
+  function formatNowForProfile() {
+    var d = new Date();
+    function p2(n) { return (n < 10 ? '0' : '') + n; }
+    return d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate()) +
+      ' ' + p2(d.getHours()) + ':' + p2(d.getMinutes()) + ':' + p2(d.getSeconds());
+  }
+
+  /** 删除所选模板(两步确认:首点变红「确认删除?」,3s 超时还原;
+   *  与 servers.js armDeleteConfirm 同款交互,本文件自带实现) */
+  function onProfileDelete() {
+    var sel = document.getElementById('deploy-profile-select');
+    var id = sel ? String(sel.value || '') : '';
+    if (!id) { window.toast('请先在下拉中选择要删除的模板', 'warn'); return; }
+    var pf = st.profiles.find(function (p) { return String(p.id) === id; });
+    if (!pf) return;
+    var btn = document.getElementById('deploy-profile-delete-btn');
+    if (!btn) return;
+    if (btn.__pfArmed) {
+      if (btn.__pfTimer) { window.clearTimeout(btn.__pfTimer); btn.__pfTimer = null; }
+      btn.__pfArmed = false;
+      btn.textContent = btn.__pfText;
+      btn.classList.remove('btn-danger');
+      btn.classList.remove('is-armed');
+      window.AppBus.invoke('deploy_profiles_delete', { id: id })
+        .then(function () {
+          window.toast('已删除模板「' + (pf.name || '未命名') + '」', 'ok');
+          refreshProfiles();
+        })
+        .catch(function (err) {
+          window.toast('删除模板失败:' + (errText(err) || '未知错误'), 'fail');
+        });
+      return;
+    }
+    btn.__pfArmed = true;
+    btn.__pfText = btn.textContent;
+    btn.textContent = '确认删除?';
+    btn.classList.add('btn-danger');
+    btn.classList.add('is-armed');
+    btn.__pfTimer = window.setTimeout(function () {
+      btn.__pfArmed = false;
+      btn.textContent = btn.__pfText;
+      btn.classList.remove('btn-danger');
+      btn.classList.remove('is-armed');
+    }, 3000);
   }
 
   // ===== 预填:镜像页「部署」按钮带入的待部署镜像 =====
@@ -2501,8 +2737,32 @@
   }
 
   /**
+   * 历史筛选谓词(第二十批阶段一,纯前端):模式精确 / 结果三态 / 关键字子串。
+   * 取消的判定与 historyResultBadge 同口径(码优先,回退文案)。
+   */
+  function historyMatchesFilter(rec) {
+    var f = st.historyFilter;
+    if (f.mode && String(rec.mode || '') !== f.mode) return false;
+    if (f.result) {
+      var canceled = window.parseErrCode(rec.message) === 'canceled'
+        || String(rec.message || '') === '部署已取消';
+      if (f.result === 'success' && rec.success !== true) return false;
+      if (f.result === 'fail' && (rec.success === true || canceled)) return false;
+      if (f.result === 'canceled' && !canceled) return false;
+    }
+    if (f.search) {
+      var q = f.search.toLowerCase();
+      var hay = (String(rec.project_name || '') + ' ' + String(rec.server_name || '')).toLowerCase();
+      if (hay.indexOf(q) === -1) return false;
+    }
+    return true;
+  }
+
+  /**
    * 渲染部署历史表:上限 50 条 + 计数;
    * 传入 errMsg 时(读取失败)以空行形式就地展示错误。
+   * 第二十批阶段一:渲染前经 historyMatchesFilter 过滤,计数行区分
+   * 「筛选后 N / 共 M」;无匹配时给「无符合筛选的记录」空态(区别于全空)。
    */
   function renderHistory(errMsg) {
     var tbody = document.getElementById('deploy-history-tbody');
@@ -2521,20 +2781,26 @@
     }
 
     var records = st.history;
-    count.textContent = records.length + ' 条记录' +
-      (records.length > HISTORY_MAX_ROWS
-        ? '(显示最新 ' + HISTORY_MAX_ROWS + ' 条)' : '');
+    var filtered = records.filter(historyMatchesFilter);
+    var hasFilter = !!(st.historyFilter.mode || st.historyFilter.result || st.historyFilter.search);
+    count.textContent = hasFilter
+      ? '筛选后 ' + filtered.length + ' / 共 ' + records.length + ' 条记录' +
+        (filtered.length > HISTORY_MAX_ROWS ? '(显示最新 ' + HISTORY_MAX_ROWS + ' 条)' : '')
+      : records.length + ' 条记录' +
+        (records.length > HISTORY_MAX_ROWS
+          ? '(显示最新 ' + HISTORY_MAX_ROWS + ' 条)' : '');
 
-    if (records.length === 0) {
+    if (filtered.length === 0) {
       var emptyTr = document.createElement('tr');
-      var emptyTd = el('td', 'empty-cell', '暂无部署记录');
+      var emptyTd = el('td', 'empty-cell',
+        records.length === 0 ? '暂无部署记录' : '无符合筛选条件的记录');
       emptyTd.colSpan = 7;
       emptyTr.appendChild(emptyTd);
       tbody.appendChild(emptyTr);
       return;
     }
 
-    records.slice(0, HISTORY_MAX_ROWS).forEach(function (rec) {
+    filtered.slice(0, HISTORY_MAX_ROWS).forEach(function (rec) {
       var r = rec || {};
       var tr = document.createElement('tr');
 
@@ -2766,11 +3032,49 @@
     }
 
     // 部署历史:折叠开关 + 手动刷新
+    // 部署模板(第二十批阶段四):套用/保存/删除 + 下拉变化联动删除按钮
+    var pfApply = document.getElementById('deploy-profile-apply-btn');
+    if (pfApply) pfApply.addEventListener('click', onProfileApply);
+    var pfSave = document.getElementById('deploy-profile-save-btn');
+    if (pfSave) pfSave.addEventListener('click', onProfileSave);
+    var pfDel = document.getElementById('deploy-profile-delete-btn');
+    if (pfDel) pfDel.addEventListener('click', onProfileDelete);
+    var pfSel = document.getElementById('deploy-profile-select');
+    if (pfSel) {
+      pfSel.addEventListener('change', function () {
+        if (pfDel) pfDel.disabled = !String(pfSel.value || '');
+      });
+    }
+
     var histToggle = document.getElementById('deploy-history-toggle');
     if (histToggle) {
       histToggle.addEventListener('click', function () {
         var body = document.getElementById('deploy-history-body');
         setHistoryOpen(!!(body && body.classList.contains('hidden')));
+      });
+    }
+    // 历史筛选条(第二十批阶段一):变更即重渲染(数据已在内存,零请求);
+    // IME 组合中的输入不触发(bindFormEnter 同款判定)
+    var hfMode = document.getElementById('deploy-history-filter-mode');
+    if (hfMode) {
+      hfMode.addEventListener('change', function () {
+        st.historyFilter.mode = hfMode.value;
+        renderHistory();
+      });
+    }
+    var hfResult = document.getElementById('deploy-history-filter-result');
+    if (hfResult) {
+      hfResult.addEventListener('change', function () {
+        st.historyFilter.result = hfResult.value;
+        renderHistory();
+      });
+    }
+    var hfSearch = document.getElementById('deploy-history-filter-search');
+    if (hfSearch) {
+      hfSearch.addEventListener('input', function (e) {
+        if (e && (e.isComposing || e.keyCode === 229)) return; // IME 组合中
+        st.historyFilter.search = hfSearch.value.trim();
+        renderHistory();
       });
     }
     var histRefresh = document.getElementById('deploy-history-refresh-btn');

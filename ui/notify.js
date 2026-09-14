@@ -184,7 +184,9 @@
         onFailure: events.onFailure !== false,
         onCancel: events.onCancel === true,
         onProbe: events.onProbe === true
-      }
+      },
+      // 成功通知最小耗时(秒;0 = 恒通知;上限 3600 与后端夹取一致)
+      minDurationSecs: Math.max(0, Math.min(3600, Number(out.minDurationSecs) || 0))
     };
   }
 
@@ -310,6 +312,11 @@
     body.appendChild(checkboxRow('notify-event-cancel', '部署取消', false));
     // 探活翻转(第十七批):服务器在线→离线 / 离线→恢复时提醒(间隔在设置中心配)
     body.appendChild(checkboxRow('notify-event-probe', '服务器探活状态翻转', false));
+    // 成功通知最小耗时(第二十批阶段五):0 = 恒通知;成功且耗时不足阈值时
+    // 跳过通知(夜间批量的短平快成功不轰炸),失败/取消恒通知
+    appendField(body, '成功通知最小耗时(秒)', 'MIN DURATION', 'notify-min-duration', 'number', '0',
+      null, '0 = 每次成功都通知;例如 300 表示仅部署耗时超过 5 分钟的成功才通知',
+      { min: 0, max: 3600, step: 1 });
 
     // ── 测试结果行(行内回显,内容见 showResult)──
     var result = el('div', 'notify-test-result');
@@ -426,6 +433,9 @@
     setValue('notify-smtp-security', known ? security : 'ssl');
 
     setValue('notify-email-from', c.email.from);
+    // 成功通知最小耗时(第二十批阶段五):无条件回填(构建时预填 '0',
+    // 若带 value === '' 守卫会重蹈探活间隔不回显的覆辙 —— 见 2026-09-13 审查 P1-1)
+    setValue('notify-min-duration', Math.max(0, Math.min(3600, Number(c.minDurationSecs) || 0)));
     var ta = document.getElementById('notify-email-to');
     if (ta) ta.value = c.email.to.join('\n');
 
@@ -499,7 +509,9 @@
         onFailure: isChecked('notify-event-failure'),
         onCancel: isChecked('notify-event-cancel'),
         onProbe: isChecked('notify-event-probe')
-      }
+      },
+      // 成功通知最小耗时(秒;空/非法按 0 = 恒通知;上限 3600 与后端夹取一致)
+      minDurationSecs: Math.max(0, Math.min(3600, Math.floor(Number(fieldVal('notify-min-duration')) || 0)))
     };
   }
 

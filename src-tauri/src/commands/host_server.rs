@@ -26,6 +26,151 @@ pub async fn list_images() -> Result<Vec<ImageInfo>, String> {
         .map_err(|e| format!("获取镜像列表任务失败: {}", e))?
 }
 
+// ===== 服务器一键诊断(第二十批阶段三)=====
+
+/// 诊断步骤的结果(前端红绿灯渲染;camelCase)。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnoseStep {
+    /// 步骤键:`tcp` / `ssh` / `docker`
+    pub step: String,
+    /// `ok` / `fail` / `skipped`(前置失败则后续 skipped,不再尝试)
+    pub state: String,
+    /// 人类可读说明(成功为通过描述;失败为原因;skipped 为未执行原因)
+    pub detail: String,
+}
+
+/// 服务器一键诊断的整份报告(逐层短路:TCP 不通则 SSH/Docker 不再尝试)。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnoseReport {
+    pub steps: Vec<DiagnoseStep>,
+    /// 全部步骤 ok(= 可部署的最低保障:连得上 + docker 可用)
+    pub all_ok: bool,
+}
+
+/// 一键诊断:TCP 可达 → SSH 连接(横幅/TOFU/认证/传输错误分类)→ docker 可用。
+///
+/// 与 `test_server` 的区别:环境检测失败只给一句合并文案,用户分不清
+/// 「密码错 / 网络断 / 主机密钥变了 / docker 没装」;本命令逐层给判定,
+/// 前端红绿灯呈现。诊断用已存凭据(不收明文密码;改密码请走「测试连接」)。
+#[tauri::command]
+pub async fn server_diagnose(server_id: String) -> Result<DiagnoseReport, String> {
+    let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    let server = find_server(&cfg, &server_id)?.clone();
+    let mut steps: Vec<DiagnoseStep> = Vec::new();
+
+    // 层 1:TCP 可达(与 probe.rs 探活同口径,5s 超时)
+    let addr = format!("{}:{}", server.host, server.port);
+    let tcp_ok = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    {
+        Ok(Ok(_)) => true,
+        Ok(Err(e)) => {
+            steps.push(DiagnoseStep {
+                step: "tcp".into(),
+                state: "fail".into(),
+                detail: format!("无法连接 {}:{}({})", server.host, server.port, e),
+            });
+            false
+        }
+        Err(_) => {
+            steps.push(DiagnoseStep {
+                step: "tcp".into(),
+                state: "fail".into(),
+                detail: format!("连接 {}:{} 超时(5 秒):地址/端口不对或防火墙拦截", server.host, server.port),
+            });
+            false
+        }
+    };
+    if !tcp_ok {
+        steps.push(DiagnoseStep { step: "ssh".into(), state: "skipped".into(), detail: "TCP 不通,未尝试".into() });
+        steps.push(DiagnoseStep { step: "docker".into(), state: "skipped".into(), detail: "TCP 不通,未尝试".into() });
+        return Ok(DiagnoseReport { steps, all_ok: false });
+    }
+    steps.push(DiagnoseStep {
+        step: "tcp".into(),
+        state: "ok".into(),
+        detail: format!("{}:{} 端口可达", server.host, server.port),
+    });
+
+    // 层 2:SSH 连接(错误码分类:auth = 密码/私钥/口令/TOFU 问题,transport = 网络层)
+    let ssh_result = with_timeout(
+        SSH_CONNECT_TIMEOUT_SECS,
+        "连接超时",
+        "请检查服务器地址与网络",
+        SshClient::connect(&server, None, None, Arc::default()),
+    )
+    .await;
+    match ssh_result {
+        Err(e) => {
+            let code = crate::errors::code_of(&e);
+            let (state, hint) = match code {
+                Some(crate::errors::ErrCode::Auth) => ("fail", "认证/主机密钥被拒".to_string()),
+                Some(crate::errors::ErrCode::Timeout) => ("fail", "SSH 握手超时".to_string()),
+                _ => ("fail", "SSH 连接失败".to_string()),
+            };
+            steps.push(DiagnoseStep {
+                step: "ssh".into(),
+                state: state.into(),
+                detail: format!("{}:{}", hint, crate::errors::strip(&e)),
+            });
+            steps.push(DiagnoseStep { step: "docker".into(), state: "skipped".into(), detail: "SSH 未连接,未尝试".into() });
+            return Ok(DiagnoseReport { steps, all_ok: false });
+        }
+        Ok(mut client) => {
+            steps.push(DiagnoseStep {
+                step: "ssh".into(),
+                state: "ok".into(),
+                detail: format!("SSH 连接成功(用户 {})", server.username),
+            });
+            // 层 3:docker 可用(docker --version 退出码;失败再探权限)
+            let docker_ok = match exec_collect(&mut client, "docker --version").await {
+                Ok((0, out)) => {
+                    steps.push(DiagnoseStep {
+                        step: "docker".into(),
+                        state: "ok".into(),
+                        detail: out.trim().to_string(),
+                    });
+                    true
+                }
+                Ok((code, out)) => {
+                    // 退出码非 0:优先怀疑权限(docker.sock 无权 → 提示加组)
+                    let perm = exec_collect(&mut client, "docker info >/dev/null 2>&1; echo $?").await;
+                    let detail = match perm {
+                        Ok((_, ref o)) if o.trim() == "1" => format!(
+                            "docker 已安装但当前用户无权限(退出码 {}):请将用户加入 docker 组或用 root 连接。原始输出: {}",
+                            code,
+                            out.trim()
+                        ),
+                        _ => format!("docker 命令失败(退出码 {}):可能未安装。输出: {}", code, out.trim()),
+                    };
+                    steps.push(DiagnoseStep {
+                        step: "docker".into(),
+                        state: "fail".into(),
+                        detail,
+                    });
+                    false
+                }
+                Err(e) => {
+                    steps.push(DiagnoseStep {
+                        step: "docker".into(),
+                        state: "fail".into(),
+                        detail: format!("探测 docker 失败:{}", crate::errors::strip(&e)),
+                    });
+                    false
+                }
+            };
+            let _ = docker_ok;
+            let all_ok = steps.iter().all(|s| s.state == "ok");
+            Ok(DiagnoseReport { steps, all_ok })
+        }
+    }
+}
+
 // ===== 服务器命令 =====
 
 /// 连接服务器并检查远端环境(docker/compose/gzip/远端目录/磁盘空间)。

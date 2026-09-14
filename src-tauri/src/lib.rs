@@ -13,6 +13,7 @@ pub mod manage_stats;
 pub mod migrate_project;
 pub mod notify;
 pub mod probe;
+pub mod profiles;
 pub mod ssh;
 pub mod stack;
 pub mod tray_status;
@@ -39,7 +40,11 @@ pub fn run() {
       commands::save_server_entry,
       commands::retrust_host_key,
       config_io::config_export_file,
+      config_io::config_import_preview,
       config_io::config_import_file,
+      profiles::deploy_profiles_list,
+      profiles::deploy_profiles_save,
+      profiles::deploy_profiles_delete,
       config_io::config_wipe,
       notify::notify_get_config,
       notify::notify_save_config,
@@ -51,6 +56,7 @@ pub fn run() {
       commands::encrypt_password,
       commands::test_server,
       commands::server_env_check,
+      commands::server_diagnose,
       commands::install_server_docker,
       commands::create_remote_dir,
       commands::check_remote_dir,
