@@ -11,6 +11,12 @@ pub struct ManifestImage {
     pub tag: String,
     /// 发布目录内的镜像包文件名;未打包(跳过传输)为 `null`
     pub file: Option<String>,
+    /// 本次发布装载的镜像完整 ID(`sha256:` 前缀原样;第二十一批补丁新增)。
+    /// `None` = 旧归档(本字段引入前的 manifest)或采集失败 —— 两版本对比
+    /// 见到 `None` 时回退按 `tag` 比较(v6.3.1 前的行为)。**有 ID 时按 ID
+    /// 比较**:同名 tag 重新构建后 ID 不同,旧行为会误判「不变」。
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 /// 整栈部署成功时写入发布目录的 `manifest.json` 结构(回滚列表页据此展示
@@ -40,10 +46,16 @@ impl ReleaseManifest {
 /// `skip[i] == true` 表示该服务未打包(skip_unchanged 剔除且未留档),
 /// `file` 记 `None`,其余按顺序消费 `packed_files` 中的镜像包文件名。
 /// `tag` 存完整镜像引用(无标签时按 Docker 约定补 latest,见 [`split_image_ref`])。
+///
+/// `ids[i]`(第二十一批补丁):该服务镜像的完整 ID(`sha256:` 前缀原样;
+/// 采集失败为 `None`)。写入 manifest 供两版本对比按内容(而非 tag 名)
+/// 判变化 —— 同名 tag 重新构建后 ID 不同,只比 tag 会把「镜像换了」
+/// 误报为「不变」(用户真机反馈)。
 pub(crate) fn build_manifest_images(
     local: &[&StackServiceChoice],
     skip: &[bool],
     packed_files: &[String],
+    ids: &[Option<String>],
 ) -> Vec<ManifestImage> {
     let mut files = packed_files.iter();
     local
@@ -60,6 +72,7 @@ pub(crate) fn build_manifest_images(
                 service: svc.service.clone(),
                 tag: format!("{}:{}", repo, tag),
                 file,
+                id: ids.get(i).cloned().flatten(),
             }
         })
         .collect()

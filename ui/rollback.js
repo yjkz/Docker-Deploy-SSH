@@ -573,8 +573,15 @@
     body.appendChild(window.formGroupTitle('镜像清单', 'IMAGES'));
     if (rel.manifestImages && rel.manifestImages.length) {
       rel.manifestImages.forEach(function (img) {
+        // 镜像 ID 短哈希(v6.3.2):有采集时附在条目尾部,支持「两次部署同 tag
+        // 但内容不同」的人工核对(两版本对比按 ID 判变化的同源数据)
+        var idHint = '';
+        if (img.id) {
+          var body8 = (img.id.indexOf('sha256:') === 0) ? img.id.slice(7) : img.id;
+          idHint = ' · ' + body8.slice(0, 8);
+        }
         body.appendChild(el('div', 'rollback-release-meta mono',
-          img.service + ' → ' + img.tag + (img.file ? ('(' + img.file + ')') : '(未留档,仅跳过传输)')));
+          img.service + ' → ' + img.tag + idHint + (img.file ? ('(' + img.file + ')') : '(未留档,仅跳过传输)')));
       });
     } else {
       body.appendChild(el('div', 'rollback-hint-inline',
@@ -732,10 +739,15 @@
     });
     body.appendChild(head);
 
-    // 逐服务镜像对比(manifestImages:service + tag)
+    // 逐服务镜像对比(manifestImages:service + tag + id)。
+    // **变化判定优先按镜像 ID(内容寻址)**:同名 tag 重新构建后 ID 不同 ——
+    // 只比 tag 名会把「镜像换了」误报为「不变」(用户真机反馈)。任一旧/新项
+    // 缺 ID(旧归档)时回退按 tag 比较(v6.3.2 前的行为),并在表下注明。
     var mapOf = function (r) {
       var m = {};
-      (r.manifestImages || []).forEach(function (img) { m[img.service] = img.tag || ''; });
+      (r.manifestImages || []).forEach(function (img) {
+        m[img.service] = { tag: img.tag || '', id: img.id || '' };
+      });
       return m;
     };
     var mOld = mapOf(older);
@@ -744,6 +756,14 @@
     Object.keys(mOld).forEach(function (k) { names[k] = true; });
     Object.keys(mNew).forEach(function (k) { names[k] = true; });
     var svcNames = Object.keys(names).sort();
+    // 短哈希展示(sha256: 前缀后取 8 位;空则空串)
+    var shortId = function (id) {
+      var s = String(id || '');
+      if (!s) return '';
+      var body = s.indexOf('sha256:') === 0 ? s.slice(7) : s;
+      return body.slice(0, 8);
+    };
+    var anyFallback = false;
 
     var table = document.createElement('table');
     table.className = 'data-table diff-table';
@@ -767,15 +787,34 @@
     svcNames.forEach(function (name) {
       var hasOld = Object.prototype.hasOwnProperty.call(mOld, name);
       var hasNew = Object.prototype.hasOwnProperty.call(mNew, name);
+      var o = hasOld ? mOld[name] : null;
+      var n = hasNew ? mNew[name] : null;
       var tr = document.createElement('tr');
       tr.appendChild(el('td', 'mono', name));
-      tr.appendChild(el('td', 'mono diff-cell' + (hasOld ? '' : ' diff-absent'),
-        hasOld ? mOld[name] : '—'));
-      tr.appendChild(el('td', 'mono diff-cell' + (hasNew ? '' : ' diff-absent'),
-        hasNew ? mNew[name] : '—'));
-      var change = hasOld && hasNew
-        ? (mOld[name] === mNew[name] ? '不变' : '镜像变化')
-        : (hasNew ? '新增服务' : '移除服务');
+      // 单元格:tag + 短哈希副行(ID 采集到才展示)
+      var cellFor = function (v, present) {
+        if (!present) return el('td', 'mono diff-cell diff-absent', '—');
+        var td = el('td', 'mono diff-cell');
+        td.appendChild(el('div', '', v.tag));
+        var sid = shortId(v.id);
+        if (sid) td.appendChild(el('div', 'diff-id-hint', sid));
+        return td;
+      };
+      tr.appendChild(cellFor(o, hasOld));
+      tr.appendChild(cellFor(n, hasNew));
+      var change;
+      if (!hasOld) {
+        change = '新增服务';
+      } else if (!hasNew) {
+        change = '移除服务';
+      } else if (o.id && n.id) {
+        // 双侧都有 ID:按内容判(核心修复)
+        change = (o.id === n.id) ? '不变' : '镜像变化';
+      } else {
+        // 任一侧缺 ID(旧归档/采集失败):回退按 tag,并注明
+        anyFallback = true;
+        change = (o.tag === n.tag) ? '不变' : '镜像变化';
+      }
       var tdChg = document.createElement('td');
       var kind = (change === '不变') ? 'info' : (change === '移除服务' ? 'fail' : 'warn');
       tdChg.appendChild(window.fillBadge(el('span'), kind, change));
@@ -784,6 +823,11 @@
     });
     table.appendChild(tbody);
     body.appendChild(table);
+    if (anyFallback) {
+      body.appendChild(el('div', 'rollback-hint-inline',
+        '部分服务缺少镜像 ID 记录(旧版本归档未采集):这些行仅按标签名比较,' +
+        '同名标签重新构建可能显示「不变」;此后新部署的归档会记录 ID,对比更准确。'));
+    }
 
     // 版本说明对比(两条各一段;空的不渲染)
     if (older.noteBody || newer.noteBody) {

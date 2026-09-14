@@ -254,12 +254,19 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 - **守护**:新源码级测试 `test_all_connect_sites_resolve_credentials` 扫描六文件全部 connect 调用必须传解析后凭据(先红后绿验证精确命中 `host_server.rs:139`)
 - 验证:333 passed(+1)/ clippy 零新增 / doc-consistency 全 PASS
 
+### 第二十一批补丁2 v6.3.2(版本对比按镜像 ID)— 已完成
+- **真机反馈**:两版本对比「明明镜像更新了还显示无变化」——原对比只比 `manifest.tag` 字符串,同名 tag 重新构建后 ID 不同却被判「不变」
+- **修复**:`ManifestImage` 增 `id`(部署时采集本地镜像完整 ID 写入 manifest;`#[serde(default)]` 兼容旧归档);前端对比**ID 优先**、任一侧缺 ID 回退按 tag 并注明;详情模态与对比表展示短哈希
+- **单测**:build_manifest_images 记录 ID / 旧归档无 id 字段 serde 兼容;行为验证 7 用例(核心:同名 tag 不同 ID → 镜像变化)
+- 验证:335 passed(+2)/ clippy 保持基线 / doc-consistency 全 PASS
+- 注意:旧归档(本版前部署)无 ID,对比其与新版仍回退按 tag;重部署一次即写入 ID
+
 
 ---
 
 ## 当前状态速览
 
-- 版本 **v6.3.1**;main = origin/main;基线 `cargo test` **333 passed** / 13 ignored
+- 版本 **v6.3.2**;main = origin/main;基线 `cargo test` **335 passed** / 13 ignored
 - 命令 **101** 个(generate_handler 实测;第二十批 +5,第二十一批 +1 `write_text_file`)
 - JS **16** 文件(含 theme-init.js;index.html 加载顺序见 wiki/03:13)
 - 前端结构:12 模态;commands/ 11 文件;三大 JS 主文件 2338/2013/2537 行

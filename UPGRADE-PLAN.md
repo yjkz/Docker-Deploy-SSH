@@ -2108,3 +2108,43 @@ host_server/deploy/rollback/cleanup/resume/manage 六文件的全部
   (基线 332 + 守护测试 1);守护测试先红后绿已证真;clippy 零新增
 - doc-consistency 四类断言全 PASS(版本 6.3.1 / 命令 101 / 测试 333)
 - 真机待确认:加密私钥服务器的「一键诊断」全绿(与测试连接行为一致)
+
+# 第二十一批补丁2(v6.3.2)— 两版本对比改按镜像 ID
+
+> 用户真机反馈:「两版本对比的版本说明比较奇怪……明明我的镜像更新了但还是
+> 对比的时候显示无变化」。用户判断准确:原实现**只比 `tag` 字符串**。
+
+## 缺陷
+
+`#release-diff-modal`(第二十一批)的对比数据源是 manifest 的
+`ManifestImage { service, tag, file }` —— **不含镜像 ID**。两次部署之间
+tag 名不变(如 `myapp:latest`)但内容已重新构建时,ID 不同而 tag 相同,
+对比必然显示「不变」;只有新增/移除服务(来自服务名集合差异)能看出来。
+
+## 修复
+
+- **后端**:`ManifestImage` 增 `id: Option<String>`(`sha256:` 前缀原样;
+  `#[serde(default)]` 兼容旧归档)。部署收尾写入 manifest:
+  - 智能传输路径复用判定时已查到的 `image_id_by_ref` 结果(零额外调用);
+  - 非智能传输/断点续传路径经新助手 `collect_local_image_ids` 采集
+    (纯本机 inspect,毫秒级;单项失败为 None 不阻断部署)
+  - `build_manifest_images` 增 `ids` 参数(纯函数,签名 +1)
+- **前端**:对比判定改为**ID 优先**——双侧都有 ID 按 ID 判(内容寻址);
+  任一侧缺 ID(旧归档/采集失败)回退按 tag 比较,并在表下注明回退原因;
+  详情模态与对比表的 tag 后附短哈希(8 位),支持人工核对
+- **单测 2**:`build_manifest_images` 记录 ID(含打包/跳过两态)/ 旧归档
+  manifest.json 无 id 字段 serde 兼容 + 新归档 id 往返
+- **行为验证**(Node 复刻判定逻辑 7 用例):核心场景「同名 tag 不同 ID →
+  镜像变化」通过;回退/新增/移除各态正确
+
+## 已知边界(记录)
+
+- 本版**之前**的旧归档没有 ID 记录,与新版对比时这些行仍走 tag 回退
+  (界面已注明);重新部署一次即写入 ID,从此对比按内容
+- 单镜像部署不受影响:走日期标签,每次 tag 自带时间戳,天然按内容区分
+
+## 验证
+
+- `cargo test` 显式确认 `test result: ok. 335 passed; 0 failed; 13 ignored`
+  (基线 333 + 2);clippy 保持基线 18;doc-consistency 全 PASS
+- 真机待确认:重新部署一次整栈 → 两次新归档对比应正确显示「镜像变化」

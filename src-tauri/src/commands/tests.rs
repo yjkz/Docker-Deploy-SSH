@@ -2552,3 +2552,42 @@ services:
             bad
         );
     }
+
+    // ===== manifest 镜像条目:ID 记录与旧归档兼容(v6.3.2)=====
+
+    #[test]
+    fn test_build_manifest_images_records_id() {
+        let owned = [
+            StackServiceChoice { service: "web".into(), image: "myapp:latest".into(), mode: TransferMode::Local },
+            StackServiceChoice { service: "db".into(), image: "postgres:16".into(), mode: TransferMode::Local },
+        ];
+        let local: Vec<&StackServiceChoice> = owned.iter().collect();
+        let ids = vec![Some("sha256:aaa".to_string()), None];
+        let files = vec!["web.tar.gz".to_string()];
+        let m = build_manifest_images(&local, &[false, true], &files, &ids);
+        assert_eq!(m.len(), 2);
+        // 打包项:id 记录 + 文件名按顺序消费
+        assert_eq!(m[0].service, "web");
+        assert_eq!(m[0].tag, "myapp:latest");
+        assert_eq!(m[0].file.as_deref(), Some("web.tar.gz"));
+        assert_eq!(m[0].id.as_deref(), Some("sha256:aaa"), "ID 应写入 manifest(对比按内容判变化)");
+        // 跳过项:file 无、id 无(采集失败回退按 tag 比较)
+        assert_eq!(m[1].service, "db");
+        assert_eq!(m[1].file, None);
+        assert_eq!(m[1].id, None);
+    }
+
+    #[test]
+    fn test_manifest_image_legacy_json_without_id() {
+        // 旧归档(本字段引入前)的 manifest.json 无 id 字段 → serde default 兼容 None
+        let legacy = r#"{"project":"app","ts":"20260101-000000","compose_copy":"docker-compose.yml",
+            "images":[{"service":"web","tag":"app:latest","file":"app.tar.gz"}]}"#;
+        let m = parse_release_manifest(legacy).expect("旧 manifest 应可解析");
+        assert_eq!(m.images.len(), 1);
+        assert_eq!(m.images[0].id, None, "旧归档 id 应为 None(对比回退按 tag)");
+        // 新归档带 id 可往返
+        let fresh = r#"{"project":"app","ts":"20260101-000000","compose_copy":"docker-compose.yml",
+            "images":[{"service":"web","tag":"app:latest","file":"app.tar.gz","id":"sha256:bbb"}]}"#;
+        let m2 = parse_release_manifest(fresh).expect("新 manifest 应可解析");
+        assert_eq!(m2.images[0].id.as_deref(), Some("sha256:bbb"));
+    }

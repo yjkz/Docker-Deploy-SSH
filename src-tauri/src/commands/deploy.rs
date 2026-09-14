@@ -1151,6 +1151,19 @@ pub(crate) async fn query_remote_image_id_map(
         .collect())
 }
 
+/// 采集逐个 Local 服务的本地镜像完整 ID(第二十一批补丁;写入 manifest 供
+/// 两版本对比按内容判变化)。逐个 `docker image inspect`(纯本机调用,毫秒级);
+/// 任一失败该项为 `None`(对比时回退按 tag 比较,不阻断部署)。
+pub(crate) async fn collect_local_image_ids(
+    local: &[&StackServiceChoice],
+) -> Vec<Option<String>> {
+    let mut ids = Vec::with_capacity(local.len());
+    for svc in local {
+        ids.push(image_id_by_ref(&svc.image).await.ok().flatten());
+    }
+    ids
+}
+
 // ===== 整栈部署管线(六步,任一步失败即中止)=====
 
 /// 整栈部署管线入口:组装部署历史记录骨架(含开始计时),执行管线主体,
@@ -1275,6 +1288,10 @@ async fn run_deploy_stack_steps(
     let skip_unchanged = req.skip_unchanged.unwrap_or(false);
     let force_archive = req.force_archive.unwrap_or(false);
     let mut unchanged: Vec<bool> = vec![false; local_choices.len()];
+    // 逐服务本地镜像完整 ID(第二十一批补丁:写入 manifest 供两版本对比按
+    // 内容判变化;采集失败为 None,对比回退按 tag 比较)。
+    // 断点续传:ID 随断点产物带回(art 无该字段时为空,重新采集)。
+    let mut local_ids: Vec<Option<String>> = Vec::new();
     if resume_step > 1 {
         emit_log(app, "断点续传:跳过步骤 1(分类确认)");
         // 恢复智能传输判定结果(与 Local 服务顺序对齐;不重跑判定,见函数文档)
@@ -1285,6 +1302,8 @@ async fn run_deploy_stack_steps(
                     .to_string(),
             );
         }
+        // 断点不含 ID 记录(旧断点/未存):就地重新采集(纯本机 inspect,快)
+        local_ids = collect_local_image_ids(&local_choices).await;
     } else {
         emit_progress(app, 1, 6, "分类确认");
         ensure_not_cancelled(app)?;
@@ -1321,13 +1340,14 @@ async fn run_deploy_stack_steps(
             let (_server, mut probe) =
                 connect_server(&req.server_id, req.password_plain.as_deref(), None).await?;
             let remote_ids = query_remote_image_id_map(&mut probe).await?;
+            local_ids = vec![None; local_choices.len()];
             for (i, svc) in local_choices.iter().enumerate() {
                 let (repo, tag) = split_image_ref(&svc.image);
                 let full_ref = format!("{}:{}", repo, tag);
-                let (Some(remote_id), Ok(Some(local_id))) = (
-                    remote_ids.get(&full_ref),
-                    image_id_by_ref(&svc.image).await,
-                ) else {
+                let local_id = image_id_by_ref(&svc.image).await.ok().flatten();
+                // 收集本地 ID(manifest 记录用;与对比判定共用同一次 inspect)
+                local_ids[i] = local_id.clone();
+                let (Some(remote_id), Some(local_id)) = (remote_ids.get(&full_ref), local_id) else {
                     continue;
                 };
                 if same_image_id(remote_id, &local_id) {
@@ -1339,6 +1359,9 @@ async fn run_deploy_stack_steps(
                     }
                 }
             }
+        } else if !local_choices.is_empty() {
+            // 非智能传输:单独采集本地 ID(纯本机 inspect;对比判变化需要)
+            local_ids = collect_local_image_ids(&local_choices).await;
         }
         art.unchanged = unchanged.clone();
         if checkpoint {
@@ -1424,7 +1447,8 @@ async fn run_deploy_stack_steps(
     // (断点续传时 unchanged 来自断点,结果与首次部署一致)
     let skip_flags: Vec<bool> = unchanged.iter().map(|u| *u && !force_archive).collect();
     let packed_files: Vec<String> = tars.files.iter().map(|(_, n)| n.clone()).collect();
-    let manifest_images = build_manifest_images(&local_choices, &skip_flags, &packed_files);
+    let manifest_images =
+        build_manifest_images(&local_choices, &skip_flags, &packed_files, &local_ids);
 
     // ---- 步骤 3:上传 ----
     // 断点续传:步骤 3 已完成时不再推送本步进度(事件从 step_next 起)

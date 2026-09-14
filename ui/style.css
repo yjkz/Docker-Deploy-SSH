@@ -4054,3 +4054,10 @@ tr.stat-flash > td:first-child {
   background: var(--ark-surface);
   border: 1px solid var(--ark-line-soft);
 }
+
+/* 两版本对比:镜像短哈希副行(v6.3.2,ID 采集到才展示) */
+.diff-id-hint {
+  font-size: 11px;
+  color: var(--ark-paper-dim-ink);
+  margin-top: 2px;
+}
