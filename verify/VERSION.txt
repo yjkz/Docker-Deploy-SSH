@@ -1,0 +1,6 @@
+{
+  "version": "6.2.0",
+  "commands": 101,
+  "tests": 332,
+  "updatedAt": "2026-09-14"
+}

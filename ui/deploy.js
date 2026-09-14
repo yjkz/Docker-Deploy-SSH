@@ -2474,6 +2474,94 @@
       .catch(function () { return null; });
   }
 
+  /**
+   * 批量报告导出(第二十一批):把本次批量的逐台结果落为 Markdown 文件。
+   * 数据全部来自 st.batch.results(关页即失,故提供导出留档);经系统保存
+   * 对话框选路径(tauri-plugin-dialog 的 save)。报告含:汇总计数、逐台
+   * 结果/消息、模式与时刻;续传台附「可用「续传此台」继续」提示。
+   */
+  function onExportBatchReport() {
+    if (!st.batch || !Array.isArray(st.batch.results) || st.batch.results.length === 0) {
+      window.toast('暂无可导出的批量结果', 'warn');
+      return;
+    }
+    var lines = [];
+    var d = new Date();
+    var pad = function (n) { return (n < 10 ? '0' : '') + n; };
+    var stamp = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+      ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+    lines.push('# 批量' + (st.batch.resume ? '续传' : '部署') + '报告');
+    lines.push('');
+    lines.push('- 时间: ' + stamp);
+    lines.push('- 模式: ' + (st.batch.mode === 'stack' ? '整栈' : '单镜像'));
+    lines.push('- 结果: ' + st.batch.success + ' 成功 / ' + st.batch.failed + ' 失败 / ' +
+      st.batch.skipped + ' 跳过(共 ' + st.batch.results.length + ' 台)');
+    lines.push('');
+    lines.push('| 服务器 | 结果 | 说明 |');
+    lines.push('|---|---|---|');
+    st.batch.results.forEach(function (r) {
+      var stateText = r.state === 'success' ? '成功'
+        : (r.state === 'skipped' ? '跳过' : '失败');
+      var msg = String(r.message || '').replace(/\|/g, '\\|').replace(/\n/g, ' ');
+      lines.push('| ' + String(r.serverName || '').replace(/\|/g, '\\|') +
+        ' | ' + stateText + ' | ' + msg + ' |');
+    });
+    var resumable = Array.isArray(st.batch.resumable) ? st.batch.resumable : [];
+    if (resumable.length > 0) {
+      lines.push('');
+      lines.push('> ' + resumable.length + ' 台可在部署页用「续传此台 / 续传未完成服务器」继续(断点保留)。');
+    }
+    var text = lines.join('\n') + '\n';
+
+    var dlg = (window.__TAURI__ || {}).dialog;
+    if (!dlg || typeof dlg.save !== 'function') {
+      window.toast('保存对话框不可用', 'fail');
+      return;
+    }
+    dlg.save({
+      defaultPath: 'batch-report-' + d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) +
+        '-' + pad(d.getHours()) + pad(d.getMinutes()) + '.md',
+      filters: [{ name: 'Markdown', extensions: ['md'] }]
+    }).then(function (path) {
+      if (!path) return; // 用户取消
+      return window.AppBus.invoke('write_text_file', { path: path, content: text });
+    }).then(function () {
+      window.toast('批量报告已导出', 'ok');
+    }).catch(function (err) {
+      window.toast('导出报告失败:' + (errText(err) || '未知错误'), 'fail');
+    });
+  }
+
+  /**
+   * 整台重跑失败台(第二十一批):把 results 里失败的台按 queue 映射回
+   * server/project,组装成普通队列从头发起(**不用断点**,与「续传此台」区分:
+   * 该入口用于续传也救不了的场景,如断点已清理/需整台重来)。
+   */
+  function onBatchRerunFailed() {
+    if (st.batchResumeBusy || st.deploying || st.checking ||
+        (st.batch && st.batch.active) || window.ddRemoteOp) return;
+    if (!st.batch || !Array.isArray(st.batch.queue)) return;
+    var failedNames = {};
+    st.batch.results.forEach(function (r) {
+      if (r && r.state === 'failed') failedNames[String(r.serverName)] = true;
+    });
+    var failedItems = st.batch.queue.filter(function (it) {
+      return it && it.server && failedNames[String(it.server.name || it.server.id)];
+    });
+    if (failedItems.length === 0) {
+      window.toast('没有可重跑的失败服务器(配置可能已变化)', 'warn');
+      return;
+    }
+    window.toast('从头发起重跑 ' + failedItems.length + ' 台失败服务器', 'info');
+    st.batch = {
+      active: true, mode: st.batch.mode, queue: failedItems, idx: 0,
+      success: 0, failed: 0, skipped: 0, aborted: false,
+      deferred: null, results: [], resumable: []
+    };
+    renderBatchPanel();
+    runBatchNext();
+  }
+
   /** 单台续传:现查断点 → 组装成单项批量队列(进度/收尾口径与批量一致) */
   function onBatchResumeOne(entry) {
     if (!entry || st.batchResumeBusy || st.deploying || st.checking ||
@@ -2572,6 +2660,31 @@
       resumeAllBtn.disabled = st.batchResumeBusy || st.deploying || st.checking;
       resumeAllBtn.addEventListener('click', onBatchResumeAll);
       head.appendChild(resumeAllBtn);
+    }
+    // 批量结束后:导出报告(第二十一批)+ 整台重跑失败台(不续传,从头跑)
+    if (!st.batch.active && Array.isArray(st.batch.results) && st.batch.results.length > 0) {
+      var exportBtn = document.createElement('button');
+      exportBtn.id = 'deploy-batch-export-btn';
+      exportBtn.className = 'btn btn-sm';
+      exportBtn.type = 'button';
+      exportBtn.textContent = '导出报告';
+      exportBtn.addEventListener('click', onExportBatchReport);
+      head.appendChild(exportBtn);
+
+      var failedCount = st.batch.results.filter(function (r) {
+        return r && r.state === 'failed';
+      }).length;
+      if (failedCount > 0) {
+        var rerunBtn = document.createElement('button');
+        rerunBtn.id = 'deploy-batch-rerun-btn';
+        rerunBtn.className = 'btn btn-sm';
+        rerunBtn.type = 'button';
+        rerunBtn.textContent = '重跑失败台(' + failedCount + ' 台)';
+        rerunBtn.title = '从头发起失败的台(不用断点续传;要续传请用「续传此台」)';
+        rerunBtn.disabled = st.batchResumeBusy || st.deploying || st.checking;
+        rerunBtn.addEventListener('click', onBatchRerunFailed);
+        head.appendChild(rerunBtn);
+      }
     }
     panel.appendChild(head);
 

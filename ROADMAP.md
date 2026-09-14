@@ -240,14 +240,22 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 - 验证:`cargo test` 332 passed(+4:并表 cap+并发/err 闭包零落盘/哨兵拒绝/import preview 摘要+不落盘;+3:profiles save_roundtrip+cap 裁剪/notify 阈值纯函数);clippy 零新增;node --check 17 个 JS;verify 三脚本 PASS;**5 项功能均经浏览器桩(本机 http.server + Tauri-stub)逐项验证**(历史筛选三轴、模板套用回填表单六字段、诊断模态红绿灯、导入预览两段式确认区、通知阈值字段保存载荷 minDurationSecs=300);judge 4 张截图全部 pass
 - 命令数:HEAD 基线 96 → 101(config_import_preview / server_diagnose / deploy_profiles_list+save+delete;此前文档记载 95 与实际差 1,本批以 awk 实测为准)
 
+### 第二十一批 v6.3.0(第二梯队五项 + 文档治理)— 已完成
+- **批量报告导出 + 重跑失败台**:批量结束面板新增「导出报告」(Markdown 落盘,新命令 `write_text_file` 原子写)与「重跑失败台(N 台)」(从头跑不用断点,与「续传此台」区分)
+- **回滚两版本对比**:06 页归档勾选两个 → `#release-diff-modal` 逐服务镜像 diff(四态徽章)+ 版本说明并排;纯前端(数据在 `rollback_project_detail` 已返回),零新命令
+- **启动静默检查更新**:`autoCheckUpdate`(缺省开)+ dock 版本号徽点(不弹窗,点击进设置);**更新失败回执**:标记版本不一致明示「已回到旧版」
+- **托盘闭环**:菜单加「停止当前部署」(动态启用,置取消位)+「上次部署:…」只读项
+- **verify/doc-consistency.js**:版本号/命令数/测试数三断言;上线当天抓到 wiki/README 测试数失准(325→332)并修复;〇清扫 ROADMAP 矛盾行与待修复清单 P1-3 终态
+- 验证:332 passed / clippy 零新增 / release build 通过 / verify 四脚本 PASS
+
 
 ---
 
 ## 当前状态速览
 
-- 版本 **v6.2.0**;main = origin/main;基线 `cargo test` **332 passed** / 13 ignored
-- 命令 **101** 个(lib.rs awk 实测;wiki/04 待同步)
-- 命令 **95** 个(lib.rs 注册;wiki/04 已同步);JS **16** 文件(含 theme-init.js;index.html 加载顺序见 wiki/03:13)
+- 版本 **v6.3.0**;main = origin/main;基线 `cargo test` **332 passed** / 13 ignored
+- 命令 **101** 个(generate_handler 实测;第二十批 +5,第二十一批 +1 `write_text_file`)
+- JS **16** 文件(含 theme-init.js;index.html 加载顺序见 wiki/03:13)
 - 前端结构:12 模态;commands/ 11 文件;三大 JS 主文件 2338/2013/2537 行
 - 表单体系(第十三批):5 处模态有真实 `<form novalidate>` 语义;失焦校验 + Enter 提交由 app.js 三助手统一承担
 - 批量部署(第十四批):失败/取消台可续传(单台 + 一键批量);「停止批量」步骤边界即时中止;批量恒落断点(与死代码 `deploy_batch` 的「不落断点」无关)

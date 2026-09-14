@@ -40,6 +40,8 @@
   var detailSeq = 0;
   /** 版本详情模态当前编辑的归档 { dir, ts } */
   var editingRelease = null;
+  /** 两版本对比勾选(第二十一批):最多两项,先进先出;切项目/重载明细时按现存归档过滤 */
+  var diffSel = [];
 
   function $(id) { return document.getElementById(id); }
 
@@ -262,12 +264,14 @@
     // 选中态若已失效(目录消失),清空明细
     if (selectedDir && !projects.some(function (p) { return p.dir === selectedDir; })) {
       selectedDir = null;
+      diffSel = [];
       renderDetailEmpty();
     }
   }
 
   function selectProject(dir) {
     selectedDir = dir;
+    diffSel = []; // 切项目清对比勾选(跨项目的归档不可比)
     renderProjects(currentProjects, true);
     loadDetail(dir, false);
   }
@@ -326,7 +330,20 @@
     }
 
     // ---- 发布归档 ----
-    box.appendChild(el('div', 'rollback-section-title', '发布归档 RELEASES'));
+    var relTitle = el('div', 'rollback-section-title', '发布归档 RELEASES');
+    // 勾选恰两个时出现「对比选中版本」(纯前端,数据都在本 detail 里)
+    diffSel = diffSel.filter(function (ts) {
+      return (detail.releases || []).some(function (x) { return x.ts === ts; });
+    });
+    if (diffSel.length === 2) {
+      var diffBtn = el('button', 'btn btn-sm rollback-diff-btn', '对比选中版本');
+      diffBtn.type = 'button';
+      diffBtn.addEventListener('click', function () {
+        openDiffModal(detail);
+      });
+      relTitle.appendChild(diffBtn);
+    }
+    box.appendChild(relTitle);
     var releases = detail.releases || [];
     if (releases.length === 0) {
       box.appendChild(el('div', 'rollback-empty-inline',
@@ -338,6 +355,26 @@
         row.addEventListener('click', function () {
           openReleaseDetail(r);
         });
+        // 两版本对比(第二十一批):行首勾选框,勾满两个出现「对比选中版本」
+        var diffCb = document.createElement('input');
+        diffCb.type = 'checkbox';
+        diffCb.className = 'rollback-diff-cb';
+        diffCb.setAttribute('aria-label', '选择用于对比的版本 ' + r.ts);
+        diffCb.checked = diffSel.indexOf(r.ts) !== -1;
+        diffCb.addEventListener('click', function (e) {
+          e.stopPropagation(); // 不触发行「查看详情」
+        });
+        diffCb.addEventListener('change', function () {
+          if (diffCb.checked) {
+            diffSel.push(r.ts);
+            if (diffSel.length > 2) diffSel.shift(); // 最多两个,先进先出
+          } else {
+            var idx = diffSel.indexOf(r.ts);
+            if (idx !== -1) diffSel.splice(idx, 1);
+          }
+          renderDetail(detailCache); // 重渲染以刷新对比按钮与勾选态
+        });
+        row.appendChild(diffCb);
         var info = el('div', 'rollback-release-info');
         info.appendChild(el('span', 'rollback-release-ts mono', r.ts));
         // 版本标题(第七批):设置了说明的归档在 ts 旁展示
@@ -652,6 +689,126 @@
     editingRelease = null;
   }
 
+  // ===== 两版本对比(第二十一批)=====
+
+  /**
+   * 打开对比模态:把 detail.releases 中勾选的两个归档并排对比。
+   * 数据源:RollbackProjectDetail.releases 每项已含 manifestImages(逐服务
+   * image tag)与服务清单——纯前端计算,零额外往返。
+   * 对比维度:服务新增/移除、同名服务的镜像 tag 变化;附版本说明与归档包数。
+   */
+  function openDiffModal(detail) {
+    var overlay = $('release-diff-modal');
+    var body = $('release-diff-modal-body');
+    if (!overlay || !body) return;
+    detailCache = detail || null;
+    var releases = (detail && Array.isArray(detail.releases)) ? detail.releases : [];
+    var older = null;
+    var newer = null;
+    // diffSel 依勾选顺序 push;按 ts 排序让「旧 → 新」阅读方向稳定(ts 可排序)
+    var picked = releases.filter(function (r) { return diffSel.indexOf(r.ts) !== -1; });
+    picked.sort(function (a, b) { return String(a.ts).localeCompare(String(b.ts)); });
+    older = picked[0] || null;
+    newer = picked[1] || null;
+
+    body.textContent = '';
+    if (!older || !newer) {
+      body.appendChild(el('div', 'rollback-empty', '请勾选两个版本后再对比'));
+      overlay.classList.remove('hidden');
+      window.modalFocusOpen(overlay);
+      return;
+    }
+
+    // 头部:两侧 ts + 标题/备注
+    var head = el('div', 'diff-head');
+    [older, newer].forEach(function (r) {
+      var col = el('div', 'diff-head-col');
+      col.appendChild(el('div', 'diff-head-ts mono', r.ts));
+      if (r.noteTitle) col.appendChild(el('div', 'diff-head-note', r.noteTitle));
+      var meta = (r.packages && r.packages.length ? r.packages.length + ' 个镜像包' : '') +
+        (r.hasComposeCopy ? ' · 含 compose' : '');
+      if (meta) col.appendChild(el('div', 'diff-head-meta', meta));
+      head.appendChild(col);
+    });
+    body.appendChild(head);
+
+    // 逐服务镜像对比(manifestImages:service + tag)
+    var mapOf = function (r) {
+      var m = {};
+      (r.manifestImages || []).forEach(function (img) { m[img.service] = img.tag || ''; });
+      return m;
+    };
+    var mOld = mapOf(older);
+    var mNew = mapOf(newer);
+    var names = {};
+    Object.keys(mOld).forEach(function (k) { names[k] = true; });
+    Object.keys(mNew).forEach(function (k) { names[k] = true; });
+    var svcNames = Object.keys(names).sort();
+
+    var table = document.createElement('table');
+    table.className = 'data-table diff-table';
+    var thead = document.createElement('thead');
+    var htr = document.createElement('tr');
+    ['服务 SERVICE', older.ts, newer.ts, '变化'].forEach(function (t) {
+      var th = document.createElement('th');
+      th.textContent = t;
+      htr.appendChild(th);
+    });
+    thead.appendChild(htr);
+    table.appendChild(thead);
+    var tbody = document.createElement('tbody');
+    if (svcNames.length === 0) {
+      var etr = document.createElement('tr');
+      var etd = el('td', 'empty-cell', '两个归档都没有服务清单(旧版本发布无 manifest),仅可对比上面的元信息');
+      etd.colSpan = 4;
+      etr.appendChild(etd);
+      tbody.appendChild(etr);
+    }
+    svcNames.forEach(function (name) {
+      var hasOld = Object.prototype.hasOwnProperty.call(mOld, name);
+      var hasNew = Object.prototype.hasOwnProperty.call(mNew, name);
+      var tr = document.createElement('tr');
+      tr.appendChild(el('td', 'mono', name));
+      tr.appendChild(el('td', 'mono diff-cell' + (hasOld ? '' : ' diff-absent'),
+        hasOld ? mOld[name] : '—'));
+      tr.appendChild(el('td', 'mono diff-cell' + (hasNew ? '' : ' diff-absent'),
+        hasNew ? mNew[name] : '—'));
+      var change = hasOld && hasNew
+        ? (mOld[name] === mNew[name] ? '不变' : '镜像变化')
+        : (hasNew ? '新增服务' : '移除服务');
+      var tdChg = document.createElement('td');
+      var kind = (change === '不变') ? 'info' : (change === '移除服务' ? 'fail' : 'warn');
+      tdChg.appendChild(window.fillBadge(el('span'), kind, change));
+      tr.appendChild(tdChg);
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    body.appendChild(table);
+
+    // 版本说明对比(两条各一段;空的不渲染)
+    if (older.noteBody || newer.noteBody) {
+      body.appendChild(el('div', 'rollback-section-title', '版本说明 NOTES'));
+      [older, newer].forEach(function (r) {
+        if (!r.noteBody) return;
+        var block = el('div', 'diff-note');
+        block.appendChild(el('div', 'diff-note-ts mono', r.ts));
+        block.appendChild(el('div', 'diff-note-body', r.noteBody));
+        body.appendChild(block);
+      });
+    }
+
+    overlay.classList.remove('hidden');
+    window.modalFocusOpen(overlay);
+  }
+
+  function closeDiffModal() {
+    var overlay = $('release-diff-modal');
+    if (overlay) overlay.classList.add('hidden');
+    window.modalFocusClose(overlay);
+    var body = $('release-diff-modal-body');
+    if (body) body.textContent = '';
+  }
+
   // ===== 回滚计划与确认 =====
 
   /**
@@ -855,6 +1012,21 @@
       document.addEventListener('keydown', function (e) {
         if (e.key === 'Escape' && window.isTopModal('release-detail-modal')) {
           closeReleaseDetail();
+        }
+      });
+    }
+
+    // 两版本对比模态(第二十一批):关闭钮 / 遮罩 / Esc 三通道
+    var dfClose = $('release-diff-modal-close');
+    if (dfClose) dfClose.addEventListener('click', closeDiffModal);
+    var dfOverlay = $('release-diff-modal');
+    if (dfOverlay) {
+      dfOverlay.addEventListener('click', function (e) {
+        if (e.target === dfOverlay) closeDiffModal();
+      });
+      document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape' && window.isTopModal('release-diff-modal')) {
+          closeDiffModal();
         }
       });
     }

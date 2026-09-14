@@ -40,3 +40,17 @@ ManageKit 桥**——`$` 不是全局,而 `toast`/`fillBadge` 恰好是 `window`
 - `dom-shim.js` 是**故意最小**的:只实现 app.js 表单助手用到的 DOM 子集
   (`classList` / `closest` / `querySelector(All)` / 事件冒泡 / `insertBefore` 语义)。
   它不追求通用,别拿它测其他模块。
+
+`verify/doc-consistency.js` 源于 2026-09-13 全量审查的统计:90% 的文档失准同根——
+版本戳与计数(命令数/测试数)靠人工同步,任何一次发版都可能漏某处(实测抓到
+v6.2.0 批次漏更 wiki/README 测试数 325→332)。本脚本把三类「客观真值」做成断言:
+
+- **版本号**:`tauri.conf.json` ↔ `Cargo.toml` 必须一致,wiki/README 与 ROADMAP
+  的版本声明必须等于该真值;
+- **命令数**:`lib.rs` 的 `generate_handler![...]` 注册条目实测,比对 wiki/04 声明;
+- **测试数**:由 `--write --tests=N` 采集写入 `verify/VERSION.txt` 缓存(避免脚本
+  自己跑 cargo test),随后比对 wiki/README 与 ROADMAP 的测试数声明。
+
+用法:改版本/加命令后 `node verify/doc-consistency.js`;发版前跑完 `cargo test`
+记录 passed 数,执行 `node verify/doc-consistency.js --write --tests=N` 采集缓存。
+退出码非零 = 有不一致。零依赖;不参与构建。

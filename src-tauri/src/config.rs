@@ -501,6 +501,11 @@ pub struct AppSettings {
     /// TCP 探活全部已配置服务器,状态翻转经通知中心分发)
     #[serde(default)]
     pub probe_interval_mins: u32,
+    /// 启动时静默检查更新(第二十一批;缺省 true = 默认开启):启动后拉取一次
+    /// GitHub releases/latest,有新版仅在 dock 版本号旁加徽点提示,**不弹窗**;
+    /// 点徽点进设置中心查看详情。检查失败静默(不打扰)。
+    #[serde(default = "default_true")]
+    pub auto_check_update: bool,
 }
 
 /// `AppSettings::default` 的手写实现:`auto_update_from_source` 缺省为 **true**
@@ -512,6 +517,7 @@ impl Default for AppSettings {
             proxy: String::new(),
             auto_update_from_source: true,
             probe_interval_mins: 0,
+            auto_check_update: true,
         }
     }
 }
@@ -594,6 +600,53 @@ pub fn open_logs_dir() -> std::result::Result<(), String> {
         .arg(&dir)
         .spawn()
         .map_err(|e| format!("打开日志文件夹失败: {}", e))?;
+    Ok(())
+}
+
+/// 把文本写入指定路径(第二十一批:批量报告导出落盘)。
+///
+/// 路径来自系统保存对话框(用户显式选定),但仍按不可信输入处理:
+/// 仅写入**已存在目录**下的文件(父目录不存在直接报错,不代建)、拒绝空路径;
+/// 写入用「临时文件 + rename」原子写,避免中断留半成品。上限 4MB(报告类
+/// 文本远超不了,防误传大内容)。
+#[tauri::command]
+pub fn write_text_file(path: String, content: String) -> std::result::Result<(), String> {
+    use std::io::Write as _;
+    const MAX_BYTES: usize = 4 * 1024 * 1024;
+    if path.trim().is_empty() {
+        return Err("保存路径为空".to_string());
+    }
+    if content.len() > MAX_BYTES {
+        return Err("内容过大(超过 4MB),已拒绝写入".to_string());
+    }
+    let target = std::path::PathBuf::from(&path);
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("保存路径无效: {}", path))?;
+    if !parent.is_dir() {
+        return Err(format!("保存目录不存在: {}", parent.display()));
+    }
+    // 临时文件名 = 原名 + .ddtmp 后缀(不用 with_extension:它会替换掉 .md)
+    let tmp = {
+        let mut t = target.clone();
+        let name = target
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "report".to_string());
+        t.set_file_name(format!("{}.ddtmp", name));
+        t
+    };
+    {
+        let mut f = std::fs::File::create(&tmp)
+            .map_err(|e| format!("创建临时文件失败 ({}): {}", tmp.display(), e))?;
+        f.write_all(content.as_bytes())
+            .map_err(|e| format!("写入失败 ({}): {}", tmp.display(), e))?;
+        f.flush().map_err(|e| format!("刷新失败 ({}): {}", tmp.display(), e))?;
+    }
+    std::fs::rename(&tmp, &target).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("保存文件失败 ({}): {}", target.display(), e)
+    })?;
     Ok(())
 }
 
@@ -986,6 +1039,7 @@ mod tests {
             proxy: "socks5://127.0.0.1:1080".into(),
             auto_update_from_source: false,
             probe_interval_mins: 5,
+            auto_check_update: true,
         };
         save_app_settings(&settings).unwrap();
         assert!(dir.join("config/settings.json").exists());
@@ -1031,6 +1085,7 @@ mod tests {
             proxy: "http://127.0.0.1:7890".into(),
             auto_update_from_source: false,
             probe_interval_mins: 0,
+            auto_check_update: true,
         };
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains("\"closeToTray\":true"));

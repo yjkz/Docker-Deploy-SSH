@@ -244,6 +244,11 @@
     main.appendChild(hint(
       '开启后打开软件会比对导入项目的源 compose(含 .env / override)与配置内副本,' +
       '发现变化即自动同步并重解析(保留已保存的服务分类);关闭后仍可在项目列表点「从源更新」手动执行'));
+    // 启动静默检查更新(第二十一批):有新版仅 dock 版本号旁加徽点,不弹窗
+    main.appendChild(checkboxRow('settings-auto-check-update', '启动时静默检查更新', true));
+    main.appendChild(hint(
+      '开启后打开软件会延迟数秒检查一次新版本;有新版时仅在左下角版本号旁亮起圆点' +
+      '(点击进本设置页),不弹窗打扰;检查失败(网络/代理不可达)静默忽略'));
     // 服务器定时探活(第十七批):间隔分钟数,0 = 关闭;保存即启停后端探活任务
     main.appendChild(buildField('服务器探活间隔(分钟)', 'PROBE',
       'settings-probe-interval-input', 'number', '0',
@@ -538,7 +543,8 @@
         closeToTray: isChecked('settings-close-tray'),
         proxy: fieldVal('settings-proxy-input').trim(),
         autoUpdateFromSource: isChecked('settings-auto-update-src'),
-        probeIntervalMins: (parseInt(fieldVal('settings-probe-interval-input'), 10) || 0)
+        probeIntervalMins: (parseInt(fieldVal('settings-probe-interval-input'), 10) || 0),
+        autoCheckUpdate: isChecked('settings-auto-check-update')
       }
     }).then(function () {
       // 过期会话(保存期间模态被关闭甚至重开)→ 静默丢弃,防旧 promise 回写新模态
@@ -638,6 +644,8 @@
         // 若保留 value === '' 守卫则恒假 —— 保存值(如 5)永不回显,用户误以为
         // 未保存而重存 0,经 probe.rs「按设置启停」联动即静默关闭探活。
         if (probe) probe.value = String(s.probeIntervalMins || 0);
+        // 启动静默检查更新(第二十一批):缺省视为开启(与后端 serde default 同口径)
+        setChecked('settings-auto-check-update', s.autoCheckUpdate !== false);
         // 代理字段预填 ''(非 '0'),保留 === '' 守卫即可满足「未改动不覆盖」
         var proxy = document.getElementById('settings-proxy-input');
         if (proxy && proxy.value === '') proxy.value = String(s.proxy || '');

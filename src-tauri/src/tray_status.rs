@@ -151,6 +151,60 @@ fn apply(app: &tauri::AppHandle, text: &str) {
             log::warn!("设置托盘 tooltip 失败: {e}");
         }
     }
+    sync_menu(app);
+}
+
+/// 同步托盘菜单动态项(第二十一批:托盘闭环)。
+///
+/// - 「停止当前部署」:`deploy.running` 时可用(点击置 cancel_deploy 的取消位,
+///   步骤边界生效);空闲时禁用;
+/// - 「上次部署:<终态>」只读项:无终态时禁用显示「上次部署:—」;
+///   有终态时可用文本(禁用态避免"点了没反应"的误读——它本就只读)。
+fn sync_menu(app: &tauri::AppHandle) {
+    use tauri::Manager as _;
+    let (running, outcome) = {
+        let guard = match STATUS.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        match guard.as_ref() {
+            Some(s) => (s.deploy.running, s.outcome.clone()),
+            None => (false, LastOutcome::None),
+        }
+    };
+    if let Some(item) = app.try_state::<MenuItems>().map(|m| m.0.clone()) {
+        let stop = &item.stop_item;
+        if let Err(e) = stop.set_enabled(running) {
+            log::warn!("更新托盘菜单「停止当前部署」失败: {e}");
+        }
+        let outcome_text = match outcome {
+            LastOutcome::None => "上次部署:—".to_string(),
+            LastOutcome::Success => "上次部署:成功".to_string(),
+            LastOutcome::Failed => "上次部署:失败".to_string(),
+            LastOutcome::Canceled => "上次部署:已取消".to_string(),
+        };
+        if let Err(e) = item.outcome_item.set_text(&outcome_text) {
+            log::warn!("更新托盘菜单「上次部署」失败: {e}");
+        }
+    }
+}
+
+/// 托盘菜单动态项句柄容器(crate 内可见:仅 lib.rs 建菜单时装箱托管)。
+struct MenuItems(TrayMenuHandles);
+
+/// 动态菜单项集合(crate 内可见,避免 private_interfaces 警告)。
+#[derive(Clone)]
+pub(crate) struct TrayMenuHandles {
+    pub stop_item: tauri::menu::MenuItem<tauri::Wry>,
+    pub outcome_item: tauri::menu::MenuItem<tauri::Wry>,
+}
+
+/// 注册菜单动态项句柄并立即同步一次(托盘就绪时由 lib.rs 调用;
+/// pub(crate) —— 参数类型 TrayMenuHandles 是 crate 内可见,不可外泄)。
+pub(crate) fn register_menu(app: &tauri::AppHandle, handles: TrayMenuHandles) {
+    use tauri::Manager as _;
+    app.manage(MenuItems(handles));
+    sync_menu(app);
 }
 
 /// 标记托盘已就绪,并用当前状态刷新一次 tooltip(lib.rs 建完托盘后调用)。

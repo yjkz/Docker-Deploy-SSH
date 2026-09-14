@@ -2003,3 +2003,67 @@ ASCII 42 = `*`,即 v6.0.0 密文最小化引入的只读视图哨兵值,被**写
 - 模板不驱动批量(见四;若反响好再考虑「按模板批量」)
 - `server_diagnose` 的 docker 权限降级探测用 `docker info` 退出码近似,
   与 manage.rs 的 perm_denied 判定同粒度(非精确匹配 stderr)
+
+# 第二十一批升级(v6.3.0)— 第二梯队五项 + 文档治理
+
+> 用户批复:「可以按你建议的来」(〇文档清扫 + 第二梯队 + doc-consistency.js)。
+> 承接 v6.2.0(第二十批第一梯队五项)与 v6.1.4(审查修复批收尾)。
+
+## 一、批量部署报告导出 + 重跑失败台(第二梯队)
+
+- 批量结束后面板新增两按钮(数据全来自 `st.batch.results`,关页即失的痛点):
+  - **导出报告**:Markdown 落盘(汇总计数/模式/时刻 + 逐台结果表 + 续传提示);
+    经系统保存对话框选路径,新命令 `write_text_file(path, content)`
+    (拒绝空路径/父目录不存在/>4MB;临时文件 + rename 原子写)
+  - **重跑失败台(N 台)**:按 results 的 failed 名称映射回 queue 的 server/project,
+    组装普通队列从头发起(**不用断点**,与「续传此台」语义区分——后者用断点)
+- 命令数 100 → 101;wiki/04 契约登记
+
+## 二、回滚两版本对比(第二梯队)
+
+- 06 页归档行首加勾选框(`.rollback-diff-cb`,最多两项先进先出,stopPropagation
+  不触发行点击);勾满两个后「发布归档」区块标题出现「对比选中版本」→
+  `#release-diff-modal`(第 13 号模态)
+- 对比内容:两侧 ts/标题/包数头部 + 逐服务镜像 tag 表(新增/移除/镜像变化/不变
+  四态徽章;缺失侧弱化)+ 版本说明并排;**数据取自 `rollback_project_detail` 已
+  返回的 `releases[].manifestImages`,零新命令零额外往返**
+- `diffSel` 切项目/目录失效时清空;Esc/遮罩/关闭钮三通道 + `isTopModal` 仲裁
+
+## 三、启动静默检查更新 + 更新失败回执(第二梯队)
+
+- **启动静默检查**:`AppSettings.auto_check_update`(serde default true,第二十一批);
+  启动延迟 4 秒读设置(尊重开关与代理)→ `update_check` → 有新版仅在
+  `#dock-version` 加 `.has-update` + 信号青圆点(不弹窗),点击打开设置中心;
+  失败静默。设置中心「通用」组新增「启动时静默检查更新」勾选框
+- **更新失败回执**:`take_update_pending` 标记与当前版本**不一致**时,原先静默
+  丢弃 → 现 toast「自动更新未生效,当前仍为 vX(可到设置中心重新检查更新)」
+  (安装中途失败的场景由「静默」转为明示)
+
+## 四、托盘闭环(第二梯队)
+
+- 托盘菜单从「显示/退出」两行扩为四行:**停止当前部署**(`deploy.running` 时
+  可用;点击置 `DeployState.cancelled`,步骤边界生效——与前端取消同语义,面板
+  未开也生效)+ **上次部署:成功/失败/已取消/—**(只读,随状态同步文本)
+- `tray_status::sync_menu` 在每次 `apply`(状态变更)时同步两菜单项;句柄经
+  `register_menu` 注册(`MenuItems`/`TrayMenuHandles`)
+- 真机待确认:托盘菜单四项显示与「停止当前部署」实停
+
+## 五、文档治理:verify/doc-consistency.js(本次审查统计同根问题)
+
+- 三类客观真值断言:**版本号**(tauri.conf ↔ Cargo.toml ↔ wiki/README ↔ ROADMAP)、
+  **命令数**(lib.rs generate_handler 实测 ↔ wiki/04 声明)、**测试数**
+  (`--write --tests=N` 采集缓存 ↔ wiki/README 与 ROADMAP 声明)
+- **上线当天即抓到一处真实失准**:wiki/README 测试数 325 落后于 332(v6.2.0
+  批次漏更)—— 已修,现全 PASS
+- 〇文档清扫:ROADMAP 状态速览新旧两行矛盾(101 vs 95)合并;待修复清单
+  P1-3 终态更新(已随 v6.2.0 配置导入预览根治)
+- 顺带修正 wiki/03:75 残留的「批量不落断点」错误记载(第十四批已更正,该处漏改)
+
+## 六、验证
+
+- `cargo test` 332 passed(本轮无新增单测;authSettings 两处测试初始化补新字段);
+  `cargo build --release` 通过;clippy 零新增
+- 改动 JS(rollback/deploy/app/settings)全过 `node --check`;verify **四**脚本
+  (form 54 / bridge / scope / **doc-consistency**)全 PASS
+- 真机待确认:托盘菜单四项(停止当前部署实停)、dock 徽点出现与点击、
+  批量报告导出落盘、两版本对比模态渲染

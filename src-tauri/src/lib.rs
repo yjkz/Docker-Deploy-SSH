@@ -134,6 +134,7 @@ pub fn run() {
       config::app_settings_get,
       config::app_settings_set,
       config::open_logs_dir,
+      config::write_text_file,
       update::open_external,
     ])
     .setup(|app| {
@@ -188,11 +189,15 @@ fn setup_desktop(app: &tauri::App) -> tauri::Result<()> {
     use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
     use tauri::Manager;
 
-    // 托盘菜单:显示主窗口 / 退出(with_id 显式指定 id 供事件分发)
+    // 托盘菜单:显示主窗口 / 停止当前部署(动态启用) / 上次部署状态(只读) / 退出
+    // (with_id 显式指定 id 供事件分发;第二十一批「托盘闭环」动态项由
+    // tray_status::sync_menu 更新文本与可用性)
     let show_item = MenuItem::with_id(app, "show-main", "显示主窗口", true, None::<&str>)?;
+    let stop_item = MenuItem::with_id(app, "cancel-deploy", "停止当前部署", false, None::<&str>)?;
+    let outcome_item = MenuItem::with_id(app, "last-outcome", "上次部署:—", false, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let tray_menu = Menu::new(app)?;
-    tray_menu.append_items(&[&show_item, &quit_item])?;
+    tray_menu.append_items(&[&show_item, &stop_item, &outcome_item, &quit_item])?;
 
     let mut tray_builder = TrayIconBuilder::with_id("main-tray")
       .menu(&tray_menu)
@@ -209,6 +214,14 @@ fn setup_desktop(app: &tauri::App) -> tauri::Result<()> {
         // 菜单事件是全局监听,按菜单项 id 分发
         match event.id().as_ref() {
           "show-main" => show_main_window(app),
+          "cancel-deploy" => {
+            // 与前端「取消部署」同语义:置取消位,管线在步骤边界中止
+            // (面板未开也生效——托盘用户的第一诉求就是「让它停」)
+            use tauri::Manager;
+            if let Some(state) = app.try_state::<commands::DeployState>() {
+              state.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+          }
           "quit" => app.exit(0),
           _ => {}
         }
@@ -225,6 +238,12 @@ fn setup_desktop(app: &tauri::App) -> tauri::Result<()> {
         }
       })
       .build(app)?;
+
+    // 动态菜单项句柄注册(「停止当前部署」启用态 / 「上次部署」文本由状态驱动)
+    tray_status::register_menu(
+      app.handle(),
+      tray_status::TrayMenuHandles { stop_item, outcome_item },
+    );
 
     // 托盘就绪:用当前状态刷新一次 tooltip(第十五批动态态)。此后部署/监控
     // 状态变化会经 tray_status 的 set_* 接口持续更新;窗口隐藏时它是用户唯一

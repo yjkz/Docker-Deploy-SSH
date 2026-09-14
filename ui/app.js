@@ -1117,15 +1117,56 @@
             if (!marked) return;
             var m = String(marked).replace(/^v/i, '');
             var c = String(current || '').replace(/^v/i, '');
-            // 版本一致(安装成功并重启)才提示;否则静默丢弃标记
             if (c && m && c === m) {
+              // 版本一致(安装成功并重启)→ 恰一次「已更新到 vX」
               window.toast('已更新到 v' + m, 'ok');
+            } else if (c && m) {
+              // 版本不一致(更新失败回执,第二十一批):安装中途失败/被中断时
+              // 标记已写但实际仍是旧版 —— 此前静默丢弃,用户无从判断;现明示
+              // 「已回到旧版」并附当前版本,可到设置中心重试。
+              window.toast('自动更新未生效,当前仍为 v' + c + '(可到设置中心重新检查更新)', 'warn');
             } else if (window.console && console.info) {
-              console.info('[update] 标记版本 ' + m + ' 与实际版本 ' + c + ' 不一致,不提示');
+              console.info('[update] 标记版本 ' + m + ' 与实际版本 ' + c + ' 无法比对,不提示');
             }
           });
         }).catch(function () { /* 无标记或读取失败:静默 */ });
       }
     } catch (e) { /* 静默 */ }
+
+    // ===== 启动静默检查更新(第二十一批)=====
+    // 设置项 auto_check_update(缺省 true)开启时,启动后延迟几秒拉取一次
+    // releases/latest:有新版仅在 dock 版本号旁加徽点(不弹窗打扰);点击徽点
+    // 打开设置中心。检查失败静默(网络/代理不可达不打扰启动)。
+    startSilentUpdateCheck(versionPromise);
+
+    function startSilentUpdateCheck(verPromise) {
+      var verNode = document.getElementById('dock-version');
+      if (!verNode) return;
+      var mark = function (latest) {
+        if (!latest || verNode.querySelector('.dock-ver-dot')) return;
+        verNode.classList.add('has-update');
+        verNode.title = '发现新版本 v' + latest + ',点击打开设置中心更新';
+        var dot = document.createElement('span');
+        dot.className = 'dock-ver-dot';
+        dot.setAttribute('aria-hidden', 'true');
+        verNode.appendChild(dot);
+        verNode.addEventListener('click', function () {
+          window.showPage('check'); // 设置中心入口在 dock 齿轮;点徽点打开设置模态
+          var gear = document.getElementById('settings-btn');
+          if (gear) gear.click();
+        });
+      };
+      // 延迟 4 秒:不与启动路径(主题/配置加载/托盘)抢资源
+      window.setTimeout(function () {
+        window.AppBus.invoke('app_settings_get').then(function (set) {
+          if (set && set.autoCheckUpdate === false) return;
+          return window.AppBus.invoke('update_check', {
+            proxy: (set && set.proxy) ? set.proxy : null
+          }).then(function (info) {
+            if (info && info.hasUpdate === true) mark(info.latest);
+          });
+        }).catch(function () { /* 静默:网络/代理失败不打扰 */ });
+      }, 4000);
+    }
   });
 })();
