@@ -37,3 +37,9 @@ targe-1/
 
 # SDD 流程产物(审查 diff / 报告;历史资料,不入库)
 .superpowers/
+
+# 工具产物(claude worktrees 等)
+.claude/
+
+# verify 采集缓存(doc-consistency.js --write 按需重生成,不入库防过期计数虚过)
+verify/VERSION.txt
