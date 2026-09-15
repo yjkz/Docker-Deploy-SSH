@@ -1462,15 +1462,50 @@ select.text-input option,
 }
 .mode-tab.active:disabled { background: var(--ark-ink); color: var(--ark-paper); }
 
-/* 迁移项目:与模式 tab 同排但靠右(它是动作入口而非模式切换,故不吃
-   active 填充与左侧分隔线,视觉上退后一档) */
+/* 迁移项目入口(第二十二批视觉修正):它是**动作**而非模式切换,与 tabs
+   同排会让裸青色文字读作「被选中的 tab」且孤零难看。改为标准小按钮语言
+   (白底墨字 + 左楔形,与全站 .btn-sm 同族),垂直居中对齐 tab 行;仍然
+   靠右(margin-left: auto)保持「动作在右」的层级。 */
 .mode-tab-action {
   margin-left: auto;
+  align-self: center;
   border-left: none;
-  font-size: 13px;
-  color: var(--ark-signal);
+  font-size: 12px;
+  padding: 4px 12px 4px 15px;
+  border: 1px solid var(--ark-line);
+  background: var(--ark-paper);
+  color: var(--ark-ink);
+  transition: transform var(--ark-dur-fast) var(--ark-ease-out),
+              background var(--ark-dur-fast) var(--ark-ease-out),
+              color var(--ark-dur-fast) var(--ark-ease-out),
+              border-color var(--ark-dur-fast) var(--ark-ease-out);
 }
-.mode-tab-action:hover { color: var(--ark-ink); }
+.mode-tab-action::before {
+  content: "";
+  position: absolute;
+  left: -1px;
+  top: -1px;
+  bottom: -1px;
+  width: 4px;
+  background: var(--ark-ink);
+  clip-path: polygon(0 0, 100% 50%, 0 100%);
+}
+.mode-tab-action:hover {
+  color: var(--ark-ink);
+  background: var(--ark-paper);
+  transform: translate(1px, 1px);
+}
+.mode-tab-action:hover::before { background: var(--ark-signal); }
+.mode-tab-action:active { transform: translate(2px, 2px); }
+.mode-tab-action:disabled,
+.mode-tab-action:disabled:hover {
+  opacity: .45;
+  cursor: not-allowed;
+  transform: none;
+  background: var(--ark-paper);
+  color: var(--ark-ink);
+}
+.mode-tab-action:disabled::before { background: var(--ark-ink); }
 .mode-tab-action::after { display: none; }
 
 /* 整栈模式:隐藏单镜像专属格子,选择区收窄为两列 */
