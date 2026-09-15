@@ -283,7 +283,10 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 - 前端 `deploy-schedule.js`(13 号模态)+ deploy.js 外部部署采纳;jadge 两视图 PASS
 - 命令 101 → **104**;测试 345 → **352**
 
-**② 终端增强** ⏳ 待开工(多标签 + 同栈广播 + 输出落盘)
+**② 终端增强 ✅ 已完成**(记录见 UPGRADE-PLAN「第二十二批(二)」)
+- 后端:会话输出自动落盘 logs/term-*.log;ContainerRow 增 compose_project
+- 前端:终端多标签(tabs 字典 + 按 sid 路由的单监听)+ 同栈广播勾选
+- judge 抓出双注册缺陷(同步守卫缺失)已修并复验 PASS;测试 352 → **355**
 **③ 配置版本历史** ⏳ 待开工(快照 + 2 命令)
 **④ 文档治理批** ⏳ 待开工(清扫 + 页首版本戳 + contract-smoke + 补测试)
 
@@ -291,7 +294,7 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 
 ## 当前状态速览
 
-- 版本 **v6.3.3**;main = origin/main;基线 `cargo test` **352 passed** / 13 ignored
+- 版本 **v6.3.3**;main = origin/main;基线 `cargo test` **355 passed** / 13 ignored
 - 命令 **104** 个(generate_handler 实测;第二十二批 +3 调度命令,待后两项继续更新)
 - JS **16** 文件(含 theme-init.js;index.html 加载顺序见 wiki/03:13)
 - 前端结构:12 模态;commands/ 11 文件;三大 JS 主文件 2338/2013/2537 行

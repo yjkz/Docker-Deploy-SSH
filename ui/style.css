@@ -4135,3 +4135,79 @@ tr.stat-flash > td:first-child {
 .sched-form .form-actions {
   margin-top: 14px;
 }
+
+/* ===== 终端多标签 + 同栈广播(第二十二批)===== */
+/* 顶栏:标签栏(横滚)+ 广播勾选 + 关闭按钮 */
+.term-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.term-tabs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+.term-tabs::-webkit-scrollbar { height: 4px; }
+.term-tab {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  border: 1px solid var(--ark-line-soft);
+  background: transparent;
+}
+.term-tab.active {
+  background: var(--ark-ink);
+}
+.term-tab.active .term-tab-label {
+  color: var(--ark-paper);
+}
+.term-tab.ended .term-tab-label {
+  opacity: 0.55;
+}
+.term-tab-label {
+  border: none;
+  background: transparent;
+  color: var(--ark-ink);
+  font-size: 12px;
+  padding: 4px 8px;
+  cursor: pointer;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.term-tab-close {
+  border: none;
+  background: transparent;
+  color: inherit;
+  font-size: 12px;
+  line-height: 1;
+  padding: 4px 6px 4px 2px;
+  cursor: pointer;
+  opacity: 0.7;
+}
+.term-tab.active .term-tab-close {
+  color: var(--ark-paper);
+}
+.term-tab-close:hover { opacity: 1; }
+/* 广播勾选:行内标签(与 .deploy-checkbox 同族语言) */
+.term-broadcast {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+  font-size: 12px;
+  color: var(--ark-ink);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.term-broadcast input { accent-color: var(--ark-signal); margin: 0; }
+.term-broadcast:has(input:disabled) {
+  opacity: 0.45;
+  cursor: not-allowed;
+}

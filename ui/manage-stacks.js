@@ -25,11 +25,15 @@
   var cState = {
     stacks: [],
     mon: { running: false, unlisten: null, errShown: false },
+    // Exec 终端(第二十二批:多标签;字段含义见「容器 Exec 终端」节头注释)
     exec: {
-      sessionId: null, unlisten: null, containerId: null, name: '',
-      lines: [], cur: '', curIdx: 0, eof: false, pend: '',
-      history: [], histIdx: -1,
-      lastCols: null, lastRows: null   // 最近一次同步给后端的终端尺寸(去重用)
+      tabs: {},        // key → Tab
+      order: [],       // 标签顺序(key 数组,左侧先开)
+      activeKey: null, // 当前标签 key
+      unlisten: null,  // 全局单监听(manage-exec-output;懒注册,模态关闭时释放)
+      listening: false,// 同步双注册守卫(注册 promise 未 resolve 期间为 true)
+      listenGen: 0,    // 监听代际(release 时自增;过期 promise 回调据此自注销)
+      buffer: []       // invoke 未返回期间的早期事件(session 建立后按 sid 认领)
     }
   };
 
@@ -792,19 +796,88 @@
     return td;
   }
 
-  // ===== 容器 Exec 终端 =====
-  function openTerminal(containerId, name) {
-    // 多开防护:同一时间只允许一个终端会话
-    if (cState.exec.sessionId || cState.exec.unlisten) {
-      toast('已有终端会话,请先关闭当前终端', 'warn');
+  // ===== 容器 Exec 终端(第二十二批:多标签 + 同栈广播)=====
+  // 状态模型:cState.exec = { tabs:{key:Tab}, order:[key], activeKey, unlisten, buffer }
+  // Tab = { key, sessionId, containerId, name, composeProject, shell,
+  //         lines, cur, curIdx, eof, pend, history, histIdx, lastCols, lastRows }
+  // - 单个 manage-exec-output 监听,按 payload.session_id 路由到对应 tab;
+  //   session_id 未知的早期事件入 buffer,invoke 返回后按 sid 认领(防早到丢失)
+  // - 模态骨架常驻:已开着终端时再点「终端」= 加标签,不重建模态
+  // - 广播:勾选后输入发给**同 compose 栈**(同 compose_project)的活跃标签;
+  //   无同栈同伴/项目名为空时禁用
+
+  function execTabsAll() {
+    var ex = cState.exec;
+    return ex.order.map(function (k) { return ex.tabs[k]; }).filter(Boolean);
+  }
+
+  function execTabByKey(key) { return cState.exec.tabs[key] || null; }
+
+  function execActiveTab() {
+    var ex = cState.exec;
+    return ex.activeKey ? ex.tabs[ex.activeKey] || null : null;
+  }
+
+  function execTabBySession(sid) {
+    var list = execTabsAll();
+    for (var i = 0; i < list.length; i++) if (list[i].sessionId === sid) return list[i];
+    return null;
+  }
+
+  function isTerminalOpen() {
+    var modal = $('manage-modal');
+    return !!(modal && !modal.classList.contains('hidden') && $('term-output'));
+  }
+
+  function newExecTab(containerId, name, composeProject) {
+    return {
+      key: 'tab-' + Date.now() + '-' + Math.random().toString(16).slice(2, 8),
+      sessionId: null,
+      containerId: containerId,
+      name: name || containerId,
+      composeProject: composeProject || null,
+      shell: '',
+      lines: [], cur: '', curIdx: 0, eof: false, pend: '',
+      history: [], histIdx: -1,
+      lastCols: null, lastRows: null
+    };
+  }
+
+  function openTerminal(containerId, name, composeProject) {
+    // 同容器已有存活标签 → 直接切过去(防重复会话)
+    var existing = execTabsAll().filter(function (t) {
+      return t.containerId === containerId && !t.eof;
+    })[0];
+    if (existing && isTerminalOpen()) {
+      selectExecTab(existing.key);
       return;
     }
 
+    var tab = newExecTab(containerId, name, composeProject);
+    var ex = cState.exec;
+    ex.tabs[tab.key] = tab;
+    ex.order.push(tab.key);
+
+    if (!isTerminalOpen()) {
+      buildTerminalModal();
+    }
+    ex.activeKey = tab.key;
+    renderExecTabs();
+    selectExecTab(tab.key);
+
+    var shellSel = $('term-shell-select');
+    startExec(tab, shellSel ? shellSel.value : '');
+  }
+
+  // 构建终端模态骨架(仅首次打开时;之后加标签只更新 DOM 片段)
+  function buildTerminalModal() {
     var body = document.createElement('div');
-    // 终端弹窗专属标记:openModal 据此给共用 modal-card 加 .modal-terminal 放大
     body.className = 'manage-terminal-modal';
     body.innerHTML =
-      '<div class="log-tail-bar">' +
+      '<div class="log-tail-bar term-toolbar">' +
+      '<div id="term-tabs" class="term-tabs" role="tablist"></div>' +
+      '<label class="term-broadcast" id="term-broadcast-label" title="需同时打开同一 compose 栈的多个容器终端">' +
+      '<input type="checkbox" id="term-broadcast-cb">广播同栈</label>' +
       '<button id="term-close-btn" class="btn btn-sm btn-danger" type="button">关闭终端</button>' +
       '</div>' +
       '<pre id="term-output" class="manage-terminal">正在连接…</pre>' +
@@ -819,21 +892,28 @@
       'spellcheck="false" placeholder="输入命令,Enter 发送;↑/↓ 切换历史">' +
       '</div>';
 
-    openModal('终端 — ' + name, body);
+    openModal('终端', body);
 
     var shellSel = $('term-shell-select');
     if (shellSel) shellSel.addEventListener('change', function () {
-      // 切换 shell:停掉当前会话,用新 shell 重开
-      stopExecSession(true);
-      var out = $('term-output');
-      resetTermBuffer();
-      if (out) out.textContent = '正在连接…';
-      startExec(containerId, name, shellSel.value);
+      // 切换 shell:重启**当前标签**的会话(其余标签不受影响)
+      var tab = execActiveTab();
+      if (!tab) return;
+      stopExecTab(tab, true);
+      resetTermBuffer(tab);
+      if (execActiveTab() === tab) {
+        var out = $('term-output');
+        if (out) out.textContent = '正在连接…';
+      }
+      startExec(tab, shellSel.value);
     });
+
+    var broadcastCb = $('term-broadcast-cb');
+    if (broadcastCb) broadcastCb.addEventListener('change', updateBroadcastState);
 
     var closeBtn = $('term-close-btn');
     if (closeBtn) closeBtn.addEventListener('click', function () {
-      stopExecSession(false);
+      stopAllExecTabs();
       closeModal();
     });
 
@@ -842,235 +922,363 @@
       input.addEventListener('keydown', onTermInputKey);
       input.focus();
     }
-    var out = $('term-output');
-    if (out) {
-      // 用户向上滚动时暂停自动滚
-      out.addEventListener('scroll', function () { /* 渲染时按位置判断,无需额外状态 */ });
-    }
 
-    startExec(containerId, name, shellSel ? shellSel.value : '');
+    ensureExecListener();
   }
 
-  function startExec(containerId, name, shell) {
-    // 先订阅再 invoke:后端在命令返回前就可能开始推送(快速失败场景 eof
-    // 会先于订阅到达),订阅期间的事件先入缓冲,拿到 session_id 后重放
-    var buffered = [];
-    var buffering = true;
-    function bufferedHandler(payload) {
-      if (buffering) { buffered.push(payload); return; }
-      onExecOutput(payload);
-    }
-    var unsubscribe = null;
-
-    AppBus.on('manage-exec-output', bufferedHandler).then(function (unlisten) {
-      unsubscribe = unlisten;
-      // invoke 已返回(正常路径):直接进入实时处理并重放缓冲;
-      // 否则保持缓冲,由 invoke 的 then 分支接管
-      if (!buffering) {
-        cState.exec.unlisten = unlisten;
-        var list = buffered || [];
-        buffered = null;
-        for (var i = 0; i < list.length; i++) onExecOutput(list[i]);
+  // 全局单监听(懒注册一次):按 session_id 路由;未知 sid 入 buffer
+  // 双注册守卫必须用**同步**标志:AppBus.on 的 unlisten 要等 promise resolve
+  // 才赋值,而 buildTerminalModal 与 startExec 在同一同步任务内都会调用本函数
+  // ——只判 ex.unlisten 会注册两次、每条 payload 路由两遍(judge 实测发现)。
+  // 代际守卫:release 后注册 promise 才 resolve 时(模态已关),立即注销新
+  // 订阅,防「释放后回挂」泄漏。
+  function ensureExecListener() {
+    var ex = cState.exec;
+    if (ex.unlisten || ex.listening) return;
+    ex.listening = true;
+    var gen = ex.listenGen;
+    AppBus.on('manage-exec-output', function (event) {
+      var payload = event ? event.payload : null;
+      if (!payload) return;
+      var sid = payload.session_id;
+      var tab = execTabBySession(sid);
+      if (tab) {
+        routeExecPayload(tab, payload);
+      } else {
+        // 新会话早期事件(invoke 未返回):缓冲,session 建立后认领
+        ex.buffer.push(payload);
       }
+    }).then(function (unlisten) {
+      if (ex.listenGen !== gen) {
+        // 期间已 release:直接注销本次注册
+        try { unlisten(); } catch (e) { /* 忽略 */ }
+        return;
+      }
+      ex.unlisten = unlisten;
+      ex.listening = false;
+    }).catch(function (err) {
+      ex.listening = false;
+      console.warn('[manage] manage-exec-output 监听注册失败:', err);
     });
+  }
+
+  // invoke 返回新 session 后:认领 buffer 中属于它的早期事件
+  function claimBufferedEvents(tab) {
+    var ex = cState.exec;
+    if (!tab.sessionId || ex.buffer.length === 0) return;
+    var rest = [];
+    for (var i = 0; i < ex.buffer.length; i++) {
+      var p = ex.buffer[i];
+      if (p && p.session_id === tab.sessionId) routeExecPayload(tab, p);
+      else rest.push(p);
+    }
+    ex.buffer = rest;
+  }
+
+  function routeExecPayload(tab, payload) {
+    if (payload.data) termWrite(tab, String(payload.data));
+    if (payload.eof) {
+      if (payload.error) {
+        var reason = window.errStripCode(String(payload.error));
+        termAppendLine(tab, '[会话已结束: ' + reason + ']');
+        if (execActiveTab() === tab) toast('终端会话结束: ' + reason, 'warn');
+      } else {
+        termAppendLine(tab, '[会话已结束]');
+      }
+      tab.eof = true;
+      tab.sessionId = null;
+      if (execActiveTab() === tab) renderTermEditor();
+      renderExecTabs();
+    }
+  }
+
+  // ===== 标签栏渲染与切换 =====
+
+  function renderExecTabs() {
+    var bar = $('term-tabs');
+    if (!bar) return;
+    bar.innerHTML = '';
+    execTabsAll().forEach(function (t) {
+      var item = document.createElement('span');
+      item.className = 'term-tab' + (t.key === cState.exec.activeKey ? ' active' : '') + (t.eof ? ' ended' : '');
+      var label = document.createElement('button');
+      label.type = 'button';
+      label.className = 'term-tab-label';
+      label.textContent = t.name + (t.eof ? '(已结束)' : '');
+      label.title = t.name + (t.composeProject ? ' @ ' + t.composeProject : '');
+      label.addEventListener('click', function () { selectExecTab(t.key); });
+      item.appendChild(label);
+      var x = document.createElement('button');
+      x.type = 'button';
+      x.className = 'term-tab-close';
+      x.textContent = '×';
+      x.title = '关闭该标签';
+      x.addEventListener('click', function (e) {
+        e.stopPropagation();
+        closeExecTab(t.key);
+      });
+      item.appendChild(x);
+      bar.appendChild(item);
+    });
+    updateBroadcastState();
+  }
+
+  function selectExecTab(key) {
+    var tab = execTabByKey(key);
+    if (!tab) return;
+    cState.exec.activeKey = key;
+    renderExecTabs();
+    // Shell 下拉回显该标签会话
+    var shellSel = $('term-shell-select');
+    if (shellSel && tab.shell) shellSel.value = tab.shell;
+    renderTermEditor();
+    // 切标签后按当前输出区尺寸补推一次(各标签尺寸缓存独立)
+    pushTermResize();
+    var input = $('term-input');
+    if (input && !tab.eof) input.focus();
+    updateBroadcastState();
+  }
+
+  function closeExecTab(key) {
+    var tab = execTabByKey(key);
+    if (!tab) return;
+    stopExecTab(tab, true);
+    delete cState.exec.tabs[key];
+    var idx = cState.exec.order.indexOf(key);
+    if (idx >= 0) cState.exec.order.splice(idx, 1);
+    if (cState.exec.activeKey === key) {
+      cState.exec.activeKey = cState.exec.order.length
+        ? cState.exec.order[Math.max(0, idx - 1)] || cState.exec.order[0]
+        : null;
+    }
+    if (cState.exec.order.length === 0) {
+      // 最后一个标签:关模态(走统一清理)
+      closeModal();
+      return;
+    }
+    renderExecTabs();
+    if (cState.exec.activeKey) selectExecTab(cState.exec.activeKey);
+  }
+
+  // 渲染输出区为**当前标签**的内容;无标签时留空
+  function renderTermEditor() {
+    var tab = execActiveTab();
+    var input = $('term-input');
+    if (!tab) return;
+    renderTerm(tab);
+    if (input) {
+      input.disabled = !!tab.eof;
+      input.placeholder = tab.eof
+        ? '会话已结束(关闭标签或切换 shell 重开)'
+        : '输入命令,Enter 发送;↑/↓ 切换历史';
+    }
+  }
+
+  // ===== 广播(同 compose 栈)=====
+
+  function broadcastPeers() {
+    var at = execActiveTab();
+    if (!at || !at.sessionId || at.eof || !at.composeProject) return [];
+    return execTabsAll().filter(function (t) {
+      return t !== at && t.sessionId && !t.eof && t.composeProject === at.composeProject;
+    });
+  }
+
+  function updateBroadcastState() {
+    var cb = $('term-broadcast-cb');
+    if (!cb) return;
+    var can = broadcastPeers().length > 0;
+    if (!can && cb.checked) cb.checked = false;
+    cb.disabled = !can;
+  }
+
+  // ===== 会话生命周期 =====
+
+  function startExec(tab, shell) {
+    // 先订阅(listener 已常驻/懒注册),invoke 返回前的事件进 buffer 后认领
+    ensureExecListener();
 
     AppBus.invoke('manage_exec_start', {
       serverId: state.serverId,
-      containerId: containerId,
+      containerId: tab.containerId,
       // 空/未选 → null,由后端自动探测容器内可用 shell(bash 优先,退回 sh)
       shell: shell || null
     }).then(function (res) {
-      // 模态框可能在等待期间被关闭
-      if (!$('term-output')) {
-        buffering = false;
-        if (unsubscribe) { try { unsubscribe(); } catch (e) { /* 忽略 */ } }
+      // 标签可能已被关闭(或模态关闭导致全部清理)
+      if (!cState.exec.tabs[tab.key]) {
         AppBus.invoke('manage_exec_stop', { sessionId: res.session_id }).catch(function () {});
         return;
       }
-      cState.exec.sessionId = res.session_id;
-      cState.exec.containerId = containerId;
-      cState.exec.name = name || containerId;
-      resetTermBuffer();
-      // 回显后端返回的实际 shell(选「自动」时为探测结果,可能与所选不同)
-      termAppendLine('已连接到容器「' + cState.exec.name + '」(shell: ' +
-        (res.shell || shell || 'bash') + ')');
-      renderTerm();
-      // 阶段五:会话建立即按当前输出区尺寸同步一次(后续变化走 resize 监听/观察器)
-      observeTermOutput();
-      pushTermResize();
-      buffering = false;
-      // 订阅已就绪:挂载正式 unlisten 并重放缓冲中的早期事件(含快速 eof);
-      // 订阅尚未 resolve:保持缓冲,由其 then 分支重放
-      if (unsubscribe) {
-        cState.exec.unlisten = unsubscribe;
-        var list = buffered || [];
-        buffered = null;
-        for (var i = 0; i < list.length; i++) onExecOutput(list[i]);
+      tab.sessionId = res.session_id;
+      tab.shell = res.shell || shell || 'bash';
+      resetTermBuffer(tab);
+      termAppendLine(tab, '已连接到容器「' + tab.name + '」(shell: ' + tab.shell + ')');
+      if (execActiveTab() === tab) {
+        var shellSel = $('term-shell-select');
+        if (shellSel) shellSel.value = tabShellOption(tab.shell);
+        renderTermEditor();
+        // 会话建立即按当前输出区尺寸同步一次(后续变化走 resize 监听/观察器)
+        observeTermOutput();
+        pushTermResize();
       }
+      renderExecTabs();
+      claimBufferedEvents(tab);
     }).catch(function (err) {
-      buffering = false;
-      if (unsubscribe) { try { unsubscribe(); } catch (e) { /* 忽略 */ } }
       var msg = err && err.message ? err.message : String(err);
-      var out = $('term-output');
-      if (out) out.textContent = '连接失败: ' + msg;
+      termAppendLine(tab, '连接失败: ' + msg);
+      tab.eof = true;
+      if (execActiveTab() === tab) renderTermEditor();
+      renderExecTabs();
       toast('打开终端失败: ' + msg, 'fail');
     });
   }
 
-  // 注意:Tauri 2 listen 回调参数是事件包裹对象 { event, id, payload }(同 onStatsEvent)
-  function onExecOutput(event) {
-    var payload = event ? event.payload : null;
-    if (!payload) return;
-    // 只处理当前会话的数据(旧会话残留事件丢弃)
-    if (payload.session_id !== cState.exec.sessionId) return;
-    if (payload.data) termWrite(String(payload.data));
-    if (payload.eof) {
-      // 后端附带结束原因(写失败/远端退出码/通道关闭);用户主动关闭不带原因
-      // (第十六批:原因文案剥码标记后展示)
-      if (payload.error) {
-        var reason = window.errStripCode(String(payload.error));
-        termAppendLine('[会话已结束: ' + reason + ']');
-        toast('终端会话结束: ' + reason, 'warn');
-      } else {
-        termAppendLine('[会话已结束]');
-      }
-      cState.exec.eof = true;
-      // eof 后释放会话与监听,避免泄漏
-      releaseExecListener();
-      cState.exec.sessionId = null;
-      var input = $('term-input');
-      if (input) input.disabled = true;
-      renderTerm();
+  // shell 值 → 下拉选项值(探测到 bash/sh 之外的值时回退「自动」)
+  function tabShellOption(shell) {
+    return (shell === 'bash' || shell === 'sh') ? shell : '';
+  }
+
+  // 停止单个标签的会话(quiet 时不提示)
+  function stopExecTab(tab, quiet) {
+    if (tab.sessionId) {
+      var sid = tab.sessionId;
+      tab.sessionId = null;
+      AppBus.invoke('manage_exec_stop', { sessionId: sid }).catch(function () { /* 忽略 */ });
     }
+    tab.history = [];
+    tab.histIdx = -1;
+    if (!quiet) toast('终端已关闭', 'info');
+  }
+
+  function stopAllExecTabs() {
+    execTabsAll().forEach(function (t) { stopExecTab(t, true); });
+    cState.exec.tabs = {};
+    cState.exec.order = [];
+    cState.exec.activeKey = null;
   }
 
   // 简易 ANSI 处理:剥除 ESC 转义序列;\r 回到行首覆盖;\n 换行
-  function termWrite(data) {
-    // 先拼接上一块残留的不完整 ESC 序列,再缓存本块尾部的不完整序列
-    if (cState.exec.pend) {
-      data = cState.exec.pend + data;
-      cState.exec.pend = '';
+  function termWrite(tab, data) {
+    if (tab.pend) {
+      data = tab.pend + data;
+      tab.pend = '';
     }
     var idx = data.lastIndexOf('\x1b');
     if (idx !== -1 && /^\x1b(\[[0-9;?]*|\][^\x07]*)?$/.test(data.slice(idx))) {
-      cState.exec.pend = data.slice(idx);
+      tab.pend = data.slice(idx);
       data = data.slice(0, idx);
     }
     data = data.replace(/\x1b(\[[0-9;?]*[A-Za-z]|\][^\x07]*\x07|[@-Z\\-_])/g, '')
                .replace(/\x07/g, '');
 
-    var ex = cState.exec;
     for (var i = 0; i < data.length; i++) {
       var ch = data[i];
       if (ch === '\n') {
-        ex.lines.push(ex.cur);
-        if (ex.lines.length > 1000) ex.lines.shift();
-        ex.cur = '';
-        ex.curIdx = 0;
+        tab.lines.push(tab.cur);
+        if (tab.lines.length > 1000) tab.lines.shift();
+        tab.cur = '';
+        tab.curIdx = 0;
       } else if (ch === '\r') {
-        ex.curIdx = 0; // 回到行首,后续字符覆盖
+        tab.curIdx = 0; // 回到行首,后续字符覆盖
       } else if (ch === '\t') {
-        var pad = 4 - (ex.cur.length % 4);
-        for (var t = 0; t < pad; t++) { ex.cur += ' '; ex.curIdx++; }
+        var pad = 4 - (tab.cur.length % 4);
+        for (var t = 0; t < pad; t++) { tab.cur += ' '; tab.curIdx++; }
       } else if (ch >= ' ') {
-        if (ex.curIdx < ex.cur.length) {
-          ex.cur = ex.cur.slice(0, ex.curIdx) + ch + ex.cur.slice(ex.curIdx + 1);
+        if (tab.curIdx < tab.cur.length) {
+          tab.cur = tab.cur.slice(0, tab.curIdx) + ch + tab.cur.slice(tab.curIdx + 1);
         } else {
-          ex.cur += ch;
+          tab.cur += ch;
         }
-        ex.curIdx++;
+        tab.curIdx++;
       }
     }
-    renderTerm();
+    if (execActiveTab() === tab) renderTerm(tab);
   }
 
-  function termAppendLine(text) {
-    cState.exec.lines.push(text);
-    if (cState.exec.lines.length > 1000) cState.exec.lines.shift();
+  function termAppendLine(tab, text) {
+    tab.lines.push(text);
+    if (tab.lines.length > 1000) tab.lines.shift();
+    if (execActiveTab() === tab) renderTerm(tab);
   }
 
-  function resetTermBuffer() {
-    cState.exec.lines = [];
-    cState.exec.cur = '';
-    cState.exec.curIdx = 0;
-    cState.exec.pend = '';
-    cState.exec.eof = false;
+  function resetTermBuffer(tab) {
+    tab.lines = [];
+    tab.cur = '';
+    tab.curIdx = 0;
+    tab.pend = '';
+    tab.eof = false;
     // 新会话(含切换 shell 重开)远端从默认尺寸起步,清缓存强制重新上报
-    cState.exec.lastCols = null;
-    cState.exec.lastRows = null;
+    tab.lastCols = null;
+    tab.lastRows = null;
   }
 
-  function renderTerm() {
+  function renderTerm(tab) {
     var out = $('term-output');
-    if (!out) return;
+    if (!out || execActiveTab() !== tab) return;
     // 用户未向上滚动(贴近底部)时才自动滚到底
     var atBottom = out.scrollTop + out.clientHeight >= out.scrollHeight - 40;
-    var ex = cState.exec;
-    out.textContent = ex.lines.join('\n') + (ex.lines.length ? '\n' : '') + ex.cur;
+    out.textContent = tab.lines.join('\n') + (tab.lines.length ? '\n' : '') + tab.cur;
     if (atBottom) out.scrollTop = out.scrollHeight;
   }
 
   function onTermInputKey(e) {
     var input = e.target;
-    var ex = cState.exec;
+    var tab = execActiveTab();
+    if (!tab) return;
     if (e.key === 'Enter') {
       var line = input.value;
-      if (!ex.sessionId) { toast('会话已结束,请关闭终端', 'warn'); return; }
-      AppBus.invoke('manage_exec_write', { sessionId: ex.sessionId, data: line + '\r' })
-        .catch(function () { /* 写失败忽略,输出流会体现 */ });
-      if (line) {
-        ex.history.push(line);
-        if (ex.history.length > 100) ex.history.shift();
+      if (!tab.sessionId) { toast('会话已结束,请关闭标签或切换 shell 重开', 'warn'); return; }
+      // 广播(勾选且有同栈同伴):发给同 compose_project 的全部活跃标签
+      var cb = $('term-broadcast-cb');
+      var targets = [tab];
+      if (cb && cb.checked) {
+        var peers = broadcastPeers();
+        if (peers.length > 0) targets = [tab].concat(peers);
       }
-      ex.histIdx = -1;
+      for (var i = 0; i < targets.length; i++) {
+        (function (t) {
+          AppBus.invoke('manage_exec_write', { sessionId: t.sessionId, data: line + '\r' })
+            .catch(function () { /* 写失败忽略,输出流会体现 */ });
+        })(targets[i]);
+      }
+      if (line) {
+        tab.history.push(line);
+        if (tab.history.length > 100) tab.history.shift();
+      }
+      tab.histIdx = -1;
       input.value = '';
       e.preventDefault();
     } else if (e.key === 'ArrowUp') {
-      if (ex.history.length === 0) return;
-      if (ex.histIdx === -1) ex.histIdx = ex.history.length - 1;
-      else if (ex.histIdx > 0) ex.histIdx--;
-      input.value = ex.history[ex.histIdx];
+      if (tab.history.length === 0) return;
+      if (tab.histIdx === -1) tab.histIdx = tab.history.length - 1;
+      else if (tab.histIdx > 0) tab.histIdx--;
+      input.value = tab.history[tab.histIdx];
       e.preventDefault();
     } else if (e.key === 'ArrowDown') {
-      if (ex.histIdx === -1) return;
-      if (ex.histIdx < ex.history.length - 1) {
-        ex.histIdx++;
-        input.value = ex.history[ex.histIdx];
+      if (tab.histIdx === -1) return;
+      if (tab.histIdx < tab.history.length - 1) {
+        tab.histIdx++;
+        input.value = tab.history[tab.histIdx];
       } else {
-        ex.histIdx = -1;
+        tab.histIdx = -1;
         input.value = '';
       }
       e.preventDefault();
     }
   }
 
-  // 关闭终端:通知后端停止会话 + unlisten(防泄漏)
+  // 兼容入口(宿主 manage.js 调用:切服务器时清终端):停**全部**标签会话。
+  // 第二十二批多标签后语义升级为「停全部」——宿主调用点语义均为
+  // 「环境已变,终端不应存活」,全停即正确行为。
   function stopExecSession(quiet) {
-    var ex = cState.exec;
-    if (ex.sessionId) {
-      var sid = ex.sessionId;
-      ex.sessionId = null;
-      AppBus.invoke('manage_exec_stop', { sessionId: sid }).catch(function () { /* 忽略 */ });
-    }
-    releaseExecListener();
-    ex.containerId = null;
-    ex.history = [];
-    ex.histIdx = -1;
+    stopAllExecTabs();
     if (!quiet) toast('终端已关闭', 'info');
-  }
-
-  function releaseExecListener() {
-    var ex = cState.exec;
-    if (ex.unlisten) {
-      try { ex.unlisten(); } catch (e) { /* 忽略 */ }
-      ex.unlisten = null;
-    }
   }
 
   // ===== 阶段五:终端尺寸自适应(接线后端 manage_exec_resize)=====
   // 行式终端(非全屏程序)resize 主要影响远端行宽(长行按新列数折行),属体验
   // 优化:同步失败仅 console.warn,不打扰用户。触发时机:
-  // 1) 会话建立成功(startExec 内)同步一次;
+  // 1) 会话建立成功(startExec 内)与切换标签时各同步一次(尺寸缓存按标签独立);
   // 2) window resize(防抖 300ms,监听器已在 bindEventsC 注册一次);
   // 3) 输出区自身尺寸变化(ResizeObserver,覆盖弹窗 min(1000px,94vw) 宽与
   //    输出区 60vh 高随窗口/布局的变化;无 RO 的老内核仅靠 window resize 兜底)。
@@ -1119,25 +1327,26 @@
     };
   }
 
-  // 向后端上报当前尺寸;无会话/已 eof/尺寸未变时跳过,失败 console.warn 静默
+  // 向后端上报**当前标签**的终端尺寸;无会话/已 eof/尺寸未变时跳过,
+  // 失败 console.warn 静默(缓存按标签独立)
   function pushTermResize() {
-    var ex = cState.exec;
-    if (!ex.sessionId || ex.eof) return; // 模态关闭后 resize 回调到这里判空直接返回
+    var tab = execActiveTab();
+    if (!tab || !tab.sessionId || tab.eof) return; // 模态关闭后 resize 回调到这里判空直接返回
     var size = termGridSize();
     if (!size) return;
-    if (ex.lastCols === size.cols && ex.lastRows === size.rows) return; // 尺寸未变不重发
-    var sid = ex.sessionId;
-    var prevCols = ex.lastCols;
-    var prevRows = ex.lastRows;
-    ex.lastCols = size.cols;
-    ex.lastRows = size.rows;
+    if (tab.lastCols === size.cols && tab.lastRows === size.rows) return; // 尺寸未变不重发
+    var sid = tab.sessionId;
+    var prevCols = tab.lastCols;
+    var prevRows = tab.lastRows;
+    tab.lastCols = size.cols;
+    tab.lastRows = size.rows;
     AppBus.invoke('manage_exec_resize', { sessionId: sid, cols: size.cols, rows: size.rows })
       .catch(function (err) {
         // 失败回滚缓存为旧值:后续同尺寸触发不被「未变」去重挡掉,可重试;
         // 会话已重建则不回写,避免旧会话结果污染新会话(新会话缓存起点为 null)
-        if (ex.sessionId === sid) {
-          ex.lastCols = prevCols;
-          ex.lastRows = prevRows;
+        if (tab.sessionId === sid) {
+          tab.lastCols = prevCols;
+          tab.lastRows = prevRows;
         }
         console.warn('[manage] 终端尺寸同步失败:', err && err.message ? err.message : err);
       });
@@ -1172,7 +1381,7 @@
     }
   }
 
-  // closeModal 钩子:模态框被关闭(含遮罩点击/关闭按钮/Esc)时清理终端会话
+  // closeModal 钩子:模态框被关闭(含遮罩点击/关闭按钮/Esc)时清理**全部**终端会话
   function execOnModalClose() {
     // 还原共用模态尺寸:任何关闭路径(关闭按钮/遮罩点击/Esc/关闭终端)都经
     // closeModal 走到这里,无条件移除终端态/查看态修饰类
@@ -1184,9 +1393,9 @@
         card.classList.remove('modal-wide');
       }
     }
-    var ex = cState.exec;
-    if (ex.sessionId || ex.unlisten) {
-      stopExecSession(true);
+    if (cState.exec.order.length > 0 || cState.exec.unlisten) {
+      stopAllExecTabs();
+      releaseExecListener();
     }
     // 阶段五:解除输出区尺寸观察(所有关闭路径统一经这里收尾)
     unobserveTermOutput();
@@ -1194,11 +1403,25 @@
     stopLogFollow(true);
   }
 
+  function releaseExecListener() {
+    var ex = cState.exec;
+    if (ex.unlisten) {
+      try { ex.unlisten(); } catch (e) { /* 忽略 */ }
+      ex.unlisten = null;
+    }
+    // 复位同步守卫:注册 promise 尚未 resolve 时关闭模态,防 listening 卡死
+    // 导致下次打开不再注册监听;代际自增使在途注册回调自注销(见 ensureExecListener)
+    ex.listening = false;
+    ex.listenGen++;
+    ex.buffer = [];
+  }
+
   // ===== C 阶段:离开 05 页清理 =====
   function onLeaveC() {
     monitorStop(true);
-    if (cState.exec.sessionId || cState.exec.unlisten) {
-      stopExecSession(true);
+    if (cState.exec.order.length > 0 || cState.exec.unlisten) {
+      stopAllExecTabs();
+      releaseExecListener();
     }
     unobserveTermOutput(); // 阶段五:离开页面同样解除终端尺寸观察
     hideMonitorError();

@@ -48,6 +48,48 @@ const SHELL_PROBE_SCRIPT: &str = "command -v bash >/dev/null 2>&1 && bash -c tru
 const TAIL_MAX: usize = 4096;
 const TAIL_KEEP: usize = 1024;
 
+// ===== 会话输出落盘(第二十二批)=====
+
+/// 终端会话日志文件名:`term-<yyyyMMdd-HHMMSS>-<容器名 sanitize>.log`
+/// (落在应用目录 `logs/` 下,与 app.log 同目录;审计/排障用)。
+/// 容器名做 sanitize:剔除路径分隔符与 Windows 保留字符,截断防超长。
+pub(crate) fn term_log_file_name(ts: &str, container_name: &str) -> String {
+    let mut safe: String = container_name
+        .trim()
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            _ => c,
+        })
+        .collect();
+    // 防空名与超长(留出前缀与扩展名余量)
+    if safe.is_empty() {
+        safe = "container".to_string();
+    }
+    let mut truncated: String = safe.chars().take(60).collect();
+    if truncated.is_empty() {
+        truncated = "container".to_string();
+    }
+    format!("term-{}-{}.log", ts, truncated)
+}
+
+/// 把一帧输出写入会话日志(尽力而为:失败仅告警并停止后续写入)。
+///
+/// 返回 `false` 表示落盘已失败(调用方置位停写,不反复告警)。
+/// 使用 std::fs(本地小文件追加;与仓库在 async 上下文直写 std::fs 的
+/// 既有风格一致 —— 见 deploy 管线的临时文件写入)。
+fn append_term_log(log: &mut Option<std::fs::File>, failed: &mut bool, text: &str) {
+    if *failed {
+        return;
+    }
+    let Some(file) = log.as_mut() else { return };
+    use std::io::Write;
+    if let Err(e) = file.write_all(text.as_bytes()) {
+        log::warn!("终端日志写入失败,该会话后续输出不再落盘: {}", e);
+        *failed = true;
+    }
+}
+
 // ===== 会话状态 =====
 
 /// 由 tauri Builder `.manage(ExecState::default())` 注册的全局状态。
@@ -233,10 +275,41 @@ pub async fn manage_exec_start(
     // 或连接断开时并不投递 ChannelMsg::Close,而是移除内部 ChannelRef 使
     // wait() 返回 None(client/encrypted.rs 的 CHANNEL_CLOSE 分支),故正常
     // 的「远端进程退出」走的是 None 分支。
+    //
+    // 输出落盘(第二十二批):会话全程输出追加到
+    // <应用目录>/logs/term-<ts>-<容器名>.log(自动落盘,失败仅告警不杀会话)。
     let sid = session_id.clone();
+    let log_file: Option<std::fs::File> = {
+        let dir = crate::config::app_dir().join("logs");
+        let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+        // 文件名用容器 ID 前 12 位(命令签名不含容器名 —— 契约零变化)
+        let short_id: String = container_id.chars().take(12).collect();
+        let name = term_log_file_name(&ts, &short_id);
+        match std::fs::create_dir_all(&dir)
+            .and_then(|_| std::fs::File::create(dir.join(&name)))
+        {
+            Ok(f) => {
+                let mut f = f;
+                use std::io::Write;
+                let header = format!(
+                    "# 交互式终端会话 {}\n# 容器:{}  shell:{}\n",
+                    ts, container_id, shell_used
+                );
+                let _ = f.write_all(header.as_bytes());
+                log::info!("终端会话输出落盘: {}", name);
+                Some(f)
+            }
+            Err(e) => {
+                log::warn!("创建终端日志文件失败,该会话输出不落盘: {}", e);
+                None
+            }
+        }
+    };
     let shell_used_read = shell_used.clone();
     tokio::spawn(async move {
         let mut channel = channel;
+        let mut log_file = log_file;
+        let mut log_failed = false;
         let mut exit_status: Option<u32> = None; // 远端 ExitStatus(正常 exit / exec 失败均有)
         let mut user_stop = false; // 用户点「停止」触发的退出(前端已自清,无需再提示)
         let mut output_tail = String::new(); // 输出尾段(退出码非 0 时并入结束原因)
@@ -255,6 +328,7 @@ pub async fn manage_exec_start(
                             }
                             output_tail.drain(..cut);
                         }
+                        append_term_log(&mut log_file, &mut log_failed, &text);
                         let payload = ExecOutputPayload {
                             session_id: sid.clone(),
                             data: text,
@@ -329,6 +403,16 @@ pub async fn manage_exec_start(
             sid,
             reason.as_deref().unwrap_or("用户主动关闭")
         );
+        // 结束行(含原因)写入会话日志;随后关闭文件句柄
+        if let Some(f) = log_file.as_mut() {
+            use std::io::Write;
+            let closing = format!(
+                "\n# 会话结束:{}\n",
+                reason.as_deref().unwrap_or("用户主动关闭")
+            );
+            let _ = f.write_all(closing.as_bytes());
+            let _ = f.flush();
+        }
         // 通道关闭:通知前端会话结束(带原因)并移除会话
         let _ = app.emit(
             EXEC_EVENT,
@@ -517,5 +601,53 @@ mod tests {
     fn test_last_output_line_empty_returns_none() {
         assert_eq!(last_output_line("", 200), None);
         assert_eq!(last_output_line("\r\n\x1b[?1h\x07", 200), None);
+    }
+
+    // ===== 会话输出落盘(第二十二批)=====
+
+    #[test]
+    fn test_term_log_file_name_sanitize() {
+        // 常规:拼接时间戳与容器名
+        assert_eq!(
+            term_log_file_name("20260915-101010", "abc123def456"),
+            "term-20260915-101010-abc123def456.log"
+        );
+        // 危险字符替换(路径分隔符/Windows 保留字符)
+        assert_eq!(
+            term_log_file_name("20260915-101010", "a/b\\c:d*e?f"),
+            "term-20260915-101010-a_b_c_d_e_f.log"
+        );
+        // 空名回退
+        assert_eq!(
+            term_log_file_name("20260915-101010", "   "),
+            "term-20260915-101010-container.log"
+        );
+        // 超长截断(容器名部分截到 60 字符)
+        let long = "x".repeat(120);
+        let name = term_log_file_name("20260915-101010", &long);
+        assert_eq!(name, format!("term-20260915-101010-{}.log", "x".repeat(60)));
+    }
+
+    #[test]
+    fn test_append_term_log_writes_and_stops_after_failure() {
+        // 写成功:内容落盘
+        let dir = std::env::temp_dir().join(format!("ddterm-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.log");
+        let mut log = Some(std::fs::File::create(&path).unwrap());
+        let mut failed = false;
+        append_term_log(&mut log, &mut failed, "hello ");
+        append_term_log(&mut log, &mut failed, "world");
+        assert!(!failed);
+        drop(log);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "hello world");
+        std::fs::remove_dir_all(&dir).ok();
+
+        // None 句柄:静默跳过(创建失败路径)
+        let mut none_log: Option<std::fs::File> = None;
+        let mut failed2 = false;
+        append_term_log(&mut none_log, &mut failed2, "ignored");
+        assert!(!failed2);
     }
 }

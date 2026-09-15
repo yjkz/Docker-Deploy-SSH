@@ -2297,3 +2297,61 @@ migrate_project.rs:兜底命中入列带标记与识别说明 / 显式声明无�
   圆角为全站既有语言、停用行有意弱化)
 - **待真机复测**:创建 daily 日程到点触发的完整链路(托盘 tooltip /
   历史 / 通知落于既有链路);互斥拒绝在并发场景下的用户体验
+
+---
+
+# 第二十二批(二):终端多标签 + 同栈广播 + 输出落盘
+
+> 第三梯队第二项。后端本就是多会话 HashMap(write/resize/stop 按 session_id
+> 独立),原前端「单会话防护」是唯一瓶颈 —— 本次放开为多标签,并补上用户
+> 点名的两项能力:命令广播(同栈限定,用户定案)与输出落盘(自动全部落盘)。
+
+## 后端(命令与事件契约零变化)
+
+- **输出落盘**(`manage_exec.rs`):读任务每帧把 data 追加到
+  `<应用目录>/logs/term-<yyyyMMdd-HHMMSS>-<容器ID前12位>.log`(会话头含
+  容器/shell;结束写一行结束原因;`term_log_file_name` sanitize 危险字符与
+  超长)。**自动全员落盘、失败仅告警不杀会话**。命令签名不含容器名,文件名
+  用容器 ID(契约零变化)。
+- **容器行增字段**(`manage.rs`):`RawContainer` 解析 `Labels` 字符串
+  (`docker ps --format json` 的逗号分隔形态),`ContainerRow` 增
+  `compose_project: Option<String>`(新纯函数 `compose_project_of_labels`),
+  供前端同栈广播限定范围。
+- 单测 +3:文件名 sanitize(危险字符/空名/超长)/ append_term_log 写与失败
+  短路 / label 提取四态。
+
+## 前端(`ui/manage-stacks.js` 终端节整体重构;ManageStacks 导出键名不变)
+
+- **多标签**:`cState.exec` 改为 `{ tabs, order, activeKey, unlisten,
+  listening, listenGen, buffer }`;每标签独立 session/lines/历史/游标/ANSI
+  悬挂缓存/resize 缓存。表内「终端」→ 模态未开则开、已开则加标签
+  (同容器已有存活标签直接切过去);标签栏(名称+×,超宽横滚)点击切换;
+  关闭 tab 停其会话,最后标签关闭即关模态;关模态/切服务器/离页停**全部**
+  会话(宿主 `stopExecSession` 语义升级为全停,调用点语义本就如此)。
+- **单监听按 sid 路由**:一个 `manage-exec-output` 监听;session 未建立期间的
+  早期事件入 `buffer`、invoke 返回后按 sid 认领(替代旧「每次 start 一个新
+  监听」的缓冲重放)。**同步双注册守卫 `listening` + 代际 `listenGen`**:
+  首版只判 `unlisten`(promise resolve 才赋值),而建模态与 startExec 在同一
+  同步任务内都调 ensureExecListener → 注册两次、每条 payload 路由两遍
+  (judge 实测抓到;**真实 Tauri 下 listen 同为异步,同样会双注册**);
+  修复为同步标志 + 过期注册回调自注销。
+- **同栈广播**:顶栏「广播同栈」勾选;开启时输入发给**同 compose_project
+  的活跃标签**(无同伴/项目名为空时禁用);广播只作用于 write,输出仍按标签
+  各归各。
+- resize 只推活跃标签,切标签补推(缓存按标签独立);渲染仅活跃标签。
+- style.css:`.term-toolbar/.term-tabs/.term-tab/.term-broadcast`(ark 纪律:
+  直角、无新色值、选中态墨底反白)。
+
+## 验证
+
+- `cargo test` **355 passed**(+3)/ clippy 保持基线 12 / node --check 17 JS /
+  verify 三脚本 PASS
+- 浏览器桩(no-cache 本地服务 + 多容器 mock,**含 compose_project 字段**)
+  端到端:开两个标签 → 广播发 `uptime` → 两个会话各恰好收到一次(切标签
+  逐一核对缓冲);judge 一轮判 FAIL(重复投递)→ 修复 → 复验 **PASS**
+  (逐行亮度扫描确认 5 行无重复)
+- **教训**:IAB 后端按 URL 缓存资源,桩验证改完 JS 必须给预览页脚本加
+  `?v=N` 查询串(记入浏览器验证流程);`AppBus.on` 的 unlisten 是异步返回,
+  任何「只判 unlisten 的幂等守卫」都是无效守卫
+- **待真机复测**:多标签并发会话(不同容器)真实 PTY;广播在真实同栈异构
+  容器上的表现;`logs/term-*.log` 落盘文件实测查看

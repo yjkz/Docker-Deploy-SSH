@@ -689,7 +689,8 @@
       execBtn.textContent = '终端';
       execBtn.addEventListener('click', function (e) {
         e.stopPropagation();
-        openTerminal(c.id, c.names || c.id);
+        // 第二十二批:传 compose 项目名(同栈广播按它限定范围;非 compose 容器为 null)
+        openTerminal(c.id, c.names || c.id, c.compose_project || null);
       });
       wrap.appendChild(execBtn);
     } else {

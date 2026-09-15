@@ -164,6 +164,30 @@ struct RawContainer {
     ports: String,
     #[serde(default)]
     created_at: String,
+    /// `docker ps --format json` 的 Labels 为**逗号分隔字符串**
+    /// (`k1=v1,k2=v2`;与 `docker ps -a --format '{{json .}}'` 的对象形态不同)。
+    /// 供 [`compose_project_of_labels`] 提取 compose 项目名(终端同栈广播用)。
+    #[serde(default)]
+    labels: String,
+}
+
+/// 从 `docker ps --format json` 的 Labels 字符串提取 compose 项目名
+/// (`com.docker.compose.project`;非 compose 容器返回 None)。纯函数,便于单测。
+///
+/// 字符串形态:`com.docker.compose.project=myproj,com.docker.compose.service=web,`
+/// (值里理论上可含逗号,但 compose 项目名/标签值不含逗号,按逗号分段匹配足够)。
+pub(crate) fn compose_project_of_labels(labels: &str) -> Option<String> {
+    const PREFIX: &str = "com.docker.compose.project=";
+    for part in labels.split(',') {
+        let seg = part.trim();
+        if let Some(v) = seg.strip_prefix(PREFIX) {
+            let name = v.trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
 }
 
 #[derive(Debug, Deserialize)]
@@ -276,6 +300,9 @@ pub struct ContainerRow {
     status: String,
     ports: String,
     created_at: String,
+    /// compose 项目名(`com.docker.compose.project`;非 compose 容器为 None)
+    /// ——前端终端「同栈广播」按它限定广播范围(第二十二批)。
+    compose_project: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -665,6 +692,7 @@ pub async fn manage_list_containers(
             status: c.status,
             ports: c.ports,
             created_at: c.created_at,
+            compose_project: compose_project_of_labels(&c.labels),
         })
         .collect())
 }
@@ -1324,5 +1352,34 @@ mod tests {
         assert_eq!(format_bytes_metric(512 * 1024 * 1024), "512 MB");
         assert_eq!(format_bytes_metric(2 * 1024 * 1024 * 1024), "2.0 GB");
         assert_eq!(format_bytes_metric(15 * 1024 * 1024 * 1024 + 5), "15.0 GB");
+    }
+
+    // ===== compose 项目名提取(第二十二批:终端同栈广播用)=====
+
+    #[test]
+    fn test_compose_project_of_labels() {
+        // 典型形态:逗号分隔的 k=v 串
+        assert_eq!(
+            compose_project_of_labels(
+                "com.docker.compose.project=myproj,com.docker.compose.service=web,"
+            ),
+            Some("myproj".to_string())
+        );
+        // 项目名非首位
+        assert_eq!(
+            compose_project_of_labels(
+                "maintainer=x,com.docker.compose.project=prod-app,com.docker.compose.service=db"
+            ),
+            Some("prod-app".to_string())
+        );
+        // 非 compose 容器 / 空串 / 只有前缀无值 → None
+        assert_eq!(compose_project_of_labels(""), None);
+        assert_eq!(compose_project_of_labels("maintainer=foo"), None);
+        assert_eq!(compose_project_of_labels("com.docker.compose.project=,x=1"), None);
+        // 前后空白容忍(docker 输出可能带空格)
+        assert_eq!(
+            compose_project_of_labels(" com.docker.compose.project=myproj , a=b"),
+            Some("myproj".to_string())
+        );
     }
 }
