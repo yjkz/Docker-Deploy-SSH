@@ -50,6 +50,8 @@ pub fn run() {
       deploy_schedule::deploy_schedules_save,
       deploy_schedule::deploy_schedules_delete,
       config_io::config_wipe,
+      config_io::config_history_list,
+      config_io::config_history_restore,
       notify::notify_get_config,
       notify::notify_save_config,
       notify::notify_test_desktop,

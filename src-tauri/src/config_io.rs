@@ -422,6 +422,9 @@ pub fn config_import_file(path: String, password: String) -> Result<ImportSummar
     // 直接写三个文件,不经过 NOTIFY_UNHEALTHY 的「跳过写回」保护)
     let dir = config_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建配置目录失败: {}", e))?;
+    // 导入是整体替换(最需要兜底的场景之一)→ 覆盖前先快照当前状态
+    // (第二十二批配置版本历史;失败仅告警不阻断)
+    crate::config::snapshot_config(&dir);
     let server_count = servers.len();
     let projects = &payload.projects;
     write_json_atomic(&dir.join("servers.json"), &servers)
@@ -454,6 +457,85 @@ pub fn config_wipe() -> Result<(), String> {
             }
         }
     }
+    Ok(())
+}
+
+// ===== 配置版本历史(第二十二批)=====
+
+/// 一条快照的元信息(camelCase 直通前端)。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigSnapshot {
+    /// 快照目录名 = `yyyyMMdd-HHMMSS`(恢复时的 id)
+    pub id: String,
+    /// 含哪些配置文件(servers/projects/notify 子集)
+    pub files: Vec<String>,
+    /// 三文件字节数合计
+    pub size_bytes: u64,
+}
+
+/// 列出全部配置快照(新 → 旧)。
+#[tauri::command]
+pub fn config_history_list() -> Vec<ConfigSnapshot> {
+    let root = crate::config::history_dir();
+    let mut dirs = crate::config::list_snapshot_dirs(&root);
+    dirs.reverse(); // 目录名 = 时间戳,倒序 = 新 → 旧
+    dirs.into_iter()
+        .filter_map(|path| {
+            let id = path.file_name()?.to_string_lossy().to_string();
+            let mut files = Vec::new();
+            let mut size: u64 = 0;
+            for name in ["servers.json", "projects.json", "notify.json"] {
+                if let Ok(meta) = std::fs::metadata(path.join(name)) {
+                    files.push(name.to_string());
+                    size += meta.len();
+                }
+            }
+            if files.is_empty() {
+                return None; // 空快照目录(异常残留)不展示
+            }
+            Some(ConfigSnapshot { id, files, size_bytes: size })
+        })
+        .collect()
+}
+
+/// 恢复指定快照到当前配置。
+///
+/// 安全与语义:
+/// - `id` 经 [`crate::config::is_valid_snapshot_id`] 校验(防路径穿越),
+///   且恢复目录必须存在;
+/// - **恢复前先把当前状态快照一份**(误恢复可再恢复回去);
+/// - 快照内存在的文件原样拷回(三件套子集;缺失的跳过)。
+#[tauri::command]
+pub fn config_history_restore(id: String) -> Result<(), String> {
+    if !crate::config::is_valid_snapshot_id(&id) {
+        return Err(format!("快照标识不合法:{}", id));
+    }
+    let root = crate::config::history_dir();
+    let src = root.join(id.trim());
+    if !src.is_dir() {
+        return Err(format!("快照不存在:{}", id));
+    }
+    let dir = config_dir();
+    // 恢复前留一份当前状态(可回退)
+    crate::config::snapshot_config(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建配置目录失败: {}", e))?;
+    let mut restored: Vec<&str> = Vec::new();
+    for name in ["servers.json", "projects.json", "notify.json"] {
+        let from = src.join(name);
+        if !from.is_file() {
+            continue;
+        }
+        let bytes = std::fs::read(&from)
+            .map_err(|e| format!("读取快照文件失败 ({}): {}", name, e))?;
+        std::fs::write(dir.join(name), bytes)
+            .map_err(|e| format!("写入配置文件失败 ({}): {}", name, e))?;
+        restored.push(name);
+    }
+    if restored.is_empty() {
+        return Err("该快照不含可恢复的配置文件".to_string());
+    }
+    log::info!("配置已从快照 {} 恢复: {:?}", id, restored);
     Ok(())
 }
 
@@ -764,6 +846,48 @@ mod tests {
         assert_eq!(before, after, "预览不得写任何配置文件");
         let loaded = crate::config::load_config().unwrap();
         assert_eq!(loaded.servers.len(), 1, "当前配置仍是 1 台(未被替换)");
+
+        std::env::remove_var("DD_CONFIG_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ===== 配置版本历史(第二十二批)=====
+
+    #[test]
+    fn test_history_restore_roundtrip_and_reject() {
+        let _guard = crate::config::TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ddhistio-{}", uuid::Uuid::new_v4()));
+        let cfg_dir = dir.join("config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
+
+        // 预置一个快照目录(合法 id),内容为标记版 servers.json
+        let root = cfg_dir.join(".history");
+        let snap_id = "20260915-101010";
+        std::fs::create_dir_all(root.join(snap_id)).unwrap();
+        std::fs::write(root.join(snap_id).join("servers.json"), br#"[{"id":"snap-marker"}]"#).unwrap();
+        // 当前配置为另一个内容
+        std::fs::write(cfg_dir.join("servers.json"), br#"[{"id":"current"}]"#).unwrap();
+
+        // 列表:含该快照
+        let list = config_history_list();
+        assert!(list.iter().any(|s| s.id == snap_id), "列表应含预置快照");
+        let entry = list.iter().find(|s| s.id == snap_id).unwrap();
+        assert!(entry.files.iter().any(|f| f == "servers.json"));
+
+        // 恢复:文件被替换为快照内容
+        config_history_restore(snap_id.into()).unwrap();
+        let restored = std::fs::read_to_string(cfg_dir.join("servers.json")).unwrap();
+        assert!(restored.contains("snap-marker"), "恢复后应为快照内容: {}", restored);
+        // 恢复前自动留了当前状态快照(可回退)
+        let snaps = crate::config::list_snapshot_dirs(&root);
+        assert!(snaps.len() >= 2, "恢复前应自动留一份当前状态快照");
+
+        // 非法 id:路径穿越拒绝
+        assert!(config_history_restore("../etc".into()).is_err());
+        assert!(config_history_restore("20260915-101010/..".into()).is_err());
+        // 合法格式但不存在
+        assert!(config_history_restore("20990101-000000".into()).is_err());
 
         std::env::remove_var("DD_CONFIG_DIR");
         std::fs::remove_dir_all(&dir).ok();

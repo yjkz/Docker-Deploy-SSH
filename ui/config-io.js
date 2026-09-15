@@ -30,7 +30,9 @@
 
   var st = {
     importPath: '',  // 已选择的备份文件路径(取消选择时保持原值)
-    busy: false      // 任一操作进行中(禁用导出/导入/清除按钮防重复触发)
+    busy: false,     // 任一操作进行中(禁用导出/导入/清除按钮防重复触发)
+    historyArmId: null,   // 两步删除:已武装的快照 id(第二十二批历史快照)
+    historyArmTimer: null // 武装超时还原句柄
   };
 
   // ===== 小工具 =====
@@ -349,6 +351,76 @@
     body.appendChild(result);
   }
 
+  function appendHistoryGroup(body) {
+    body.appendChild(groupTitle('历史快照', 'HISTORY'));
+    body.appendChild(note(
+      '每次配置写盘前自动留档最近 20 份(servers / projects / notify 三件套同快照);' +
+      '展示为 新 → 旧,点「恢复」将当前配置替换为该快照内容(恢复前会先自动留一份当前状态)'));
+    var listBox = el('div', 'cio-history-list');
+    listBox.id = 'cio-history-list';
+    listBox.appendChild(el('div', 'cio-history-loading', '加载中…'));
+    body.appendChild(listBox);
+    // 单次异步填充(打开模态时调一次)
+    window.AppBus.invoke('config_history_list').then(function (list) {
+      renderHistoryList(Array.isArray(list) ? list : []);
+    }).catch(function (err) {
+      listBox.textContent = '';
+      listBox.appendChild(el('div', 'cio-history-empty',
+        '读取快照失败:' + (window.errText(err) || '未知错误')));
+    });
+  }
+
+  function renderHistoryList(list) {
+    var box = document.getElementById('cio-history-list');
+    if (!box) return;
+    box.textContent = '';
+    if (list.length === 0) {
+      box.appendChild(el('div', 'cio-history-empty', '(暂无快照:配置写盘前会自动留档)'));
+      return;
+    }
+    st.historyArmId = null;
+    list.forEach(function (snap) {
+      var row = el('div', 'cio-history-row');
+      row.appendChild(el('span', 'cio-history-id mono', snap.id));
+      row.appendChild(el('span', 'cio-history-meta',
+        (snap.files || []).join(' / ') + ' · ' + formatBytesLocal(snap.sizeBytes)));
+      var btn = el('button', 'btn btn-sm', '恢复');
+      btn.type = 'button';
+      btn.addEventListener('click', function () {
+        if (st.historyArmId === snap.id) {
+          if (st.historyArmTimer) { clearTimeout(st.historyArmTimer); st.historyArmTimer = null; }
+          st.historyArmId = null;
+          runHistoryRestore(snap.id);
+        } else {
+          // 两步内联确认(同 servers 删除行交互:再点一次「确认恢复?」)
+          st.historyArmId = snap.id;
+          if (st.historyArmTimer) clearTimeout(st.historyArmTimer);
+          btn.textContent = '确认恢复?';
+          btn.classList.add('is-armed');
+          st.historyArmTimer = setTimeout(function () {
+            st.historyArmTimer = null;
+            st.historyArmId = null;
+            renderHistoryList(list);
+          }, 3000);
+        }
+      });
+      row.appendChild(btn);
+      box.appendChild(row);
+    });
+  }
+
+  function runHistoryRestore(id) {
+    st.busy = true;
+    window.AppBus.invoke('config_history_restore', { id: id }).then(function () {
+      window.toast('配置已恢复到 ' + id + ',将刷新应用', 'ok');
+      // 与导入/清除同口径:摘要停留一拍再整页刷新
+      setTimeout(function () { window.location.reload(); }, 400);
+    }).catch(function (err) {
+      st.busy = false;
+      window.formFailLoud('cio-error', '恢复失败:' + (window.errText(err) || '未知错误'));
+    });
+  }
+
   function appendDangerGroup(body) {
     var box = el('div', 'cio-danger-box');
     // 危险区标题保留自己的视觉(已有专属 .cio-danger-title),仅把英文拆出
@@ -398,6 +470,15 @@
     return row;
   }
 
+  /** 字节 → 人类可读(1024 进制;与 images.js formatBytes 同口径简版) */
+  function formatBytesLocal(n) {
+    var v = Number(n) || 0;
+    if (v < 1024) return v + ' B';
+    if (v < 1024 * 1024) return (v / 1024).toFixed(1) + ' KB';
+    if (v < 1024 * 1024 * 1024) return (v / 1024 / 1024).toFixed(1) + ' MB';
+    return (v / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+  }
+
   function openConfigIoModal() {
     st.importPath = '';
     st.busy = false;
@@ -411,6 +492,7 @@
     body.appendChild(window.formErrorBox('cio-error'));
     appendExportGroup(body);
     appendImportGroup(body);
+    appendHistoryGroup(body);
     appendDangerGroup(body);
     bindWipeConfirm();
     overlay.classList.remove('hidden');
@@ -422,6 +504,12 @@
     if (overlay) {
       overlay.classList.add('hidden');
       window.modalFocusClose(overlay);
+    }
+    // 复位历史快照的两步确认武装(重开时不应残留「确认恢复?」态)
+    st.historyArmId = null;
+    if (st.historyArmTimer) {
+      clearTimeout(st.historyArmTimer);
+      st.historyArmTimer = null;
     }
   }
 

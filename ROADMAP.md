@@ -287,15 +287,20 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 - 后端:会话输出自动落盘 logs/term-*.log;ContainerRow 增 compose_project
 - 前端:终端多标签(tabs 字典 + 按 sid 路由的单监听)+ 同栈广播勾选
 - judge 抓出双注册缺陷(同步守卫缺失)已修并复验 PASS;测试 352 → **355**
-**③ 配置版本历史** ⏳ 待开工(快照 + 2 命令)
+**③ 配置版本历史 ✅ 已完成**(记录见 UPGRADE-PLAN「第二十二批(三)」)
+- save_config 写前自动快照三件套到 config/.history/(全等去重、cap 20);
+  config_import_file 导入前同样快照;config_wipe 不涉(清除语义)
+- 新命令 config_history_list / config_history_restore(id 校验防穿越 +
+  恢复前自动留当前态);config-io.js 新增「历史快照」区块(两步确认)
+- 测试 355 → **360**;命令 104 → **106**
 **④ 文档治理批** ⏳ 待开工(清扫 + 页首版本戳 + contract-smoke + 补测试)
 
 ---
 
 ## 当前状态速览
 
-- 版本 **v6.3.3**;main = origin/main;基线 `cargo test` **355 passed** / 13 ignored
-- 命令 **104** 个(generate_handler 实测;第二十二批 +3 调度命令,待后两项继续更新)
+- 版本 **v6.3.3**;main = origin/main;基线 `cargo test` **360 passed** / 13 ignored
+- 命令 **106** 个(generate_handler 实测;第二十二批 +3 调度 +2 配置历史)
 - JS **16** 文件(含 theme-init.js;index.html 加载顺序见 wiki/03:13)
 - 前端结构:12 模态;commands/ 11 文件;三大 JS 主文件 2338/2013/2537 行
 - 表单体系(第十三批):5 处模态有真实 `<form novalidate>` 语义;失焦校验 + Enter 提交由 app.js 三助手统一承担

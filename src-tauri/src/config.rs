@@ -414,9 +414,17 @@ fn load_notify_config(path: &Path) -> NotifyConfig {
 /// 例外:notify.json 读取异常(损坏/不可读,`NOTIFY_UNHEALTHY` 置位)期间
 /// 跳过 notify.json 写回,避免用回退的默认值覆盖原文件(丢密文),见
 /// [`NOTIFY_UNHEALTHY`] 文档。
+///
+/// **配置版本历史(第二十二批)**:写盘前先把**当前磁盘上的三件套**快照到
+/// `config/.history/<yyyyMMdd-HHMMSS>/`(folder-per-event,三文件同快照保持
+/// 同一时刻一致性;与最新快照全等时跳过 —— TOFU 指纹记录等高频写点不刷屏)。
+/// 快照失败仅 `log::warn`(**绝不阻断保存主流程** —— 版本历史是兜底能力,
+/// 其故障不该影响配置写入)。cap [`HISTORY_KEEP`] 份裁最旧。
+/// 不变量:「先快照、后覆盖」,快照内容永远至少包含上一个已落盘版本。
 pub fn save_config(cfg: &AppConfig) -> Result<()> {
     let dir = config_dir();
     std::fs::create_dir_all(&dir)?;
+    snapshot_config(&dir);
     write_json_atomic(&dir.join("servers.json"), &cfg.servers)?;
     write_json_atomic(&dir.join("projects.json"), &cfg.projects)?;
     if NOTIFY_UNHEALTHY.load(Ordering::Acquire) {
@@ -425,6 +433,123 @@ pub fn save_config(cfg: &AppConfig) -> Result<()> {
         write_json_atomic(&dir.join("notify.json"), &cfg.notify)?;
     }
     Ok(())
+}
+
+// ===== 配置版本历史(第二十二批)=====
+
+/// 快照保留份数(超限按目录名 = 时间戳排序裁最旧)。
+pub const HISTORY_KEEP: usize = 20;
+
+/// 快照三件套文件名(与主配置同名;恢复时原样拷回)。
+const SNAPSHOT_FILES: [&str; 3] = ["servers.json", "projects.json", "notify.json"];
+
+/// 快照根目录 `config/.history/`。
+pub(crate) fn history_dir() -> PathBuf {
+    config_dir().join(".history")
+}
+
+/// 快照当前配置三件套(尽力而为;失败仅告警)。
+///
+/// - 与**最新快照全等**时跳过(防高频写点 —— 如 TOFU 指纹每次连接写入 ——
+///   生成大量同内容快照);
+/// - 目录名 `<yyyyMMdd-HHMMSS>`,同秒重复调用时以 `-N` 后缀避让;
+/// - 写后按目录名排序裁最旧,保留 [`HISTORY_KEEP`] 份。
+pub(crate) fn snapshot_config(dir: &Path) {
+    // 1) 收集当前三件套内容;全部不存在(首次运行)时无可快照
+    let mut contents: Vec<(&str, Vec<u8>)> = Vec::new();
+    for name in SNAPSHOT_FILES {
+        match std::fs::read(dir.join(name)) {
+            Ok(bytes) => contents.push((name, bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                log::warn!("配置快照读取 {} 失败,跳过本次快照: {}", name, e);
+                return;
+            }
+        }
+    }
+    if contents.is_empty() {
+        return;
+    }
+
+    // 2) 与最新快照全等 → 跳过(同内容不重复留档)
+    let root = dir.join(".history");
+    if let Some(latest) = list_snapshot_dirs(&root).last() {
+        let same = contents.iter().all(|(name, bytes)| {
+            std::fs::read(latest.join(name)).map(|b| b == *bytes).unwrap_or(false)
+        });
+        if same {
+            return;
+        }
+    }
+
+    // 3) 建目录写文件(同秒冲突加后缀)
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let mut target = root.join(&ts);
+    let mut seq = 1;
+    while target.exists() {
+        seq += 1;
+        target = root.join(format!("{}-{}", ts, seq));
+    }
+    if let Err(e) = std::fs::create_dir_all(&target) {
+        log::warn!("配置快照建目录失败 ({}): {}", target.display(), e);
+        return;
+    }
+    for (name, bytes) in &contents {
+        if let Err(e) = std::fs::write(target.join(name), bytes) {
+            log::warn!("配置快照写入 {} 失败: {}", name, e);
+            let _ = std::fs::remove_dir_all(&target); // 半份快照不留
+            return;
+        }
+    }
+
+    // 4) 裁剪最旧
+    let mut dirs = list_snapshot_dirs(&root);
+    if dirs.len() > HISTORY_KEEP {
+        dirs.sort();
+        let cut = dirs.len() - HISTORY_KEEP;
+        for old in dirs.drain(0..cut) {
+            if let Err(e) = std::fs::remove_dir_all(&old) {
+                log::warn!("清理旧快照失败 ({}): {}", old.display(), e);
+            }
+        }
+    }
+}
+
+/// 列出快照目录(只含目录项,按目录名排序 = 时间序;读失败返回空表)。
+pub(crate) fn list_snapshot_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.push(path);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// 快照 id 合法性(纯函数,便于单测):`yyyyMMdd-HHMMSS` 或带 `-N` 后缀序。
+/// 恢复命令用它防路径穿越(不接受 `/`、`\`、`.` 等字符)。
+pub fn is_valid_snapshot_id(id: &str) -> bool {
+    let s = id.trim();
+    if s.is_empty() || s.len() > 24 || s.contains('/') || s.contains('\\') || s.contains('.') {
+        return false;
+    }
+    let mut parts = s.splitn(3, '-');
+    let date = parts.next().unwrap_or("");
+    let time = parts.next().unwrap_or("");
+    let tail = parts.next();
+    let digit_ok = |x: &str, n: usize| x.len() == n && x.chars().all(|c| c.is_ascii_digit());
+    if !digit_ok(date, 8) || !digit_ok(time, 6) {
+        return false;
+    }
+    match tail {
+        None => true,
+        Some(t) => !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()),
+    }
 }
 
 // ===== 配置读改写收口(第二十批 P2-4)=====
@@ -1333,6 +1458,120 @@ mod tests {
         let final_cfg = load_config().unwrap();
         assert_eq!(final_cfg.servers.len(), 1, "Err 闭包不落盘:ghost 不得出现在磁盘");
         assert_eq!(final_cfg.servers[0].id, "base");
+
+        std::env::remove_var("DD_CONFIG_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ===== 配置版本历史(第二十二批)=====
+
+    /// 建隔离环境并预置 servers.json(直接写文件,不走 save_config —— 避免
+    /// 被测函数自身产生快照干扰断言)。注意写的是**可被 load_config 解析的
+    /// 完整结构**(ServerConfig 需 auth 等必填字段)。
+    fn setup_history_env() -> (std::path::PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ddhist-{}", uuid::Uuid::new_v4()));
+        let cfg_dir = dir.join("config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let s1 = r#"[{"id":"s1","name":"旧服务器","host":"1.1.1.1","port":22,"username":"root",
+            "auth":{"auth_type":"Key","key_path":null,"password_enc":null,"key_pass_enc":null},
+            "remote_dir":"/opt","host_key_sha256":null}]"#;
+        std::fs::write(cfg_dir.join("servers.json"), s1).unwrap();
+        (dir, cfg_dir)
+    }
+
+    #[test]
+    fn test_snapshot_config_creates_and_dedupes() {
+        let _guard = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (dir, cfg_dir) = setup_history_env();
+
+        // 首次快照:目录生成,含 servers.json 内容
+        snapshot_config(&cfg_dir);
+        let snaps = list_snapshot_dirs(&cfg_dir.join(".history"));
+        assert_eq!(snaps.len(), 1, "首次快照应生成一个目录");
+        let content = std::fs::read_to_string(snaps[0].join("servers.json")).unwrap();
+        assert!(content.contains("s1"), "快照应含当前内容: {}", content);
+
+        // 同内容再快照:全等去重,不新增
+        snapshot_config(&cfg_dir);
+        assert_eq!(
+            list_snapshot_dirs(&cfg_dir.join(".history")).len(),
+            1,
+            "内容全等时应跳过(防高频写点刷屏)"
+        );
+
+        // 内容变化后快照:新增第二份(同秒 → -N 后缀避让)
+        std::fs::write(cfg_dir.join("servers.json"), b"[{\"id\":\"changed\"}]").unwrap();
+        snapshot_config(&cfg_dir);
+        let snaps2 = list_snapshot_dirs(&cfg_dir.join(".history"));
+        assert_eq!(snaps2.len(), 2, "内容变化应新增快照");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_snapshot_config_cap_trims_oldest() {
+        let _guard = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (dir, cfg_dir) = setup_history_env();
+        // 预置超过上限的旧快照目录(名字按时间序)
+        let root = cfg_dir.join(".history");
+        for i in 0..(HISTORY_KEEP + 3) {
+            let name = format!("20260101-0000{:02}", i);
+            std::fs::create_dir_all(root.join(&name)).unwrap();
+            std::fs::write(root.join(&name).join("servers.json"), b"[]").unwrap();
+        }
+        // 触发一次新快照(内容与既有不同)
+        snapshot_config(&cfg_dir);
+        let snaps = list_snapshot_dirs(&root);
+        assert_eq!(snaps.len(), HISTORY_KEEP, "超限应裁最旧至保留上限");
+        // 23 + 1 = 24 份,裁 4 份:000000-000003 应被裁掉,000004 起保留
+        let names: Vec<String> = snaps
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(!names.contains(&"20260101-000000".to_string()), "最旧应先裁");
+        assert!(!names.contains(&"20260101-000003".to_string()), "裁 4 份应到 000003");
+        assert!(names.contains(&"20260101-000004".to_string()), "000004 起应保留");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_is_valid_snapshot_id() {
+        // 合法:yyyyMMdd-HHMMSS 与带 -N 后缀
+        assert!(is_valid_snapshot_id("20260915-101010"));
+        assert!(is_valid_snapshot_id("20260915-101010-2"));
+        // 非法:路径穿越 / 分隔符 / 点 / 空 / 位数不符 / 非数字
+        assert!(!is_valid_snapshot_id(""));
+        assert!(!is_valid_snapshot_id("../etc"));
+        assert!(!is_valid_snapshot_id("20260915-101010/.."));
+        assert!(!is_valid_snapshot_id("20260915\\101010"));
+        assert!(!is_valid_snapshot_id("20260915-10101"));
+        assert!(!is_valid_snapshot_id("2026091a-101010"));
+        assert!(!is_valid_snapshot_id("20260915-101010-"));
+        assert!(!is_valid_snapshot_id("20260915-101010-x"));
+    }
+
+    #[test]
+    fn test_save_config_snapshots_previous_state() {
+        let _guard = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (dir, cfg_dir) = setup_history_env();
+        std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
+
+        // 首次保存:快照的是「保存前」的旧内容(s1)
+        let mut cfg = load_config().unwrap();
+        cfg.servers.push(ServerConfig {
+            id: "s-new".into(), name: "新".into(), host: "9.9.9.9".into(), port: 22,
+            username: "root".into(),
+            auth: AuthConfig { auth_type: AuthType::Key, key_path: None, password_enc: None, key_pass_enc: None },
+            remote_dir: "/opt".into(),
+            host_key_sha256: None,
+        });
+        save_config(&cfg).unwrap();
+
+        let snaps = list_snapshot_dirs(&cfg_dir.join(".history"));
+        assert_eq!(snaps.len(), 1, "保存应产生一份「保存前」快照");
+        let snap = std::fs::read_to_string(snaps[0].join("servers.json")).unwrap();
+        assert!(snap.contains("s1") && !snap.contains("s-new"), "快照内容应为覆盖前状态");
 
         std::env::remove_var("DD_CONFIG_DIR");
         std::fs::remove_dir_all(&dir).ok();
