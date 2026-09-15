@@ -66,3 +66,15 @@ jobs:
           done
           exit $fail
         shell: bash
+
+      # 契约 smoke(第二十二批):前端 invoke/listen 集合与后端注册/emit 集合
+      # 双向核对;零依赖纯文本解析(不执行代码),数值一致性问题尽早拦住
+      - name: Contract smoke (verify/)
+        run: node verify/contract-smoke.js
+        shell: bash
+
+      # 文档一致性(第二十二批):版本号/命令数/测试数/页首版本戳跨文档核对
+      # (测试数比对依赖 verify/VERSION.txt 缓存;缓存被 .gitignore 时该项跳过)
+      - name: Doc consistency (verify/)
+        run: node verify/doc-consistency.js
+        shell: bash

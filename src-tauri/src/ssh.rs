@@ -707,6 +707,19 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn test_join_remote_and_normalize() {
+        // join_remote:去尾部 '/' 后拼接(多余斜杠不产生双斜杠)
+        assert_eq!(join_remote("/opt/app", "file.txt"), "/opt/app/file.txt");
+        assert_eq!(join_remote("/opt/app/", "file.txt"), "/opt/app/file.txt");
+        assert_eq!(join_remote("/", "f"), "/f");
+        // normalize_remote:去尾部 '/',根目录保持 '/'
+        assert_eq!(normalize_remote("/opt/app/"), "/opt/app");
+        assert_eq!(normalize_remote("/opt/app///"), "/opt/app");
+        assert_eq!(normalize_remote("/"), "/");
+        assert_eq!(normalize_remote(""), "/");
+    }
+
     fn test_mkdir_p_cmd_nested_path() {
         assert_eq!(
             mkdir_p_cmd("/data/app/releases/2026"),

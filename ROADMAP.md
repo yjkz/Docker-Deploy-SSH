@@ -293,14 +293,23 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 - 新命令 config_history_list / config_history_restore(id 校验防穿越 +
   恢复前自动留当前态);config-io.js 新增「历史快照」区块(两步确认)
 - 测试 355 → **360**;命令 104 → **106**
-**④ 文档治理批** ⏳ 待开工(清扫 + 页首版本戳 + contract-smoke + 补测试)
+**④ 文档治理批 ✅ 已完成**
+- 文档不符清扫:russh 0.46→0.60.3 等实证漂移全清;命令数/测试数/行数引用对齐实测
+- 七篇 wiki 页首统一版本戳 + doc-consistency.js 增「页首戳」断言(7 项)
+- verify/contract-smoke.js:前后端命令/事件集合双向核对(含动态调用点补充表;
+  负向测试验证有效);ci.yml 增 contract-smoke + doc-consistency 两步
+- 编排层补测试 +3(compose_file_flags 转义/compose_override_names/ssh 路径助手)
+- README 补「密码与密文说明」章节;AGENTS.md 补互斥收口与版本历史两条硬约束
+- 测试 360 → **363**
 
 ---
 
 ## 当前状态速览
 
-- 版本 **v6.3.3**;main = origin/main;基线 `cargo test` **360 passed** / 13 ignored
+- 版本 **v6.4.0**;main = origin/main;基线 `cargo test` **363 passed** / 13 ignored
 - 命令 **106** 个(generate_handler 实测;第二十二批 +3 调度 +2 配置历史)
+- **第二十二批(v6.4.0)第三梯队三项全完成**:定时部署 / 终端多标签+广播+落盘 / 配置版本历史;文档治理批完成(contract-smoke 上线)
+- verify/ 六脚本:form-validation / bridge-integrity / scope-integrity / contract-smoke / doc-consistency / VERSION.txt(缓存)
 - JS **16** 文件(含 theme-init.js;index.html 加载顺序见 wiki/03:13)
 - 前端结构:12 模态;commands/ 11 文件;三大 JS 主文件 2338/2013/2537 行
 - 表单体系(第十三批):5 处模态有真实 `<form novalidate>` 语义;失焦校验 + Enter 提交由 app.js 三助手统一承担

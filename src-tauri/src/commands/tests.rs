@@ -2648,3 +2648,44 @@ services:
             "全部线程结束后互斥位应释放(无泄漏)"
         );
     }
+
+    // ===== compose 覆盖文件参数拼装(第二十二批补测)=====
+
+    #[test]
+    fn test_compose_file_flags_single_and_overrides() {
+        // 单文件:仅 -f,无 override 时不追加
+        assert_eq!(compose_file_flags("docker-compose.yml", &[]), "-f 'docker-compose.yml'");
+        // 带 override:按序追加(与 load 顺序一致,后者覆盖前者)
+        assert_eq!(
+            compose_file_flags(
+                "docker-compose.yml",
+                &["compose.override.yml".to_string(), "docker-compose.override.yml".to_string()]
+            ),
+            "-f 'docker-compose.yml' -f 'compose.override.yml' -f 'docker-compose.override.yml'"
+        );
+        // 单引号注入:经 shell_single_quote 转义无损(`'\''` 序列)
+        let escaped = compose_file_flags("a'b.yml", &[]);
+        assert_eq!(
+            escaped,
+            r#"-f 'a'\''b.yml'"#,
+            "路径内单引号必须以 shell 转义序列包裹"
+        );
+    }
+
+    #[test]
+    fn test_compose_override_names_detects_existing_files() {
+        // 构造临时目录:只有两个 override 实际存在,其余候选不返回
+        let dir = std::env::temp_dir().join(format!("ddovr-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("compose.override.yml"), "services: {}\n").unwrap();
+        std::fs::write(dir.join("compose.override.yaml"), "services: {}\n").unwrap();
+        let compose = dir.join("docker-compose.yml");
+        std::fs::write(&compose, "services: {}\n").unwrap();
+
+        let names = compose_override_names(compose.to_str().unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(names.len(), 2, "只返回存在的 override: {:?}", names);
+        assert!(names.contains(&"compose.override.yml".to_string()));
+        assert!(names.contains(&"compose.override.yaml".to_string()));
+    }

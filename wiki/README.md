@@ -28,7 +28,7 @@
 | [01-架构总览.md](01-架构总览.md) | 技术栈、系统分层、三条数据流、目录结构 | 第一篇,建立全局图景 |
 | [02-后端模块.md](02-后端模块.md) | 14 个功能 Rust 模块职责、关键结构体/函数签名、超时常量 | 改后端前 |
 | [03-前端说明.md](03-前端说明.md) | 页面结构、JS 模块(含 manage/notify/config-io/settings/help)、全局约定(AppState/AppBus)、设计语言 | 改前端前 |
-| [04-契约参考.md](04-契约参考.md) | **95 个命令 + 12 个事件 + 配置 JSON Schema 完整速查** | 跨前后端改动的对账表 |
+| [04-契约参考.md](04-契约参考.md) | **106 个命令 + 12 个事件 + 配置 JSON Schema 完整速查** | 跨前后端改动的对账表 |
 | [05-构建与运行.md](05-构建与运行.md) | 环境要求、dev/build 命令、安装布局、日志、配置文件夹 | 跑起来之前 |
 | [06-部署流程与回滚.md](06-部署流程与回滚.md) | 两条部署管线的逐步语义、智能传输、一键回滚、独立回滚中心(06 页)、环境检测闸门规则 | 理解/调试部署行为 |
 | [07-安全与已知取舍.md](07-安全与已知取舍.md) | 敏感数据数据流、导出加密格式、注入防护、设计决策记录、已知限制 | 评估改动影响时 |
@@ -37,17 +37,17 @@
 
 ```
 仓库:D:\Github-repositories\docker-deploy-ssh(git,主分支 main)
-代码量:Rust ~25,200 行(28 文件,含 main.rs;commands/ 为 11 文件子模块目录)+ 原生 JS/HTML/CSS ~20,100 行(无框架无打包器,字体 woff2 自捆绑)
+代码量:Rust ~29,000 行(33 文件,含 main.rs;commands/ 为 11 文件子模块目录)+ 原生 JS/HTML/CSS ~22,600 行(无框架无打包器,字体 woff2 自捆绑)
 技术:Tauri 2 + tokio + russh/russh-sftp + flate2 + serde_yaml + windows-dpapi + tauri-plugin-dialog
       + tauri-plugin-notification + lettre(rustls)+ argon2 + aes-gcm + reqwest(rustls+socks)+ ureq
-前端调用后端:window.__TAURI__.core.invoke(95 个命令),事件 12 个,字段默认 snake_case
+前端调用后端:window.__TAURI__.core.invoke(106 个命令),事件 12 个,字段默认 snake_case
       (notify/config-io/settings/update/回滚列表与回滚中心/.env/批量/断点/清理/项目源更新/日志流/迁移/项目迁移契约为 camelCase,例外清单见 04)
 页面:6 页导航(01 检测 / 02 镜像 / 03 服务器 / 04 部署 / 05 远程管理 / 06 回滚中心)+ 设置中心 + 全站帮助
 构建:npm run tauri dev / npm run tauri build(产物 NSIS 安装包 ~8.2MB)
 配置:安装目录 config/ 下 servers.json + projects.json + notify.json + settings.json +
       deployments.json + resume-deploy.json(便携式;原子写);日志 logs/app.log
-测试:cargo test(纯函数单测 360 passed;真机测试 #[ignore] 13 个)
-当前版本:v6.3.3(第二十一批补丁3:项目迁移默认命名兜底——compose 未声明 image 的 build 服务在迁移预检/执行阶段注入源服务器镜像列表与目录名候选,与部署管线同口径的默认命名兜底识别后一并搬运,两机命名不一致时目标补打标签;此前误报「需在目标服务器构建」;补丁2:修复两版本对比把「同名 tag 重新构建的镜像」误报为不变——manifest 新增镜像 ID 记录,对比改 ID 优先(tag 回退),详情与对比表展示短哈希;补丁1 v6.3.1:修复一键诊断对加密私钥服务器误报(连接点未解析凭据)+ 源码级连接点凭据纪律守护。第二十一批补丁:修复一键诊断对加密私钥服务器误报——诊断连接点曾直传 None 凭据,未经 resolve_password/resolve_key_passphrase 解析,加密私钥报「私钥已加密」而「测试连接」正常;现与全仓连接点同款解析凭据,并新增源码级守护测试固化「连接点必须传解析后凭据」纪律(先红后绿验证精确命中)。tauri.conf.json / Cargo.toml;**第二十一批:第二梯队五项 + 文档治理**——批量报告导出(追加批量面板「导出报告」/「重跑失败台」,新命令 write_text_file)、回滚两版本对比(勾选两归档 diff 服务/镜像,纯前端)、启动静默检查更新(autoCheckUpdate 缺省开,dock 徽点不弹窗)、更新失败回执(标记版本不一致明示「已回到旧版」)、托盘闭环(停止当前部署 + 上次部署状态菜单项)、verify/doc-consistency.js(版本号/命令数/测试数三断言,上线即抓到 README 测试数失准)。第二十批:v6.2.0 第一梯队五项(历史筛选/导入预览/一键诊断/部署模板/通知阈值)。第十九批补丁3:v6.1.3 RSA 私钥修复 + 四路全量审查。第十八批:v6.0.0 安全强化与并发互斥。
+测试:cargo test(纯函数单测 363 passed;真机测试 #[ignore] 13 个)
+当前版本:v6.4.0(第二十二批:第三梯队三项 + 文档治理——①定时/延迟部署(deploy_schedule.rs 新模块:每天 HH:MM / 一次性,后端 30s tick 自主发起,错过不补跑;前置「后端远程操作互斥收口」REMOTE_OP_IN_FLIGHT + RAII guard);②终端多标签 + 同栈广播 + 会话输出自动落盘 logs/term-*.log;③配置版本历史(config/.history/ 写前自动快照 + config_history_list/restore 两命令);④文档治理(清扫 + 七篇页首版本戳 + verify/contract-smoke.js + 编排层补测试)。命令 101→106;测试 335→360。补丁3 v6.3.3:项目迁移默认命名兜底;补丁2 v6.3.2:版本对比按镜像 ID;补丁1 v6.3.1:诊断凭据修复。第二十一批:v6.3.0 第二梯队五项;第二十批:v6.2.0 第一梯队五项;第十九批补丁3:v6.1.3 RSA 私钥修复 + 四路全量审查;第十八批:v6.0.0 安全强化与并发互斥。)
 ```
 
 ## 权威计划/完成记录(仓库根目录)

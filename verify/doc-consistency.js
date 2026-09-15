@@ -86,5 +86,17 @@ if (cached && cached.tests) {
   console.log('SKIP  无 VERSION.txt 测试数缓存;跑完 cargo test 后执行 `node verify/doc-consistency.js --write --tests=N` 采集');
 }
 
+// ---- 七篇 wiki 页首版本戳(第二十二批):`> 对齐版本:vX.Y.Z(...)` 必须等于真值 ----
+console.log('\n--- wiki 页首版本戳(对齐版本:vX.Y.Z)---');
+const wikiPages = [
+  'wiki/01-架构总览.md', 'wiki/02-后端模块.md', 'wiki/03-前端说明.md',
+  'wiki/04-契约参考.md', 'wiki/05-构建与运行.md', 'wiki/06-部署流程与回滚.md',
+  'wiki/07-安全与已知取舍.md',
+];
+for (const page of wikiPages) {
+  const m = read(page).match(/> 对齐版本:\s*v([0-9.]+)/);
+  check(page + ' 页首戳', versionTauri, m ? m[1] : '(未找到声明)');
+}
+
 console.log(fail ? `\n不一致 ${fail} 处` : '\n文档一致性:全部通过');
 process.exit(fail ? 1 : 0);

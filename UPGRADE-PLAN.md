@@ -2399,3 +2399,69 @@ migrate_project.rs:兜底命中入列带标记与识别说明 / 显式声明无�
   等宽 id、按钮不被压扁、危险区不受影响)
 - **待真机复测**:真实写盘(编辑服务器/保存项目)后 .history 出现快照;
   恢复后应用刷新且数据回退正确;全等去重(连续两次同内容保存只留一份)
+
+---
+
+# 第二十二批(四):文档治理批
+
+> 候选池「文档/治理批」五项收口:90% 文档问题同根(版本戳与计数靠人工
+> 同步),本次把「能自动断言的全部自动断言」。
+
+## 1. 文档不符清扫(实证清单逐条落地)
+
+- russh 0.46 → **0.60.3**(wiki/01 技术栈表、wiki/07 取舍表 6;含
+  RUSTSEC-2026-0153/0154 修复说明);
+- 命令数 95/94 → **106**(wiki/01 架构图两处 + lib.rs 行注、wiki/02
+  Builder 描述、wiki/README 两处);
+- 测试基线 290/320/335 → 363(wiki/07 全绿清单、wiki/README 速览);
+- migrate_project 1,625/1,600 → 约 1,900;manage_exec 521 → 653;
+  lib.rs 255 → 289;代码量口径(Rust ~29,000 行 33 文件 / 前端 ~22,600 行);
+- wiki/04 `open_external` 口径修正(explorer 直开,非 `cmd /c start`);
+  `prune_server` 标注「已无前端调用点」(03 页改走清理分析后的遗留兜底);
+- wiki/01 目录结构补 `deploy_schedule.rs` 与 `deploy-schedule.js`。
+
+## 2. 七篇 wiki 页首版本戳 + doc-consistency 增断言
+
+- 七篇页首统一 `> 对齐版本:v6.4.0(测试基线 363 passed / 13 ignored;命令 106 个)`;
+- `verify/doc-consistency.js` 增第 4 类断言:**七篇页首戳必须等于真值版本**
+  (此前只有 版本号/命令数/测试数 三类)。「三处版本号」纪律正式扩为
+  「页首戳自动守护」。
+
+## 3. verify/contract-smoke.js(新,契约集合双向核对)
+
+四条断言(零依赖纯文本解析,不执行代码):
+- **前端 invoke ⊆ 后端注册**(严格,ghost 命令 = 运行期必挂);
+- **注册 − 前端消费 ⊆ 白名单**(死命令显式登记:`prune_server` /
+  `deploy_batch`,各附理由);
+- **前端 listen ⊆ 后端 emit**(严格,ghost 事件);
+- **后端 emit − 前端 listen ⊆ 白名单**(`deploy-batch`,跟随死代码路径)。
+
+解析口径(保守可解释):invoke 仅字面量形态 + `DYNAMIC_COMMANDS` 补充表
+(6 个变量形态调用点:test_server / showResourceInspect 系 / beginRbExecution
+等);emit 收集过滤 kebab-case 或 KNOWN_EVENT_NAMES(排除 `batch-done` 这类
+状态值常量误收)+ 事件常量名表(EXEC_EVENT/STATS_EVENT/LOGS_EVENT)。
+
+**负向测试验证有效性**:注入一个 ghost 命令调用 → 精确捕获并 exit=1;
+恢复后 PASS。**ci.yml 接入**:clippy/test/语法检查之后追加 contract-smoke
+与 doc-consistency 两步(纯本地解析零风险)。
+
+## 4. 编排层补测试(+3)
+
+- `compose_file_flags`:单/多 -f 拼装 + 单引号注入转义(**断言修正过一次**:
+  首版按 substring 断言转义序列写法失真,改精确全串断言);
+- `compose_override_names`:临时目录只返回实际存在的 override;
+- ssh.rs `join_remote`/`normalize_remote`:斜杠边界六态。
+
+## 5. README 与 AGENTS.md
+
+- README 新增「密码与密文说明」章节:密文不出后端(只读视图哨兵)、
+  DPAPI 绑定机器与用户、跨机迁移用配置中心导出/导入;
+- AGENTS.md(/init 产物)随批入库并更新至 v6.4.0 状态,新增两条硬约束:
+  **远程操作互斥收口**(新后端发起功能必须取 `acquire_remote_op`)与
+  **版本历史不变量**(绕过 save_config 的直写路径必须先快照)。
+
+## 验证
+
+- `cargo test` **363 passed**(+3)/ clippy 保持基线 12 / node --check 17 JS /
+  verify **六脚本**全 PASS(含新增 contract-smoke 的负向测试)
+- doc-consistency 四类断言全 PASS(版本/命令数/测试数/七篇页首戳)
