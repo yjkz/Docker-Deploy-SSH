@@ -65,6 +65,11 @@ pub struct StackService {
     /// 私有仓库主机名(image 首段,见 [`registry_of`]);docker.io 官方仓库为 None
     #[serde(default)]
     pub registry: Option<String>,
+    /// `image` 是否由**默认命名兜底**填充(compose 未声明 image 且候选命中)。
+    /// 供消费方区分「compose 显式声明」与「兜底推导」(迁移侧据此给提示口径)。
+    /// 序列化跳过:前后端契约结构不变(warning 文本仍承载命中提示)。
+    #[serde(skip)]
+    pub fallback_filled: bool,
 }
 
 /// compose 解析结果。
@@ -95,6 +100,22 @@ pub struct ComposeStack {
 pub fn parse_compose_file(
     compose_path: &Path,
     local_images: &[(String, String)],
+) -> Result<ComposeStack, String> {
+    parse_compose_file_with_dirs(compose_path, local_images, &[])
+}
+
+/// [`parse_compose_file`] 的**候选目录名覆盖**变体(项目跨服务器迁移场景)。
+///
+/// compose 文本被取回到无关的本地临时目录时,默认命名兜底的「父目录名」
+/// 候选会失真 —— `dir_names` 传入**服务器侧的真实目录名来源**(如应用内
+/// compose 副本 `origin.json` 的原目录名 + 源服务器部署目录末段名),候选
+/// 推导即与服务器上镜像的实际命名一致;`local_images` 相应地传**源服务器**
+/// 镜像列表(迁移搬运的对象)。`dir_names` 为空时行为与
+/// [`parse_compose_file`] 完全相同(按 compose 路径推导)。
+pub fn parse_compose_file_with_dirs(
+    compose_path: &Path,
+    local_images: &[(String, String)],
+    dir_names: &[String],
 ) -> Result<ComposeStack, String> {
     let (value, overrides) = load_compose_document(compose_path)?;
 
@@ -185,10 +206,14 @@ pub fn parse_compose_file(
         // compose 显式写了该镜像(Exact),未命中保持 Missing 并提示先构建/
         // 补 image。image 字段已存在(即使本地 Missing)不参与兜底:此时构建
         // 产物的命名就是该字段,默认命名不适用。
+        let mut fallback_filled = false;
         if image.is_none() {
             if has_build {
-                let projects =
-                    compose_project_name_candidates(compose_path, declared_name.as_deref());
+                let projects = compose_project_name_candidates_with_dirs(
+                    compose_path,
+                    declared_name.as_deref(),
+                    dir_names,
+                );
                 let candidates = default_image_candidates(&projects, service_name);
                 match scan_default_image(&candidates, local_images) {
                     Some((repo, tag)) => {
@@ -199,6 +224,7 @@ pub fn parse_compose_file(
                         image = Some(format!("{}:{}", repo, tag));
                         match_state = MatchState::Exact;
                         local_tag = Some(tag);
+                        fallback_filled = true;
                     }
                     None => {
                         // 展示用候选剔除 uuid 副本目录名派生的候选,避免误导
@@ -248,6 +274,7 @@ pub fn parse_compose_file(
             local_tag,
             warning,
             registry,
+            fallback_filled,
         });
     }
 
@@ -623,11 +650,33 @@ pub fn compose_project_name_candidates(
     compose_path: &Path,
     declared_name: Option<&str>,
 ) -> Vec<String> {
+    compose_project_name_candidates_with_dirs(compose_path, declared_name, &[])
+}
+
+/// [`compose_project_name_candidates`] 的**候选目录名覆盖**变体:compose 文本
+/// 被取回到无关本地目录时(项目迁移的临时解析),`dir_names` 直接给出
+/// 服务器侧的真实目录名来源(如应用内副本 `origin.json` 原目录名 + 源部署
+/// 目录末段名),替代 origin.json/父目录名的路径推导 —— 迁移场景下候选即与
+/// 服务器镜像的实际命名一致。`dir_names` 为空时行为与原函数完全相同。
+pub fn compose_project_name_candidates_with_dirs(
+    compose_path: &Path,
+    declared_name: Option<&str>,
+    dir_names: &[String],
+) -> Vec<String> {
     let mut bases: Vec<String> = Vec::new();
     if let Some(name) = declared_name.map(str::trim).filter(|s| !s.is_empty()) {
         bases.push(name.to_string());
     }
-    if let Some(dir) = compose_path.parent() {
+    let overrides: Vec<&str> = dir_names
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !overrides.is_empty() {
+        for dir in overrides {
+            bases.push(dir.to_string());
+        }
+    } else if let Some(dir) = compose_path.parent() {
         if let Some(origin_dir) = load_origin_dir_name(dir) {
             bases.push(origin_dir);
         }
@@ -638,10 +687,7 @@ pub fn compose_project_name_candidates(
     let mut candidates: Vec<String> = Vec::new();
     for base in bases {
         let lower = base.to_lowercase();
-        let normalized: String = lower
-            .chars()
-            .filter(|c| matches!(c, 'a'..='z' | '0'..='9' | '_' | '-'))
-            .collect();
+        let normalized = sanitize_project_name(&base);
         for candidate in [base, lower, normalized] {
             if !candidate.is_empty() && !candidates.contains(&candidate) {
                 candidates.push(candidate);
@@ -649,6 +695,41 @@ pub fn compose_project_name_candidates(
         }
     }
     candidates
+}
+
+/// 项目名合规化(compose 默认命名规则):转小写 + 剔除 `[^a-z0-9_-]` 字符。
+/// 与 [`compose_project_name_candidates`] 的「合规化小写」派生同一口径;
+/// 迁移场景按目标目录名推导 compose 默认镜像名时复用。
+pub fn sanitize_project_name(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .filter(|c| matches!(c, 'a'..='z' | '0'..='9' | '_' | '-'))
+        .collect()
+}
+
+/// 目标侧 compose 将按什么名字引用「未声明 image 的 build 服务」的镜像。
+///
+/// 目标侧项目名 = 顶层 `name:`(若有,与源一致)否则**目标部署目录末段名**
+/// (compose 未用 `-p`);compose v2 默认命名 `<项目名>-<服务名>`,构建未写
+/// 标签时默认 `latest`。迁移在两机命名不一致时,据此在目标补打标签 ——
+/// 否则目标 compose 找不到镜像会转去构建(目标没有构建上下文,必然失败)。
+pub fn target_default_image_ref(
+    compose_path: &Path,
+    target_dir_name: &str,
+    service: &str,
+) -> String {
+    let declared = load_compose_document(compose_path)
+        .ok()
+        .and_then(|(value, _)| {
+            value
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        });
+    let project = declared.unwrap_or_else(|| target_dir_name.to_string());
+    format!("{}-{}:latest", sanitize_project_name(&project), service)
 }
 
 /// uuid 常规连字符形态判定(8-4-4-4-12 十六进制段,大小写均可)。
@@ -745,7 +826,7 @@ pub struct StackOrigin {
 
 /// 读取 compose 同目录 `origin.json` 的原始目录名。
 /// 文件不存在 / JSON 损坏 / 字段缺失或为空 → `None`(兜底推导静默降级)。
-fn load_origin_dir_name(compose_dir: &Path) -> Option<String> {
+pub(crate) fn load_origin_dir_name(compose_dir: &Path) -> Option<String> {
     let text = std::fs::read_to_string(compose_dir.join("origin.json")).ok()?;
     let origin: StackOrigin = serde_json::from_str(&text).ok()?;
     let name = origin.dir_name.trim().to_string();
@@ -1697,6 +1778,107 @@ mod tests {
         let web = find_svc(&stack, "web");
         assert_eq!(web.image.as_deref(), Some("myproj-web:latest"));
         assert_eq!(web.match_state, MatchState::Exact);
+    }
+
+    // ===== 兜底集成(迁移场景):目录名覆盖 + 远端镜像列表命中 =====
+
+    #[test]
+    fn test_parse_with_dirs_uses_override_dir_names() {
+        // 迁移:compose 文本落在无关临时目录(父目录名失真),目录名由参数注入
+        let root = temp_fixture_dir();
+        let path = root.join("docker-compose.yml");
+        std::fs::write(&path, "services:\n  web:\n    build: ./web\n").unwrap();
+        let remote = vec![("zetok-web".to_string(), "latest".to_string())];
+        let stack =
+            parse_compose_file_with_dirs(&path, &remote, &["zetok".to_string()]).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+
+        let web = find_svc(&stack, "web");
+        assert_eq!(
+            web.image.as_deref(),
+            Some("zetok-web:latest"),
+            "目录名覆盖应参与默认命名兜底(父目录名是随机临时目录,不注入则必不命中)"
+        );
+        assert_eq!(web.match_state, MatchState::Exact);
+        assert!(web.fallback_filled, "兜底命中应打标记(迁移侧据此给提示口径)");
+    }
+
+    #[test]
+    fn test_parse_with_dirs_empty_matches_legacy() {
+        // dir_names 为空:行为与 parse_compose_file 完全相同(迁移外的调用方零影响)
+        let (path, root) = copy_fixture(
+            Some("myproj"),
+            "services:\n  web:\n    build: ./web\n",
+        );
+        let local = vec![("myproj-web".to_string(), "latest".to_string())];
+        let via_legacy = parse_compose_file(&path, &local).unwrap();
+        let via_dirs = parse_compose_file_with_dirs(&path, &local, &[]).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(via_legacy, via_dirs, "空目录名列表必须与旧入口等价");
+    }
+
+    #[test]
+    fn test_parse_with_dirs_repro_old_miss_vs_new_hit() {
+        // 红绿对照(迁移误报的机制固化):
+        // 旧调用 = 空镜像列表 + 临时目录名失真 → 兜底必然 miss(误报「需在目标
+        // 服务器构建」);新调用 = 注入源镜像列表 + 真实目录名 → 命中并搬运。
+        let root = temp_fixture_dir();
+        let path = root.join("docker-compose.yml");
+        std::fs::write(&path, "services:\n  backend:\n    build: ./backend\n").unwrap();
+
+        // 旧行为:两者皆空 → miss(与迁移修复前实际调用一致)
+        let legacy = parse_compose_file_with_dirs(&path, &[], &[]).unwrap();
+        assert_eq!(
+            find_svc(&legacy, "backend").image,
+            None,
+            "空列表+临时目录必须 miss —— 这正是修复前的误报路径"
+        );
+
+        // 新行为:注入源镜像列表 + 源部署目录末段名 → 命中
+        let remote = vec![("zetok-backend".to_string(), "latest".to_string())];
+        let fixed =
+            parse_compose_file_with_dirs(&path, &remote, &["zetok".to_string()]).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+
+        let svc = find_svc(&fixed, "backend");
+        assert_eq!(svc.image.as_deref(), Some("zetok-backend:latest"));
+        assert!(svc.fallback_filled);
+    }
+
+    #[test]
+    fn test_fallback_filled_false_when_declared_or_missed() {
+        // 显式声明 image → 不标记;未命中 → 不标记
+        let (path, root) = copy_fixture(
+            Some("myproj"),
+            "services:\n  a:\n    build: ./a\n    image: custom:1\n  b:\n    build: ./b\n",
+        );
+        let stack = parse_compose_file(&path, &[]).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+
+        assert!(!find_svc(&stack, "a").fallback_filled, "声明了 image 不应标记");
+        assert!(!find_svc(&stack, "b").fallback_filled, "未命中不应标记");
+    }
+
+    // ===== 目标侧默认镜像名推导(迁移兜底补标签) =====
+
+    #[test]
+    fn test_target_default_image_ref_by_dir_name() {
+        // 无顶层 name:按目标部署目录末段名(合规化:小写 + 剔除非法字符)
+        let dir = temp_fixture_dir();
+        let path = dir.join("docker-compose.yml");
+        std::fs::write(&path, "services:\n  web:\n    build: ./web\n").unwrap();
+        let by_dir = target_default_image_ref(&path, "Prod-App", "web");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(by_dir, "prod-app-web:latest", "应合规化目标目录名并拼服务名");
+
+        // 有顶层 name:优先(与目标目录无关,两机同名)
+        let dir = temp_fixture_dir();
+        let path = dir.join("docker-compose.yml");
+        std::fs::write(&path, "name: myproj\nservices:\n  web:\n    build: ./web\n").unwrap();
+        let by_name = target_default_image_ref(&path, "prod-app", "web");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(by_name, "myproj-web:latest");
     }
 
     // ===== image 字段存在但本地 Missing → 不参与兜底 =====

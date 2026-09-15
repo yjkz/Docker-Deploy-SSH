@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
 use crate::commands::{
-    self, connect_server, exec_forwarded_via_event, format_log_line, query_remote_image_id_map,
+    self, connect_server, exec_forwarded_via_event, format_log_line, query_remote_images_full,
     save_gzip_remote, same_image_id, shell_single_quote, with_timeout, TempFileGuard,
     SSH_EXEC_TIMEOUT_SECS, STACK_COMPOSE_TIMEOUT_SECS,
 };use crate::config::{self, ProjectConfig, ServerConfig};
@@ -310,6 +310,77 @@ pub fn resolve_volume_names(
     (src, tgt, renamed)
 }
 
+/// 迁移场景的默认命名兜底候选目录名来源(按优先级,供
+/// [`stack::parse_compose_file_with_dirs`];空串自动过滤):
+/// ① 应用内 compose 副本同目录 `origin.json` 记录的**导入时原目录名**
+///    (导入项目才有;手工项目的 compose_file 是远端相对路径,跳过);
+/// ② 源服务器部署目录末段名(与 compose 构建产物命名同源的目录名)。
+///
+/// 迁移解析发生在本地临时目录(与真实目录名无关),不注入这两个来源时
+/// 「未设 image 的 build 服务」兜底必然未命中——这正是「未声明 image,
+/// 需在目标服务器构建」误报的根因。
+fn migration_dir_name_candidates(project: &ProjectConfig, src_dir: &str) -> Vec<String> {
+    let mut dirs: Vec<String> = Vec::new();
+    let compose_path = std::path::Path::new(&project.compose_file);
+    // 仅绝对路径才读同目录 origin.json(远端相对路径会拼出 CWD 下的同名文件)
+    if compose_path.is_absolute() {
+        if let Some(origin) = compose_path.parent().and_then(stack::load_origin_dir_name) {
+            dirs.push(origin);
+        }
+    }
+    let base = dir_basename(src_dir);
+    if !base.is_empty() {
+        dirs.push(base);
+    }
+    dirs
+}
+
+/// 单条待搬运镜像(迁移侧收集结果;执行时兜底条目需在目标补打标签)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferImage {
+    pub service: String,
+    pub reference: String,
+    /// 镜像由**默认命名兜底**识别(compose 未声明 image)。
+    pub fallback_filled: bool,
+}
+
+/// 从 compose 解析结果提取待搬运镜像与迁移口径提示(纯函数,便于单测)。
+///
+/// 与部署管线的「默认命名兜底」打通:解析时经
+/// [`stack::parse_compose_file_with_dirs`] 注入源服务器镜像列表与目录名候选,
+/// compose 未声明 image 的 build 服务命中默认命名后 `fallback_filled` 为真
+/// —— 此处按「已识别、参与搬运」处理并说明识别来源;仍未命中(image 为
+/// None)时不再提「需在目标服务器构建」(本系统镜像一律 `docker save/load`
+/// 搬运,目标侧没有构建能力),改为给出迁移前可执行的修正指引。
+///
+/// 返回 `(待搬运镜像列表, 提示列表)`;提示并入迁移 warnings。
+pub fn collect_transfer_images(parsed: &stack::ComposeStack) -> (Vec<TransferImage>, Vec<String>) {
+    let mut images: Vec<TransferImage> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    for svc in &parsed.services {
+        match svc.image.as_deref() {
+            Some(image) => {
+                images.push(TransferImage {
+                    service: svc.service.clone(),
+                    reference: image.to_string(),
+                    fallback_filled: svc.fallback_filled,
+                });
+                if svc.fallback_filled {
+                    warnings.push(format!(
+                        "服务「{}」未声明 image,已按 compose 默认命名在源服务器识别到 {} 并参与搬运;建议在 compose 中显式写 image: 固化命名",
+                        svc.service, image
+                    ));
+                }
+            }
+            None => warnings.push(format!(
+                "服务「{}」未声明 image,且未在源服务器识别到默认命名镜像,不参与搬运;如需搬运,请先在源服务器部署过该服务(或确认镜像命名),或在 compose 中补 image: 字段",
+                svc.service
+            )),
+        }
+    }
+    (images, warnings)
+}
+
 // ===== 预检 =====
 
 #[allow(clippy::too_many_arguments)]
@@ -345,6 +416,8 @@ async fn build_plan(
     // 取回 compose 文本并在本地临时目录解析(复用既有解析器,不重复实现)
     let mut images: Vec<PlanImage> = Vec::new();
     let mut volume_mounts: Vec<stack::VolumeMount> = Vec::new();
+    // 源服务器镜像列表(一次往返,两用:默认命名兜底扫描 + 存在性校验)
+    let mut src_image_list: Option<Vec<crate::docker::ImageInfo>> = None;
     if code == 0 {
         let (code, content) = with_timeout(
             SSH_EXEC_TIMEOUT_SECS,
@@ -363,21 +436,33 @@ async fn build_plan(
             std::fs::write(&tmp_compose, &content)
                 .map_err(|e| format!("写入本地临时 compose 失败: {}", e))?;
 
-            // 服务镜像清单(本地无镜像也可解析:传空列表即可)
-            match stack::parse_compose_file(&tmp_compose, &[]) {
+            // ---- 1b. 源服务器镜像列表:此前解析传空列表 → 未设 image 的 build
+            // 服务默认命名兜底恒未命中,误报「需在目标服务器构建」----
+            let list = match query_remote_images_full(client).await {
+                Ok(list) => list,
+                Err(e) => {
+                    warnings.push(format!(
+                        "查询源服务器镜像列表失败,默认命名兜底与存在性校验不可用:{}",
+                        e
+                    ));
+                    Vec::new()
+                }
+            };
+            let scan_pairs: Vec<(String, String)> = list
+                .iter()
+                .map(|i| (i.repository.clone(), i.tag.clone()))
+                .collect();
+
+            // 服务镜像清单:注入源镜像列表 + 目录名候选(origin.json 原目录名 /
+            // 源部署目录末段名),默认命名兜底与部署管线同口径
+            let dir_names = migration_dir_name_candidates(project, src_dir);
+            match stack::parse_compose_file_with_dirs(&tmp_compose, &scan_pairs, &dir_names) {
                 Ok(stack) => {
-                    for svc in &stack.services {
-                        let Some(image) = svc.image.clone() else {
-                            // 未设 image 且本机无 match(build-only)时无法搬运,
-                            // 目标侧会由 compose 自行 build/carry,这里只提示
-                            warnings.push(format!(
-                                "服务「{}」未声明 image,其镜像不参与搬运(需在目标服务器构建)",
-                                svc.service
-                            ));
-                            continue;
-                        };
+                    let (refs, notes) = collect_transfer_images(&stack);
+                    warnings.extend(notes);
+                    for item in refs {
                         images.push(PlanImage {
-                            reference: image,
+                            reference: item.reference,
                             exists_on_source: false,
                             already_on_target: false,
                         });
@@ -385,6 +470,7 @@ async fn build_plan(
                 }
                 Err(e) => errors.push(format!("解析源 compose 失败:{}", e)),
             }
+            src_image_list = Some(list);
 
             // 卷清单
             if include_volumes {
@@ -398,21 +484,20 @@ async fn build_plan(
         }
     }
 
-    // ---- 2. 源侧镜像存在性(一次 docker images 全量,避免逐镜像往返)----
+    // ---- 2. 源侧镜像存在性(复用 1b 的全量列表,零额外往返)----
     if !images.is_empty() {
-        match query_remote_image_id_map(client).await {
-            Ok(map) => {
-                for img in images.iter_mut() {
-                    img.exists_on_source = map.contains_key(&img.reference);
-                    if !img.exists_on_source {
-                        warnings.push(format!(
-                            "源服务器上不存在镜像 {},该服务需在目标服务器重新构建或拉取",
-                            img.reference
-                        ));
-                    }
+        if let Some(list) = &src_image_list {
+            for img in images.iter_mut() {
+                img.exists_on_source = list
+                    .iter()
+                    .any(|i| format!("{}:{}", i.repository, i.tag) == img.reference);
+                if !img.exists_on_source {
+                    warnings.push(format!(
+                        "源服务器上不存在镜像 {},不参与搬运;请确认目标服务器可自行获取(如从镜像仓库拉取)",
+                        img.reference
+                    ));
                 }
             }
-            Err(e) => warnings.push(format!("查询源服务器镜像列表失败,存在性未校验:{}", e)),
         }
     }
 
@@ -903,22 +988,53 @@ async fn run_migrate_project(
 
     // ---- ② 镜像搬运 ----
     check_cancel!();
-    let images: Vec<String> = match stack::parse_compose_file(&local_compose, &[]) {
-        Ok(stack) => stack.services.iter().filter_map(|s| s.image.clone()).collect(),
+    // 与预检同口径:注入源镜像列表 + 目录名候选,未设 image 的 build 服务
+    // 经默认命名兜底识别后一并搬运(过滤空 None 服务保持不变)
+    let src_image_list = match query_remote_images_full(&mut src).await {
+        Ok(list) => list,
         Err(e) => {
-            warnings.push(format!("解析 compose 失败,跳过镜像搬运:{}", e));
+            warnings.push(format!("查询源服务器镜像列表失败,默认命名兜底不可用:{}", e));
             Vec::new()
         }
     };
-    emit_line(&format!("待搬运镜像 {} 个", images.len()));
+    let scan_pairs: Vec<(String, String)> = src_image_list
+        .iter()
+        .map(|i| (i.repository.clone(), i.tag.clone()))
+        .collect();
+    let dir_names = migration_dir_name_candidates(&project, &src_dir);
+    let transfer_images: Vec<TransferImage> =
+        match stack::parse_compose_file_with_dirs(&local_compose, &scan_pairs, &dir_names) {
+            Ok(stack) => collect_transfer_images(&stack).0,
+            Err(e) => {
+                warnings.push(format!("解析 compose 失败,跳过镜像搬运:{}", e));
+                Vec::new()
+            }
+        };
+    emit_line(&format!("待搬运镜像 {} 个", transfer_images.len()));
 
     let noop = |_a: u64, _b: u64| {};
-    for (i, image) in images.iter().enumerate() {
+    for (i, item) in transfer_images.iter().enumerate() {
         check_cancel!();
-        emit_line(&format!("({}/{}) 搬运镜像 {}", i + 1, images.len(), image));
+        let image = item.reference.as_str();
+        emit_line(&format!("({}/{}) 搬运镜像 {}", i + 1, transfer_images.len(), image));
+
+        // 兜底条目:目标 compose 将按**目标侧项目名**引用镜像(compose v2 构建
+        // 默认命名),与源侧镜像名不一致时在目标补打标签 —— 否则目标 compose
+        // 找不到镜像会转去构建(目标没有构建上下文,必然失败)
+        let retag_to: Option<String> = if item.fallback_filled {
+            let tgt_ref =
+                stack::target_default_image_ref(&local_compose, &dir_basename(&tgt_dir), &item.service);
+            if tgt_ref != item.reference {
+                Some(tgt_ref)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // 目标已有同 ID → 跳过(复用镜像迁移的同口径判定)
-        let src_id = remote_image_id(&mut src, image)
+        let src_id = remote_image_id(&mut src, item.reference.as_str())
             .await
             .map_err(|e| (e, warnings.clone()))?;
         let Some(src_id) = src_id else {
@@ -926,12 +1042,22 @@ async fn run_migrate_project(
             emit_line(&format!("警告:源服务器上不存在镜像 {},跳过", image));
             continue;
         };
-        let dst_id = remote_image_id(&mut dst, image)
+        let dst_id = remote_image_id(&mut dst, item.reference.as_str())
             .await
             .map_err(|e| (e, warnings.clone()))?;
         if let Some(dst_id) = dst_id {
             if same_image_id(&src_id, &dst_id) {
                 emit_line(&format!("目标服务器已有同 ID 镜像,跳过传输: {}", image));
+                // 目标侧命名补标签与装载路径同口径:失败仅告警(up 时二次暴露)
+                if let Some(target_ref) = &retag_to {
+                    if let Err(e) = ensure_target_tag(&mut dst, image, target_ref, &emit_line).await
+                    {
+                        warnings.push(format!(
+                            "目标服务器补打标签失败({} → {}),若目标启动时报找不到镜像,请手动执行 docker tag:{}",
+                            image, target_ref, e
+                        ));
+                    }
+                }
                 continue;
             }
         }
@@ -940,7 +1066,7 @@ async fn run_migrate_project(
         let local_path = stage_dir.join(&tar_name);
         let guard = TempFileGuard::new_pub(local_path.clone());
 
-        save_gzip_remote(&mut src, image, &local_path, &emit_line)
+        save_gzip_remote(&mut src, item.reference.as_str(), &local_path, &emit_line)
             .await
             .map_err(|e| (e, warnings.clone()))?;
 
@@ -957,6 +1083,17 @@ async fn run_migrate_project(
         let _ = exec_collect(&mut dst, &format!("rm -f {}", shell_single_quote(&remote_tar))).await;
         drop(guard);
         emit_line(&format!("镜像已装载:{}", image));
+
+        // 兜底条目的目标侧命名补标签(零拷贝;失败仅告警,不推翻已完成的搬运
+        // —— 目标 compose up 时会再次暴露)
+        if let Some(target_ref) = &retag_to {
+            if let Err(e) = ensure_target_tag(&mut dst, image, target_ref, &emit_line).await {
+                warnings.push(format!(
+                    "目标服务器补打标签失败({} → {}),若目标启动时报找不到镜像,请手动执行 docker tag:{}",
+                    image, target_ref, e
+                ));
+            }
+        }
     }
 
     // ---- ③ compose 三件套 + 归档落目标 ----
@@ -1036,11 +1173,37 @@ async fn run_migrate_project(
         &project.name,
         &source.name,
         &target.name,
-        &images,
+        &transfer_images
+            .iter()
+            .map(|i| i.reference.clone())
+            .collect::<Vec<_>>(),
         &warnings,
     );
 
     Ok(warnings)
+}
+
+/// 在目标服务器为已存在的镜像补打标签(零拷贝 `docker tag`,不拉不传)。
+/// 供兜底条目在「目标已有同 ID 镜像」与「装载完成」两条路径复用。
+async fn ensure_target_tag(
+    client: &mut SshClient,
+    source_ref: &str,
+    target_ref: &str,
+    emit_line: &Arc<dyn Fn(&str) + Send + Sync>,
+) -> Result<(), String> {
+    let cmd = commands::docker_tag_cmd(source_ref, target_ref);
+    let (code, out) = with_timeout(
+        SSH_EXEC_TIMEOUT_SECS,
+        "补打镜像标签超时",
+        "请检查服务器网络后重试",
+        exec_collect(client, &cmd),
+    )
+    .await?;
+    if code != 0 {
+        return Err(commands::tail_lines(&out, 3));
+    }
+    emit_line(&format!("已在目标补打标签:{} → {}", source_ref, target_ref));
+    Ok(())
 }
 
 /// 远程取镜像完整 ID(取不到返回 None,不视为错误)。
@@ -1581,6 +1744,117 @@ mod tests {
         // 镜像条目内层同样 camelCase
         assert!(v["images"][0].get("existsOnSource").is_some());
         assert!(v["images"][0].get("alreadyOnTarget").is_some());
+    }
+
+    // ===== 迁移默认命名兜底(修复「未声明 image 不参与搬运」误报)=====
+
+    /// 构造一个最小的 ComposeStack(只需 services 参与断言)。
+    fn mk_stack(services: Vec<crate::stack::StackService>) -> crate::stack::ComposeStack {
+        crate::stack::ComposeStack {
+            project_name: "zetok".into(),
+            services,
+            errors: vec![],
+            overrides: vec![],
+        }
+    }
+
+    fn mk_service(name: &str, image: Option<&str>, fallback_filled: bool) -> crate::stack::StackService {
+        crate::stack::StackService {
+            service: name.into(),
+            image: image.map(str::to_string),
+            has_build: true,
+            mode: crate::config::TransferMode::Local,
+            match_state: crate::stack::MatchState::Exact,
+            local_tag: None,
+            warning: None,
+            registry: None,
+            fallback_filled,
+        }
+    }
+
+    #[test]
+    fn test_collect_transfer_images_fallback_filled_included() {
+        // 核心场景:未声明 image 的 build 服务经默认命名兜底识别 → 参与搬运,
+        // 提示说明「识别来源」而非「不搬运/需在目标服务器构建」
+        let stack = mk_stack(vec![
+            mk_service("backend", Some("zetok-backend:latest"), true),
+            mk_service("offical", Some("zetok-offical:latest"), true),
+            mk_service("houtai", Some("zetok-houtai:latest"), true),
+        ]);
+        let (images, warnings) = collect_transfer_images(&stack);
+
+        assert_eq!(
+            images
+                .iter()
+                .map(|i| (i.service.as_str(), i.reference.as_str(), i.fallback_filled))
+                .collect::<Vec<_>>(),
+            vec![
+                ("backend", "zetok-backend:latest", true),
+                ("offical", "zetok-offical:latest", true),
+                ("houtai", "zetok-houtai:latest", true),
+            ],
+            "兜底识别的镜像必须进入待搬运列表(带服务名与兜底标记)"
+        );
+        assert_eq!(warnings.len(), 3, "每个兜底服务给一条识别说明");
+        for w in &warnings {
+            assert!(w.contains("已按 compose 默认命名在源服务器识别到"), "实际: {}", w);
+            assert!(!w.contains("需在目标服务器构建"), "不得再出现旧误导文案: {}", w);
+        }
+    }
+
+    #[test]
+    fn test_collect_transfer_images_declared_no_note() {
+        // 显式声明 image:照旧参与搬运,不产生任何「未声明」提示
+        let stack = mk_stack(vec![mk_service("web", Some("myapp:v1"), false)]);
+        let (images, warnings) = collect_transfer_images(&stack);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].reference, "myapp:v1");
+        assert!(!images[0].fallback_filled);
+        assert!(warnings.is_empty(), "显式声明不应有提示: {:?}", warnings);
+    }
+
+    #[test]
+    fn test_collect_transfer_images_missed_gives_actionable_note() {
+        // 仍未命中:不搬运,但提示是可执行的修正指引(不再提「在目标服务器构建」——
+        // 本系统镜像靠 docker save/load 搬运,目标侧没有构建能力)
+        let stack = mk_stack(vec![mk_service("db", None, false)]);
+        let (images, warnings) = collect_transfer_images(&stack);
+        assert!(images.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("未在源服务器识别到默认命名镜像"), "实际: {}", warnings[0]);
+        assert!(warnings[0].contains("补 image: 字段"), "应给修正指引: {}", warnings[0]);
+        assert!(!warnings[0].contains("需在目标服务器构建"), "旧误导文案必须消失: {}", warnings[0]);
+    }
+
+    #[test]
+    fn test_migration_dir_name_candidates_manual_project() {
+        // 手工项目:compose_file 是远端相对路径(非绝对)→ 只取源部署目录末段名
+        let mut project = sample_project();
+        project.compose_file = "docker-compose.yml".into();
+        let dirs = migration_dir_name_candidates(&project, "/opt/zetok/");
+        assert_eq!(dirs, vec!["zetok".to_string()]);
+    }
+
+    #[test]
+    fn test_migration_dir_name_candidates_imported_project_origin_first() {
+        // 导入项目:origin.json 原目录名在前,源部署目录末段名在后
+        let root = std::env::temp_dir().join(format!("ddmig-{}", uuid::Uuid::new_v4()));
+        let copy_dir = root.join("11111111-1111-1111-1111-111111111111");
+        std::fs::create_dir_all(&copy_dir).unwrap();
+        std::fs::write(
+            copy_dir.join("origin.json"),
+            r#"{"dir_name": "origproj"}"#,
+        )
+        .unwrap();
+        let compose = copy_dir.join("docker-compose.yml");
+        std::fs::write(&compose, "services: {}\n").unwrap();
+
+        let mut project = sample_project();
+        project.compose_file = compose.to_string_lossy().to_string();
+        let dirs = migration_dir_name_candidates(&project, "/srv/prod-app");
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(dirs, vec!["origproj".to_string(), "prod-app".to_string()]);
     }
 
     // ===== 测试辅助 =====

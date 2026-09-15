@@ -2148,3 +2148,76 @@ tag 名不变(如 `myapp:latest`)但内容已重新构建时,ID 不同而 tag �
 - `cargo test` 显式确认 `test result: ok. 335 passed; 0 failed; 13 ignored`
   (基线 333 + 2);clippy 保持基线 18;doc-consistency 全 PASS
 - 真机待确认:重新部署一次整栈 → 两次新归档对比应正确显示「镜像变化」
+
+---
+
+# 第二十一批补丁3(v6.3.3)— 项目迁移默认命名兜底
+
+> 用户真机反馈:项目迁移预检报「服务「backend」未声明 image,其镜像不参与
+> 搬运(需在目标服务器构建)」(offical / houtai 同构)。用户判断准确且提出
+> 两点:①部署管线对「build 无 image」有默认命名兜底,迁移同样需要;
+> ②本系统镜像靠 `docker save → SFTP → docker load` 搬运,目标服务器
+> **没有构建能力**,「需在目标服务器构建」的说法本身不成立。
+
+## 缺陷(根因)
+
+迁移两处解析都调 `stack::parse_compose_file(&compose, &[])` 传**空镜像列表**,
+且解析发生在本地临时目录(`dd-plan-<uuid>` / `dd-migrate-<uuid>`,父目录名
+失真)——默认命名兜底的两个输入(镜像列表数据源、目录名候选来源)双双缺位:
+
+- `scan_default_image(candidates, local_images=[])` 必然 miss → `image = None`;
+- 迁移侧对 `None` 服务直接丢弃并报「需在目标服务器构建」(且该表述不成立)。
+
+同构项目(服务名 backend/offical/houtai,compose 只有 `build:` 没写 `image:`)
+在源服务器上镜像实际以 `<源目录名>-<服务名>:latest` 存在,却全部漏搬。
+
+## 修复(与部署管线同口径;后端为主,零前端逻辑改动)
+
+- **stack.rs**
+  - `StackService` 增 `fallback_filled: bool`(`#[serde(skip)]`)——消费方
+    区分「compose 显式声明」与「兜底推导」,前后端契约结构不变;
+  - 新入口 `parse_compose_file_with_dirs(compose_path, local_images, dir_names)`
+    与 `compose_project_name_candidates_with_dirs(...)`:候选目录名**覆盖**
+    (迁移注入 origin.json 原目录名 + 源部署目录末段名,替代失真的临时目录
+    推导);`dir_names` 为空时与原入口**逐字节等价**(有等价性单测钉死);
+  - `sanitize_project_name` 抽出(与既有候选「合规化小写」派生同口径);
+  - `target_default_image_ref(compose_path, target_dir_name, service)`:
+    推导**目标侧** compose 默认命名(`<顶层 name 或目标目录名>-<服务>:latest`),
+    供迁移补标签。
+- **migrate_project.rs**
+  - 预检 `build_plan` 与执行侧都改为:先 `query_remote_images_full` 查源
+    服务器镜像列表(**一次往返**,同时服务兜底扫描与存在性校验,后者从
+    第二次查询降为零),再以 (镜像对, 目录名候选) 注入 `parse_compose_file_with_dirs`;
+  - 新纯函数 `collect_transfer_images(&ComposeStack) -> (Vec<TransferImage>, Vec<String>)`:
+    兜底命中 → 入列 `TransferImage { service, reference, fallback_filled }`
+    + 识别说明(「已按 compose 默认命名在源服务器识别到 X 并参与搬运」);
+    仍未命中 → 可执行修正指引(先部署过该服务/确认命名/补 image: 字段),
+    **删除「需在目标服务器构建」全部表述**;
+  - `migration_dir_name_candidates`(纯函数):候选目录名来源 = 应用内副本
+    origin.json 原目录名(仅绝对路径时读,防远端相对路径拼出 CWD 同名文件)
+    → 源部署目录末段名;
+  - **目标侧补标签(正确性闭环)**:兜底条目在两机命名推导不一致时——
+    「目标 load 完成后」与「目标已有同 ID 镜像跳过传输」两条路径——执行
+    `docker tag` 零拷贝补目标名(如 `zetok-backend:latest` →
+    `prod-app-backend:latest`);否则目标 `compose up` 找不到镜像会转去构建
+    (目标无构建上下文,必然失败)。补打失败仅记 warning(up 时二次暴露,
+    文案附手动命令),不推翻已完成的搬运。
+- **前端**:`ui/deploy-migrate.js` 镜像表空态文案同步(「未声明 image 且
+  源服务器未识别到默认命名镜像」)。
+
+## 单测(+10)
+
+stack.rs:with_dirs 覆盖命中 / 空列表等价旧入口 / **红绿对照**(空列表必须
+miss = 修复前误报路径,注入后命中)/ fallback_filled 两态 / target 命名推导
+(目录名合规化小写、顶层 name 优先)。
+migrate_project.rs:兜底命中入列带标记与识别说明 / 显式声明无提示 / 未命中
+给指引且旧文案消失 / 目录名候选优先级(origin.json 前、部署目录后)/ 手工
+项目(远端相对路径)仅取部署目录名。
+
+## 验证
+
+- `cargo test` 显式确认 `test result: ok. 345 passed; 0 failed; 13 ignored`
+  (基线 335 + 10);clippy 保持基线 12(改动文件零新增);
+  `node --check` 全部 JS;verify 三脚本 PASS;doc-consistency 全 PASS
+- **待真机复测**:真实同构项目迁移预检应识别到镜像并列入搬运清单;两机
+  目录名不同时,目标补标签日志出现且目标 `compose up` 成功

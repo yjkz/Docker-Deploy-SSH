@@ -261,12 +261,23 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 - 验证:335 passed(+2)/ clippy 保持基线 / doc-consistency 全 PASS
 - 注意:旧归档(本版前部署)无 ID,对比其与新版仍回退按 tag;重部署一次即写入 ID
 
+### 第二十一批补丁3 v6.3.3(项目迁移默认命名兜底)— 已完成
+- **真机反馈**:项目迁移预检报「服务「backend」未声明 image,其镜像不参与搬运(需在目标服务器构建)」(offical/houtai 同)。用户判断准确:①部署管线对「build 无 image」有默认命名兜底(`<项目名>-<服务名>` 扫描候选),迁移侧没有;②本系统镜像一律 `docker save/load` 搬运,目标服务器**没有构建能力**,「需在目标服务器构建」的说法本身不成立
+- **根因**:迁移两处解析(`build_plan` 与执行侧)都调 `stack::parse_compose_file(&compose, &[])` 传**空镜像列表**,且解析发生在本地临时目录(父目录名失真)——兜底数据源(镜像列表)与候选来源(目录名)双双缺位,`scan_default_image` 必然 miss → 服务被丢弃 + 误报文案
+- **修复(与部署管线同口径)**:
+  - `stack.rs`:`StackService` 增 `fallback_filled`(`#[serde(skip)]`,区分「声明」与「兜底推导」,契约结构不变);新增 `parse_compose_file_with_dirs` / `compose_project_name_candidates_with_dirs`(候选目录名覆盖:迁移注入 origin.json 原目录名 + 源部署目录末段名,替代失真的临时目录推导;空列表行为与旧入口等价,有等价性单测);新增 `target_default_image_ref`(按目标项目名/目录名推导 compose 期望的镜像名)
+  - `migrate_project.rs`:预检与执行两处都改为「先查源服务器镜像列表(`query_remote_images_full`,一次往返,复用存在性校验)→ 注入解析」;新增纯函数 `collect_transfer_images`(命中→搬运+识别说明;未命中→可执行修正指引,删除「需在目标服务器构建」表述)与 `migration_dir_name_candidates`
+  - **目标侧补标签**(迁移正确性闭环):兜底条目在目标 load/同 ID 跳过后,若目标 compose 期望名(目标目录名推导)与源镜像名不同,执行 `docker tag` 零拷贝补标签并 emit 日志——否则目标 `compose up` 找不到镜像会转去构建(目标无构建上下文,必然失败);补打失败仅告警(up 时二次暴露)+ 指引手动命令
+- **单测 +10**:兜底命中入列带标记 / 显式声明无提示 / 未命中给指引且旧文案消失 / 目录名候选优先级(origin.json 前、部署目录后)/ 手工项目仅取部署目录名 / with_dirs 覆盖命中 / 空列表等价旧入口 / 红绿对照(空列表必须 miss=修复前误报路径)/ target 命名推导(目录名合规化、顶层 name 优先)/ fallback_filled 两态
+- 前端:迁移空态文案同步(`ui/deploy-migrate.js` 镜像表空态说明兜底口径)
+- 验证:345 passed(+10)/ clippy 保持基线 12 / node --check 全部 JS / verify 三脚本 PASS / doc-consistency 全 PASS
+- **待真机复测**:真实项目(backend/offical/houtai 同构)迁移预检应识别到镜像并列入搬运清单;两机目录名不同时目标补标签日志与目标 up 成功
 
 ---
 
 ## 当前状态速览
 
-- 版本 **v6.3.2**;main = origin/main;基线 `cargo test` **335 passed** / 13 ignored
+- 版本 **v6.3.3**;main = origin/main;基线 `cargo test` **345 passed** / 13 ignored
 - 命令 **101** 个(generate_handler 实测;第二十批 +5,第二十一批 +1 `write_text_file`)
 - JS **16** 文件(含 theme-init.js;index.html 加载顺序见 wiki/03:13)
 - 前端结构:12 模态;commands/ 11 文件;三大 JS 主文件 2338/2013/2537 行

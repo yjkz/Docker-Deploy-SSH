@@ -1132,6 +1132,21 @@ async fn remote_disk_precheck(
 pub(crate) async fn query_remote_image_id_map(
     client: &mut SshClient,
 ) -> Result<HashMap<String, String>, String> {
+    Ok(query_remote_images_full(client)
+        .await?
+        .into_iter()
+        .map(|i| (format!("{}:{}", i.repository, i.tag), i.id))
+        .collect())
+}
+
+/// 查询远端完整镜像列表(完整 64 位 ID 口径,`REPO:TAG` 形态)。
+///
+/// [`query_remote_image_id_map`] 与项目迁移的默认命名兜底共用同一查询口径;
+/// 行解析复用 [`parse_image_lines`];退出码非 0 以中文错误返回,调用方决定
+/// 中止或降级(迁移侧降级为空列表并记 warning)。
+pub(crate) async fn query_remote_images_full(
+    client: &mut SshClient,
+) -> Result<Vec<crate::docker::ImageInfo>, String> {
     let (code, out) = with_timeout(
         SSH_EXEC_TIMEOUT_SECS,
         "查询远端镜像超时",
@@ -1145,10 +1160,7 @@ pub(crate) async fn query_remote_image_id_map(
             code
         ));
     }
-    Ok(parse_image_lines(&out)
-        .into_iter()
-        .map(|i| (format!("{}:{}", i.repository, i.tag), i.id))
-        .collect())
+    Ok(parse_image_lines(&out))
 }
 
 /// 采集逐个 Local 服务的本地镜像完整 ID(第二十一批补丁;写入 manifest 供

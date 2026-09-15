@@ -405,7 +405,7 @@
     var imgs = Array.isArray(p.images) ? p.images : [];
     box.appendChild(el('div', 'migrate-plan-label', '镜像 ' + imgs.length + ' 个'));
     if (imgs.length === 0) {
-      box.appendChild(el('div', 'migrate-plan-empty', '(无:compose 未声明 image,或解析失败)'));
+      box.appendChild(el('div', 'migrate-plan-empty', '(无:compose 未声明 image 且源服务器未识别到默认命名镜像,或解析失败)'));
     } else {
       var imgTable = buildPlanTable(['镜像', '状态']);
       imgs.forEach(function (it) {
