@@ -160,12 +160,17 @@ pub fn migrate_images(
         return Err("请至少选择一个要迁移的镜像".to_string());
     }
 
+    // 远程操作互斥(第二十二批):同步获取(被拒立即返回命令 Err),守卫随
+    // 任务移动、任务结束(含 panic 兜底)时释放
+    let guard = acquire_remote_op()?;
+
     migrate_state.reset();
     let migrate_id = migrate_state.next_generation();
     log::info!("镜像迁移启动: {} -> {} 共 {} 个", req.source_id, req.target_id, images.len());
     let state = Arc::clone(&migrate_state.inner);
 
     tauri::async_runtime::spawn(async move {
+        let _guard = guard;
         // panic 兜底:迁移任务 panic 时前端会永久停在「迁移中…」,故以错误收尾
         // (与 deploy_batch 的编排层兜底同一做法)
         let (success, message, images_done) = match CatchPanic::new(run_migrate(

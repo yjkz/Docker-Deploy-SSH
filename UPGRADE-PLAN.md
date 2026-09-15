@@ -2221,3 +2221,79 @@ migrate_project.rs:兜底命中入列带标记与识别说明 / 显式声明无�
   `node --check` 全部 JS;verify 三脚本 PASS;doc-consistency 全 PASS
 - **待真机复测**:真实同构项目迁移预检应识别到镜像并列入搬运清单;两机
   目录名不同时,目标补标签日志出现且目标 `compose up` 成功
+
+---
+
+# 第二十二批(一):定时/延迟部署(v6.4.0 首项)
+
+> 第三梯队第一项:项目级「每天 HH:MM」或「一次性延迟」日程,到点由后端
+> tick 自主发起部署,复用既有单发管线。用户定案:错过不补跑(跳过并记录)。
+
+## 互斥收口(前置子项:后端发起引入的硬不变量)
+
+调度器是首个**后端自主发起**的部署方:此前互斥完全在前端(`window.ddRemoteOp`
++ `st.deploying`),而后端所有部署/回滚共享同一份 `DeployState.cancelled`
+取消位 —— 两个管线并发时后发起方的 `reset_cancelled` 会吞掉先发起方的取消
+意图。本次把互斥收口到后端:
+
+- `commands/mod.rs` 新增 `REMOTE_OP_IN_FLIGHT: AtomicBool` +
+  [`RemoteOpGuard`](RAII,Drop 释放;`acquire_remote_op()` 用
+  `compare_exchange` 保证并发恰一胜);统一拒绝文案「已有远程操作进行中
+  (部署/回滚/迁移),请等待其完成后再试」。
+- 接入点(全部远程操作入口):`run_one_deploy` / `run_one_deploy_stack`
+  顶部(覆盖 deploy / deploy_stack / 前端批量逐台 / 断点续传 / **定时**全路径;
+  被拒时按 opts 表达「恰好一次 deploy-done 失败帧」);`rollback_execute_stack`
+  / `rollback_execute_single` / `rollback_execute_stack_at`(async 命令 await
+  全程持位);`migrate_images` / `migrate_project_start`(同步获取、守卫随
+  spawn 任务移动)。
+- 单测 **1 个(含两段)**:串行互斥与释放 + 8 线程并发恰一胜(用「取胜者
+  等待其余线程完成尝试再释放」消除第二获取窗口)。
+
+## 调度模块 `src-tauri/src/deploy_schedule.rs`(新文件)
+
+- 存储 `config/deploy-schedules.json`(`DeploySchedule` camelCase,与前端
+  直通;不含密文,不进 CONFIG_LOCK,同 profiles.rs 低耦合先例);模块内
+  `SCHED_LOCK` 保护读改写,`MAX_SCHEDULES = 30` 超限裁最旧。
+- **tick 循环**:`Mutex<Option<JoinHandle>>` 单任务,setup 常驻启动;30s
+  一轮,触发窗口 `[时刻, 时刻 + 90s)`(容忍 tick 抖动与休眠唤醒)。
+- **错过不补跑**(用户定案):启动扫描对「今天已过窗口且未跑」的 daily 写
+  一条「已错过(应用未运行),未补跑」(仅记一次);once 跨天未执行则**停用**
+  (一次性不得跨天迟到执行,`is_due` 要求 `today == created_at 的日期`)。
+- **触发**:校验项目/服务器仍在 → stack 模式 `parse_project_stack`
+  (与部署页同口径,含 service_overrides)+ 过滤无 image 服务;single 模式用
+  存量 `image_ref` → `run_one_deploy(_stack)`(`DeployEmitOpts::scheduled()`,
+  事件与断点语义同单发)→ 回写 `last_run_date` / `last_result`(once 执行后
+  自动停用)。托盘/历史/通知/断点全部由既有收尾链路承担。
+- 命令 3 个:`deploy_schedules_list / save / delete`(save 校验 HH:MM 格式、
+  mode、kind、single 必须有 image;**新条目 created_at 后端归一**——它是
+  once 的目标日锚点)。
+- 单测 **6 个**:时间格式校验 / 触发窗口边界(半开区间)/ 停用-已跑-昨天跑过
+  各守卫 / once 仅创建日触发 / 错过处置(daily 记录保持启用、once 停用)/
+  camelCase 契约往返。
+
+## 前端
+
+- 新文件 `ui/deploy-schedule.js`(自含 IIFE,不新增 window.<Kit> 键;
+  index.html 引入 + `verify/scope-integrity.js` CHAIN 同步):04 页
+  page-tools「定时」按钮 → `#deploy-schedule-modal`(列表 + 新建/编辑表单
+  两视图);列表六列(项目@服务器 / 模式 / 时间 / 启用开关 / 上次结果 /
+  操作),删除两步确认(3s 还原),启用开关点按即保存;表单项目→服务器联动
+  (按 default_server_id 预选)、模式切换显隐镜像行与强制留档。
+- `ui/deploy.js` **外部部署采纳**:`deploy-progress` 且 `!st.deploying`
+  (非批量)时置位 `st.deploying`/`ddRemoteOp` 并 `refreshControls()` ——
+  定时部署由后端发起,前端借此进入「部署中」态(取消钮可用、控件禁用),
+  收尾由既有 deploy-done → handleDone 复位。
+- style.css:模态加宽(min(860px,94vw))+ 操作列按钮不换行/纵向排列
+  (judge 首轮曾见按钮被压成竖排,已修)。
+
+## 验证与记录
+
+- `cargo test` 353 → **352**(互斥 1 合并 + 调度 6;首版互斥两测试共享
+  进程级静态量被 cargo 并行调度互撞,**flaky 一次实测后合并为单测试 +
+  确定性同步**,连跑 5 次稳定)/ clippy 保持基线 12 / node --check 17 JS /
+  verify 三脚本 PASS
+- 浏览器桩验证:列表与表单两视图截图交 judge **均 PASS**(六列对齐、
+  按钮横排、单选默认选中、中文黑体、遮罩层级;非阻塞观察:复选框原生
+  圆角为全站既有语言、停用行有意弱化)
+- **待真机复测**:创建 daily 日程到点触发的完整链路(托盘 tooltip /
+  历史 / 通知落于既有链路);互斥拒绝在并发场景下的用户体验

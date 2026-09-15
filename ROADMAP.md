@@ -275,10 +275,24 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 
 ---
 
+### 第二十二批(进行中)— 第三梯队三项 + 文档治理批
+
+**① 定时/延迟部署 ✅ 已完成**(记录见 UPGRADE-PLAN「第二十二批(一)」)
+- 前置:后端远程操作互斥收口(`REMOTE_OP_IN_FLIGHT` + RAII guard,接入部署双入口/回滚三入口/迁移两入口)
+- 新模块 `deploy_schedule.rs`:30s tick、触发窗口 90s、错过不补跑(once 跨天停用)、3 命令
+- 前端 `deploy-schedule.js`(13 号模态)+ deploy.js 外部部署采纳;jadge 两视图 PASS
+- 命令 101 → **104**;测试 345 → **352**
+
+**② 终端增强** ⏳ 待开工(多标签 + 同栈广播 + 输出落盘)
+**③ 配置版本历史** ⏳ 待开工(快照 + 2 命令)
+**④ 文档治理批** ⏳ 待开工(清扫 + 页首版本戳 + contract-smoke + 补测试)
+
+---
+
 ## 当前状态速览
 
-- 版本 **v6.3.3**;main = origin/main;基线 `cargo test` **345 passed** / 13 ignored
-- 命令 **101** 个(generate_handler 实测;第二十批 +5,第二十一批 +1 `write_text_file`)
+- 版本 **v6.3.3**;main = origin/main;基线 `cargo test` **352 passed** / 13 ignored
+- 命令 **104** 个(generate_handler 实测;第二十二批 +3 调度命令,待后两项继续更新)
 - JS **16** 文件(含 theme-init.js;index.html 加载顺序见 wiki/03:13)
 - 前端结构:12 模态;commands/ 11 文件;三大 JS 主文件 2338/2013/2537 行
 - 表单体系(第十三批):5 处模态有真实 `<form novalidate>` 语义;失焦校验 + Enter 提交由 app.js 三助手统一承担

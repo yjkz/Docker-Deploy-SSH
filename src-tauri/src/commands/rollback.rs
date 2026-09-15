@@ -295,6 +295,9 @@ pub async fn rollback_execute_stack(
     project_id: String,
     release_ts: String,
 ) -> Result<(), String> {
+    // 远程操作互斥(第二十二批):回滚与部署/迁移互斥;被拒返回命令 Err
+    // (前端 toast 原文),不进入管线
+    let _guard = acquire_remote_op()?;
     finish_rollback(
         &app,
         rollback_execute_stack_inner(
@@ -514,6 +517,8 @@ pub async fn rollback_execute_single(
     date_tag: String,
     target_ref: String,
 ) -> Result<(), String> {
+    // 远程操作互斥(第二十二批):与部署/迁移互斥
+    let _guard = acquire_remote_op()?;
     finish_rollback(
         &app,
         rollback_execute_single_inner(
@@ -1253,6 +1258,8 @@ pub async fn rollback_execute_stack_at(
     dir: String,
     release_ts: String,
 ) -> Result<(), String> {
+    // 远程操作互斥(第二十二批):与部署/迁移互斥
+    let _guard = acquire_remote_op()?;
     finish_rollback(
         &app,
         rollback_execute_stack_at_inner(

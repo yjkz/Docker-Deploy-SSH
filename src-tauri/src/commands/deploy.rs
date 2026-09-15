@@ -33,6 +33,11 @@ pub fn deploy_stack(req: StackDeployRequest, app: AppHandle) -> Result<(), Strin
 /// - `log_prefix`(批量 = `[服务器名] `):任务级 `deploy-log` 前缀;
 /// - `checkpoint = false`(批量):断点落盘整体关闭(resume 一律 `None`)。
 ///
+/// 互斥(第二十二批):入口处经 [`acquire_remote_op`] 取全局远程操作位,与
+/// 回滚/迁移互斥;被拒时按 `opts` 表达「恰好一次 deploy-done 失败帧」(单发
+/// 路径)后返回 Err,不触碰管线(以未占用互斥位的语义返回 —— 定时任务据此
+/// 区分「跳过」与「执行失败」)。
+///
 /// 返回 `Ok(部署记录)`(成功)/ `Err(错误文案)`(失败/取消/panic)。
 pub(crate) async fn run_one_deploy(
     app: &AppHandle,
@@ -40,6 +45,9 @@ pub(crate) async fn run_one_deploy(
     resume: Option<ResumeContext>,
     opts: DeployEmitOpts,
 ) -> Result<DeployRecord, String> {
+    let Some(_guard) = acquire_deploy_slot(app, &opts) else {
+        return Err("已有远程操作进行中(部署/回滚/迁移),本次部署未启动".to_string());
+    };
     DEPLOY_EVENT_CTX
         .scope(
             DeployEventCtx::of(&opts),
@@ -59,6 +67,9 @@ pub(crate) async fn run_one_deploy_stack(
     resume: Option<ResumeContext>,
     opts: DeployEmitOpts,
 ) -> Result<DeployRecord, String> {
+    let Some(_guard) = acquire_deploy_slot(app, &opts) else {
+        return Err("已有远程操作进行中(部署/回滚/迁移),本次部署未启动".to_string());
+    };
     DEPLOY_EVENT_CTX
         .scope(
             DeployEventCtx::of(&opts),
@@ -69,6 +80,32 @@ pub(crate) async fn run_one_deploy_stack(
             ),
         )
         .await
+}
+
+/// 取远程操作互斥位;被拒时按 `opts` 表达事件后返回 `None`。
+///
+/// - `emit_done = true`(单发/续传):emit 一帧 `deploy-done{success:false}`
+///   (前端据此复位按钮与「部署中」态,与管线失败路径同形),并同步日志;
+/// - `emit_done = false`(批量收敛路径):不 emit(结果由批量侧表达)。
+fn acquire_deploy_slot(app: &AppHandle, opts: &DeployEmitOpts) -> Option<RemoteOpGuard> {
+    match acquire_remote_op() {
+        Ok(guard) => Some(guard),
+        Err(msg) => {
+            log::warn!("部署被拒(远程操作互斥):{}", msg);
+            if opts.emit_done {
+                emit_log(app, "已有远程操作进行中(部署/回滚/迁移),本次部署未启动");
+                let _ = app.emit(
+                    "deploy-done",
+                    DeployDone {
+                        success: false,
+                        message: msg.clone(),
+                        error_code: Some("input"),
+                    },
+                );
+            }
+            None
+        }
+    }
 }
 
 /// 部署管线入口:组装部署历史记录骨架(含开始计时),执行管线主体,

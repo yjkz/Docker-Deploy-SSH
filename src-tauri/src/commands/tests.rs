@@ -2591,3 +2591,60 @@ services:
         let m2 = parse_release_manifest(fresh).expect("新 manifest 应可解析");
         assert_eq!(m2.images[0].id.as_deref(), Some("sha256:bbb"));
     }
+
+    // ===== 远程操作互斥(第二十二批)=====
+
+    /// 合并为单一测试:互斥位是**进程级静态量**,两个独立 #[test] 会被 cargo
+    /// 并行调度而互撞(串行用例持位期间并发用例的线程全部被拒 → won=0;
+    /// 调度延迟又可能让失败线程二次成功 → won>1),首版实测 flaky。
+    /// 并发段另用「获胜者等待其余线程全部完成尝试」消除第二个获取窗口
+    /// (否则被延迟调度的线程可能在取胜者释放后二次成功)。
+    #[test]
+    fn test_remote_op_guard_serial_and_concurrent() {
+        // --- 串行语义:先取成功,持有期间第二次取被拒;Drop 后可再次取 ---
+        let g1 = acquire_remote_op().expect("首次获取应成功");
+        let denied = acquire_remote_op();
+        assert!(denied.is_err(), "持有期间第二次获取必须被拒");
+        assert!(
+            denied.unwrap_err().contains("已有远程操作进行中"),
+            "拒绝文案应面向用户且可识别"
+        );
+        assert!(REMOTE_OP_IN_FLIGHT.load(Ordering::SeqCst));
+        drop(g1);
+        assert!(
+            !REMOTE_OP_IN_FLIGHT.load(Ordering::SeqCst),
+            "Drop 应释放互斥位"
+        );
+
+        // --- 并发语义:8 线程争抢,恰好一方获胜(RAII + compare_exchange) ---
+        const N: usize = 8;
+        let attempts_done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..N {
+            let done = std::sync::Arc::clone(&attempts_done);
+            handles.push(std::thread::spawn(move || {
+                let guard = acquire_remote_op();
+                let won = guard.is_ok();
+                if won {
+                    // 持位等待其余 N-1 个线程完成各自的一次尝试再释放,
+                    // 保证此后不会有任何成功路径(确定性:恰一胜)
+                    while done.load(Ordering::SeqCst) < N - 1 {
+                        std::thread::yield_now();
+                    }
+                }
+                done.fetch_add(1, Ordering::SeqCst);
+                drop(guard);
+                won
+            }));
+        }
+        let won = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|w| *w)
+            .count();
+        assert_eq!(won, 1, "8 线程并发争抢应恰好一方获胜");
+        assert!(
+            !REMOTE_OP_IN_FLIGHT.load(Ordering::SeqCst),
+            "全部线程结束后互斥位应释放(无泄漏)"
+        );
+    }

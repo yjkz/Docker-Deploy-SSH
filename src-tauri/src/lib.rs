@@ -2,6 +2,7 @@ pub mod commands;
 pub mod config;
 pub mod config_io;
 pub mod crypto;
+pub mod deploy_schedule;
 pub mod docker;
 pub mod errors;
 pub mod history;
@@ -45,6 +46,9 @@ pub fn run() {
       profiles::deploy_profiles_list,
       profiles::deploy_profiles_save,
       profiles::deploy_profiles_delete,
+      deploy_schedule::deploy_schedules_list,
+      deploy_schedule::deploy_schedules_save,
+      deploy_schedule::deploy_schedules_delete,
       config_io::config_wipe,
       notify::notify_get_config,
       notify::notify_save_config,
@@ -164,6 +168,8 @@ pub fn run() {
       // 服务器定时探活(第十七批):按已存设置决定启动或保持关闭
       // (probe_interval_mins > 0 时启动;设置中心保存时也会 sync)
       crate::probe::sync_from_settings(app.handle());
+      // 定时部署调度器(第二十二批):常驻 tick(30s),按日程表到点发起部署
+      crate::deploy_schedule::start_scheduler(app.handle());
       Ok(())
     })
     .run(tauri::generate_context!())

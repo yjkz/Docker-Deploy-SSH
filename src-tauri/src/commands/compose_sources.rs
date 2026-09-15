@@ -469,6 +469,13 @@ pub fn update_project_from_source(project_id: String) -> Result<ProjectSourceSta
 pub async fn parse_compose(project_id: String) -> Result<ComposeStack, String> {
     let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
     let project = find_project(&cfg, &project_id)?.clone();
+    parse_project_stack(&project).await
+}
+
+/// [`parse_compose`] 的内部形态(定时部署等后端发起方复用;不经过命令层)。
+pub(crate) async fn parse_project_stack(
+    project: &crate::config::ProjectConfig,
+) -> Result<ComposeStack, String> {
     if project.compose_file.trim().is_empty() {
         return Err(format!("项目「{}」未配置 compose 文件", project.name));
     }

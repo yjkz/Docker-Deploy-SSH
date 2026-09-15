@@ -217,6 +217,10 @@ pub fn migrate_project_start(
     commands::find_server_pub(&cfg, &req.source_server_id)?;
     commands::find_server_pub(&cfg, &req.target_server_id)?;
 
+    // 远程操作互斥(第二十二批):同步获取(被拒立即返回命令 Err),守卫随
+    // 任务移动、任务结束(含 panic 兜底)时释放
+    let guard = commands::acquire_remote_op()?;
+
     let migrate_id = migrate_state.begin_migration();
     log::info!(
         "项目迁移启动:项目 {} {} -> {}",
@@ -227,6 +231,7 @@ pub fn migrate_project_start(
     let state = migrate_state.inner_arc();
 
     tauri::async_runtime::spawn(async move {
+        let _guard = guard;
         let (success, message, warnings) =
             match commands::CatchPanic::new(run_migrate_project(&app, &state, migrate_id, &req)).await
             {

@@ -2979,6 +2979,20 @@
 
     window.AppBus.on('deploy-progress', function (event) {
       var p = (event && event.payload) || {};
+      // 外部部署采纳(第二十二批):定时部署由后端发起,前端没有对应的
+      // 「发起时置位」——首次收到进度时若本地未处于部署态则接管(置
+      // st.deploying/ddRemoteOp,取消按钮可用、页面控件进入部署中态;
+      // 收尾由 deploy-done 的 handleDone 天然复位)。批量队列自身置位过
+      // st.deploying,回滚执行不 emit deploy-progress,均不会误触。
+      if (!st.deploying && Number(p.step) > 0) {
+        if (st.batch && st.batch.active) {
+          // 批量队列在跑(置位由队列保证):只当计时/状态看,不接管
+        } else {
+          st.deploying = true;
+          window.ddRemoteOp = 'deploy';
+          refreshControls();
+        }
+      }
       renderProgress(Number(p.step) || 0, String(p.message || ''));
     }).catch(function (err) { warn('deploy-progress', err); });
 

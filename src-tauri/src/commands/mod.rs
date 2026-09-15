@@ -191,6 +191,46 @@ pub struct DeployState {
     pub cancelled: AtomicBool,
 }
 
+// ===== 远程操作互斥(第二十二批:定时部署引入「后端自主发起」后的硬不变量)=====
+
+/// 全局远程操作互斥位:**同一时刻只允许一个远程操作** (部署 / 续传 /
+/// 一键回滚 / 回滚中心 / 项目迁移 / 镜像迁移) 处于执行期。
+///
+/// 引入背景:此前互斥完全在前端(`window.ddRemoteOp` + `st.deploying`),
+/// 但定时部署(第二十二批)由**后端 tick 自主发起**,没有前端动作可依赖;
+/// 而所有部署/回滚共享同一份 [`DeployState.cancelled`] 取消位 —— 两个管线
+/// 并发时后发起方的 `reset_cancelled` 会吞掉先发起方的取消意图,且托盘
+/// 状态面互相覆盖。互斥收口到后端后,无论发起方是前端命令还是定时任务,
+/// 行为一致。
+///
+/// 持有方式:经 [`acquire_remote_op`] 取 [`RemoteOpGuard`](RAII,Drop 释放);
+/// 批量部署由前端的逐台串行队列保证同一时刻只有一个 `run_one_deploy*` 在跑,
+/// 因此逐台 acquire/release 与批量语义不冲突。
+static REMOTE_OP_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// 远程操作互斥的 RAII 守卫(由 [`acquire_remote_op`] 创建;Drop 时释放)。
+#[derive(Debug)]
+pub(crate) struct RemoteOpGuard;
+
+impl Drop for RemoteOpGuard {
+    fn drop(&mut self) {
+        REMOTE_OP_IN_FLIGHT.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 尝试获取远程操作执行权。失败返回统一文案(面向用户,可操作)。
+///
+/// 调用方语义:部署类管线在**后台任务顶部**获取(失败时按各自路径收尾:
+/// 单发/续传 emit `deploy-done` 失败帧,定时任务写 last_result 跳过);
+/// 回滚/迁移类在 spawn 前同步获取(失败直接以命令 Err 返回)。
+pub(crate) fn acquire_remote_op() -> Result<RemoteOpGuard, String> {
+    // compare_exchange:并发两方仅一方成功,JIT 通过 SeqCst 保证可见性
+    REMOTE_OP_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .map(|_| RemoteOpGuard)
+        .map_err(|_| "已有远程操作进行中(部署/回滚/迁移),请等待其完成后再试".to_string())
+}
+
 /// `deploy-progress` 事件负载。
 #[derive(Debug, Clone, Serialize)]
 pub struct DeployProgress {
@@ -458,6 +498,18 @@ pub(crate) struct DeployEmitOpts {
 impl DeployEmitOpts {
     /// 单发/续传路径:事件与断点行为与历史版本完全一致。
     fn single() -> Self {
+        Self {
+            emit_progress: true,
+            emit_done: true,
+            log_prefix: String::new(),
+            checkpoint: true,
+        }
+    }
+
+    /// 定时部署路径(第二十二批):与单发同事件语义(前端在无本地部署
+    /// 进行中时「采纳」外部部署——deploy-progress 驱动进度、deploy-done
+    /// 收尾复位);断点照常落盘(失败可经 04 页横幅续传)。
+    pub(crate) fn scheduled() -> Self {
         Self {
             emit_progress: true,
             emit_done: true,
