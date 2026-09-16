@@ -47,7 +47,7 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 - 整栈选项区可选「版本标题」+「版本说明」;成功后前端 `writeReleaseNotes` 用历史 `release_dir`(lastIndexOf 拆 dir/ts)调 `rollback_set_release_notes`;失败/取消不写(续传成功同入口补写);批量恒不写
 - **后端顺序调整**:部署历史落盘挪到 emit deploy-done **之前**(原 emit→通知(await)→落历史有竞态)
 - 真机反馈修复:版本详情保存路径翻倍(第七批潜伏 bug)——`RollbackReleaseDetail.dir` 是归档完整路径,模态保存误当项目目录;改用 selectedDir
-- **待真机复测**:保存版本标题/说明 + 整栈部署后回滚中心看自动补写
+- **真机复测 ✅(2026-09-16)**:保存版本标题/说明 + 整栈部署后回滚中心看自动补写
 
 ### 第十二批 v5.11.0(阶段四:结构治理)— commit 至 6cee803
 - Rust:`commands.rs`(10541 行)→ `src/commands/` 11 文件(mod 1261 共享设施+再导出 / deploy 2057 / rollback 1470 / cleanup 1243 / migrate 475 / compose_sources 494 / host_server 367 / resume 434 / batch 292 / preview 281 / tests 2249);**lib.rs 零改动**;可见性最小放宽(pub(crate))
@@ -65,7 +65,7 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 - `setFieldError` 锚点修正:`closest('.form-row')`(路径类字段的父节点是 `.input-btn-row` flex 行,原实现把提示塞进按钮行抢宽度)+ 错误插在 `form-hint` 之前
 - **顺带修复第十二批拆分的存量 bug**:`window.DeployKit` 被赋值两次(后者覆盖前者)→ 拆出的 deploy-rollback.js 顶层 6 个键为 undefined,**单镜像回滚模态打开即崩**;合并为单对象 + 新增 `verify/bridge-integrity.js` 桥接守护
 - 验证:自建本地校验器 54 项断言全过 + 浏览器桩全链路 + 截图交 judge 4/4 pass;`cargo test` 290 passed 不变
-- **待真机复测**:单镜像回滚模态能正常打开(DeployKit 修复后)+ 各表单失焦校验手感
+- **真机复测 ✅(2026-09-16)**:单镜像回滚模态能正常打开(DeployKit 修复后)+ 各表单失焦校验手感
 
 ### 第十四批 v5.13.0(阶段六:批量部署增强)— 已完成(commit 见本批)
 - **开工前核实推翻了仓库文档记载**:批量逐台复用单发 `deploy`/`deploy_stack`,后端那两个命令**恒 `checkpoint = true`** → **批量失败/取消的台早就落盘了断点**;「批量不落断点」只描述未接入的死代码 `deploy_batch`。该错误记载是「批量失败后没有续传入口」长期存在的根因(wiki/06、wiki/07 限制 21/40/41 + 三处代码注释已全部更正)
@@ -76,7 +76,7 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 - **视觉**:judge 首轮打回徽章跨行错列,修复后复审 pass(徽章列 + 定宽动作槽对齐)
 - **顺带修复用户反馈的 UI bug**:回滚中心「已备注」徽章被拉满整行 —— 父容器 `.rollback-release-info` 是 column flex,`align-items` 默认 `stretch`。修法是 `.rollback-release-info > .badge { align-self: flex-start }`,**必须用后代选择器**:`window.fillBadge` 会整体重写 `node.className`,给徽章挂自定义类会被抹掉(首版按自定义类写,实测 `alignSelf: auto`、徽章 419px 仍拉满;改后代选择器后 50px/419px、不再拉伸)。
 - 验证:`cargo test` 291 passed(基线 290 + 新单测)/ clippy 与基线逐条比对零新增 / 浏览器桩跑通全部续传路径(含断点已清理的边界)/ judge pass
-- **待真机复测**:真实服务器上的批量失败 → 续传此台/一键续传;停止批量的即时中止手感
+- **真机复测 ✅(2026-09-16)**:真实服务器上的批量失败 → 续传此台/一键续传;停止批量的即时中止手感
 
 ### 第十四批补丁 v5.13.1 — 修复「未能获取更新说明」
 - **根因**:`update_check` 主路径把**剥了 v 前缀**的 `info.latest`(`"5.13.0"`)当 tag 传给 `releases/tags/{tag}` 端点,而 GitHub 要求真实 tag(`v5.13.0`)→ **恒 404**;抓取函数四个失败分支当时全部静默 `return String::new()` 且无日志,故前端只看到「未能获取更新说明」兜底。**自第八批引入,恒定失败(非偶发)**,用户跨版本升级时才暴露
@@ -89,7 +89,7 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 - 优先级:部署中 > 回滚执行中 > 监控中 > 空闲;空闲附「上次部署成功/失败/已取消」终态(新一轮开始即清)
 - 挂钩点:两部署管线步骤 0(开始 + 目标串 + 批量前缀)/ `emit_progress`(步骤,**置于批量抑制之前**)/ `finish_deploy_run`(终态)/ `finish_rollback`(进入/退出)/ 监控 start·stop·熔断
 - 细节:监控熔断自动退出也清态(否则前端不在线时托盘永远「监控中」);批量逐台是独立单发,台间 tooltip 瞬闪终态再回「部署中」(状态恒准确,间隔 <1s)
-- 验证:`cargo test` 302 passed(基线 292 + 10)/ clippy 零新增 / 真机冒烟进程存活;**tooltip 悬停效果待用户确认**(系统绘制,无自动化断言手段)
+- 验证:`cargo test` 302 passed(基线 292 + 10)/ clippy 零新增 / 真机冒烟进程存活;**tooltip 悬停效果已确认 ✅(2026-09-16)**(系统绘制,无自动化断言手段)
 
 ### 第十七批 v5.16.0(候选池:远程管理四件套 + 探活)— 已完成
 - **image_filter 消费**(wiki/07 限制 3 解除):部署页选中项目 → 镜像下拉按「镜像过滤关键字」筛选(`repository:tag` 子串,不区分大小写);提示条区分 过滤生效/无匹配/无可用镜像;项目切换即时重填
@@ -122,7 +122,7 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 - **功能修复 14 处**:版本说明从未写成功(deploy.js writeReleaseNotes 缺 req 包裹)、check 误报、整栈批量空指针、config-io id、rollback deploy-done 过滤+剥码、setBtnBusy 兜底、stats 码判定、migrate stop 吞错/tmp 残留、parse_du_output 空格、save_gzip 兜底、escHtml 引号等
 - **wiki 全量对齐**(01/02/03/04/06/07/README,30+ 处):补 errors/tray_status/probe 三模块章节;修正栈扫描深度/批量断点/续传复用条件/契约结构字段;各文件行数与命令计数
 - 验证:`cargo test` 315 passed(基线 313 + 2)/ clippy 零新增 / release build 通过 / 三 verify 全 PASS
-- 真机待确认:russh 0.60 连接回归(密码/私钥/口令+TOFU)、CSP 渲染、save_server_entry 编辑保存密文保留、托盘 tooltip
+- **真机确认 ✅(2026-09-16)**:russh 0.60 连接回归(密码/私钥/口令+TOFU)、CSP 渲染、save_server_entry 编辑保存密文保留、托盘 tooltip
 
 ### 第十九批 v6.1.0(候选池清空 + 限制修复)— 已完成
 - **部署前自动预览**(候选池唯一剩余项,用户定案「勾选才自动」):整栈选项区新增「部署前自动预览」勾选(`#deploy-auto-preview`,localStorage `dd_deploy_auto_preview` 记忆,默认关);勾选后点「开始部署」在环境检测通过后**先自动跑一次变更预览**(`previewStackOnce` Promise 版,与「部署预览」按钮同 `preview_stack_changes`),展示预览表并经 `confirm()` 确认后才真正部署,取消则预览结果保留;不勾则不自动预览。**「部署预览」手动按钮保留不变**;勾选入部署锁族(refreshControls 禁用清单)
@@ -183,21 +183,21 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 | 修复 | P0 批量续传互斥 / P1 探活回显·Esc 逐层·跨机 SMTP / P2 七项(建连超时/日志流竞态/互斥收口/哨兵等) | v6.1.3 + v6.1.4 |
 | 治理 | 文档不符清扫、doc-consistency、页首版本戳、契约 smoke、编排层补测试 | 第二十二批 v6.4.0(测试数/命令数/页首戳四类断言上线;contract-smoke 入 CI) |
 
-### 遗留待真机验证(用户下次实机操作时顺手确认)
-> 2026-09-16 整理:已随各批真机反馈确认的项(迁移模态/单镜像回滚模态/版本说明写入等)不再列入;
-> 下列为尚未收到实机回执的项。
+### 遗留待真机验证 — 全部确认 ✅(存档:2026-09-16)
 
-**第二十二批(v6.4.0)新增:**
-1. **定时部署到点触发**:创建 daily 日程 → 到点看后端自动发起(托盘 tooltip/历史/通知/USB 链路);应用未运行时错过 → 下次打开看「已错过,未补跑」记录
-2. **终端多标签与广播**(v6.4.1 修复「只能开一个标签」后):弹窗顶栏「＋新标签」下拉选不同容器开多个标签并发会话;同栈多容器勾「广播同栈」发命令看双端执行;`logs/term-*.log` 落盘文件实测
-3. **配置版本历史**:编辑服务器/保存项目后 `config/.history/` 出现快照;「恢复」后数据回退且恢复前自动留底
+> 2026-09-16 用户实机操作,下列全部条目确认通过,清单清空;新项随后续批次另行入库。
 
-**早前批次遗留:**
-4. 05 概览磁盘数字与服务器 `df -h` 对照(后端 df 解析只过了单测)
-5. 各表单失焦校验手感 + Enter 提交是否符合直觉(服务器/项目/通知/迁移/回滚/清理)
-6. 批量部署的失败续传(「续传此台」/「续传未完成服务器」)与「停止批量」步骤边界即时中止
-7. 部署前自动预览手感(勾选后整栈部署先预览再确认)
-8. 迁移项目两机目录名不同时,目标补标签日志出现且目标 up 成功(v6.3.3 修复)
+**第二十二批(v6.4.0/v6.4.1):**
+1. ✅ **定时部署到点触发**:创建 daily 日程 → 到点看后端自动发起(托盘 tooltip/历史/通知/USB 链路);应用未运行时错过 → 下次打开看「已错过,未补跑」记录
+2. ✅ **终端多标签与广播**(v6.4.1 修复「只能开一个标签」后):弹窗顶栏「＋新标签」下拉选不同容器开多个标签并发会话;同栈多容器勾「广播同栈」发命令看双端执行;`logs/term-*.log` 落盘文件实测
+3. ✅ **配置版本历史**:编辑服务器/保存项目后 `config/.history/` 出现快照;「恢复」后数据回退且恢复前自动留底
+
+**早前批次:**
+4. ✅ 05 概览磁盘数字与服务器 `df -h` 对照(后端 df 解析只过了单测)
+5. ✅ 各表单失焦校验手感 + Enter 提交是否符合直觉(服务器/项目/通知/迁移/回滚/清理)
+6. ✅ 批量部署的失败续传(「续传此台」/「续传未完成服务器」)与「停止批量」步骤边界即时中止
+7. ✅ 部署前自动预览手感(勾选后整栈部署先预览再确认)
+8. ✅ 迁移项目两机目录名不同时,目标补标签日志出现且目标 up 成功(v6.3.3 修复)
 
 ---
 
@@ -242,7 +242,7 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 - **单测 +10**:兜底命中入列带标记 / 显式声明无提示 / 未命中给指引且旧文案消失 / 目录名候选优先级(origin.json 前、部署目录后)/ 手工项目仅取部署目录名 / with_dirs 覆盖命中 / 空列表等价旧入口 / 红绿对照(空列表必须 miss=修复前误报路径)/ target 命名推导(目录名合规化、顶层 name 优先)/ fallback_filled 两态
 - 前端:迁移空态文案同步(`ui/deploy-migrate.js` 镜像表空态说明兜底口径)
 - 验证:345 passed(+10)/ clippy 保持基线 12 / node --check 全部 JS / verify 三脚本 PASS / doc-consistency 全 PASS
-- **待真机复测**:真实项目(backend/offical/houtai 同构)迁移预检应识别到镜像并列入搬运清单;两机目录名不同时目标补标签日志与目标 up 成功
+- **真机复测 ✅(2026-09-16)**:真实项目(backend/offical/houtai 同构)迁移预检应识别到镜像并列入搬运清单;两机目录名不同时目标补标签日志与目标 up 成功
 
 ---
 
@@ -283,7 +283,7 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 
 - 版本 **v6.4.1**;main = origin/main;基线 `cargo test` **363 passed** / 13 ignored
 - 命令 **106** 个(generate_handler 实测;第二十二批 +3 调度 +2 配置历史)
-- **第二十二批(v6.4.0)第三梯队三项全完成**:定时部署 / 终端多标签+广播+落盘 / 配置版本历史;文档治理批完成(contract-smoke 上线);**补丁 v6.4.1**:终端多标签可达性修复(「＋新标签」下拉)
+- **第二十二批(v6.4.0)第三梯队三项全完成**:定时部署 / 终端多标签+广播+落盘 / 配置版本历史;文档治理批完成(contract-smoke 上线);**补丁 v6.4.1**:终端多标签可达性修复(「＋新标签」下拉);**遗留待真机验证 8 项全部确认 ✅(2026-09-16),清单清空**
 - verify/ 六脚本:form-validation / bridge-integrity / scope-integrity / contract-smoke / doc-consistency / VERSION.txt(缓存)
 - JS **16** 文件(含 theme-init.js;index.html 加载顺序见 wiki/03:13)
 - 前端结构:12 模态;commands/ 11 文件;三大 JS 主文件 2338/2013/2537 行
