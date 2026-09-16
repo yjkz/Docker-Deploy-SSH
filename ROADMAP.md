@@ -189,7 +189,7 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 
 **第二十二批(v6.4.0)新增:**
 1. **定时部署到点触发**:创建 daily 日程 → 到点看后端自动发起(托盘 tooltip/历史/通知/USB 链路);应用未运行时错过 → 下次打开看「已错过,未补跑」记录
-2. **终端多标签与广播**:不同容器各开一个标签并发会话;同栈多容器勾「广播同栈」发命令看双端执行;`logs/term-*.log` 落盘文件实测
+2. **终端多标签与广播**(v6.4.1 修复「只能开一个标签」后):弹窗顶栏「＋新标签」下拉选不同容器开多个标签并发会话;同栈多容器勾「广播同栈」发命令看双端执行;`logs/term-*.log` 落盘文件实测
 3. **配置版本历史**:编辑服务器/保存项目后 `config/.history/` 出现快照;「恢复」后数据回退且恢复前自动留底
 
 **早前批次遗留:**
@@ -258,6 +258,10 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 - 后端:会话输出自动落盘 logs/term-*.log;ContainerRow 增 compose_project
 - 前端:终端多标签(tabs 字典 + 按 sid 路由的单监听)+ 同栈广播勾选
 - judge 抓出双注册缺陷(同步守卫缺失)已修并复验 PASS;测试 352 → **355**
+- **补丁 v6.4.1(真机反馈修复)**:「只能开一个标签」——多标签状态机本身正确,
+  但加标签的唯一入口(表格行「终端」按钮)被全屏模态遮罩盖死,模态内无任何
+  新建入口;修复 = 模态顶栏增「＋新标签」下拉(运行中容器,选中即开/切,同容器
+  去重切回),`ui/help.js` 旧「单会话」文案同步改多标签口径;桩端到端 judge PASS
 **③ 配置版本历史 ✅ 已完成**(记录见 UPGRADE-PLAN「第二十二批(三)」)
 - save_config 写前自动快照三件套到 config/.history/(全等去重、cap 20);
   config_import_file 导入前同样快照;config_wipe 不涉(清除语义)
@@ -277,9 +281,9 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 
 ## 当前状态速览
 
-- 版本 **v6.4.0**;main = origin/main;基线 `cargo test` **363 passed** / 13 ignored
+- 版本 **v6.4.1**;main = origin/main;基线 `cargo test` **363 passed** / 13 ignored
 - 命令 **106** 个(generate_handler 实测;第二十二批 +3 调度 +2 配置历史)
-- **第二十二批(v6.4.0)第三梯队三项全完成**:定时部署 / 终端多标签+广播+落盘 / 配置版本历史;文档治理批完成(contract-smoke 上线)
+- **第二十二批(v6.4.0)第三梯队三项全完成**:定时部署 / 终端多标签+广播+落盘 / 配置版本历史;文档治理批完成(contract-smoke 上线);**补丁 v6.4.1**:终端多标签可达性修复(「＋新标签」下拉)
 - verify/ 六脚本:form-validation / bridge-integrity / scope-integrity / contract-smoke / doc-consistency / VERSION.txt(缓存)
 - JS **16** 文件(含 theme-init.js;index.html 加载顺序见 wiki/03:13)
 - 前端结构:12 模态;commands/ 11 文件;三大 JS 主文件 2338/2013/2537 行

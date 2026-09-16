@@ -802,7 +802,10 @@
   //         lines, cur, curIdx, eof, pend, history, histIdx, lastCols, lastRows }
   // - 单个 manage-exec-output 监听,按 payload.session_id 路由到对应 tab;
   //   session_id 未知的早期事件入 buffer,invoke 返回后按 sid 认领(防早到丢失)
-  // - 模态骨架常驻:已开着终端时再点「终端」= 加标签,不重建模态
+  // - 模态骨架常驻:已开着终端时再点「终端」= 加标签,不重建模态;
+  //   但模态是全屏遮罩会盖住表格,表格按钮在模态打开时不可达——故顶栏
+  //   另有「新标签」下拉(运行中容器,选中即开/切),作为加标签的可达闭环
+  //   (第二十二批修复:v6.4.0 只有表格入口,实际第二个标签开不出来)
   // - 广播:勾选后输入发给**同 compose 栈**(同 compose_project)的活跃标签;
   //   无同栈同伴/项目名为空时禁用
 
@@ -876,6 +879,8 @@
     body.innerHTML =
       '<div class="log-tail-bar term-toolbar">' +
       '<div id="term-tabs" class="term-tabs" role="tablist"></div>' +
+      '<label class="term-newtab" id="term-newtab-label" title="选择运行中的容器,打开/切换到其终端标签">＋新标签' +
+      '<select id="term-newtab-select" class="form-input form-input-sm"></select></label>' +
       '<label class="term-broadcast" id="term-broadcast-label" title="需同时打开同一 compose 栈的多个容器终端">' +
       '<input type="checkbox" id="term-broadcast-cb">广播同栈</label>' +
       '<button id="term-close-btn" class="btn btn-sm btn-danger" type="button">关闭终端</button>' +
@@ -893,6 +898,25 @@
       '</div>';
 
     openModal('终端', body);
+
+    // 新标签下拉:选项来自表格数据(state.containers);打开/展开时重填,
+    // 保证与表格最新一致(容器可能被启动/删除)
+    newTabSelSig = ''; // 骨架是全新 DOM,签名复位强制首填
+    populateNewTabSelect();
+    var newTabSel = $('term-newtab-select');
+    if (newTabSel) {
+      newTabSel.addEventListener('focus', populateNewTabSelect);
+      newTabSel.addEventListener('mousedown', populateNewTabSelect);
+      newTabSel.addEventListener('change', function () {
+        var cid = newTabSel.value;
+        newTabSel.value = '';
+        if (!cid) return;
+        var c = state.containers.filter(function (x) { return x.id === cid; })[0];
+        if (!c) return;
+        // 与表格「终端」按钮同口径:同容器已开标签时 openTerminal 内部去重切换
+        openTerminal(c.id, c.names || c.id, c.compose_project || null);
+      });
+    }
 
     var shellSel = $('term-shell-select');
     if (shellSel) shellSel.addEventListener('change', function () {
@@ -924,6 +948,55 @@
     }
 
     ensureExecListener();
+  }
+
+  // 重填「新标签」下拉:仅运行中容器(state.containers 为表格数据,
+  // 与容器渲染同源);名称@compose 项目便于同栈广播时辨认。
+  // 数据为空给禁用占位;createElement/textContent 防 XSS。
+  // 签名守卫:数据未变时不重建 DOM(避免在 mousedown/弹出原生下拉期间
+  // 做无谓的 option 替换)。
+  var newTabSelSig = '';
+  function populateNewTabSelect() {
+    var sel = $('term-newtab-select');
+    if (!sel) return;
+    var list = (state.containers || []).filter(function (c) {
+      return (c.state || '').toLowerCase() === 'running';
+    });
+    // 签名含「是否已开标签」(标注后缀依赖它),标签开/关时也需重建
+    var sig = list.map(function (c) {
+      var opened = execTabsAll().some(function (t) {
+        return t.containerId === c.id && !t.eof;
+      });
+      return c.id + '|' + (c.names || '') + '|' + (c.compose_project || '') + '|' + (opened ? '1' : '0');
+    }).join(';');
+    if (sig === newTabSelSig) return; // 数据未变不重建
+    newTabSelSig = sig;
+    sel.innerHTML = '';
+    if (list.length === 0) {
+      var opt0 = document.createElement('option');
+      opt0.value = '';
+      opt0.textContent = '无运行中容器';
+      sel.appendChild(opt0);
+      sel.disabled = true;
+      return;
+    }
+    sel.disabled = false;
+    var placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = '选择容器…';
+    sel.appendChild(placeholder);
+    for (var i = 0; i < list.length; i++) {
+      var c = list[i];
+      var opt = document.createElement('option');
+      opt.value = c.id;
+      opt.textContent = (c.names || c.id) + (c.compose_project ? ' @ ' + c.compose_project : '');
+      // 已开标签的容器加后缀标注(选中 = 切过去,不是重复开会话)
+      var opened = execTabsAll().some(function (t) {
+        return t.containerId === c.id && !t.eof;
+      });
+      if (opened) opt.textContent += '(已打开)';
+      sel.appendChild(opt);
+    }
   }
 
   // 全局单监听(懒注册一次):按 session_id 路由;未知 sid 入 buffer
@@ -1021,6 +1094,8 @@
       bar.appendChild(item);
     });
     updateBroadcastState();
+    // 标签开/关会改变「(已打开)」标注,同步刷新新标签下拉(签名守卫去重)
+    populateNewTabSelect();
   }
 
   function selectExecTab(key) {

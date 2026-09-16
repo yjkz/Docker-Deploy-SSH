@@ -47,7 +47,7 @@
 配置:安装目录 config/ 下 servers.json + projects.json + notify.json + settings.json +
       deployments.json + resume-deploy.json(便携式;原子写);日志 logs/app.log
 测试:cargo test(纯函数单测 363 passed;真机测试 #[ignore] 13 个)
-当前版本:v6.4.0(第二十二批:第三梯队三项 + 文档治理——①定时/延迟部署(deploy_schedule.rs 新模块:每天 HH:MM / 一次性,后端 30s tick 自主发起,错过不补跑;前置「后端远程操作互斥收口」REMOTE_OP_IN_FLIGHT + RAII guard);②终端多标签 + 同栈广播 + 会话输出自动落盘 logs/term-*.log;③配置版本历史(config/.history/ 写前自动快照 + config_history_list/restore 两命令);④文档治理(清扫 + 七篇页首版本戳 + verify/contract-smoke.js + 编排层补测试)。命令 101→106;测试 335→360。补丁3 v6.3.3:项目迁移默认命名兜底;补丁2 v6.3.2:版本对比按镜像 ID;补丁1 v6.3.1:诊断凭据修复。第二十一批:v6.3.0 第二梯队五项;第二十批:v6.2.0 第一梯队五项;第十九批补丁3:v6.1.3 RSA 私钥修复 + 四路全量审查;第十八批:v6.0.0 安全强化与并发互斥。)
+当前版本:v6.4.1(第二十二批补丁:终端多标签可达性修复——模态内新增「＋新标签」下拉,修复「只能开一个标签」;第二十二批:第三梯队三项 + 文档治理——①定时/延迟部署(deploy_schedule.rs 新模块:每天 HH:MM / 一次性,后端 30s tick 自主发起,错过不补跑;前置「后端远程操作互斥收口」REMOTE_OP_IN_FLIGHT + RAII guard);②终端多标签 + 同栈广播 + 会话输出自动落盘 logs/term-*.log;③配置版本历史(config/.history/ 写前自动快照 + config_history_list/restore 两命令);④文档治理(清扫 + 七篇页首版本戳 + verify/contract-smoke.js + 编排层补测试)。命令 101→106;测试 335→360。补丁3 v6.3.3:项目迁移默认命名兜底;补丁2 v6.3.2:版本对比按镜像 ID;补丁1 v6.3.1:诊断凭据修复。第二十一批:v6.3.0 第二梯队五项;第二十批:v6.2.0 第一梯队五项;第十九批补丁3:v6.1.3 RSA 私钥修复 + 四路全量审查;第十八批:v6.0.0 安全强化与并发互斥。)
 ```
 
 ## 权威计划/完成记录(仓库根目录)

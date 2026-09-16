@@ -2465,3 +2465,55 @@ migrate_project.rs:兜底命中入列带标记与识别说明 / 显式声明无�
 - `cargo test` **363 passed**(+3)/ clippy 保持基线 12 / node --check 17 JS /
   verify **六脚本**全 PASS(含新增 contract-smoke 的负向测试)
 - doc-consistency 四类断言全 PASS(版本/命令数/测试数/七篇页首戳)
+
+---
+
+# 第二十二批补丁:v6.4.1 终端多标签可达性修复(真机反馈)
+
+## 1. 现象与根因
+
+用户真机反馈:**开启多标签后实际一次只能打开一个终端标签**,打开一个后只能
+点击关闭(关闭即关闭整个终端),再打开新的又只有一个。
+
+根因不在多标签状态机(harness 用真实 manage-stacks.js 实测:程序化连续
+`openTerminal` 两次,两标签并存、独立会话、独立关闭、单监听单注册,全部正常),
+而在**入口可达性**:
+
+- 「加标签」的唯一入口是模态外表格行的「终端」按钮(`manage.js:686-695`);
+  但终端模态是全屏遮罩 `.modal-overlay { position:fixed; inset:0; z-index:900 }`,
+  打开后完全盖住表格,该按钮物理上不可达;
+- 点击落在遮罩上还会命中 `e.target === overlay → closeModal()`,而 closeModal
+  经 `execOnModalClose` 执行 `stopAllExecTabs()` —— **全停会话并关模态**;
+- 模态骨架内没有任何「新建标签」控件,也没有快捷键/右键路径。
+
+于是操作链恒定收敛到「开一个 → 想开第二个只能关掉整个终端 → 再开还是 1 个」。
+桩验证当时只覆盖了程序化双开,没有覆盖真实层叠布局下的入口可达性,故未暴露。
+
+## 2. 修复(纯前端,不动后端与契约)
+
+- `manage-stacks.js` `buildTerminalModal()` 顶栏新增「＋新标签」下拉
+  (`#term-newtab-select`):选项来自表格数据 `state.containers`(只列运行中
+  容器,文本 `名称 @ compose项目`);选中即 `openTerminal(...)`(同容器已开
+  走既有去重直接切回);已开标签的容器加「(已打开)」后缀标注。
+  - `populateNewTabSelect()` 带签名守卫(数据未变不重建 DOM,避免在原生下拉
+    弹出期间做无谓 option 替换);开关标签经 `renderExecTabs` 同步刷新标注;
+  - 模态骨架重建时签名复位强制首填;空列表给「无运行中容器」禁用占位;
+  - 选项一律 createElement/textContent 防 XSS。
+- `style.css` 新增 `.term-newtab`(镜像 `.term-broadcast` 语言:inline-flex /
+  gap 5px / flex:none / 12px;select 限宽 180px);无新色值,圆角纪律不变。
+- `ui/help.js` 终端章节旧文案「同一时间只允许一个终端会话」改为多标签口径
+  (＋新标签下拉、标签切换、× 关单标签、广播同栈、落盘文件说明)。
+
+明确不做:改「表格按钮=加标签」原设计(需把模态改抽屉,动共享模态体系/
+焦点陷阱/尺寸量测耦合,不成比例);改遮罩点击行为(「关闭弹窗即断开会话」
+是既有文档化设计)。
+
+## 3. 验证
+
+- 桩端到端(mock 3 容器含 2 个同 compose 栈):开第一标签 → 下拉开同栈第二
+  标签(2 标签并存、active 切换、输出各归各)→ 广播输入两会话各写 1 次
+  (桩计数断言)→ × 关非活跃标签(模态保持、会话精准停)→ × 关最后标签
+  (模态关、全停)→ 重开 + 遮罩关闭回归(既有行为不变);**judge PASS**
+- `node --check` + verify 四脚本(form-validation / bridge-integrity /
+  scope-integrity / contract-smoke)全 PASS
+- `cargo test` **363 passed / 13 ignored**(纯前端改动,基线不变)
