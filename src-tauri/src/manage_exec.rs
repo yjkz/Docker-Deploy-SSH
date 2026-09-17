@@ -73,6 +73,94 @@ pub(crate) fn term_log_file_name(ts: &str, container_name: &str) -> String {
     format!("term-{}-{}.log", ts, truncated)
 }
 
+// ===== 终端日志保留(第二十三批,时间制)=====
+
+/// 保留天数上限(越界夹取;`0` = 永久保留)。
+pub const TERM_LOG_KEEP_DAYS_MAX: u32 = 3650;
+
+/// 从严格命名 `term-<yyyyMMdd-HHMMSS>-<容器名>.log` 解析文件名时间戳。
+/// 结构或时间戳任一不可解析 → `None`(调用方跳过保留,绝不误删)。
+fn parse_term_log_ts(name: &str) -> Option<chrono::NaiveDateTime> {
+    let rest = name.strip_prefix("term-")?.strip_suffix(".log")?;
+    // 时间戳固定 15 字符 `yyyyMMdd-HHMMSS`;get 同时兜住非 char 边界
+    let ts = rest.get(..15)?;
+    let remainder = rest.get(15..)?;
+    let container = remainder.strip_prefix('-')?;
+    if container.is_empty() {
+        return None;
+    }
+    chrono::NaiveDateTime::parse_from_str(ts, "%Y%m%d-%H%M%S").ok()
+}
+
+/// 筛选待删终端日志文件名(纯函数,不触碰文件系统)。
+///
+/// 规则(见 ROADMAP「终端日志保留(时间制)规格」):
+/// - `keep_days == 0` → 永久保留,返回空列表(整段跳过);
+/// - 只认 `term-<yyyyMMdd-HHMMSS>-<容器名>.log` 严格命名(容器名非空);
+/// - 时间戳取自**文件名**(非 mtime);严格早于 `now - keep_days 天` 才入选;
+/// - 文件名不可解析(含 app.log 等其他文件)→ 跳过保留。
+pub(crate) fn select_expired_term_logs(
+    names: &[String],
+    keep_days: u32,
+    now: chrono::NaiveDateTime,
+) -> Vec<String> {
+    // 越界夹取(0–3650;防手改配置写入离谱值 ⇒ Duration::days 溢出 panic)
+    let keep = keep_days.min(TERM_LOG_KEEP_DAYS_MAX);
+    if keep == 0 {
+        return Vec::new();
+    }
+    let cutoff = now - chrono::Duration::days(i64::from(keep));
+    names
+        .iter()
+        .filter(|name| match parse_term_log_ts(name) {
+            Some(ts) => ts < cutoff,
+            None => false,
+        })
+        .cloned()
+        .collect()
+}
+
+/// 删除 `dir` 下过期终端日志,返回成功删除数(best-effort:单个失败仅告警)。
+/// 目录不存在/不可读 → 返回 0(首次运行还没写过日志)。
+pub(crate) fn cleanup_term_logs(
+    dir: &std::path::Path,
+    keep_days: u32,
+    now: chrono::NaiveDateTime,
+) -> usize {
+    if keep_days.min(TERM_LOG_KEEP_DAYS_MAX) == 0 {
+        return 0; // 永久保留:连目录都不读
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let names: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    let mut removed = 0;
+    for name in select_expired_term_logs(&names, keep_days, now) {
+        match std::fs::remove_file(dir.join(&name)) {
+            Ok(()) => removed += 1,
+            Err(e) => log::warn!("删除过期终端日志失败 ({}): {}", name, e),
+        }
+    }
+    removed
+}
+
+/// 按当前设置清理过期终端日志(调用点:应用启动 + 终端会话创建前)。
+/// best-effort:任何失败仅 `log::warn!`,绝不阻断调用方。
+pub(crate) fn cleanup_term_logs_from_settings() {
+    let keep = crate::config::load_app_settings().term_log_keep_days;
+    if keep.min(TERM_LOG_KEEP_DAYS_MAX) == 0 {
+        return;
+    }
+    let dir = crate::config::app_dir().join("logs");
+    let removed = cleanup_term_logs(&dir, keep, chrono::Local::now().naive_local());
+    if removed > 0 {
+        log::info!("终端日志清理:删除 {} 个超过 {} 天的旧日志", removed, keep);
+    }
+}
+
 /// 把一帧输出写入会话日志(尽力而为:失败仅告警并停止后续写入)。
 ///
 /// 返回 `false` 表示落盘已失败(调用方置位停写,不反复告警)。
@@ -278,6 +366,8 @@ pub async fn manage_exec_start(
     //
     // 输出落盘(第二十二批):会话全程输出追加到
     // <应用目录>/logs/term-<ts>-<容器名>.log(自动落盘,失败仅告警不杀会话)。
+    // 写新日志前先按设置清理过期终端日志(第二十三批;best-effort 不阻断)。
+    cleanup_term_logs_from_settings();
     let sid = session_id.clone();
     let log_file: Option<std::fs::File> = {
         let dir = crate::config::app_dir().join("logs");
@@ -649,5 +739,115 @@ mod tests {
         let mut failed2 = false;
         append_term_log(&mut none_log, &mut failed2, "ignored");
         assert!(!failed2);
+    }
+
+    // ===== 终端日志保留(第二十三批,时间制)=====
+
+    /// 测试基准时刻解析(时间戳取自文件名,不依赖真实时钟)。
+    fn ts_at(s: &str) -> chrono::NaiveDateTime {
+        chrono::NaiveDateTime::parse_from_str(s, "%Y%m%d-%H%M%S").unwrap()
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_select_expired_term_logs_basic_split() {
+        // now = 2026-09-17 12:00:00,keep = 30 天 → 分界线 2026-08-18 12:00:00
+        let now = ts_at("20260917-120000");
+        let all = names(&[
+            "term-20260818-115959-old.log",  // 早 1 秒 → 过期
+            "term-20260818-120000-edge.log", // 恰好等于分界 → 保留(严格早于才删)
+            "term-20260917-120000-new.log",  // 刚生成 → 保留
+        ]);
+        assert_eq!(
+            select_expired_term_logs(&all, 30, now),
+            vec!["term-20260818-115959-old.log".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_select_expired_term_logs_keep_zero_skips_all() {
+        // keep = 0 ⇒ 永久保留:整段跳过,再旧的日志也不入选
+        let now = ts_at("20260917-120000");
+        let all = names(&["term-20200101-000000-ancient.log"]);
+        assert!(select_expired_term_logs(&all, 0, now).is_empty());
+    }
+
+    #[test]
+    fn test_select_expired_term_logs_ignores_non_term_files() {
+        // 非 term-* 文件一律不碰(app.log / 其他日志 / 无扩展名)
+        let now = ts_at("20260917-120000");
+        let all = names(&[
+            "app.log",
+            "app.2026-08-01.log",
+            "term.log",
+            "term-20200101-000000-nope.txt",
+            "term-20200101-000000-ok.log",
+        ]);
+        assert_eq!(
+            select_expired_term_logs(&all, 30, now),
+            vec!["term-20200101-000000-ok.log".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_select_expired_term_logs_skips_bad_names() {
+        // 时间戳/结构不可解析 → 跳过保留(绝不误删)
+        let now = ts_at("20260917-120000");
+        let all = names(&[
+            "term-20260132-000000-bad-day.log",   // 1 月 32 日
+            "term-20261301-000000-bad-month.log", // 13 月
+            "term-20260917-250000-bad-hour.log",  // 25 时
+            "term-20260917-1200-bad-short.log",   // 时间戳缺段
+            "term--empty-ts.log",                 // 时间戳空
+            "term-20260801-000000-.log",          // 容器名空
+            "term-20260801-000000-dash-ed.log",   // 容器名含连字符(合法,过期)
+        ]);
+        // 仅最后一条(合法且过期)入选;连字符容器名不破坏解析
+        assert_eq!(
+            select_expired_term_logs(&all, 30, now),
+            vec!["term-20260801-000000-dash-ed.log".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_select_expired_term_logs_clamps_keep_days() {
+        // 越界值夹到 0–3650:极大值不 panic,极小视为永久
+        let now = ts_at("20260917-120000");
+        let all = names(&["term-20260917-120000-now.log"]);
+        // 3650 天前 = 2016-09-20 前后;2026 年的日志当然不过期
+        assert!(select_expired_term_logs(&all, 99_999, now).is_empty());
+        // 3650 夹取后仍生效:构造一条 10 年前的日志
+        let old = names(&["term-20160101-000000-old.log"]);
+        assert_eq!(select_expired_term_logs(&old, 99_999, now).len(), 1);
+    }
+
+    #[test]
+    fn test_cleanup_term_logs_removes_only_expired() {
+        // 目录不存在 → 返回 0 不报错
+        let missing = std::env::temp_dir().join(format!("ddterm-missing-{}", uuid::Uuid::new_v4()));
+        assert_eq!(
+            cleanup_term_logs(&missing, 30, ts_at("20260917-120000")),
+            0
+        );
+
+        // 真实目录:过期被删、未过期与非 term 文件保留
+        let dir = std::env::temp_dir().join(format!("ddterm-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in [
+            "term-20260818-115959-old.log",
+            "term-20260917-120000-new.log",
+            "app.log",
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let removed = cleanup_term_logs(&dir, 30, ts_at("20260917-120000"));
+        assert_eq!(removed, 1);
+        assert!(!dir.join("term-20260818-115959-old.log").exists());
+        assert!(dir.join("term-20260917-120000-new.log").exists());
+        assert!(dir.join("app.log").exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

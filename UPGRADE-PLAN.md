@@ -2570,3 +2570,68 @@ migrate_project.rs:兜底命中入列带标记与识别说明 / 显式声明无�
 - 浏览器 + Tauri 桩(8799):终端模态截图交 judge **PASS**(0 issue);
   `getComputedStyle` 实测占位符 `rgba(244,246,246,0.55)` on `#080a0b`、
   三处 gap/字号 8/8/12px,零 JS 错误;`.env` 编辑器占位符规则同款实测生效
+
+---
+
+# 第二十三批(二):终端日志保留(时间制)(S2 会话,2026-09-17)
+
+> 双会话并行开发协议(AGENTS.md)下的 S2 批次;S1 细节补正 7 项
+> 已完成并先合入(da03d2e),本批为**后完成方**:合入代码后执行批次收尾
+> (三处版本号 bump 至 v6.5.0 / wiki/README / 七篇页首戳 /
+> doc-consistency --write --tests=N)。
+
+## 1. 需求与规格
+
+终端会话输出自第二十二批起自动落盘 `logs/term-<ts>-<容器ID12>.log`,但只增
+不减 —— 长期使用持续占用磁盘。按 ROADMAP「终端日志保留(时间制)规格」实施:
+
+- 设置项 `AppSettings.term_log_keep_days: u32`(camelCase `termLogKeepDays`;
+  **默认 30,0 = 永久保留**;越界夹取 0–3650)。零新命令。
+- 清理时机:① 终端会话创建时(manage_exec)② 应用启动时(lib.rs setup 一行)。
+- 规则:只处理 **严格命名** `term-<yyyyMMdd-HHMMSS>-<容器名>.log`;时间戳取自
+  **文件名**(非 mtime);早于 `now - N 天` 即删;坏名跳过保留;**不碰 app.log**。
+- best-effort:任何失败仅 `log::warn!`,绝不阻断启动或开终端。
+
+## 2. 实现
+
+**后端(唯一新增逻辑文件 = manage_exec.rs,主权内)**
+
+- `TERM_LOG_KEEP_DAYS_MAX = 3650` 常量 + `parse_term_log_ts(name)`:严格切
+  `term-` 前缀 / `.log` 后缀 / 15 字符时间戳 / 非空容器名四段,任一不满足
+  或时间戳非合法日期 → `None`(`get(..15)` 同时兜住非 char 边界,不 panic)。
+- `select_expired_term_logs(names, keep_days, now)` **纯函数**(无 I/O):
+  keep 先夹取;keep=0 直接返回空;严格 `< cutoff` 才入选(恰好等于分界保留)。
+- `cleanup_term_logs(dir, keep_days, now)`:读目录 → 筛 → `remove_file`;
+  单个删除失败仅 warn 继续;目录不存在返回 0。
+- `cleanup_term_logs_from_settings()`:**唯一读设置/时钟的入口**,供两个调用点
+  复用;keep=0 时连目录都不读。
+- `AppSettings` 增 `term_log_keep_days`(+`default_term_log_keep_days()` 函数,
+  serde default 让旧 settings.json 缺字段时得 30);`config.rs` 两处测试构造点
+  同步补字段。
+- 调用点:`lib.rs` setup(deploy_schedule 启动之后、`Ok(())` 之前)一行 +
+  `manage_exec_start` 内写新日志文件之前一行。
+
+**前端(settings.js,主权内)**
+
+- 「通用」区「服务器探活间隔」与「日志文件」两行之间新增数字输入
+  `settings-term-keep-days`(默认回填 30)+ hint(0 = 永久保留;清理时机)。
+- `onSave` 载荷增 `termLogKeepDays: termKeepDaysArg()`;回填走**无条件覆盖**
+  (第二十批探活间隔 P1 同款教训:构建时预填默认值会让 `=== ''` 守卫恒假)。
+- `termKeepDaysArg()` 前端同口径夹取 0–3650 并在空/非数字时回退 30 ——
+  负值直传会因 u32 反序列化失败**整单拒绝**(连其他字段一起丢),故必须先夹。
+
+## 3. 测试与验证
+
+- 新增 6 单测(manage_exec):过期/未过期分界(恰等分界保留)、keep=0 全跳过、
+  非 term 文件(app.log 等)跳过、坏名跳过(1月32日/13月/25时/缺段/空时间戳/
+  空容器名 + 连字符容器名合法)、越界夹取(99999 天不 panic 且夹后仍生效)、
+  目录不存在 + 真实目录只删过期(端到端):**369 passed / 13 ignored**
+  (基线 363 + 6);先 RED(5 失败:桩返回空)后 GREEN。
+- `cargo clippy --all-targets` 与 main 基线 **20 条警告逐条一致,零新增**。
+- `node --check ui/settings.js`(全 16 JS 通过)+ verify 四脚本全 PASS。
+- **桩验证(8798,no-cache 服务)**:设置中心新字段渲染正确,与相邻 PROBE 行
+  **11 项计算样式逐项 SAME**(input 的 font/size/color/bg/border/radius/height/
+  type、label 三项、hint 三项,亮暗双主题各测一遍);保存载荷 5 组断言
+  45→45 / 空→30 / -5→0 / 99999→3650 / 非数字→30,其他字段不受影响;
+  **judge 3 张截图(亮色全貌/字段特写/暗色全貌)全部 pass**。
+- 桩文件已删、8798 服务已停、预览页已关。

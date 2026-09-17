@@ -6,9 +6,11 @@
  *
  * 后端命令(src-tauri/src/config.rs / update.rs;JS 参数名为 Tauri camelCase):
  * - app_settings_get()
- *     -> { closeToTray: bool, proxy: string }
+ *     -> { closeToTray, proxy, autoUpdateFromSource, probeIntervalMins,
+ *          autoCheckUpdate, termLogKeepDays }
  *     (独立持久化于 config/settings.json;文件缺失/损坏后端回退默认值)
- * - app_settings_set({ closeToTray, proxy }) -> Ok/Err
+ * - app_settings_set({ closeToTray, proxy, autoUpdateFromSource,
+ *                      probeIntervalMins, autoCheckUpdate, termLogKeepDays }) -> Ok/Err
  *     (顶层参数包;托盘与「关闭窗口隐藏到托盘」的拦截在后端事件里现读
  *      settings.json,保存后立即生效,无需重启)
  * - update_check({ proxy }) -> { current, latest, hasUpdate, url, notes }
@@ -255,6 +257,14 @@
       '0 = 关闭;例如 5 表示每 5 分钟探活一次',
       '按间隔 TCP 探活全部已配置服务器;状态翻转(在线→离线 / 离线→恢复)时经通知中心提醒,' +
       '订阅开关在通知中心的「事件」区;探活不触发 SSH 认证,不碰密钥'));
+
+    // 终端日志保留(第二十三批):天数,0 = 永久保留(默认 30)。
+    // hint 同时说明清理时机(打开终端 / 启动软件时 best-effort 清理)
+    main.appendChild(buildField('终端日志保留(天)', 'TERM LOGS',
+      'settings-term-keep-days', 'number', '30',
+      '0 = 永久保留;例如 30 表示只保留最近 30 天',
+      '超过保留天数的终端会话日志(term-<时间戳>-<容器>.log)在打开终端或启动软件时自动清理;' +
+      '运行日志 app.log 不受影响'));
 
     // 诊断日志:此前设置中心没有日志入口,排障需手动定位应用目录 logs/。
     // 打开动作经 open_logs_dir 由系统资源管理器完成(后端确保目录存在)
@@ -533,6 +543,19 @@
     return value === '' ? null : value;
   }
 
+  /**
+   * 终端日志保留天数输入 → app_settings_set 载荷(u32)。
+   * 非数字/空回退 30(与后端 serde default 同口径);夹取 0–3650(与后端
+   * 读取侧 `TERM_LOG_KEEP_DAYS_MAX` 同口径)——负值直接传给后端会因 u32
+   * 反序列化失败整单拒绝,故前端先夹取。
+   */
+  function termKeepDaysArg() {
+    var raw = fieldVal('settings-term-keep-days').trim();
+    var n = raw === '' ? 30 : parseInt(raw, 10);
+    if (isNaN(n)) n = 30;
+    return Math.min(3650, Math.max(0, n));
+  }
+
   function onSave() {
     if (st.saving) return;
     var session = st.session; // 捕获模态会话,异步收尾校验是否已过期
@@ -544,7 +567,8 @@
         proxy: fieldVal('settings-proxy-input').trim(),
         autoUpdateFromSource: isChecked('settings-auto-update-src'),
         probeIntervalMins: (parseInt(fieldVal('settings-probe-interval-input'), 10) || 0),
-        autoCheckUpdate: isChecked('settings-auto-check-update')
+        autoCheckUpdate: isChecked('settings-auto-check-update'),
+        termLogKeepDays: termKeepDaysArg()
       }
     }).then(function () {
       // 过期会话(保存期间模态被关闭甚至重开)→ 静默丢弃,防旧 promise 回写新模态
@@ -646,6 +670,10 @@
         if (probe) probe.value = String(s.probeIntervalMins || 0);
         // 启动静默检查更新(第二十一批):缺省视为开启(与后端 serde default 同口径)
         setChecked('settings-auto-check-update', s.autoCheckUpdate !== false);
+        // 终端日志保留天数(第二十三批):无条件回填(同探活间隔的 P1 教训 ——
+        // 构建时预填默认值会恒假,须覆盖);缺省视为 30(与后端 serde default 同口径)
+        var termKeep = document.getElementById('settings-term-keep-days');
+        if (termKeep) termKeep.value = String(s.termLogKeepDays == null ? 30 : s.termLogKeepDays);
         // 代理字段预填 ''(非 '0'),保留 === '' 守卫即可满足「未改动不覆盖」
         var proxy = document.getElementById('settings-proxy-input');
         if (proxy && proxy.value === '') proxy.value = String(s.proxy || '');

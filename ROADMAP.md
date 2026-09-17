@@ -187,7 +187,7 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 
 | 项 | 要点 | 规模 |
 |---|---|---|
-| **终端日志保留(时间制)** | 规格见下小节;**推荐并行首发 S2** | 小 |
+| ~~终端日志保留(时间制)~~ ✅ 已完成 | 第二十三批(二),S2 会话(见下「已完成」区) | 小 |
 | 05 页各 Tab 搜索筛选 | 容器/镜像/卷/网络/栈各加筛选输入(不区分大小写子串);过滤只影响渲染、state 保留全量(终端「＋新标签」下拉仍读全量);空态给「无匹配项」 | 小-中 |
 | 容器批量操作 | 多选启停/重启/pause/rename(复用 manage_container_action 扩展 action + 前端多选框) | 中 |
 | 资源阈值告警 | 磁盘/内存/CPU 超阈值 → 现有通知管道(桌面/SMTP/webhook) | 中 |
@@ -316,6 +316,30 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 - 编排层补测试 +3(compose_file_flags 转义/compose_override_names/ssh 路径助手)
 - README 补「密码与密文说明」章节;AGENTS.md 补互斥收口与版本历史两条硬约束
 - 测试 360 → **363**
+
+---
+
+### 第二十三批(2026-09-17)— 双会话并行开发首对(S1 细节补正 / S2 终端日志保留)
+
+> 协议见 AGENTS.md「双会话并行开发协议」;每会话一个 worktree + 独立分支,
+> 文件主权互不重叠,**合入串行**:S1 先合入(da03d2e,测试 363→364),
+> S2 后合入并执行批次收尾(三处版本号 bump 至 v6.5.0 / wiki/README /
+> 七篇页首戳 / doc-consistency --write --tests=N)。
+
+**① S1 细节补正 7 项 ✅ 已完成**(记录见 UPGRADE-PLAN「第二十三批(一)」)
+- 视觉 3 项(占位符对比度 AA / 终端模态 gap 8px 与字号 12px / help 文案)、
+  文档 4 项(wiki/07 四处)、工程 2 项(死常量 / import_compose 残留清理+单测)
+- 测试 363 → **364**;桩验证 8799 judge PASS
+
+**② S2 终端日志保留(时间制)✅ 已完成**(记录见 UPGRADE-PLAN「第二十三批(二)」)
+- `AppSettings.term_log_keep_days`(camelCase `termLogKeepDays`;默认 30,
+  0 = 永久;夹取 0–3650);零新命令
+- 清理时机 = 开终端时(manage_exec)+ 应用启动时(lib.rs setup 一行);
+  `select_expired_term_logs` 纯函数按**文件名时间戳**筛,坏名/非 term 跳过,
+  best-effort 失败仅 warn
+- 设置中心「通用」区新增数字输入 + hint;前端同口径夹取(负值会整单拒绝)
+- 测试 364 → **369**(+6);桩验证 5 组载荷断言 + 亮暗双主题 11 项计算样式
+  比对,judge 3 图 PASS
 
 ---
 

@@ -156,6 +156,11 @@ fn default_true() -> bool {
     true
 }
 
+/// 终端日志保留天数默认值:30(第二十三批;缺字段的旧 settings.json 按此补齐)。
+fn default_term_log_keep_days() -> u32 {
+    30
+}
+
 /// 邮件(SMTP)通知配置。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmailNotify {
@@ -631,6 +636,11 @@ pub struct AppSettings {
     /// 点徽点进设置中心查看详情。检查失败静默(不打扰)。
     #[serde(default = "default_true")]
     pub auto_check_update: bool,
+    /// 终端会话日志保留天数(第二十三批,时间制;`0` = 永久保留,默认 30)。
+    /// 清理时机:应用启动 + 每次终端会话创建前;判定时间戳取自文件名,
+    /// 越界值在读侧夹取(见 `manage_exec::TERM_LOG_KEEP_DAYS_MAX`)。
+    #[serde(default = "default_term_log_keep_days")]
+    pub term_log_keep_days: u32,
 }
 
 /// `AppSettings::default` 的手写实现:`auto_update_from_source` 缺省为 **true**
@@ -643,6 +653,7 @@ impl Default for AppSettings {
             auto_update_from_source: true,
             probe_interval_mins: 0,
             auto_check_update: true,
+            term_log_keep_days: default_term_log_keep_days(),
         }
     }
 }
@@ -1165,6 +1176,7 @@ mod tests {
             auto_update_from_source: false,
             probe_interval_mins: 5,
             auto_check_update: true,
+            term_log_keep_days: 90,
         };
         save_app_settings(&settings).unwrap();
         assert!(dir.join("config/settings.json").exists());
@@ -1211,10 +1223,12 @@ mod tests {
             auto_update_from_source: false,
             probe_interval_mins: 0,
             auto_check_update: true,
+            term_log_keep_days: 30,
         };
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains("\"closeToTray\":true"));
         assert!(json.contains("\"proxy\":\"http://127.0.0.1:7890\""));
+        assert!(json.contains("\"termLogKeepDays\":30"));
 
         let partial: AppSettings = serde_json::from_str(r#"{"closeToTray":true}"#).unwrap();
         assert!(partial.close_to_tray);
@@ -1222,6 +1236,9 @@ mod tests {
         // 旧配置无 autoUpdateFromSource → 默认开启(第三批默认行为)
         assert!(partial.auto_update_from_source);
         assert!(AppSettings::default().auto_update_from_source);
+        // 旧配置无 termLogKeepDays → 默认 30(第二十三批)
+        assert_eq!(partial.term_log_keep_days, 30);
+        assert_eq!(AppSettings::default().term_log_keep_days, 30);
     }
 
     // ===== 部署断点续传(阶段六):键构造 / roundtrip / 覆盖 / 删除 / 裁剪 / 容错 =====
