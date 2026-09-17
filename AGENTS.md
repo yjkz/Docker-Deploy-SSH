@@ -98,16 +98,11 @@ git worktree add -b dev/s2-<topic>  D:/Github-repositories/docker-deploy-ssh-s2 
 4. **验证链各自跑**：`cargo test` 亲眼确认 `test result: ok` → clippy 与基线逐条比对 → 改 JS 跑 `node --check` → verify 四脚本 → UI 改动走「浏览器 + Tauri 桩」截图交 judge。worktree 无需 `node_modules`。
 5. **资源冲突避免**：两会话的本地静态服务用**不同端口**（S1:8799 / S2:8798）；**不要同时跑两个 `npm run tauri dev`**（WebView2 dev 实例会互相抢端口/配置）；cargo target 各自 worktree 独立，首次全量编译慢属正常。
 
-### 当前并行对（2026-09-17 第三批，v6.5.0 后）
+### 并行对状态（2026-09-17 第三批已完结）
 
-| | S1 `dev/s1-manage-batch`（`docker-deploy-ssh-s1`） | S2 `dev/s2-fleet-diagnose`（`docker-deploy-ssh-s2`，延续中） |
-|---|---|---|
-| 任务 | 05 页各 Tab 搜索筛选 + 容器批量操作（pause/unpause/rename + 多选批量启停） | 多机巡检汇总（继续） |
-| 主权文件 | `ui/manage.js`、`ui/manage-stacks.js`、`ui/index.html`、`ui/style.css`、`src-tauri/src/manage.rs`、`wiki/02`、`wiki/04` | `ui/servers.js`、`src-tauri/src/commands/host_server.rs`（如需要）、`wiki/03`（合入时） |
-| 共享小改 | `wiki/03`（S1 只在合入时碰终端/设置无关的新节；先进者先写，后进者 rebase 解冲突）；`UPGRADE-PLAN.md` 尾部追加自己的批次节；`ROADMAP.md` 各自标记完成行 | 同左 |
-| 冻结 | 版本三件套 / `wiki/README.md` / 七篇页首戳 / `verify/VERSION.txt` / `app.js` / `deploy*.js` / `lib.rs` / `ui/servers*.js` / `ui/settings.js` / `ui/notify.js` | 同左（冻结 `ui/manage*.js` / `ui/index.html` **至 S1 合入**——S2 不得触碰这两个文件） |
-
-**冲突注意**：S2 已在 `ui/style.css` 有未提交改动（诊断样式小改）。S1 本批也需改 `ui/style.css`（勾选列/批量条 + 容器表 nth-child 重排）——S1 先合入，S2 rebase 时解冲突（大概率是不同段落，机械合并）；**S2 合入前应确认 style.css 合入顺序**。
+> 第三批 **S1 05页筛选+容器批量 / S2 多机巡检汇总** 均已完成并交接合入 main
+> （v6.6.0，`646dcef`）；worktree 与 dev 分支已全部清退，当前**无并行对**。
+> 下一批开工时按「规则（五条）」重新分配主权文件并更新本节。
 
 ### 使用前检查
 
