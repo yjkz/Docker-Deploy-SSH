@@ -34,7 +34,10 @@
  *     在远端创建任意指定目录(mkdir -p;dir 须为 / 开头绝对路径);
  *     项目表单检测到目录缺失后调它,成功后前端自动重新检测
  * - prune_server({ serverId, passwordPlain? }) -> null
- *     清理悬空镜像与已退出容器;输出经 'server-log' 事件逐行推送(300s 超时)
+ *     清理悬空镜像与已退出容器;输出经 'server-log' 事件逐行推送(300s 超时)。
+ *     **前端已无调用点**(第二十三批注释对齐):「清理优化」按钮改走
+ *     openCleanupModal(cleanup_preview + cleanup_execute 定向删除),本命令
+ *     为保留的兜底实现(contract-smoke 白名单登记)
  * - preview_compose({ sourcePath }) -> ComposeStack
  *     ComposeStack = { project_name, services: StackService[], errors: string[] }
  *     StackService = { service, image, has_build, mode: "Local"|"Pull",
@@ -366,7 +369,8 @@
     envBtn.addEventListener('click', function () { runEnvCheck(server, 'env'); });
     actions.appendChild(envBtn);
 
-    // 清理优化:自绘确认条 → prune_server(输出经 server-log 回显)
+    // 清理优化:打开清理分析模态(openCleanupModal:预览 → 勾选 → 定向执行);
+    // 此前注释描述的「自绘确认条 → prune_server」是旧流程,早已不再使用
     var pruning = !!st.pruning[server.id];
     var pruneBtn = el('button', 'btn btn-sm', pruning ? '清理中…' : '清理优化');
     pruneBtn.type = 'button';
@@ -506,8 +510,9 @@
     container.appendChild(cancel);
   }
 
-  /** 清理优化自绘确认条:插入卡片内嵌确认条(检测区上方),取消即移除 */
-  /** 「清理优化」:打开清理分析模态(预览 → 勾选 → 定向执行) */
+  /** 「清理优化」:打开清理分析模态(预览 → 勾选 → 定向执行)。
+   *  (第二十三批注释对齐:此前留下的「自绘确认条」上半句已删除,函数体
+   *  自第五批起即直通 openCleanupModal) */
   function showPruneConfirm(card, server) {
     openCleanupModal(server);
   }

@@ -2514,6 +2514,13 @@ select.text-input option,
   opacity: .45;
   cursor: not-allowed;
 }
+/* 占位符(第二十三批细节补正):此前漏配 ::placeholder,吃 UA 默认 #757575,
+   在恒暗底 --ark-terminal-bg 上实测仅 4.1:1(低于 AA 4.5:1);补 token
+   --ink-on-paper-55(浅墨 alpha,与 :269/:1754 同为暗底弱化文字角色),
+   实测 5.8:1,零新色值。同文件 .manage-env-editor 同款补配(恒暗底同源) */
+.manage-terminal-input::placeholder {
+  color: var(--ink-on-paper-55);
+}
 
 /* ============================================================
    05 远程管理表格列宽终版优化(末尾追加,覆盖上方「方案D」的 px 列宽)
@@ -2883,10 +2890,12 @@ select.text-input option,
 .manage-terminal-modal .manage-terminal-shell {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  /* 第二十三批细节补正:gap 6px→8px、字号 13px→12px,与顶栏
+     .term-newtab/.term-broadcast(12px)统一,label↔下拉间隙全模态一致 */
+  gap: 8px;
   flex: 0 0 auto;
   white-space: nowrap;
-  font-size: 13px;
+  font-size: 12px;
 }
 /* 防止 .form-input 的 width:100% 把下拉撑满整行 */
 .manage-terminal-modal .manage-terminal-shell select { width: auto; }
@@ -3339,6 +3348,11 @@ code {
   border-color: var(--ark-signal);
 }
 .manage-env-editor[readonly] { cursor: default; }
+/* 占位符(第二十三批细节补正):同 .manage-terminal-input,此前吃 UA 默认,
+   恒暗底上 4.1:1 低于 AA;补 --ink-on-paper-55(实测 5.8:1) */
+.manage-env-editor::placeholder {
+  color: var(--ink-on-paper-55);
+}
 
 /* 暗底块滚动条与 .manage-terminal/.manage-log-body 同款修复
    (暗色 scheme 下避免出现系统亮色滚动条) */
@@ -4246,11 +4260,12 @@ tr.stat-flash > td:first-child {
   opacity: 0.45;
   cursor: not-allowed;
 }
-/* 新标签下拉(第二十二批修复:模态遮罩盖住表格时仍能开第二个标签) */
+/* 新标签下拉(第二十二批修复:模态遮罩盖住表格时仍能开第二个标签;
+   第二十三批细节补正:label↔下拉 gap 5px→8px,与 .manage-terminal-shell 统一) */
 .term-newtab {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 8px;
   flex: none;
   font-size: 12px;
   color: var(--ark-ink);

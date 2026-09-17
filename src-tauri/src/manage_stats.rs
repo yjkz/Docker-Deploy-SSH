@@ -16,8 +16,8 @@
 //! 自动退出,从而实现旧会话自清理、新会话无缝接管。
 //!
 //! 低耦合:复用 `crate::manage` 已 pub(crate) 的助手
-//! (`connect_server` / `parse_ndjson` / `is_docker_perm_denied` /
-//! `PERM_DENIED_MSG`)与 `crate::ssh::exec_collect`。
+//! (`connect_server` / `parse_ndjson` / `is_docker_perm_denied`)与
+//! `crate::ssh::exec_collect`。
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};

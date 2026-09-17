@@ -2516,3 +2516,57 @@ migrate_project.rs:兜底命中入列带标记与识别说明 / 显式声明无�
 - `node --check` + verify 四脚本(form-validation / bridge-integrity /
   scope-integrity / contract-smoke)全 PASS
 - `cargo test` **363 passed / 13 ignored**(纯前端改动,基线不变)
+
+---
+
+# 第二十三批(一):细节补正 7 项(S1 会话,2026-09-17)
+
+> 双会话并行开发首发:S1(本批,细节补正 7 项)/ S2(终端日志保留,
+> 见「第二十三批(二)」)。文件主权矩阵见 AGENTS.md「双会话并行开发协议」。
+
+## 1. 视觉 3 项
+
+- **终端输入框 / `.env` 编辑器占位符对比度**(`ui/style.css`):
+  两处均漏配 `::placeholder`,吃浏览器默认 `#757575` —— 实测亮/暗两
+  scheme 下 4.12–4.31:1,低于 AA 4.5:1;补规则 `color: var(--ink-on-paper-55)`
+  (既有 token,实测 5.85:1 亮 / 5.82:1 暗,零新色值)。旁注:全站占位符
+  口径(`--ark-ink-faint`)约 3.0–3.1:1 是历史 P2-1 既定取舍,本次不动;
+  这两处的特殊性在「漏配吃 UA 默认」。
+- **终端模态间距/字号**(`ui/style.css`):「＋新标签」label↔select gap
+  5px → 8px;「Shell:」label↔select gap 6px → 8px、字号 13px → 12px
+  (与顶栏 `.term-newtab`/`.term-broadcast` 12px 统一)。实测三处 computed
+  值分别为 8px / 8px / 12px。
+- **help.js 终端文案**(`ui/help.js:273`):「默认 bash,可切换 sh」与实现
+  不符(下拉默认「自动(推荐)」,后端探测 bash/sh 并回显)→ 改为实现口径。
+
+## 2. 文档 4 项(wiki/07 为主)
+
+- **限制 35 过期**:原文「安装中途失败标记被静默丢弃不提示」—— v6.3.0
+  「更新失败回执」已实现为明示 toast(`ui/app.js` 的 take_update_pending
+  消费分支),改为现状描述。
+- **正文测试数**:360 → 364(此前 360 为第二十二批(二)快照,未随文档治理批
+  360→363 同步;本批新增单测再 +1)。
+- **编号重复**:决策表两个 #63(更新说明抓取 / 迁移保留源),前者改 #63b
+  (编号重复修正注明);限制 46 引用的「取舍 63」指向后者,不受影响。
+- **尾部乱序**:限制尾部 57→62 后接 54,55,56,53,52 的顺序整理为 52→62 顺排。
+
+## 3. 工程 2 项
+
+- **删死常量**(`src-tauri/src/manage.rs`):`PERM_DENIED_MSG`(第十六批起
+  生产一律走 `errors::perm_denied` 带错误码,该常量仅剩 `#[allow(dead_code)]`
+  占位)→ 删除;`manage_stats.rs` 头部引用它的文档注释同步清理。
+- **import_compose 失败残留**(`src-tauri/src/commands/compose_sources.rs`,
+  wiki/07 限制 7):复制/写配置失败时残留 `config/stacks/<uuid>/`(含副本
+  文件、无清理入口)→ 失败路径统一 `remove_dir_all`(尽力清理、失败仅
+  `log::warn!` 不掩盖原错误);新增失败路径单测(损坏 projects.json 触发
+  写回失败,断言 stacks 下无残留、源文件不受影响)——测试 363 → **364**。
+
+## 4. 验证
+
+- `cargo test` **364 passed / 13 ignored**(+1 新单测)/ clippy 与 main
+  逐条 diff **零新增**(20 条集合完全一致)
+- `node --check` 改动 JS;verify 六脚本全 PASS(form 54 / bridge / scope /
+  contract-smoke / doc-consistency)
+- 浏览器 + Tauri 桩(8799):终端模态截图交 judge **PASS**(0 issue);
+  `getComputedStyle` 实测占位符 `rgba(244,246,246,0.55)` on `#080a0b`、
+  三处 gap/字号 8/8/12px,零 JS 错误;`.env` 编辑器占位符规则同款实测生效

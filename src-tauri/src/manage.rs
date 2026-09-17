@@ -27,12 +27,9 @@ pub(crate) const CONNECT_TIMEOUT_SECS: u64 = 15;
 pub(crate) const EXEC_TIMEOUT_SECS: u64 = 60;
 pub(crate) const PULL_TIMEOUT_SECS: u64 = 300;
 
-/// 非 root 用户无 docker.sock 权限时的明确中文提示。
-/// 第十六批:判定与展示文案分离 —— 生产一律用 [`crate::errors::perm_denied`]
-/// (带 perm_denied 码);本常量已无引用,文案本体收编进 errors::perm_denied。
-#[allow(dead_code)]
-pub(crate) const PERM_DENIED_MSG: &str =
-    "当前 SSH 用户无 Docker 权限(无法访问 /var/run/docker.sock),请将该用户加入 docker 组或使用 root 用户连接";
+// (原 PERM_DENIED_MSG 常量已删:第二十三批细节补正。第十六批起判定与展示
+//  文案分离,生产一律用 crate::errors::perm_denied(带 perm_denied 码),
+//  该常量自那时起无引用、仅剩 #[allow(dead_code)] 占位)
 
 // ===== 连接辅助(自实现,不调用 commands.rs 私有函数) =====
 

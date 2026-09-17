@@ -27,52 +27,73 @@ pub fn import_compose(source_path: String, name: String) -> Result<ProjectConfig
 
     let id = uuid::Uuid::new_v4().to_string();
     let dest_dir = crate::config::config_dir().join("stacks").join(&id);
-    // 复制口径与「从源更新」共用(compose + .env + override 同名副本)
-    let dest = copy_compose_bundle(&source, &dest_dir)?;
 
-    // 记录导入来源的原始 compose 父目录名(origin.json):副本父目录是 uuid,
-    // 后续解析推导 compose 默认镜像名兜底候选(<原目录名>-<服务名>)需要它。
-    // 失败仅告警不阻断导入(缺失时候选退化为 uuid 目录名,兜底扫描不可用)。
-    if let Some(dir_name) = source.parent().and_then(Path::file_name) {
-        if let Err(e) = crate::stack::save_origin_file(&dest_dir, &dir_name.to_string_lossy()) {
-            log::warn!("导入栈「{}」记录来源目录名失败: {}", name, e);
+    // 第二十三批细节补正(wiki/07 限制 7):失败路径回收已创建的
+    // `stacks/<uuid>/` 目录 —— 此前复制中途失败或配置保存失败时,残留的
+    // 副本文件既不在配置中、也无清理入口(不可达垃圾)。清理失败仅告警,
+    // 不掩盖原错误(尽力而为,与 save_origin_file 同口径)。
+    let result = (|| -> Result<ProjectConfig, String> {
+        // 复制口径与「从源更新」共用(compose + .env + override 同名副本)
+        let dest = copy_compose_bundle(&source, &dest_dir)?;
+
+        // 记录导入来源的原始 compose 父目录名(origin.json):副本父目录是 uuid,
+        // 后续解析推导 compose 默认镜像名兜底候选(<原目录名>-<服务名>)需要它。
+        // 失败仅告警不阻断导入(缺失时候选退化为 uuid 目录名,兜底扫描不可用)。
+        if let Some(dir_name) = source.parent().and_then(Path::file_name) {
+            if let Err(e) = crate::stack::save_origin_file(&dest_dir, &dir_name.to_string_lossy()) {
+                log::warn!("导入栈「{}」记录来源目录名失败: {}", name, e);
+            }
         }
-    }
 
-    let project = ProjectConfig {
-        id,
-        name,
-        image_filter: String::new(),
-        compose_file: dest.to_string_lossy().to_string(),
-        file_mappings: Vec::new(),
-        service_overrides: stack
-            .services
-            .iter()
-            .map(|s| ServiceOverride {
-                service: s.service.clone(),
-                mode: s.mode.clone(),
-            })
-            .collect(),
-        health_wait_secs: 0,
-        pre_deploy_cmd: None,
-        post_deploy_cmd: None,
-        notify_webhook: None,
-        source_compose_path: Some(source.to_string_lossy().to_string()),
-        source_hash: source_content_hash(&source).ok(),
-        // 项目级部署目录留空 = 沿用服务器目录(保持导入后即可部署的旧行为);
-        // 需要多项目分目录时在项目表单里填一次
-        remote_dir: None,
-        default_server_id: None,
-        // 归档保留数留空 = 默认 5 个(与历史行为一致)
-        release_keep: None,
-    };
-    // update_config 收口(第二十批 P2-4):push 与落盘整体持锁,并发保存不丢
-    update_config(|cfg| {
-        cfg.projects.push(project.clone());
-        Ok(())
-    })
-    .map_err(|e| format!("保存配置失败: {}", e))?;
-    Ok(project)
+        let project = ProjectConfig {
+            id,
+            name,
+            image_filter: String::new(),
+            compose_file: dest.to_string_lossy().to_string(),
+            file_mappings: Vec::new(),
+            service_overrides: stack
+                .services
+                .iter()
+                .map(|s| ServiceOverride {
+                    service: s.service.clone(),
+                    mode: s.mode.clone(),
+                })
+                .collect(),
+            health_wait_secs: 0,
+            pre_deploy_cmd: None,
+            post_deploy_cmd: None,
+            notify_webhook: None,
+            source_compose_path: Some(source.to_string_lossy().to_string()),
+            source_hash: source_content_hash(&source).ok(),
+            // 项目级部署目录留空 = 沿用服务器目录(保持导入后即可部署的旧行为);
+            // 需要多项目分目录时在项目表单里填一次
+            remote_dir: None,
+            default_server_id: None,
+            // 归档保留数留空 = 默认 5 个(与历史行为一致)
+            release_keep: None,
+        };
+        // update_config 收口(第二十批 P2-4):push 与落盘整体持锁,并发保存不丢
+        update_config(|cfg| {
+            cfg.projects.push(project.clone());
+            Ok(())
+        })
+        .map_err(|e| format!("保存配置失败: {}", e))?;
+        Ok(project)
+    })();
+
+    if let Err(e) = result {
+        if dest_dir.exists() {
+            if let Err(ce) = std::fs::remove_dir_all(&dest_dir) {
+                log::warn!(
+                    "导入失败后清理残留目录失败 ({}): {}",
+                    dest_dir.display(),
+                    ce
+                );
+            }
+        }
+        return Err(e);
+    }
+    result
 }
 
 // ===== 项目「从源更新」(第三批:源 compose 变更检测与副本同步)=====
@@ -512,3 +533,63 @@ async fn parse_with_local_images(compose_path: &Path) -> Result<ComposeStack, St
 
 // ===== 宿主机 Docker 命令 =====
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 第二十三批细节补正(wiki/07 限制 7):导入失败路径不得残留
+    /// `config/stacks/<uuid>/` 目录(含副本文件)。
+    ///
+    /// 触发方式:预置损坏的 `projects.json` 使 `update_config` 的 load 阶段
+    /// 失败 —— 此时 compose 副本已复制完成,正是「写配置失败残留」的场景。
+    #[test]
+    fn test_import_compose_failure_cleans_stray_stack_dir() {
+        let _guard = crate::config::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("ddtest-import-cleanup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
+
+        // 源 compose 可解析、可复制(失败点在其后的配置写回)
+        let src_dir = dir.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let source = src_dir.join("compose.yml");
+        std::fs::write(&source, "services:\n  web:\n    image: nginx:1.27\n").unwrap();
+
+        // 损坏 projects.json:update_config → load_config 读它失败 → 导入报错
+        let cfg_dir = dir.join("config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(cfg_dir.join("projects.json"), "{ definitely broken").unwrap();
+
+        let err =
+            import_compose(source.to_string_lossy().to_string(), "清理测试".into()).unwrap_err();
+        assert!(
+            err.contains("保存配置失败"),
+            "导入应以配置写回失败收尾,实际: {}",
+            err
+        );
+
+        // 失败后不得残留 stacks/<uuid>/(含 compose 副本)
+        let stacks = cfg_dir.join("stacks");
+        let leftover: Vec<String> = std::fs::read_dir(&stacks)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            leftover.is_empty(),
+            "失败后不应残留栈目录: {:?}",
+            leftover
+        );
+
+        // 源文件不受影响
+        assert!(source.is_file(), "源 compose 不应被清理逻辑触碰");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
