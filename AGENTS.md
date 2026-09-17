@@ -98,14 +98,16 @@ git worktree add -b dev/s2-<topic>  D:/Github-repositories/docker-deploy-ssh-s2 
 4. **验证链各自跑**：`cargo test` 亲眼确认 `test result: ok` → clippy 与基线逐条比对 → 改 JS 跑 `node --check` → verify 四脚本 → UI 改动走「浏览器 + Tauri 桩」截图交 judge。worktree 无需 `node_modules`。
 5. **资源冲突避免**：两会话的本地静态服务用**不同端口**（S1:8799 / S2:8798）；**不要同时跑两个 `npm run tauri dev`**（WebView2 dev 实例会互相抢端口/配置）；cargo target 各自 worktree 独立，首次全量编译慢属正常。
 
-### 当前并行对（2026-09-17 起）
+### 当前并行对（2026-09-17 第二批，v6.5.0 后）
 
-| | S1 `dev/s1-detail-fixes`（`docker-deploy-ssh-s1`） | S2 `dev/s2-term-log-retention`（`docker-deploy-ssh-s2`） |
+| | S1 `dev/s1-resource-alerts`（`docker-deploy-ssh-s1`） | S2 `dev/s2-fleet-diagnose`（`docker-deploy-ssh-s2`） |
 |---|---|---|
-| 任务 | 细节补正 7 项（ROADMAP 细节补正池全量） | 终端日志保留（时间制，ROADMAP 规格节） |
-| 主权文件 | `ui/style.css`、`ui/help.js`、`ui/servers.js`、`src-tauri/src/manage.rs`、`src-tauri/src/commands/compose_sources.rs`、`wiki/07`（合入时） | `src-tauri/src/config.rs`、`src-tauri/src/manage_exec.rs`、`src-tauri/src/lib.rs`（setup 一行）、`ui/settings.js`、`wiki/02`（合入时） |
-| 共享小改 | `wiki/03`（两方都可能小改：先进者先写，后进者 rebase 解冲突）；`UPGRADE-PLAN.md`（各自在尾部追加自己的批次节，append-only 冲突罕见） | 同左 |
-| 冻结 | 版本三件套 / `wiki/README.md` / 七篇页首戳 / `verify/VERSION.txt` / `index.html` / `app.js` / `manage*.js`（S1 的 `manage.rs` 除外）/ `deploy*.js` / `ROADMAP.md` 公共行 / `UPGRADE-PLAN.md` 公共行 | 同左（S2 的 `config.rs`/`manage_exec.rs`/`lib.rs` 除外） |
+| 任务 | 资源阈值告警（磁盘/内存/CPU 超阈值 → 通知管道） | 多机巡检汇总（全部服务器一键诊断 + 汇总视图） |
+| 主权文件 | `src-tauri/src/probe.rs`、`src-tauri/src/notify.rs`、`src-tauri/src/config.rs`、`src-tauri/src/manage.rs`（采样复用）、`ui/notify.js`、`ui/settings.js`、`wiki/07`（合入时） | `ui/servers.js`、`ui/style.css`、`src-tauri/src/commands/host_server.rs`（如需要）、`wiki/03`（合入时） |
+| 共享小改 | `wiki/03`（先进者先写，后进者 rebase 解冲突）；`UPGRADE-PLAN.md` 尾部追加自己的批次节；`ROADMAP.md` 各自标记完成行 | 同左 |
+| 冻结 | 版本三件套 / `wiki/README.md` / 七篇页首戳 / `verify/VERSION.txt` / `index.html` / `app.js` / `ui/manage*.js` / `deploy*.js` / `lib.rs` / `wiki/04` | 同左 |
+
+**S2 特别约束**：多机巡检**优先纯前端方案**（前端串行调用现有 `server_diagnose` + 汇总视图），**不新增后端命令**——避免触碰 `lib.rs` / `wiki/04` / 契约计数。若确需后端改动，先在汇报中点名原因。
 
 ### 使用前检查
 
