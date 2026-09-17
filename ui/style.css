@@ -779,6 +779,95 @@ select.text-input option,
 }
 .diagnose-summary-ok { color: var(--ark-signal-dim); }
 .diagnose-summary-fail { color: var(--ark-warn-text, inherit); }
+
+/* 多机巡检汇总(第二十四批):逐台一行,行内复用 .diagnose-row 的
+   [徽章 步骤名 详情] 三列语言;此处只补「台行」外壳与计数/按钮行。
+   flex 纪律同 .diagnose-*:文字列 min-width:0,徽章与编号 flex:none。
+
+   高度策略:台数多时模态会超出视口(实测 5 台即 728px > 720px 视口),
+   若放任自然高度,「停止巡检 / 复制全部结果」会被推到屏幕外 —— 而停止按钮
+   在巡检进行中必须随时可点。故 .fleet-box 用 max-height 封顶,只让
+   .fleet-list 内滚,计数行与按钮行常驻可见(flex:none + min-height:0
+   是内滚生效的必要条件,缺 min-height:0 时 flex 子项不肯收缩)。 */
+.fleet-box {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  max-height: 68vh;
+}
+.fleet-summary {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 10px;
+  flex: none;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--ark-line);
+}
+.fleet-count {
+  flex: none;
+  font-family: var(--font-cjk);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ark-ink);
+}
+.fleet-note {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-cjk);
+  font-size: 12.5px;
+  color: var(--ark-paper-dim-ink);
+  overflow-wrap: anywhere;
+}
+/* 台列表:每台一块,块间用细分隔线分节(不引新色,复用 --ark-line)。
+   flex:1 + min-height:0 = 唯一的滚动容器(见 .fleet-box 注释) */
+.fleet-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+.fleet-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--ark-line);
+}
+.fleet-row:last-child { border-bottom: none; padding-bottom: 0; }
+.fleet-row-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+.fleet-row-head > .badge { flex: none; }
+.fleet-host {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--ark-paper-dim-ink);
+}
+.fleet-steps { display: flex; flex-direction: column; gap: 6px; padding-left: 2px; }
+.fleet-note-line,
+.fleet-err-line {
+  font-family: var(--font-cjk);
+  font-size: 12.5px;
+  color: var(--ark-paper-dim-ink);
+  overflow-wrap: anywhere;
+}
+.fleet-err-line { color: var(--ark-warn-text, inherit); }
+.fleet-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+  padding-top: 12px;
+  border-top: 1px solid var(--ark-line);
+}
+.fleet-actions .btn { flex: none; }
 .images-error {
   display: flex;
   align-items: center;

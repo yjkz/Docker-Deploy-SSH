@@ -95,7 +95,11 @@
     projectSources: null, // projectId -> ProjectSourceStatus(源 compose 变更检测缓存)
     sourceChecked: false, // 本次启动是否已做过源比对(启动自动比对只跑一次)
     sourceChecking: false,// 源比对进行中(防并发重入导致重复更新)
-    logs: []              // server-log 事件累积的输出行
+    logs: [],             // server-log 事件累积的输出行
+    // 多机巡检(第二十四批):运行状态独立于单台诊断,防重入 + 支持中止。
+    // fleet.running 为真期间「全部巡检」按钮禁用;fleet.cancel 置位后
+    // 串行泵在**每台边界**检查并中止剩余台(在途那一台等它自己结束)。
+    fleet: null           // null=未巡检;否则 { running, cancel, rows: {id -> 结果} }
   };
 
   /** server-log 事件监听守卫:只注册一次,防止重复绑定 */
@@ -579,6 +583,319 @@
             '诊断发起失败:' + (errText(err) || '未知错误')));
         });
     });
+  }
+
+  // ===== 多机巡检汇总(第二十四批):全部服务器一键诊断 + 汇总视图 =====
+  //
+  // 纯前端方案(并行开发协议 S2 特别约束):串行复用现有 server_diagnose
+  // 命令逐台跑,不新增后端命令 —— 零 lib.rs / wiki/04 / 契约计数改动。
+  // 为什么串行而非并发:每台诊断都要建 SSH 连接,并发 N 台会同时占用 N 条
+  // 连接与远端资源,而巡检是排障场景、不追求吞吐;串行还天然给「每台完成
+  // 即渲染」提供了确定顺序。
+  //
+  // 互斥口径:与单台诊断一致 —— 后端 server_diagnose 不取 acquire_remote_op
+  // (只读探测,不占用服务器做变更),故巡检也不与之争锁;与部署/回滚并发时
+  // 仅多打几条只读连接,不产生写冲突。
+
+  /** 巡检中一台的三种终态(与单台诊断同口径) */
+  function fleetStateOf(report) {
+    if (!report) return 'fail';
+    if (report.allOk === true) return 'ok';
+    var steps = Array.isArray(report.steps) ? report.steps : [];
+    // 任一层 fail ⇒ fail;否则(全 ok / 含 skipped 但无 fail)按「有未通过项」处理
+    for (var i = 0; i < steps.length; i++) {
+      if (steps[i] && steps[i].state === 'fail') return 'fail';
+    }
+    return steps.length ? 'skipped' : 'fail';
+  }
+
+  /** 巡检结果 → 可复制文本(逐台一段,含三层明细) */
+  function fleetReportText(title, rows) {
+    var lines = ['# ' + title];
+    rows.forEach(function (row) {
+      lines.push('');
+      lines.push('[' + (row.state || '') + '] ' + row.name + (row.host ? ' (' + row.host + ')' : ''));
+      (row.steps || []).forEach(function (stp) {
+        lines.push('  [' + String(stp.state || '') + '] ' +
+          diagnoseStepLabel(String(stp.step || '')) + ': ' + String(stp.detail || ''));
+      });
+      if (row.error) lines.push('  ' + row.error);
+    });
+    return lines.join('\n');
+  }
+
+  /**
+   * 打开「全部巡检」模态:串行逐台诊断,每台完成即增量渲染一行。
+   *
+   * 一行 = [徽章 服务器名] + 第二行三层明细(ok 折叠为一行摘要)。
+   * 顶部实时计数(N 通过 / M 失败 / K 跳过 / 剩余 L),底部「停止巡检」
+   * (运行中)与「复制全部结果」(有结果后常驻)。
+   */
+  function openFleetModal(idleBtn) {
+    var servers = (st.cfg && Array.isArray(st.cfg.servers)) ? st.cfg.servers.slice() : [];
+    if (st.fleet && st.fleet.running) return; // 防重入(按钮已禁用,此处兜底)
+
+    var fleet = { running: true, cancel: false, rows: {}, btn: idleBtn };
+    st.fleet = fleet;
+
+    var total = servers.length;
+
+    /**
+     * 收尾:复位运行标志与入口按钮。
+     * 仅当本 fleet 仍是「当前 fleet」时才动按钮 —— 否则说明用户已关闭
+     * 模态并开了新一轮巡检,旧一轮的收尾不能把新按钮打回可用态。
+     */
+    function finishFleet() {
+      fleet.running = false;
+      if (st.fleet === fleet && idleBtn) window.setBtnBusy(idleBtn, false, '全部巡检');
+    }
+
+    openModal('全部巡检 — ' + total + ' 台服务器', function (body) {
+      var box = el('div', 'fleet-box');
+      body.appendChild(box);
+
+      // 顶部:实时计数行 + 总进度
+      var summary = el('div', 'fleet-summary');
+      box.appendChild(summary);
+      var listBox = el('div', 'fleet-list');
+      box.appendChild(listBox);
+
+      // 底部按钮行:停止巡检(运行中) + 复制全部结果(有结果后可用)
+      var actions = el('div', 'fleet-actions');
+      var stopBtn = el('button', 'btn btn-sm', '停止巡检');
+      stopBtn.type = 'button';
+      stopBtn.addEventListener('click', function () {
+        fleet.cancel = true;
+        stopBtn.disabled = true;
+        stopBtn.textContent = '正在停止…';
+        renderSummary();
+      });
+      var copyBtn = el('button', 'btn btn-sm', '复制全部结果');
+      copyBtn.type = 'button';
+      copyBtn.disabled = true;
+      copyBtn.addEventListener('click', function () {
+        window.copyText(fleetReportText('全部巡检结果', orderedRows()));
+      });
+      actions.appendChild(stopBtn);
+      actions.appendChild(copyBtn);
+      box.appendChild(actions);
+
+      /** 已出结果的台按巡检顺序(即配置顺序)排列 —— 复制只含有结果的台 */
+      function orderedRows() {
+        var out = [];
+        servers.forEach(function (srv) {
+          var r = fleet.rows[srv.id];
+          if (r && !r.waiting && !r.pending) out.push(r);
+        });
+        return out;
+      }
+
+      /**
+       * 重绘计数行(每台完成 / 用户点停止时调用)。
+       *
+       * 四类台的归属(waiting/pending 都是「还没出结果」,只是前者未发起、
+       * 后者在途;notrun 是中止后落地的未巡检):
+       * - 通过/失败/跳过 = 已巡检完成(done)
+       * - 剩余 = 等待中 + 巡检中
+       * - 未巡检 = 中止导致根本没跑
+       */
+      function renderSummary() {
+        var done = 0, ok = 0, failN = 0, skipN = 0, waitingN = 0, notRun = 0;
+        Object.keys(fleet.rows).forEach(function (key) {
+          var r = fleet.rows[key];
+          if (r.waiting || r.pending) { waitingN += 1; return; }
+          if (r.state === 'notrun') { notRun += 1; return; }
+          done += 1;
+          if (r.state === 'ok') ok += 1;
+          else if (r.state === 'fail') failN += 1;
+          else skipN += 1;
+        });
+        var remaining = waitingN;
+        summary.textContent = '';
+        summary.appendChild(el('span', 'fleet-count',
+          '通过 ' + ok + ' / 失败 ' + failN + ' / 跳过 ' + skipN +
+          (remaining > 0 ? ' / 剩余 ' + remaining : '')));
+        if (fleet.cancel && notRun > 0) {
+          // 中止:明确区分「已巡检的 K 台」与「因停止未巡检的 M 台」
+          summary.appendChild(el('span', 'fleet-note',
+            '已停止:' + notRun + ' 台未巡检(上方计数只统计已巡检的 ' + done + ' 台)'));
+        } else if (remaining === 0 && notRun === 0 && total > 0) {
+          summary.appendChild(el('span', 'fleet-note',
+            failN === 0 ? '全部通过' : '存在未通过项,按各台详情处理后再试'));
+        }
+        // 复制:已巡检完成的台才有可复制内容
+        copyBtn.disabled = done === 0;
+        stopBtn.disabled = !fleet.running || fleet.cancel || remaining === 0;
+        if (fleet.cancel && fleet.running) stopBtn.textContent = '正在停止…';
+        else if (remaining === 0 || fleet.cancel) stopBtn.textContent = '巡检已结束';
+        else stopBtn.textContent = '停止巡检';
+      }
+
+      /** 渲染一台的整行内容(占位与终态共用;重绘即就地替换,不追加新行) */
+      function renderRow(row) {
+        var wrap = el('div', 'fleet-row');
+        var head = el('div', 'fleet-row-head');
+        head.appendChild(el('span', 'server-index', row.index));
+        head.appendChild(el('span', 'server-name', row.name));
+        if (row.pending) {
+          head.appendChild(window.fillBadge(el('span'), 'info', '巡检中…'));
+        } else if (row.waiting) {
+          head.appendChild(window.fillBadge(el('span'), 'info', '等待中'));
+        } else if (row.state === 'notrun') {
+          head.appendChild(window.fillBadge(el('span'), 'info', '未巡检'));
+        } else {
+          var kind = row.state === 'ok' ? 'ok' : (row.state === 'fail' ? 'fail' : 'info');
+          var label = row.state === 'ok' ? '通过' : (row.state === 'fail' ? '失败' : '跳过');
+          head.appendChild(window.fillBadge(el('span'), kind, label));
+        }
+        if (row.host) head.appendChild(el('span', 'fleet-host', row.host));
+        wrap.appendChild(head);
+
+        // 明细:全通过折叠为一行(三层原文太长);失败/跳过逐层展开;
+        // 等待中/未巡检不需要明细行
+        var steps = row.steps || [];
+        if (row.pending) {
+          wrap.appendChild(el('div', 'fleet-note-line', '正在逐层排查:TCP → SSH → Docker…'));
+        } else if (row.waiting || row.state === 'notrun') {
+          wrap.appendChild(el('div', 'fleet-note-line',
+            row.state === 'notrun' ? '已停止,本台未巡检' : '排队等待巡检…'));
+        } else if (row.state === 'ok') {
+          wrap.appendChild(el('div', 'fleet-note-line', 'TCP / SSH / Docker 三层均通过'));
+        } else if (steps.length) {
+          var detailBox = el('div', 'fleet-steps');
+          steps.forEach(function (stp) {
+            var stRow = el('div', 'diagnose-row');
+            var stState = String(stp.state || 'skipped');
+            stRow.appendChild(window.fillBadge(el('span'),
+              stState === 'ok' ? 'ok' : (stState === 'fail' ? 'fail' : 'info'),
+              stState === 'ok' ? '通过' : (stState === 'fail' ? '失败' : '跳过')));
+            stRow.appendChild(el('span', 'diagnose-name', diagnoseStepLabel(String(stp.step || ''))));
+            stRow.appendChild(el('span', 'diagnose-detail', String(stp.detail || '')));
+            detailBox.appendChild(stRow);
+          });
+          wrap.appendChild(detailBox);
+        } else if (row.error) {
+          wrap.appendChild(el('div', 'fleet-err-line', row.error));
+        }
+        return wrap;
+      }
+
+      /** serverId -> 该台的行节点(就地重绘用,保证行顺序恒 = 配置顺序) */
+      var rowNodes = {};
+
+      /** 就地更新一台的行(节点不存在则按序插入 —— 正常路径恒存在) */
+      function updateRow(serverId) {
+        var row = fleet.rows[serverId];
+        if (!row) return;
+        var newNode = renderRow(row);
+        var old = rowNodes[serverId];
+        if (old && old.parentNode) old.parentNode.replaceChild(newNode, old);
+        else listBox.appendChild(newNode);
+        rowNodes[serverId] = newNode;
+      }
+
+      /** 串行泵:一台接一台;每台结束即就地更新该行 + 计数 */
+      function pump(idx) {
+        if (idx >= servers.length || fleet.cancel) {
+          // 中止时把未跑到的台从「等待中」落成「未巡检」(留着「等待中」
+          // 会误导用户以为还在跑)。串行保证 idx 之后全是 waiting;
+          // state='notrun' 与诊断层的 'skipped'(某层被短路未尝试)语义区分。
+          if (fleet.cancel && idx < servers.length) {
+            for (var k = idx; k < servers.length; k++) {
+              var pendingSrv = servers[k];
+              fleet.rows[pendingSrv.id] = {
+                name: pendingSrv.name,
+                index: 'SRV-' + ('0' + (k + 1)).slice(-2),
+                host: pendingSrv.host + ':' + pendingSrv.port,
+                state: 'notrun',
+                steps: [],
+                error: '已停止,未巡检'
+              };
+              updateRow(pendingSrv.id);
+            }
+          }
+          renderSummary();
+          finishFleet();
+          return;
+        }
+        var srv = servers[idx];
+        var index = 'SRV-' + ('0' + (idx + 1)).slice(-2);
+        fleet.rows[srv.id] = { pending: true, name: srv.name, index: index, host: srv.host + ':' + srv.port, state: 'pending', steps: [] };
+        updateRow(srv.id);
+        renderSummary();
+
+        window.AppBus.invoke('server_diagnose', { serverId: srv.id })
+          .then(function (report) {
+            fleet.rows[srv.id] = {
+              name: srv.name,
+              index: index,
+              host: srv.host + ':' + srv.port,
+              state: fleetStateOf(report),
+              steps: (report && Array.isArray(report.steps)) ? report.steps : [],
+              error: ''
+            };
+          })
+          .catch(function (err) {
+            // 单台发起失败(如配置读取异常):记为该台失败,不中断整体巡检
+            fleet.rows[srv.id] = {
+              name: srv.name,
+              index: index,
+              host: srv.host + ':' + srv.port,
+              state: 'fail',
+              steps: [],
+              error: '诊断发起失败:' + (errText(err) || '未知错误')
+            };
+          })
+          .then(function () {
+            // 会话已过期(模态被关/重开)→ 丢弃回写,不影响新巡检
+            if (st.fleet !== fleet) return;
+            updateRow(srv.id);
+            renderSummary();
+            pump(idx + 1);
+          });
+      }
+
+      if (total === 0) {
+        listBox.appendChild(el('div', 'list-hint', '暂无服务器,先在 03 页添加'));
+        renderSummary();
+        finishFleet();
+        return;
+      }
+      // 先把全部台按配置顺序铺成「等待中」占位行(用户立刻看到总量与顺序),
+      // 串行泵逐台就地把对应行改成「巡检中…」→ 终态。
+      servers.forEach(function (srv, i) {
+        fleet.rows[srv.id] = {
+          waiting: true,
+          name: srv.name,
+          index: 'SRV-' + ('0' + (i + 1)).slice(-2),
+          host: srv.host + ':' + srv.port,
+          state: 'waiting',
+          steps: [],
+          error: ''
+        };
+        updateRow(srv.id);
+      });
+      renderSummary();
+      pump(0);
+    });
+  }
+
+  /**
+   * 「全部巡检」入口:打开汇总模态并启动串行泵。
+   *
+   * 中止语义:模态关闭(关闭钮/遮罩/Esc 三通道均经 closeModal)会置
+   * `cancel`,串行泵在**下一台边界**停下并把未跑到的台标为「未巡检」;
+   * 在途那一台无后端取消通道(纯只读探测,不值得为此新增命令),跑完后
+   * 回写被静默丢弃。
+   */
+  function runFleetDiagnose(btn) {
+    if (st.fleet && st.fleet.running) return; // 防重入
+    if (!st.loaded) {
+      window.toast('配置尚未加载完成,请稍候重试', 'warn');
+      return;
+    }
+    window.setBtnBusy(btn, true, '巡检中…');
+    openFleetModal(btn);
   }
 
   function runEnvCheck(server, mode, extras) {
@@ -1203,6 +1520,15 @@
   }
 
   function closeModal() {
+    // 关模态即中止在跑的巡检(第二十四批):否则串行泵会在模态不可见时
+    // 继续逐台建连 —— 用户已明确关闭,不应再有后台网络动作。
+    // 置 cancel 后,泵在**下一台边界**停下(在途那一台的 promise 仍会
+    // 回收,但回写被 st.fleet !== fleet 判定安全丢弃,不会摸到已关闭的 DOM)。
+    // 入口气泡态也一并复位:用户关掉模态就要能立刻重开,不该等旧一轮跑完。
+    if (st.fleet && st.fleet.running) {
+      st.fleet.cancel = true;
+      if (st.fleet.btn) window.setBtnBusy(st.fleet.btn, false, '全部巡检');
+    }
     var overlay = document.getElementById('servers-modal');
     if (overlay) {
       overlay.classList.add('hidden');
@@ -2581,7 +2907,33 @@
 
   // ===== 初始化 =====
 
+  /**
+   * 在 03 页「服务器」区段头注入「全部巡检」按钮(第二十四批)。
+   *
+   * 为什么用注入而非写 index.html:index.html 属并行开发协议的**冻结文件**
+   * (双会话都可能改脚本加载序/结构,合并期冲突成本高);而区段头本就支持
+   * 右侧工具按钮 ——「部署项目」区段头的「检查源变更」就是 HTML 里写死的同款
+   * 形态。此处按同一形态注入,视觉与既有按钮群一致。
+   * 幂等:重复调用(如多次 init)先查 id 再插,不产生第二个按钮。
+   */
+  function installFleetButton() {
+    if (document.getElementById('servers-fleet-btn')) return;
+    var list = document.getElementById('servers-list');
+    if (!list) return;
+    // 「服务器」区段头 = servers-list 的前一个兄弟节点(结构见 index.html:170)
+    var head = list.previousElementSibling;
+    if (!head || !head.classList || !head.classList.contains('section-head')) return;
+    var btn = el('button', 'btn btn-sm', '全部巡检');
+    btn.type = 'button';
+    btn.id = 'servers-fleet-btn';
+    btn.title = '逐台诊断全部服务器(TCP / SSH / Docker),汇总视图给每台红绿灯;' +
+      '串行执行,每台完成即显示';
+    btn.addEventListener('click', function () { runFleetDiagnose(btn); });
+    head.appendChild(btn);
+  }
+
   function bindStaticEvents() {
+    installFleetButton();
     var addServer = document.getElementById('servers-add-btn');
     if (addServer) {
       addServer.addEventListener('click', function () { openServerModal(null); });
