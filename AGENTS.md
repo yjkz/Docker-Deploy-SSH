@@ -7,7 +7,7 @@
 Windows 桌面客户端（Tauri 2）：把本地构建的 Docker 镜像一键部署到自己的服务器 —— `docker save → gzip → SFTP → docker load → compose up`，不依赖镜像仓库与 CI/CD。
 
 - 后端：纯 Rust（`src-tauri/src/`，全部业务逻辑）；前端：原生 HTML/CSS/JS（`ui/`，**无框架、无打包器、无 npm 运行时依赖**）。
-- 主分支 `main`；当前版本 v6.4.0，`cargo test` 基线 **363 passed / 13 ignored**，命令 **106** 个（实测口径 = 数 `lib.rs` 的 `generate_handler![]`）。
+- 主分支 `main`；当前版本 v6.4.1，`cargo test` 基线 **363 passed / 13 ignored**，命令 **106** 个（实测口径 = 数 `lib.rs` 的 `generate_handler![]`）。
 
 ## 目录导览
 
@@ -80,3 +80,29 @@ node verify/doc-consistency.js   # 版本号/命令数/测试数/七篇页首版
 - 改动前：`wiki/README.md` → 对应篇（架构 `01` / 后端 `02` / 前端 `03` / 契约 `04` / 构建 `05` / 部署回滚 `06` / 安全 `07`）。
 - 当前进度与每阶段执行协议：`ROADMAP.md` 的「执行协议」「硬约束」「当前状态速览」。
 - 动密文、哨兵、注入防护、TOFU、导出加密等安全敏感区前：必读 `wiki/07-安全与已知取舍.md`。
+
+## 双会话并行开发协议（2026-09-17 起）
+
+用户会用**两个并行会话**同时开发。隔离机制 = **每会话一个 git worktree + 独立分支**，互不进对方目录、不直接改 main：
+
+```
+git worktree add -b dev/s1-<topic>  D:/Github-repositories/docker-deploy-ssh-s1  main
+git worktree add -b dev/s2-<topic>  D:/Github-repositories/docker-deploy-ssh-s2  main
+```
+
+### 规则（五条）
+
+1. **文件主权**：每批开工前先在 ROADMAP 候选池节确认本会话的「文件主权矩阵」（哪些文件归你改）；**除此之外的文件开发期冻结**——尤其 `lib.rs`、三处版本号（`tauri.conf.json`/`Cargo.toml`/`package.json`）、`wiki/README.md`、七篇页首戳、`verify/VERSION.txt`、`index.html`、`app.js`、`ROADMAP.md`/`UPGRADE-PLAN.md` 公共行。
+2. **合入串行**：同一时刻只有一方合入 main。先完成方：验证链全绿 → 合入 main（代码 + 测试 + 自己的 UPGRADE-PLAN 节/ROADMAP 条目）→ push → 停下汇报。
+3. **后完成方**：`git rebase main` → 合入 → 补自己文档 + **批次收尾一次**（三处版本号 bump + wiki/README + 七篇页首戳 + `doc-consistency --write --tests=N`）→ push → 停下汇报。
+4. **验证链各自跑**：`cargo test` 亲眼确认 `test result: ok` → clippy 与基线逐条比对 → 改 JS 跑 `node --check` → verify 四脚本 → UI 改动走「浏览器 + Tauri 桩」截图交 judge。worktree 无需 `node_modules`。
+5. **资源冲突避免**：两会话的本地静态服务用**不同端口**（S1:8799 / S2:8798）；**不要同时跑两个 `npm run tauri dev`**（WebView2 dev 实例会互相抢端口/配置）；cargo target 各自 worktree 独立，首次全量编译慢属正常。
+
+### 使用前检查
+
+```bash
+git worktree list   # 确认两个 worktree 都在
+git status          # 各自 worktree 内应干净（半成品不应跨会话存留）
+```
+
+批次结束（双方均合入）后：`git worktree remove <dir>` + 删分支，恢复单会话模式。
