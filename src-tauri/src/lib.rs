@@ -170,6 +170,8 @@ pub fn run() {
       // 服务器定时探活(第十七批):按已存设置决定启动或保持关闭
       // (probe_interval_mins > 0 时启动;设置中心保存时也会 sync)
       crate::probe::sync_from_settings(app.handle());
+      // 资源阈值告警(第二十四批):与探活并列的独立采样任务
+      crate::probe::sync_alert_from_settings(app.handle());
       // 定时部署调度器(第二十二批):常驻 tick(30s),按日程表到点发起部署
       crate::deploy_schedule::start_scheduler(app.handle());
       // 终端日志保留(第二十三批):启动时按设置 best-effort 清理过期会话日志

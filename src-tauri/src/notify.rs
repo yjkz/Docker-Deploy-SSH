@@ -70,6 +70,7 @@ pub struct NotifyEventsView {
     pub on_failure: bool,
     pub on_cancel: bool,
     pub on_probe: bool,
+    pub on_alert: bool,
 }
 
 /// `notify_get_config` 的返回(camelCase 序列化给前端)。
@@ -126,6 +127,8 @@ pub struct NotifyEventsInput {
     pub on_cancel: bool,
     #[serde(default)]
     pub on_probe: bool,
+    #[serde(default)]
+    pub on_alert: bool,
 }
 
 /// `notify_save_config` 的入参(camelCase)。
@@ -264,6 +267,7 @@ pub async fn notify_save_config(cfg: NotifyConfigInput) -> Result<(), String> {
             on_failure: cfg.events.on_failure,
             on_cancel: cfg.events.on_cancel,
             on_probe: cfg.events.on_probe,
+            on_alert: cfg.events.on_alert,
         },
         // 第二十批阶段五:成功通知的最小部署耗时(0 = 恒通知;上限夹取)
         min_duration_secs: cfg.min_duration_secs.min(MIN_DURATION_SECS_MAX),
@@ -500,8 +504,9 @@ fn smtp_error_message(e: &lettre::transport::smtp::Error) -> String {
 
 /// 部署收尾通知分发入口(commands.rs 三个收尾点在 emit `deploy-done` 之后调用)。
 ///
-/// `kind`:`"success"` / `"failure"` / `"cancel"`,对应事件订阅开关
-/// `events.on_success` / `on_failure` / `on_cancel`。
+/// `kind`:`"success"` / `"failure"` / `"cancel"` / `"probe"` / `"alert"`,
+/// 对应事件订阅开关 `events.on_success` / `on_failure` / `on_cancel` /
+/// `on_probe`(第十七批)/ `on_alert`(第二十四批资源阈值告警)。
 ///
 /// - 内部 `tauri::async_runtime::spawn` 异步执行,不阻塞调用方(部署收尾路径);
 /// - 读配置失败、事件未订阅、渠道未启用或发送失败一律仅 `log::warn!`,
@@ -536,6 +541,7 @@ pub(crate) async fn fire_with_duration(
             "failure" => notify.events.on_failure,
             "cancel" => notify.events.on_cancel,
             "probe" => notify.events.on_probe,
+            "alert" => notify.events.on_alert,
             other => {
                 log::warn!("通知跳过:未知事件类型「{}」", other);
                 return;
@@ -609,6 +615,7 @@ fn to_view(cfg: &NotifyConfig) -> NotifyConfigView {
             on_failure: cfg.events.on_failure,
             on_cancel: cfg.events.on_cancel,
             on_probe: cfg.events.on_probe,
+            on_alert: cfg.events.on_alert,
         },
         min_duration_secs: cfg.min_duration_secs.min(MIN_DURATION_SECS_MAX),
     }

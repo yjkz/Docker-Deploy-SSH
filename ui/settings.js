@@ -10,7 +10,9 @@
  *          autoCheckUpdate, termLogKeepDays }
  *     (独立持久化于 config/settings.json;文件缺失/损坏后端回退默认值)
  * - app_settings_set({ closeToTray, proxy, autoUpdateFromSource,
- *                      probeIntervalMins, autoCheckUpdate, termLogKeepDays }) -> Ok/Err
+ *                      probeIntervalMins, autoCheckUpdate, termLogKeepDays,
+ *                      alertIntervalMins, alertDiskPercent, alertMemPercent,
+ *                      alertCpuPercent }) -> Ok/Err
  *     (顶层参数包;托盘与「关闭窗口隐藏到托盘」的拦截在后端事件里现读
  *      settings.json,保存后立即生效,无需重启)
  * - update_check({ proxy }) -> { current, latest, hasUpdate, url, notes }
@@ -257,6 +259,27 @@
       '0 = 关闭;例如 5 表示每 5 分钟探活一次',
       '按间隔 TCP 探活全部已配置服务器;状态翻转(在线→离线 / 离线→恢复)时经通知中心提醒,' +
       '订阅开关在通知中心的「事件」区;探活不触发 SSH 认证,不碰密钥'));
+
+    // 资源阈值告警(第二十四批):采样间隔 + 三项阈值(0 = 该项不告警)。
+    // 判定口径:连续 2 轮超阈才告警(防瞬态尖峰),回落单轮即恢复通知;
+    // 订阅开关在通知中心「事件」区的「资源阈值告警」勾选
+    main.appendChild(buildField('资源告警采样间隔(分钟)', 'ALERT',
+      'settings-alert-interval-input', 'number', '0',
+      '0 = 关闭;例如 10 表示每 10 分钟采样一次磁盘 / 内存 / CPU',
+      '采样经 SSH 逐台获取服务器资源占用;与部署 / 回滚互斥(执行中被跳过,下轮重试);' +
+      '订阅开关与通知渠道见通知中心'));
+    main.appendChild(buildField('磁盘告警阈值(%)', 'DISK',
+      'settings-alert-disk-input', 'number', '90',
+      null,
+      '根分区与 Docker 数据盘取较高者;0 = 不告警该项'));
+    main.appendChild(buildField('内存告警阈值(%)', 'MEM',
+      'settings-alert-mem-input', 'number', '90',
+      null,
+      '0 = 不告警该项'));
+    main.appendChild(buildField('CPU 告警阈值(%)', 'CPU',
+      'settings-alert-cpu-input', 'number', '90',
+      null,
+      '0 = 不告警该项'));
 
     // 终端日志保留(第二十三批):天数,0 = 永久保留(默认 30)。
     // hint 同时说明清理时机(打开终端 / 启动软件时 best-effort 清理)
@@ -556,6 +579,25 @@
     return Math.min(3650, Math.max(0, n));
   }
 
+  /**
+   * 资源告警字段采集(第二十四批)。间隔:非数字/空回退 0(关)、夹取
+   * 0–1440(一天);阈值:非数字/空回退 90、夹取 0–100(越界直传会被
+   * 后端 u32 反序列化失败整单拒绝,同 termKeepDaysArg 的先例)。
+   */
+  function alertIntervalArg() {
+    var raw = fieldVal('settings-alert-interval-input').trim();
+    var n = raw === '' ? 0 : parseInt(raw, 10);
+    if (isNaN(n)) n = 0;
+    return Math.min(1440, Math.max(0, n));
+  }
+
+  function alertPercentArg(id) {
+    var raw = fieldVal(id).trim();
+    var n = raw === '' ? 90 : parseInt(raw, 10);
+    if (isNaN(n)) n = 90;
+    return Math.min(100, Math.max(0, n));
+  }
+
   function onSave() {
     if (st.saving) return;
     var session = st.session; // 捕获模态会话,异步收尾校验是否已过期
@@ -568,7 +610,11 @@
         autoUpdateFromSource: isChecked('settings-auto-update-src'),
         probeIntervalMins: (parseInt(fieldVal('settings-probe-interval-input'), 10) || 0),
         autoCheckUpdate: isChecked('settings-auto-check-update'),
-        termLogKeepDays: termKeepDaysArg()
+        termLogKeepDays: termKeepDaysArg(),
+        alertIntervalMins: alertIntervalArg(),
+        alertDiskPercent: alertPercentArg('settings-alert-disk-input'),
+        alertMemPercent: alertPercentArg('settings-alert-mem-input'),
+        alertCpuPercent: alertPercentArg('settings-alert-cpu-input')
       }
     }).then(function () {
       // 过期会话(保存期间模态被关闭甚至重开)→ 静默丢弃,防旧 promise 回写新模态
@@ -674,6 +720,15 @@
         // 构建时预填默认值会恒假,须覆盖);缺省视为 30(与后端 serde default 同口径)
         var termKeep = document.getElementById('settings-term-keep-days');
         if (termKeep) termKeep.value = String(s.termLogKeepDays == null ? 30 : s.termLogKeepDays);
+        // 资源告警(第二十四批):无条件回填(同 P1 教训);缺省视为 0/90
+        var alertIv = document.getElementById('settings-alert-interval-input');
+        if (alertIv) alertIv.value = String(s.alertIntervalMins || 0);
+        var alertDisk = document.getElementById('settings-alert-disk-input');
+        if (alertDisk) alertDisk.value = String(s.alertDiskPercent == null ? 90 : s.alertDiskPercent);
+        var alertMem = document.getElementById('settings-alert-mem-input');
+        if (alertMem) alertMem.value = String(s.alertMemPercent == null ? 90 : s.alertMemPercent);
+        var alertCpu = document.getElementById('settings-alert-cpu-input');
+        if (alertCpu) alertCpu.value = String(s.alertCpuPercent == null ? 90 : s.alertCpuPercent);
         // 代理字段预填 ''(非 '0'),保留 === '' 守卫即可满足「未改动不覆盖」
         var proxy = document.getElementById('settings-proxy-input');
         if (proxy && proxy.value === '') proxy.value = String(s.proxy || '');

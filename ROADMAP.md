@@ -190,7 +190,7 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 | ~~终端日志保留(时间制)~~ ✅ 已完成 | 第二十三批(二),S2 会话(见下「已完成」区) | 小 |
 | 05 页各 Tab 搜索筛选 | 容器/镜像/卷/网络/栈各加筛选输入(不区分大小写子串);过滤只影响渲染、state 保留全量(终端「＋新标签」下拉仍读全量);空态给「无匹配项」 | 小-中 |
 | 容器批量操作 | 多选启停/重启/pause/rename(复用 manage_container_action 扩展 action + 前端多选框) | 中 |
-| 资源阈值告警 | 磁盘/内存/CPU 超阈值 → 现有通知管道(桌面/SMTP/webhook)。**已选中:S1(`dev/s1-resource-alerts`)进行中** | 中 |
+| ~~资源阈值告警~~ ✅ 已完成 | 第二十四批(一),S1 会话:独立采样任务(SSH 复用 host_metrics 链)+ 连续 2 轮防抖 + `alert` 通知类型;设置中心四字段 + 通知中心勾选(记录见 UPGRADE-PLAN) | 中 |
 | 栈 compose 查看/编辑 | 栈操作区「compose」入口;base64 读写(镜像 .env 口径)+ 保存前远端备份(.ddbak.<ts> 保留 3 份);新命令 ×2 | 中 |
 | 部署失败自动回滚 | 失败且健康检查不过 → 自动回滚上一归档(可选开关);需接 `acquire_remote_op` 互斥、防双失败,先设计 | 大 |
 | 多机巡检汇总 | 复用 server_diagnose 批量跑 + 汇总视图。**已选中:S2(`dev/s2-fleet-diagnose`)进行中** | 小 |
@@ -350,6 +350,7 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 - 版本 **v6.5.0**;main = origin/main;基线 `cargo test` **370 passed** / 13 ignored
 - 命令 **106** 个(generate_handler 实测;第二十二批 +3 调度 +2 配置历史)
 - **第二十三批(2026-09-17,双会话并行首发)已完成**:S1 细节补正 7 项 + S2 终端日志保留(时间制);批次收尾由 S2 统一执行(版本 v6.5.0)
+- **第二十四批(进行中,双会话并行第二批)**:S1 资源阈值告警 ✅(UPGRADE-PLAN「第二十四批(一)」)/ S2 多机巡检汇总(进行中)
 - **第二十二批(v6.4.0)第三梯队三项全完成**:定时部署 / 终端多标签+广播+落盘 / 配置版本历史;文档治理批完成(contract-smoke 上线);**补丁 v6.4.1**:终端多标签可达性修复(「＋新标签」下拉);**遗留待真机验证 8 项全部确认 ✅(2026-09-16),清单清空**
 - verify/ 六脚本:form-validation / bridge-integrity / scope-integrity / contract-smoke / doc-consistency / VERSION.txt(缓存)
 - JS **16** 文件(含 theme-init.js;index.html 加载顺序见 wiki/03:13)

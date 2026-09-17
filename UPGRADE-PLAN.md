@@ -2635,3 +2635,55 @@ migrate_project.rs:兜底命中入列带标记与识别说明 / 显式声明无�
   45→45 / 空→30 / -5→0 / 99999→3650 / 非数字→30,其他字段不受影响;
   **judge 3 张截图(亮色全貌/字段特写/暗色全貌)全部 pass**。
 - 桩文件已删、8798 服务已停、预览页已关。
+
+---
+
+# 第二十四批(一):资源阈值告警(S1 会话,2026-09-17)
+
+> 双会话并行开发第二批:S1(本批,资源阈值告警)/ S2(多机巡检汇总)。
+> 文件主权矩阵见 AGENTS.md「当前并行对」(v6.5.0 后批次)。
+
+## 1. 需求与设计
+
+磁盘/内存/CPU 超阈值 → 现有通知管道(桌面/邮件);与探活任务(纯 TCP)
+并列的**独立采样任务**,复用 manage.rs 的宿主机指标采样链。
+
+- **设置项**(`AppSettings`,camelCase 直通 settings.json):
+  `alert_interval_mins`(0=关,默认 0;夹取 0–1440)+ `alert_disk_percent` /
+  `alert_mem_percent` / `alert_cpu_percent`(默认 90;0 = 该项不告警);
+  无新命令。
+- **采样**:每台完整 SSH 连接(`commands::connect_server` 内部解析凭据,
+  守护测试覆盖)+ `manage::host_metrics_cmd` 一次往返;samples 解析复用,
+  新增 `manage::host_percent_of` 把 `HostMetrics` 折成 CPU/内存/磁盘百分比
+  三元组(磁盘取根分区与 Docker 数据盘较高者;解析细节不外泄,字段保持私有)。
+- **防抖状态机**(纯函数 `evaluate_alert_flips`):**连续 2 轮**超阈才告警
+  (瞬态尖峰不误报);回落**单轮**即发「已恢复」;采样缺失(None)视作
+  「维持既有状态」不误判恢复;阈值 0 = 维度关闭且状态清零;各维度独立
+  跟踪(`AlertServerState`:streak + alerted 双字段)。
+- **通知**:事件类型 `alert`(`NotifyEvents.on_alert`,默认关 + `fire` 映射
+  + View/Input 结构 + 保存映射,全线同探活先例)。
+- **互斥**(硬约束 9):每台采样前取 `acquire_remote_op`(逐台短持有);
+  部署/回滚/迁移进行中被拒 → 跳过该台本轮(不打扰,下轮自然重试)。
+- **任务模型**:`sync_alert_from_settings` 独立 JoinHandle(与探活同模式
+  独立实例);lib.rs setup 与 `app_settings_set` 保存时同步(即改即停)。
+
+## 2. 前端
+
+- 设置中心「通用」组:探活间隔下方新增**告警采样间隔** + **三阈值**四个
+  数字输入(buildField 同款;hint 说明「连续 2 轮才通知、与部署互斥」);
+  采集侧夹取(间隔 0–1440、阈值 0–100,防负值 u32 反序列化整单拒绝,同
+  termKeepDaysArg 先例);回填**无条件覆盖**(同 P1 教训)。
+- 通知中心「事件订阅」组:新增「资源阈值告警」勾选(`notify-event-alert`
+  / `events.onAlert`);**`normalizeCfg` 白名单补 `onAlert` 透传**(首版
+  漏加,桩验证实测恒 false 后发现——白名单过滤器是新增字段的静默丢失点,
+  记入本批教训)。
+
+## 3. 验证
+
+- `cargo test` **376 passed / 13 ignored**(+6:防抖两轮/单轮回落恢复/
+  未达阈值清零重置/缺失保持状态/阈值 0 关闭/多维度独立)
+- clippy 与基线集合逐条 diff **零新增**(20 条一致)
+- `node --check` 改动 JS;verify 六脚本全 PASS(含 doc-consistency)
+- 浏览器 + Tauri 桩(8799):设置中心四字段回填(15/80/85/0)与保存载荷
+  (磁盘改 75 实测采集)、通知中心 `onAlert` 回填与保存载荷均端到端验证;
+  截图交 judge **PASS**(唯一 minor:alert hint 折行孤字→已收紧文案)

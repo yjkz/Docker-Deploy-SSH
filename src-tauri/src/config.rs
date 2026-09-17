@@ -161,6 +161,11 @@ fn default_term_log_keep_days() -> u32 {
     30
 }
 
+/// 资源阈值默认值:90% 使用率(第二十四批;缺字段的旧 settings.json 按此补齐)。
+fn default_alert_percent() -> u32 {
+    90
+}
+
 /// 邮件(SMTP)通知配置。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmailNotify {
@@ -222,6 +227,11 @@ pub struct NotifyEvents {
     /// 离线→恢复」翻转时发,不做每轮轰炸
     #[serde(default)]
     pub on_probe: bool,
+    /// 服务器资源超阈值时通知(第二十四批;默认关)—— 磁盘/内存/CPU 连续
+    /// 2 轮超阈才发(防瞬态尖峰),恢复后单次回落到阈值下即发「已恢复」;
+    /// 阈值与采样间隔在设置中心配(`alert_*` 系列字段)
+    #[serde(default)]
+    pub on_alert: bool,
 }
 
 impl Default for NotifyEvents {
@@ -231,6 +241,7 @@ impl Default for NotifyEvents {
             on_failure: true,
             on_cancel: false,
             on_probe: false,
+            on_alert: false,
         }
     }
 }
@@ -641,6 +652,20 @@ pub struct AppSettings {
     /// 越界值在读侧夹取(见 `manage_exec::TERM_LOG_KEEP_DAYS_MAX`)。
     #[serde(default = "default_term_log_keep_days")]
     pub term_log_keep_days: u32,
+    /// 资源阈值告警采样间隔分钟(第二十四批;`0` = 关闭,默认关;>0 时每 N
+    /// 分钟逐台 SSH 采样磁盘/内存/CPU,超阈经通知中心分发;与探活任务独立)
+    #[serde(default)]
+    pub alert_interval_mins: u32,
+    /// 磁盘使用率阈值(百分比,默认 90;`0` = 该项不告警)—— 根分区与
+    /// Docker 数据盘取两者较差值判定
+    #[serde(default = "default_alert_percent")]
+    pub alert_disk_percent: u32,
+    /// 内存使用率阈值(百分比,默认 90;`0` = 该项不告警)
+    #[serde(default = "default_alert_percent")]
+    pub alert_mem_percent: u32,
+    /// CPU 占用阈值(百分比,默认 90;`0` = 该项不告警)
+    #[serde(default = "default_alert_percent")]
+    pub alert_cpu_percent: u32,
 }
 
 /// `AppSettings::default` 的手写实现:`auto_update_from_source` 缺省为 **true**
@@ -654,6 +679,10 @@ impl Default for AppSettings {
             probe_interval_mins: 0,
             auto_check_update: true,
             term_log_keep_days: default_term_log_keep_days(),
+            alert_interval_mins: 0,
+            alert_disk_percent: default_alert_percent(),
+            alert_mem_percent: default_alert_percent(),
+            alert_cpu_percent: default_alert_percent(),
         }
     }
 }
@@ -715,6 +744,8 @@ pub fn app_settings_get() -> AppSettings {
 pub fn app_settings_set(app: tauri::AppHandle, settings: AppSettings) -> std::result::Result<(), String> {
     save_app_settings(&settings).map_err(|e| format!("保存设置失败: {}", e))?;
     crate::probe::sync_from_settings(&app);
+    // 资源阈值告警(第二十四批):保存即按新设置启停(同探活口径)
+    crate::probe::sync_alert_from_settings(&app);
     Ok(())
 }
 
@@ -1030,6 +1061,7 @@ mod tests {
             on_failure: true,
             on_cancel: true,
             on_probe: false,
+            on_alert: true,
         };
         std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
         save_config(&cfg).unwrap();
@@ -1177,6 +1209,10 @@ mod tests {
             probe_interval_mins: 5,
             auto_check_update: true,
             term_log_keep_days: 90,
+            alert_interval_mins: 15,
+            alert_disk_percent: 80,
+            alert_mem_percent: 85,
+            alert_cpu_percent: 0,
         };
         save_app_settings(&settings).unwrap();
         assert!(dir.join("config/settings.json").exists());
@@ -1224,6 +1260,10 @@ mod tests {
             probe_interval_mins: 0,
             auto_check_update: true,
             term_log_keep_days: 30,
+            alert_interval_mins: 0,
+            alert_disk_percent: 90,
+            alert_mem_percent: 90,
+            alert_cpu_percent: 90,
         };
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains("\"closeToTray\":true"));
@@ -1239,6 +1279,11 @@ mod tests {
         // 旧配置无 termLogKeepDays → 默认 30(第二十三批)
         assert_eq!(partial.term_log_keep_days, 30);
         assert_eq!(AppSettings::default().term_log_keep_days, 30);
+        // 旧配置无 alert 系列 → 间隔 0(关)/ 阈值 90(第二十四批)
+        assert_eq!(partial.alert_interval_mins, 0);
+        assert_eq!(partial.alert_disk_percent, 90);
+        assert_eq!(partial.alert_mem_percent, 90);
+        assert_eq!(partial.alert_cpu_percent, 90);
     }
 
     // ===== 部署断点续传(阶段六):键构造 / roundtrip / 覆盖 / 删除 / 裁剪 / 容错 =====

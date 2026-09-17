@@ -178,12 +178,13 @@
         from: String(email.from || ''),
         to: Array.isArray(email.to) ? email.to.map(String) : []
       },
-      // 事件订阅缺省口径与后端一致:成功/失败默认开,取消/探活默认关
+      // 事件订阅缺省口径与后端一致:成功/失败默认开,取消/探活/告警默认关
       events: {
         onSuccess: events.onSuccess !== false,
         onFailure: events.onFailure !== false,
         onCancel: events.onCancel === true,
-        onProbe: events.onProbe === true
+        onProbe: events.onProbe === true,
+        onAlert: events.onAlert === true
       },
       // 成功通知最小耗时(秒;0 = 恒通知;上限 3600 与后端夹取一致)
       minDurationSecs: Math.max(0, Math.min(3600, Number(out.minDurationSecs) || 0))
@@ -312,6 +313,8 @@
     body.appendChild(checkboxRow('notify-event-cancel', '部署取消', false));
     // 探活翻转(第十七批):服务器在线→离线 / 离线→恢复时提醒(间隔在设置中心配)
     body.appendChild(checkboxRow('notify-event-probe', '服务器探活状态翻转', false));
+    // 资源阈值告警(第二十四批):磁盘/内存/CPU 超阈时提醒(采样与阈值在设置中心配)
+    body.appendChild(checkboxRow('notify-event-alert', '资源阈值告警', false));
     // 成功通知最小耗时(第二十批阶段五):0 = 恒通知;成功且耗时不足阈值时
     // 跳过通知(夜间批量的短平快成功不轰炸),失败/取消恒通知
     appendField(body, '成功通知最小耗时(秒)', 'MIN DURATION', 'notify-min-duration', 'number', '0',
@@ -443,6 +446,7 @@
     setChecked('notify-event-failure', c.events.onFailure);
     setChecked('notify-event-cancel', c.events.onCancel);
     setChecked('notify-event-probe', c.events.onProbe);
+    setChecked('notify-event-alert', c.events.onAlert);
   }
 
   // ===== 收集与校验(保存 / 测试邮件共用)=====
@@ -508,7 +512,8 @@
         onSuccess: isChecked('notify-event-success'),
         onFailure: isChecked('notify-event-failure'),
         onCancel: isChecked('notify-event-cancel'),
-        onProbe: isChecked('notify-event-probe')
+        onProbe: isChecked('notify-event-probe'),
+        onAlert: isChecked('notify-event-alert')
       },
       // 成功通知最小耗时(秒;空/非法按 0 = 恒通知;上限 3600 与后端夹取一致)
       minDurationSecs: Math.max(0, Math.min(3600, Math.floor(Number(fieldVal('notify-min-duration')) || 0)))

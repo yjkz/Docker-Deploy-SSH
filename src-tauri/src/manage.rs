@@ -469,7 +469,7 @@ pub(crate) fn host_metrics_cmd() -> String {
 
 /// [`host_metrics_cmd`] 的解析产出。
 #[derive(Debug, Default, PartialEq)]
-struct HostMetrics {
+pub(crate) struct HostMetrics {
     /// 两次 /proc/stat 采样差分的 CPU 占用(0-100,一位小数)
     cpu_percent: Option<f64>,
     /// 逻辑核心数(nproc)
@@ -488,14 +488,14 @@ struct HostMetrics {
 
 /// `df -kP` 单行解析样本(1024-blocks 口径)。
 #[derive(Debug, Default, PartialEq)]
-struct DfSample {
+pub(crate) struct DfSample {
     total_kb: u64,
     used_kb: u64,
     mount: String,
 }
 
 /// 解析宿主机性能采样输出(纯函数,便于单测)。
-fn parse_host_metrics(out: &str) -> HostMetrics {
+pub(crate) fn parse_host_metrics(out: &str) -> HostMetrics {
     let mut m = HostMetrics::default();
     const S_NONE: u8 = 0;
     const S_CPU1: u8 = 1;
@@ -623,11 +623,44 @@ fn split_df_line(line: &str) -> Option<DfSample> {
 }
 
 /// 磁盘占用百分比(四舍五入整数;total 为 0 → None)。纯函数便于单测。
-fn disk_percent(used_kb: u64, total_kb: u64) -> Option<u64> {
+pub(crate) fn disk_percent(used_kb: u64, total_kb: u64) -> Option<u64> {
     if total_kb == 0 {
         return None;
     }
     Some(((used_kb as f64) / (total_kb as f64) * 100.0).round() as u64)
+}
+
+/// 宿主机指标 → 告警判定用的百分比三元组(第二十四批,probe 告警任务复用;
+/// 采样解析细节不外泄,字段保持模块私有)。
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct HostPercent {
+    /// CPU 占用(0-100,一位小数)
+    pub(crate) cpu: Option<f64>,
+    /// 内存使用率(0-100,整数)
+    pub(crate) mem: Option<u64>,
+    /// 磁盘使用率(0-100,整数)—— 根分区与 Docker 数据盘取较高者
+    pub(crate) disk: Option<u64>,
+}
+
+/// 由 [`parse_host_metrics`] 的产出折算百分比三元组(纯函数,便于单测)。
+/// 任一维度采样缺失(如 /proc 不可读)则该维度为 None(不参与告警判定)。
+pub(crate) fn host_percent_of(m: &HostMetrics) -> HostPercent {
+    let mem = match (m.mem_used, m.mem_total) {
+        (Some(used), Some(total)) if total > 0 => {
+            Some(((used as f64) / (total as f64) * 100.0).round() as u64)
+        }
+        _ => None,
+    };
+    let disk = [m.root_disk.as_ref(), m.docker_disk.as_ref()]
+        .into_iter()
+        .flatten()
+        .filter_map(|d| disk_percent(d.used_kb, d.total_kb))
+        .max();
+    HostPercent {
+        cpu: m.cpu_percent,
+        mem,
+        disk,
+    }
 }
 
 /// 用两次 /proc/stat `cpu ` 汇总行差分计算 CPU 占用百分比(纯函数,便于单测)。
