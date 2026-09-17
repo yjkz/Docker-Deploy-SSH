@@ -340,13 +340,16 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 - 设置中心「通用」区新增数字输入 + hint;前端同口径夹取(负值会整单拒绝)
 - 测试 364 → **369**(+6);桩验证 5 组载荷断言 + 亮暗双主题 11 项计算样式
   比对,judge 3 图 PASS
+- **批次收尾(本批为后完成方)**:S1+S2 合并基线 **370 passed**;三处版本号
+  bump **v6.5.0** + wiki/README + 七篇页首戳 + doc-consistency 采集
 
 ---
 
 ## 当前状态速览
 
-- 版本 **v6.4.1**;main = origin/main;基线 `cargo test` **363 passed** / 13 ignored
+- 版本 **v6.5.0**;main = origin/main;基线 `cargo test` **370 passed** / 13 ignored
 - 命令 **106** 个(generate_handler 实测;第二十二批 +3 调度 +2 配置历史)
+- **第二十三批(2026-09-17,双会话并行首发)已完成**:S1 细节补正 7 项 + S2 终端日志保留(时间制);批次收尾由 S2 统一执行(版本 v6.5.0)
 - **第二十二批(v6.4.0)第三梯队三项全完成**:定时部署 / 终端多标签+广播+落盘 / 配置版本历史;文档治理批完成(contract-smoke 上线);**补丁 v6.4.1**:终端多标签可达性修复(「＋新标签」下拉);**遗留待真机验证 8 项全部确认 ✅(2026-09-16),清单清空**
 - verify/ 六脚本:form-validation / bridge-integrity / scope-integrity / contract-smoke / doc-consistency / VERSION.txt(缓存)
 - JS **16** 文件(含 theme-init.js;index.html 加载顺序见 wiki/03:13)

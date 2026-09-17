@@ -2625,8 +2625,8 @@ migrate_project.rs:兜底命中入列带标记与识别说明 / 显式声明无�
 - 新增 6 单测(manage_exec):过期/未过期分界(恰等分界保留)、keep=0 全跳过、
   非 term 文件(app.log 等)跳过、坏名跳过(1月32日/13月/25时/缺段/空时间戳/
   空容器名 + 连字符容器名合法)、越界夹取(99999 天不 panic 且夹后仍生效)、
-  目录不存在 + 真实目录只删过期(端到端):**369 passed / 13 ignored**
-  (基线 363 + 6);先 RED(5 失败:桩返回空)后 GREEN。
+  目录不存在 + 真实目录只删过期(端到端):合入 main 后 **370 passed / 13 ignored**
+  (S1 的 364 + 本批 6);先 RED(5 失败:桩返回空)后 GREEN。
 - `cargo clippy --all-targets` 与 main 基线 **20 条警告逐条一致,零新增**。
 - `node --check ui/settings.js`(全 16 JS 通过)+ verify 四脚本全 PASS。
 - **桩验证(8798,no-cache 服务)**:设置中心新字段渲染正确,与相邻 PROBE 行
