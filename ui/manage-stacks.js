@@ -53,6 +53,13 @@
     var mstop = $('monitor-stop-btn');
     if (mstop) mstop.addEventListener('click', function () { monitorStop(false); });
 
+    // 第二十四批三:栈筛选输入(变更即重渲染,零请求;IME 组合态过滤)
+    var sf = $('manage-stack-filter');
+    if (sf) sf.addEventListener('input', function (e) {
+      if (e.isComposing || e.keyCode === 229) return;
+      refreshVisibleStacks();
+    });
+
     // 阶段五:终端尺寸自适应 —— window resize 防抖同步(全程仅注册一次;
     // 回调内部对会话判空,无终端会话时直接返回,不随模态反复注册)
     window.addEventListener('resize', scheduleTermResize);
@@ -103,6 +110,20 @@
       if (emptyRow) emptyRow.remove();
     }
 
+    // 第二十四批三:筛选只影响渲染(收尾 cState.stacks 仍赋全量)
+    var full = list;
+    var kw = stacksFilterKw();
+    if (kw) {
+      list = list.filter(function (st) {
+        return ((st.dir || '') + ' ' + (st.compose_file || '')).toLowerCase().indexOf(kw) !== -1;
+      });
+      if (list.length === 0) {
+        tbody.innerHTML = '<tr><td class="empty-cell" colspan="3">无匹配的栈</td></tr>';
+        cState.stacks = full;
+        return;
+      }
+    }
+
     // 按 compose_file 做行差异更新(同 B 阶段卷/网络模式)
     var rowMap = {};
     var rows = tbody.querySelectorAll('tr[data-skid]');
@@ -128,7 +149,21 @@
       if (!seen[k]) rowMap[k].remove();
     }
     tbody.appendChild(frag);
-    cState.stacks = list;
+    cState.stacks = full;
+  }
+
+  /** 栈筛选关键字(读输入框当前值,小写;第二十四批三) */
+  function stacksFilterKw() {
+    var el = $('manage-stack-filter');
+    return el ? String(el.value || '').trim().toLowerCase() : '';
+  }
+
+  /** 宿主筛选输入变更时重渲染栈列表(全量数据,零请求;第二十四批三) */
+  function refreshVisibleStacks() {
+    var tb = $('manage-stacks-tbody');
+    if (!tb) return;
+    if (cState.stacks.length === 0 && !state.serverId) return;
+    renderStacks(cState.stacks);
   }
 
   function updateStackRow(tr, st) {
@@ -1639,5 +1674,5 @@
     return bar;
   }
 
-  window.ManageStacks = { buildFollowToggle: buildFollowToggle, execOnModalClose: execOnModalClose, monitorStop: monitorStop, onLeaveC: onLeaveC, openTerminal: openTerminal, refreshStacks: refreshStacks, stopExecSession: stopExecSession };
+  window.ManageStacks = { buildFollowToggle: buildFollowToggle, execOnModalClose: execOnModalClose, monitorStop: monitorStop, onLeaveC: onLeaveC, openTerminal: openTerminal, refreshStacks: refreshStacks, refreshVisibleStacks: refreshVisibleStacks, stopExecSession: stopExecSession };
 })();

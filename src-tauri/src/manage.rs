@@ -759,6 +759,9 @@ pub async fn manage_container_action(
     password_plain: Option<String>,
     container_id: String,
     action: String,
+    // 仅 action="rename" 时使用(第二十四批三):新容器名,须经
+    // validate_container_name 校验后入命令;其余 action 为 None
+    new_name: Option<String>,
 ) -> Result<ActionResult, String> {
     let docker_cmd = match action.as_str() {
         "start" => format!("docker start {}", shell_quote(&container_id)),
@@ -766,6 +769,18 @@ pub async fn manage_container_action(
         "restart" => format!("docker restart {}", shell_quote(&container_id)),
         // 删除运行中容器用 docker rm -f(对已停止容器同样有效)
         "rm" => format!("docker rm -f {}", shell_quote(&container_id)),
+        // 第二十四批三(容器批量操作):暂停 / 恢复 / 改名
+        "pause" => format!("docker pause {}", shell_quote(&container_id)),
+        "unpause" => format!("docker unpause {}", shell_quote(&container_id)),
+        "rename" => {
+            let new = new_name.as_deref().unwrap_or("");
+            validate_container_name(new)?;
+            format!(
+                "docker rename {} {}",
+                shell_quote(&container_id),
+                shell_quote(new.trim())
+            )
+        }
         other => return Err(format!("不支持的容器操作: {}", other)),
     };
     let (_server, mut client) = connect_server(&server_id, password_plain.as_deref()).await?;
@@ -776,6 +791,33 @@ pub async fn manage_container_action(
         exec_action(&mut client, &docker_cmd),
     )
     .await
+}
+
+/// 校验容器名(rename 用;第二十四批三,纯函数便于单测)。
+///
+/// 规则与 Docker 容器名约束一致:非空、≤128 字符,首字符为字母或数字,
+/// 其余允许 `[a-zA-Z0-9_.-]`。**先于 shell_quote 校验** —— 非法字符直接
+/// 拒绝,不进入命令拼装(双保险:即便绕过此处,shell_quote 仍单引号包裹)。
+pub(crate) fn validate_container_name(name: &str) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("容器名不能为空".to_string());
+    }
+    if name.len() > 128 {
+        return Err("容器名过长(上限 128 字符)".to_string());
+    }
+    let mut chars = name.chars();
+    let first = chars.next().unwrap_or(' ');
+    if !first.is_ascii_alphanumeric() {
+        return Err("容器名首字符须为字母或数字".to_string());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+    {
+        return Err("容器名仅允许字母、数字、下划线、点与连字符".to_string());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1245,6 +1287,30 @@ pub async fn manage_network_disconnect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ===== 容器名校验(第二十四批三,rename)=====
+
+    #[test]
+    fn test_validate_container_name() {
+        // 合法:字母/数字开头,含 _ . -
+        assert!(validate_container_name("web-1").is_ok());
+        assert!(validate_container_name("shop_api.v2").is_ok());
+        assert!(validate_container_name("A1").is_ok());
+        assert!(validate_container_name("  padded  ").is_ok(), "首尾空白应被 trim");
+        // 非法:空 / 超长 / 首字符非字母数字 / 含非法字符
+        assert!(validate_container_name("").is_err());
+        assert!(validate_container_name("   ").is_err());
+        assert!(validate_container_name(&"a".repeat(129)).is_err());
+        assert!(validate_container_name(&"a".repeat(128)).is_ok());
+        assert!(validate_container_name("-lead").is_err());
+        assert!(validate_container_name("_lead").is_err());
+        assert!(validate_container_name("has space").is_err());
+        assert!(validate_container_name("semi;colon").is_err());
+        assert!(validate_container_name("dollar$").is_err());
+        assert!(validate_container_name("中文名").is_err());
+        // 注入形状(即便被拒,shell_quote 亦是双保险)
+        assert!(validate_container_name("a'; rm -rf /; '").is_err());
+    }
 
     #[test]
     fn test_cpu_percent_between() {

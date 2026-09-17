@@ -561,10 +561,24 @@
 
         <!-- 容器列表面板(隐藏语义沿用 .hidden 类 = display:none,已从无障碍树移除,不再叠加 aria-hidden) -->
         <div id="manage-containers-panel" class="manage-tab-panel" role="tabpanel" aria-label="容器">
+          <div class="manage-pull-bar">
+            <input id="manage-container-filter" class="text-input manage-pull-input" type="search" placeholder="筛选:名称 / 镜像 / 状态" autocomplete="off" aria-label="筛选容器">
+          </div>
+          <div id="manage-batch-bar" class="manage-batch-bar hidden">
+            <span class="manage-batch-count" id="manage-batch-count">已选 0 个</span>
+            <button id="manage-batch-start" class="btn btn-sm btn-primary" type="button">启动</button>
+            <button id="manage-batch-stop" class="btn btn-sm" type="button">停止</button>
+            <button id="manage-batch-restart" class="btn btn-sm" type="button">重启</button>
+            <button id="manage-batch-pause" class="btn btn-sm" type="button">暂停</button>
+            <button id="manage-batch-unpause" class="btn btn-sm" type="button">恢复</button>
+            <button id="manage-batch-rename" class="btn btn-sm" type="button">改名</button>
+            <button id="manage-batch-clear" class="btn btn-sm" type="button">清除选择</button>
+          </div>
           <div class="table-wrap">
             <table class="data-table manage-table">
               <thead>
                 <tr>
+                  <th scope="col" class="col-pick"><input type="checkbox" id="manage-pick-all" title="全选当前筛选结果" aria-label="全选当前筛选结果"></th>
                   <th scope="col">状态 STATE</th>
                   <th scope="col">名称 NAME</th>
                   <th scope="col">镜像 IMAGE</th>
@@ -574,7 +588,7 @@
                 </tr>
               </thead>
               <tbody id="manage-containers-tbody">
-                <tr><td class="empty-cell" colspan="6">选择服务器后加载</td></tr>
+                <tr><td class="empty-cell" colspan="7">选择服务器后加载</td></tr>
               </tbody>
             </table>
           </div>
@@ -586,6 +600,7 @@
             <input id="manage-pull-input" class="text-input manage-pull-input" type="text" placeholder="输入镜像名，如 nginx:latest" autocomplete="off">
             <button id="manage-pull-btn" class="btn btn-primary btn-sm" type="button">拉取镜像</button>
             <button id="manage-migrate-btn" class="btn btn-sm" type="button">迁移镜像</button>
+            <input id="manage-image-filter" class="text-input manage-filter-input" type="search" placeholder="筛选:仓库 / 标签" autocomplete="off" aria-label="筛选镜像">
           </div>
           <div class="table-wrap">
             <table class="data-table manage-table">
@@ -610,6 +625,7 @@
         <div id="manage-volumes-panel" class="manage-tab-panel hidden" role="tabpanel" aria-label="卷">
           <div class="manage-pull-bar">
             <button id="manage-volume-create-btn" class="btn btn-primary btn-sm" type="button">创建卷</button>
+            <input id="manage-volume-filter" class="text-input manage-filter-input" type="search" placeholder="筛选:名称 / 驱动 / 挂载点" autocomplete="off" aria-label="筛选卷">
           </div>
           <div class="table-wrap">
             <table class="data-table manage-table">
@@ -633,6 +649,7 @@
         <div id="manage-networks-panel" class="manage-tab-panel hidden" role="tabpanel" aria-label="网络">
           <div class="manage-pull-bar">
             <button id="manage-network-create-btn" class="btn btn-primary btn-sm" type="button">创建网络</button>
+            <input id="manage-network-filter" class="text-input manage-filter-input" type="search" placeholder="筛选:名称 / 驱动" autocomplete="off" aria-label="筛选网络">
           </div>
           <div class="table-wrap">
             <table class="data-table manage-table">
@@ -656,6 +673,7 @@
         <div id="manage-stacks-panel" class="manage-tab-panel hidden" role="tabpanel" aria-label="栈">
           <div class="manage-pull-bar">
             <button id="manage-stack-refresh-btn" class="btn btn-sm" type="button">刷新栈</button>
+            <input id="manage-stack-filter" class="text-input manage-filter-input" type="search" placeholder="筛选:目录 / 文件" autocomplete="off" aria-label="筛选栈">
             <label class="manage-autorefresh" title="勾选后把 releases/ 归档内的 compose 副本也列入栈列表(默认排除——那是回滚留档,不是可操作栈)">
               <input type="checkbox" id="manage-stacks-archived-toggle">
               <span>显示归档副本</span>

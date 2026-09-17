@@ -2151,6 +2151,41 @@ select.text-input option,
   max-width: 400px;
 }
 
+/* ===== 第二十四批三:各 Tab 筛选输入 / 容器勾选列 / 批量条 ===== */
+/* 筛选输入:各 pull-bar 右端延伸(text-input 同族;search 原生清除钮可保留) */
+.manage-filter-input {
+  flex: 1;
+  max-width: 280px;
+  margin-left: auto;
+}
+/* 勾选列:窄列 + 居中复选框(行 hover 反白时复选框身份色豁免) */
+.manage-table .col-pick {
+  width: 40px;
+  text-align: center;
+  padding-left: 0;
+  padding-right: 0;
+}
+.manage-table th.col-pick input { margin: 0; vertical-align: middle; }
+.data-table tbody tr:hover input[type="checkbox"] { accent-color: var(--ark-paper); }
+/* 批量条:选中 ≥1 时出现(与 pull-bar 同节奏的另一行;hidden 时整体退出布局) */
+.manage-batch-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  background: var(--ark-paper-dim);
+  border: 1px solid var(--ark-line-soft);
+  border-left: 3px solid var(--ark-signal);
+}
+.manage-batch-count {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--ark-ink);
+  margin-right: 4px;
+  white-space: nowrap;
+}
+
 /* ===== 容器行与详情面板 ===== */
 .container-row { cursor: default; }
 .container-name-cell { font-weight: 500; }
@@ -2460,18 +2495,21 @@ select.text-input option,
 }
 
 /* 容器表列宽:状态|名称|镜像|端口|创建时间|操作 */
+/* 第二十四批三:行首插勾选列 → nth-child 顺次 +1 重排(勾选40|状态80|名称140|镜像200|端口210|创建110|操作210) */
 #manage-containers-panel .data-table th:nth-child(1),
-#manage-containers-panel .data-table td:nth-child(1) { width: 80px; }
+#manage-containers-panel .data-table td:nth-child(1) { width: 40px; }
 #manage-containers-panel .data-table th:nth-child(2),
-#manage-containers-panel .data-table td:nth-child(2) { width: 140px; }
+#manage-containers-panel .data-table td:nth-child(2) { width: 80px; }
 #manage-containers-panel .data-table th:nth-child(3),
-#manage-containers-panel .data-table td:nth-child(3) { width: 200px; }
+#manage-containers-panel .data-table td:nth-child(3) { width: 140px; }
 #manage-containers-panel .data-table th:nth-child(4),
-#manage-containers-panel .data-table td:nth-child(4) { width: 210px; }
+#manage-containers-panel .data-table td:nth-child(4) { width: 200px; }
 #manage-containers-panel .data-table th:nth-child(5),
-#manage-containers-panel .data-table td:nth-child(5) { width: 110px; }
+#manage-containers-panel .data-table td:nth-child(5) { width: 210px; }
 #manage-containers-panel .data-table th:nth-child(6),
-#manage-containers-panel .data-table td:nth-child(6) { width: 210px; }
+#manage-containers-panel .data-table td:nth-child(6) { width: 110px; }
+#manage-containers-panel .data-table th:nth-child(7),
+#manage-containers-panel .data-table td:nth-child(7) { width: 210px; }
 
 /* 镜像表列宽:仓库|标签|ID|大小|创建时间|操作 */
 #manage-images-panel .data-table th:nth-child(1),
@@ -2652,19 +2690,21 @@ select.text-input option,
   font-size: 11px;
 }
 
-/* ---- 容器表:状态9 | 名称18 | 镜像23 | 端口18 | 创建时间13 | 操作19 ---- */
+/* ---- 容器表:勾选4 | 状态9 | 名称17 | 镜像22 | 端口17 | 创建时间12 | 操作19 ---- */
 #manage-containers-panel .manage-table th:nth-child(1),
-#manage-containers-panel .manage-table td:nth-child(1) { width: 9%; }
+#manage-containers-panel .manage-table td:nth-child(1) { width: 4%; }
 #manage-containers-panel .manage-table th:nth-child(2),
-#manage-containers-panel .manage-table td:nth-child(2) { width: 18%; }
+#manage-containers-panel .manage-table td:nth-child(2) { width: 9%; }
 #manage-containers-panel .manage-table th:nth-child(3),
-#manage-containers-panel .manage-table td:nth-child(3) { width: 23%; }
+#manage-containers-panel .manage-table td:nth-child(3) { width: 17%; }
 #manage-containers-panel .manage-table th:nth-child(4),
-#manage-containers-panel .manage-table td:nth-child(4) { width: 18%; }
+#manage-containers-panel .manage-table td:nth-child(4) { width: 22%; }
 #manage-containers-panel .manage-table th:nth-child(5),
-#manage-containers-panel .manage-table td:nth-child(5) { width: 13%; }
+#manage-containers-panel .manage-table td:nth-child(5) { width: 17%; }
 #manage-containers-panel .manage-table th:nth-child(6),
-#manage-containers-panel .manage-table td:nth-child(6) { width: 19%; }
+#manage-containers-panel .manage-table td:nth-child(6) { width: 12%; }
+#manage-containers-panel .manage-table th:nth-child(7),
+#manage-containers-panel .manage-table td:nth-child(7) { width: 19%; }
 
 /* ---- 镜像表:仓库32 | 标签13 | ID15 | 大小10 | 创建时间14 | 操作16 ---- */
 #manage-images-panel .manage-table th:nth-child(1),

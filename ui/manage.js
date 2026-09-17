@@ -40,7 +40,14 @@
     containers: [],
     images: [],
     volumes: [],   // B 阶段追加
-    networks: []   // B 阶段追加
+    networks: [],  // B 阶段追加
+    // 各 Tab 筛选关键字(第二十四批三;空串 = 不过滤)。过滤只影响渲染,
+    // 下方四组全量列表保持原语义(终端「＋新标签」/迁移模态等读取点不受影响)
+    filter: { containers: '', images: '', volumes: '', networks: '' },
+    // 容器多选批量(第二十四批三):selected = { containerId: true },
+    // 勾选列常显(无模式开关);选择态存 state 而非 DOM(自动刷新重建行
+    // 后由 updateContainerRow 回填),切服务器整组清空。
+    selected: {}
   };
 
   // ===== DOM 引用(延迟获取,确保 DOM 就绪) =====
@@ -125,6 +132,46 @@
     if (vBtn) vBtn.addEventListener('click', showVolumeCreateModal);
     var nBtn = $('manage-network-create-btn');
     if (nBtn) nBtn.addEventListener('click', showNetworkCreateModal);
+
+    // 第二十四批三:各 Tab 筛选输入(变更即重渲染,零请求;过滤 IME 组合态,
+    // 同 04 页历史搜索先例——中文输入法组合中不触发,避免半成品关键字闪烁)
+    bindFilterInput('manage-container-filter', 'containers');
+    bindFilterInput('manage-image-filter', 'images');
+    bindFilterInput('manage-volume-filter', 'volumes');
+    bindFilterInput('manage-network-filter', 'networks');
+
+    // 第二十四批三:容器批量操作(勾选列常显,无模式开关)
+    var pickAll = $('manage-pick-all');
+    if (pickAll) pickAll.addEventListener('change', function () { togglePickAll(pickAll.checked); });
+    bindBatchAction('manage-batch-start', 'start', '启动');
+    bindBatchAction('manage-batch-stop', 'stop', '停止');
+    bindBatchAction('manage-batch-restart', 'restart', '重启');
+    bindBatchAction('manage-batch-pause', 'pause', '暂停');
+    bindBatchAction('manage-batch-unpause', 'unpause', '恢复');
+    var renameBtn = $('manage-batch-rename');
+    if (renameBtn) renameBtn.addEventListener('click', onBatchRename);
+    var clearBtn = $('manage-batch-clear');
+    if (clearBtn) clearBtn.addEventListener('click', function () { clearSelection(); });
+  }
+
+  /** 筛选输入接线:input 变更即按关键字重渲染该 Tab(IME 组合态过滤) */
+  function bindFilterInput(inputId, tab) {
+    var el = $(inputId);
+    if (!el) return;
+    el.addEventListener('input', function (e) {
+      if (e.isComposing || e.keyCode === 229) return;
+      state.filter[tab] = String(el.value || '').trim().toLowerCase();
+      rerenderTab(tab);
+    });
+  }
+
+  /** 按 Tab 名用当前全量列表重渲染(过滤生效,零网络请求) */
+  function rerenderTab(tab) {
+    if (tab === 'containers') renderContainers(state.containers);
+    else if (tab === 'images') renderImages(state.images);
+    else if (tab === 'volumes') renderVolumes(state.volumes);
+    else if (tab === 'networks') renderNetworks(state.networks);
+    else if (tab === 'stacks') window.ManageStacks.refreshVisibleStacks();
   }
 
   function restorePrefs() {
@@ -228,6 +275,8 @@
     state.expanded = {};
     state.expandedPorts = {};
     state.inspectCache = {};
+    // 第二十四批三:批量选择随之清空(新服务器容器集完全不同)
+    state.selected = {};
     hideError();
     if (state.serverId) setTablePlaceholdersLoading();
     refreshAll();
@@ -523,10 +572,23 @@
     }
 
     if (list.length === 0) {
-      tbody.innerHTML = '<tr><td class="empty-cell" colspan="6">暂无容器</td></tr>';
+      tbody.innerHTML = '<tr><td class="empty-cell" colspan="7">暂无容器</td></tr>';
       state.containers = [];
+      renderBatchBar();
       return;
     }
+
+    // 第二十四批三:筛选只影响渲染(收尾 state.containers 仍赋全量;
+    // 「＋新标签」下拉等读取点不受影响);空态区分「无匹配」与「暂无数据」
+    var fullList = list;
+    var visible = list.filter(containerMatchesFilter);
+    if (visible.length === 0) {
+      tbody.innerHTML = '<tr><td class="empty-cell" colspan="7">无匹配的容器</td></tr>';
+      state.containers = list;
+      renderBatchBar();
+      return;
+    }
+    list = visible;
 
     // 索引现有数据行
     var rowMap = {};
@@ -537,6 +599,7 @@
 
     var seen = {};
     var frag = document.createDocumentFragment();
+    var needInspect = []; // 新造详情行待载(见上方注释)
 
     for (var j = 0; j < list.length; j++) {
       var c = list[j];
@@ -549,12 +612,14 @@
       }
       frag.appendChild(row);
 
-      // 详情行(inspect 折叠面板)
+      // 详情行(inspect 折叠面板);新建行登记待载(append 后统一 loadInspect,
+      // 覆盖「筛掉又恢复」路径的缓存重放)
       var detailSel = 'tr[data-cid-detail="' + c.id + '"]';
       var detailRow = tbody.querySelector(detailSel);
       if (state.expanded[c.id]) {
         if (!detailRow) {
           detailRow = createDetailRow(c.id);
+          needInspect.push(c.id);
         }
         frag.appendChild(detailRow);
       } else if (detailRow) {
@@ -562,20 +627,30 @@
       }
     }
 
-    // 移除已不存在的容器行
+    // 移除行:区分「真正消失」(清 expanded/cache)与「仅被筛掉」(只移 DOM,
+    // 保住展开态与 inspect 缓存 —— 筛选清除后恢复展开,第二十四批三)
+    var alive = {};
+    for (var m = 0; m < fullList.length; m++) alive[fullList[m].id] = true;
     for (var id in rowMap) {
       if (!seen[id]) {
         rowMap[id].remove();
         var d = tbody.querySelector('tr[data-cid-detail="' + id + '"]');
         if (d) d.remove();
-        delete state.expanded[id];
-        delete state.expandedPorts[id];
-        delete state.inspectCache[id];
+        if (!alive[id]) {
+          delete state.expanded[id];
+          delete state.expandedPorts[id];
+          delete state.inspectCache[id];
+        }
       }
     }
 
     tbody.appendChild(frag);
-    state.containers = list;
+    state.containers = fullList;
+    // 第二十四批三:容器已不存在的选中项清理 + 批量条/全选复位
+    pruneSelection(fullList);
+    renderBatchBar();
+    // 新造详情行补载(缓存命中即渲染,未命中走请求;append 后行已在 DOM)
+    for (var ni = 0; ni < needInspect.length; ni++) loadInspect(needInspect[ni]);
   }
 
   function createContainerRow(c) {
@@ -591,6 +666,22 @@
     var actions = containerActionButtons(c);
 
     tr.innerHTML = '';
+    // 勾选单元格(第二十四批三;常显)。勾选态存 state.selected,
+    // 行重建后按 state 回填 —— 自动刷新重建行不丢勾选。
+    var tdPick = document.createElement('td');
+    tdPick.className = 'col-pick';
+    var pick = document.createElement('input');
+    pick.type = 'checkbox';
+    pick.checked = !!state.selected[c.id];
+    pick.title = '选择容器';
+    pick.setAttribute('aria-label', '选择容器 ' + (c.names || c.id));
+    pick.addEventListener('change', function () {
+      if (pick.checked) state.selected[c.id] = true;
+      else delete state.selected[c.id];
+      renderBatchBar();
+    });
+    tdPick.appendChild(pick);
+    tr.appendChild(tdPick);
     // 状态
     var tdState = document.createElement('td');
     tdState.appendChild(stateBadge);
@@ -768,13 +859,250 @@
     }, null, risk));
   }
 
+  // ===== 第二十四批三:容器筛选 + 多选批量 =====
+
+  /** 容器筛选谓词(不区分大小写子串;名称/镜像/状态三字段;空关键字恒真) */
+  function containerMatchesFilter(c) {
+    var kw = state.filter.containers;
+    if (!kw) return true;
+    var hay = [(c.names || ''), (c.image || ''), (c.state || '')].join(' ').toLowerCase();
+    return hay.indexOf(kw) !== -1;
+  }
+
+  /** 当前「筛选后可见」的容器列表(批量执行与全选均以其为范围) */
+  function visibleContainers() {
+    return state.containers.filter(containerMatchesFilter);
+  }
+
+  /** 选中项清理:容器已不存在于最新全量列表时移除(切服务器时另有整组清空) */
+  function pruneSelection(list) {
+    var alive = {};
+    for (var i = 0; i < list.length; i++) alive[list[i].id] = true;
+    for (var id in state.selected) {
+      if (!alive[id]) delete state.selected[id];
+    }
+  }
+
+  function selectedIds() {
+    return Object.keys(state.selected);
+  }
+
+  function clearSelection() {
+    state.selected = {};
+    // 行内勾选框状态同步(DOM 重建成本低,直接对可见行复位)
+    var boxes = document.querySelectorAll('#manage-containers-tbody input[type=checkbox]');
+    for (var i = 0; i < boxes.length; i++) boxes[i].checked = false;
+    renderBatchBar();
+  }
+
+  /** 批量条渲染:计数 + 全选框三态(未选/部分/全选);无选中时隐藏操作按钮行 */
+  function renderBatchBar() {
+    var bar = $('manage-batch-bar');
+    var countEl = $('manage-batch-count');
+    var pickAll = $('manage-pick-all');
+    if (!bar) return;
+    var n = selectedIds().length;
+    if (n === 0) {
+      bar.classList.add('hidden');
+    } else {
+      bar.classList.remove('hidden');
+    }
+    if (countEl) countEl.textContent = '已选 ' + n + ' 个';
+    // 全选框三态:可见项全选 = checked;部分 = indeterminate
+    if (pickAll) {
+      var vis = visibleContainers();
+      var selectedVisible = 0;
+      for (var i = 0; i < vis.length; i++) {
+        if (state.selected[vis[i].id]) selectedVisible++;
+      }
+      pickAll.checked = vis.length > 0 && selectedVisible === vis.length;
+      pickAll.indeterminate = selectedVisible > 0 && selectedVisible < vis.length;
+    }
+  }
+
+  /** 全选/取消全选(范围 = 当前筛选后可见项;隐藏未选中行不受影响) */
+  function togglePickAll(checked) {
+    var vis = visibleContainers();
+    for (var i = 0; i < vis.length; i++) {
+      if (checked) state.selected[vis[i].id] = true;
+      else delete state.selected[vis[i].id];
+    }
+    // 可见行勾选框同步
+    for (var j = 0; j < vis.length; j++) {
+      var row = document.querySelector('tr[data-cid="' + vis[j].id + '"]');
+      if (row) {
+        var box = row.querySelector('.col-pick input');
+        if (box) box.checked = !!state.selected[vis[j].id];
+      }
+    }
+    renderBatchBar();
+  }
+
+  /** 批量条动作按钮接线(执行循环共用,见 runBatchAction) */
+  function bindBatchAction(btnId, action, label) {
+    var btn = $(btnId);
+    if (!btn) return;
+    btn.addEventListener('click', function () { runBatchAction(action, label); });
+  }
+
+  /**
+   * 批量执行:对选中容器**串行**逐台调用 manage_container_action(与部署
+   * 批量的串行纪律一致;避免瞬时并发连发 SSH 会话风暴),完成后一次刷新。
+   * 结果 toast 汇总:全部成功 / 部分失败列出失败容器名(最多 5 个)。
+   */
+  function runBatchAction(action, label) {
+    if (!state.serverId) return;
+    var ids = selectedIds();
+    if (ids.length === 0) return;
+    if (state.opInProgress) { toast('已有操作进行中,请稍候', 'warn'); return; }
+    state.opInProgress = true;
+    stopTimer();
+    setBatchBusy(true);
+    var nameOf = {};
+    for (var i = 0; i < state.containers.length; i++) {
+      nameOf[state.containers[i].id] = state.containers[i].names || state.containers[i].id;
+    }
+    var failed = [];
+    var done = 0;
+    var total = ids.length;
+    var next = function () {
+      if (done >= total) {
+        state.opInProgress = false;
+        setBatchBusy(false);
+        if (failed.length === 0) {
+          toast('批量' + label + '成功(' + total + ' 个)', 'ok');
+        } else {
+          var shown = failed.slice(0, 5).join('、');
+          var more = failed.length > 5 ? ' 等 ' + failed.length + ' 个' : '';
+          toast('批量' + label + '完成:成功 ' + (total - failed.length) + ' 个,失败:' + shown + more, 'fail');
+        }
+        clearSelection();
+        refreshContainers();
+        refreshOverview();
+        startTimerIfEnabled();
+        return;
+      }
+      var cid = ids[done];
+      done++;
+      AppBus.invoke('manage_container_action', {
+        serverId: state.serverId,
+        containerId: cid,
+        action: action
+      }).then(function (res) {
+        if (!res || res.success !== true) {
+          failed.push(nameOf[cid] || cid);
+        }
+        next();
+      }).catch(function () {
+        failed.push(nameOf[cid] || cid);
+        next();
+      });
+    };
+    next();
+  }
+
+  /** 批量执行期禁用批量条按钮与勾选框(防中途改选/连点) */
+  function setBatchBusy(busy) {
+    var bar = $('manage-batch-bar');
+    if (bar) {
+      var btns = bar.querySelectorAll('button');
+      for (var i = 0; i < btns.length; i++) btns[i].disabled = busy;
+    }
+    var pickAll = $('manage-pick-all');
+    if (pickAll) pickAll.disabled = busy;
+    var boxes = document.querySelectorAll('#manage-containers-tbody .col-pick input');
+    for (var j = 0; j < boxes.length; j++) boxes[j].disabled = busy;
+  }
+
+  /** 批量改名:仅选中 1 个时可用;模态输入新名 → manage_container_action(rename) */
+  function onBatchRename() {
+    var ids = selectedIds();
+    if (ids.length !== 1) {
+      toast('改名仅支持选中 1 个容器', 'warn');
+      return;
+    }
+    var cid = ids[0];
+    var c = null;
+    for (var i = 0; i < state.containers.length; i++) {
+      if (state.containers[i].id === cid) { c = state.containers[i]; break; }
+    }
+    var oldName = c ? (c.names || cid) : cid;
+
+    var body = document.createElement('div');
+    body.innerHTML =
+      '<div class="form-row">' +
+      '<label class="form-label" for="rename-old">当前名称</label>' +
+      '<input id="rename-old" class="form-input" type="text" value="' + escHtml(oldName) + '" readonly>' +
+      '</div>' +
+      '<div class="form-row">' +
+      '<label class="form-label" for="rename-new">新名称</label>' +
+      '<input id="rename-new" class="form-input" type="text" placeholder="字母或数字开头,可含 _ . -" autocomplete="off">' +
+      '</div>' +
+      '<div class="modal-actions">' +
+      '<button id="rename-confirm-btn" class="btn btn-primary" type="button">确认改名</button>' +
+      '</div>';
+
+    openModal('容器改名', body);
+    var newInput = $('rename-new');
+    if (newInput) {
+      newInput.value = oldName;
+      newInput.focus();
+      newInput.select();
+      newInput.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') doBatchRename(cid, oldName);
+      });
+    }
+    var confirmBtn = $('rename-confirm-btn');
+    if (confirmBtn) confirmBtn.addEventListener('click', function () { doBatchRename(cid, oldName); });
+  }
+
+  function doBatchRename(containerId, oldName) {
+    var input = $('rename-new');
+    if (!input) return;
+    var name = input.value.trim();
+    // 前端预校验(与后端 validate_container_name 同口径;后端仍有权威校验)
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(name)) {
+      window.setFieldError(input, '须字母或数字开头,仅含字母、数字、下划线、点与连字符,长度 1-128');
+      toast('容器名不合法', 'warn');
+      return;
+    }
+    if (name === oldName) {
+      toast('新名称与当前名称相同', 'warn');
+      return;
+    }
+    state.opInProgress = true;
+    stopTimer();
+    AppBus.invoke('manage_container_action', {
+      serverId: state.serverId,
+      containerId: containerId,
+      action: 'rename',
+      newName: name
+    }).then(function (res) {
+      state.opInProgress = false;
+      if (res && res.success) {
+        toast('改名成功:「' + oldName + '」→「' + name + '」', 'ok');
+        closeModal();
+        clearSelection();
+        refreshContainers();
+      } else {
+        toast('改名失败: ' + ((res && res.message) || '未知错误'), 'fail');
+      }
+      startTimerIfEnabled();
+    }).catch(function (err) {
+      state.opInProgress = false;
+      var msg = err && err.message ? err.message : String(err);
+      toast('改名失败: ' + msg, 'fail');
+      startTimerIfEnabled();
+    });
+  }
+
   // ===== 容器详情(inspect) =====
   function createDetailRow(containerId) {
     var tr = document.createElement('tr');
     tr.setAttribute('data-cid-detail', containerId);
     tr.className = 'container-detail-row';
     var td = document.createElement('td');
-    td.colSpan = 6;
+    td.colSpan = 7; // 第二十四批三:勾选列 +1
     var panel = document.createElement('div');
     panel.className = 'manage-detail-panel';
     panel.id = 'detail-panel-' + containerId;
@@ -938,6 +1266,20 @@
       return;
     }
 
+    // 第二十四批三:筛选只影响渲染(收尾 state.images 仍赋全量,迁移模态读全量)
+    var full = list;
+    var kwImg = state.filter.images;
+    if (kwImg) {
+      list = list.filter(function (img) {
+        return ((img.repository || '') + ' ' + (img.tag || '')).toLowerCase().indexOf(kwImg) !== -1;
+      });
+      if (list.length === 0) {
+        tbody.innerHTML = '<tr><td class="empty-cell" colspan="6">无匹配的镜像</td></tr>';
+        state.images = full;
+        return;
+      }
+    }
+
     // 移除初始占位行(参照 renderContainers,否则占位行残留在数据行上方)
     var emptyCell = tbody.querySelector('.empty-cell');
     if (emptyCell) {
@@ -973,7 +1315,7 @@
     }
 
     tbody.appendChild(frag);
-    state.images = list;
+    state.images = full;
   }
 
   function createImageRow(img, key) {
@@ -1382,6 +1724,20 @@
       return;
     }
 
+    // 第二十四批三:筛选只影响渲染(收尾 state.volumes 仍赋全量)
+    var full = list;
+    var kwVol = state.filter.volumes;
+    if (kwVol) {
+      list = list.filter(function (v) {
+        return ((v.name || '') + ' ' + (v.driver || '') + ' ' + (v.mountpoint || '')).toLowerCase().indexOf(kwVol) !== -1;
+      });
+      if (list.length === 0) {
+        tbody.innerHTML = '<tr><td class="empty-cell" colspan="5">无匹配的卷</td></tr>';
+        state.volumes = full;
+        return;
+      }
+    }
+
     // 移除初始占位行(参照 renderContainers,否则占位行残留在数据行上方)
     var emptyCell = tbody.querySelector('.empty-cell');
     if (emptyCell) {
@@ -1418,7 +1774,7 @@
     }
 
     tbody.appendChild(frag);
-    state.volumes = list;
+    state.volumes = full;
   }
 
   function updateVolumeRow(tr, v) {
@@ -1594,6 +1950,20 @@
       return;
     }
 
+    // 第二十四批三:筛选只影响渲染(收尾 state.networks 仍赋全量)
+    var full = list;
+    var kwNet = state.filter.networks;
+    if (kwNet) {
+      list = list.filter(function (n) {
+        return ((n.name || '') + ' ' + (n.driver || '')).toLowerCase().indexOf(kwNet) !== -1;
+      });
+      if (list.length === 0) {
+        tbody.innerHTML = '<tr><td class="empty-cell" colspan="5">无匹配的网络</td></tr>';
+        state.networks = full;
+        return;
+      }
+    }
+
     // 移除初始占位行(参照 renderContainers,否则占位行残留在数据行上方)
     var emptyCell = tbody.querySelector('.empty-cell');
     if (emptyCell) {
@@ -1630,7 +2000,7 @@
     }
 
     tbody.appendChild(frag);
-    state.networks = list;
+    state.networks = full;
   }
 
   function updateNetworkRow(tr, n) {
