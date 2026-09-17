@@ -98,16 +98,16 @@ git worktree add -b dev/s2-<topic>  D:/Github-repositories/docker-deploy-ssh-s2 
 4. **验证链各自跑**：`cargo test` 亲眼确认 `test result: ok` → clippy 与基线逐条比对 → 改 JS 跑 `node --check` → verify 四脚本 → UI 改动走「浏览器 + Tauri 桩」截图交 judge。worktree 无需 `node_modules`。
 5. **资源冲突避免**：两会话的本地静态服务用**不同端口**（S1:8799 / S2:8798）；**不要同时跑两个 `npm run tauri dev`**（WebView2 dev 实例会互相抢端口/配置）；cargo target 各自 worktree 独立，首次全量编译慢属正常。
 
-### 当前并行对（2026-09-17 第二批，v6.5.0 后）
+### 当前并行对（2026-09-17 第三批，v6.5.0 后）
 
-| | S1 `dev/s1-resource-alerts`（`docker-deploy-ssh-s1`） | S2 `dev/s2-fleet-diagnose`（`docker-deploy-ssh-s2`） |
+| | S1 `dev/s1-manage-batch`（`docker-deploy-ssh-s1`） | S2 `dev/s2-fleet-diagnose`（`docker-deploy-ssh-s2`，延续中） |
 |---|---|---|
-| 任务 | 资源阈值告警（磁盘/内存/CPU 超阈值 → 通知管道） | 多机巡检汇总（全部服务器一键诊断 + 汇总视图） |
-| 主权文件 | `src-tauri/src/probe.rs`、`src-tauri/src/notify.rs`、`src-tauri/src/config.rs`、`src-tauri/src/manage.rs`（采样复用）、`ui/notify.js`、`ui/settings.js`、`wiki/07`（合入时） | `ui/servers.js`、`ui/style.css`、`src-tauri/src/commands/host_server.rs`（如需要）、`wiki/03`（合入时） |
-| 共享小改 | `wiki/03`（先进者先写，后进者 rebase 解冲突）；`UPGRADE-PLAN.md` 尾部追加自己的批次节；`ROADMAP.md` 各自标记完成行 | 同左 |
-| 冻结 | 版本三件套 / `wiki/README.md` / 七篇页首戳 / `verify/VERSION.txt` / `index.html` / `app.js` / `ui/manage*.js` / `deploy*.js` / `lib.rs` / `wiki/04` | 同左 |
+| 任务 | 05 页各 Tab 搜索筛选 + 容器批量操作（pause/unpause/rename + 多选批量启停） | 多机巡检汇总（继续） |
+| 主权文件 | `ui/manage.js`、`ui/manage-stacks.js`、`ui/index.html`、`ui/style.css`、`src-tauri/src/manage.rs`、`wiki/02`、`wiki/04` | `ui/servers.js`、`src-tauri/src/commands/host_server.rs`（如需要）、`wiki/03`（合入时） |
+| 共享小改 | `wiki/03`（S1 只在合入时碰终端/设置无关的新节；先进者先写，后进者 rebase 解冲突）；`UPGRADE-PLAN.md` 尾部追加自己的批次节；`ROADMAP.md` 各自标记完成行 | 同左 |
+| 冻结 | 版本三件套 / `wiki/README.md` / 七篇页首戳 / `verify/VERSION.txt` / `app.js` / `deploy*.js` / `lib.rs` / `ui/servers*.js` / `ui/settings.js` / `ui/notify.js` | 同左（冻结 `ui/manage*.js` / `ui/index.html` **至 S1 合入**——S2 不得触碰这两个文件） |
 
-**S2 特别约束**：多机巡检**优先纯前端方案**（前端串行调用现有 `server_diagnose` + 汇总视图），**不新增后端命令**——避免触碰 `lib.rs` / `wiki/04` / 契约计数。若确需后端改动，先在汇报中点名原因。
+**冲突注意**：S2 已在 `ui/style.css` 有未提交改动（诊断样式小改）。S1 本批也需改 `ui/style.css`（勾选列/批量条 + 容器表 nth-child 重排）——S1 先合入，S2 rebase 时解冲突（大概率是不同段落，机械合并）；**S2 合入前应确认 style.css 合入顺序**。
 
 ### 使用前检查
 
