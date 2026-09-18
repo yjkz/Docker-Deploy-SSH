@@ -671,6 +671,16 @@ pub struct AppSettings {
     /// 同时保证升级不改变既有行为)。设计与边界见 `auto_rollback` 模块注释。
     #[serde(default)]
     pub auto_rollback_on_failure: bool,
+    /// 自定义 compose 文件名(第二十六批;空列表 = 用内置四标准名)。
+    /// 项目/栈扫描时按此匹配 —— 支持 `docker-compose.prod.yml` 类变体命名。
+    /// **安全**:名字会拼进远端 find 命令,读取侧经
+    /// `compose_scan::normalize_compose_names` 严格校验(仅 [A-Za-z0-9._-],
+    /// 拒绝路径分隔符与 `..`),非法项丢弃、全非法回退默认。
+    #[serde(default)]
+    pub compose_file_names: Vec<String>,
+    /// 扫描最大深度(第二十六批;0/缺省 = 4,夹取 1..=8)。
+    #[serde(default)]
+    pub compose_scan_max_depth: u32,
 }
 
 /// `AppSettings::default` 的手写实现:`auto_update_from_source` 缺省为 **true**
@@ -689,6 +699,8 @@ impl Default for AppSettings {
             alert_mem_percent: default_alert_percent(),
             alert_cpu_percent: default_alert_percent(),
             auto_rollback_on_failure: false,
+            compose_file_names: Vec::new(),
+            compose_scan_max_depth: 0,
         }
     }
 }
@@ -828,6 +840,31 @@ pub fn write_text_file(path: String, content: String) -> std::result::Result<(),
 /// 断点条目上限:超出后按 `ts` 从最旧开始裁剪(防止无限膨胀)。
 /// 裁剪会连带清理被裁条目的本地临时 tar(见 [`trim_checkpoints`])。
 pub(crate) const MAX_CHECKPOINTS: usize = 10;
+
+/// 迁移断点的模式串(第二十六批「迁移断点续传」)。
+///
+/// **为什么复用同一张断点表**:迁移与部署的断点形态一致(阶段 + 产物),
+/// 复用一个机制比发明第二套更不容易出错;隔离靠 `key` 前缀(见
+/// [`migrate_checkpoint_key`])与 `mode` 值,`deploy_resume_status` 的
+/// 「同服务器 + 同项目」查询按 `mode` 过滤,不会把迁移断点当部署断点展示。
+pub(crate) const MODE_MIGRATE: &str = "migrate";
+
+/// 迁移断点键:`migrate|<源服务器>|<目标服务器>|<项目>|<目标目录>`。
+///
+/// 与部署断点键(`server|project|mode`)刻意不同形 —— 迁移的「同一迁移」
+/// 判定要含目标服务器与目标目录(改目标重迁是一次新迁移,不应复用旧断点);
+/// 前缀 `migrate|` 也让两类断点在同一个文件里一眼可辨。
+pub fn migrate_checkpoint_key(
+    source_server_id: &str,
+    target_server_id: &str,
+    project_id: &str,
+    target_dir: &str,
+) -> String {
+    format!(
+        "migrate|{}|{}|{}|{}",
+        source_server_id, target_server_id, project_id, target_dir
+    )
+}
 
 /// 单条部署断点(`resume-deploy.json` 的值,键见 [`checkpoint_key`])。
 ///
@@ -1220,6 +1257,8 @@ mod tests {
             alert_mem_percent: 85,
             alert_cpu_percent: 0,
             auto_rollback_on_failure: true,
+            compose_file_names: vec!["docker-compose.prod.yml".into(), "app.yml".into()],
+            compose_scan_max_depth: 6,
         };
         save_app_settings(&settings).unwrap();
         assert!(dir.join("config/settings.json").exists());
@@ -1272,6 +1311,8 @@ mod tests {
             alert_mem_percent: 90,
             alert_cpu_percent: 90,
             auto_rollback_on_failure: false,
+            compose_file_names: Vec::new(),
+            compose_scan_max_depth: 0,
         };
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains("\"closeToTray\":true"));
@@ -1313,6 +1354,20 @@ mod tests {
             project_name: "项目".into(),
             artifacts: serde_json::json!({ "imageRef": format!("app:20260906-1000{:02}", idx % 60) }),
         }
+    }
+
+    #[test]
+    fn test_migrate_checkpoint_key_shape_and_isolation() {
+        // 迁移键:含源/目标/项目/目标目录,且与部署键不同形(前缀隔离)
+        let k = migrate_checkpoint_key("src-1", "tgt-2", "proj-3", "/opt/app");
+        assert_eq!(k, "migrate|src-1|tgt-2|proj-3|/opt/app");
+        // 换目标服务器/目录 → 不同键(改目标重迁是一次新迁移)
+        assert_ne!(k, migrate_checkpoint_key("src-1", "tgt-9", "proj-3", "/opt/app"));
+        assert_ne!(k, migrate_checkpoint_key("src-1", "tgt-2", "proj-3", "/srv/app"));
+        // 与部署键的形态差异:部署键是 `server|project|mode`,不含 migrate 前缀
+        let deploy_like = format!("{}|{}|{}", "src-1", "proj-3", "stack");
+        assert!(!k.starts_with("src-1|"), "迁移键不得以服务器 id 开头(防被部署查询误命中)");
+        assert_ne!(k, deploy_like);
     }
 
     #[test]

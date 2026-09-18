@@ -50,7 +50,8 @@ use crate::stack::{self, VolumeKind};
 const MIGRATE_TMP_DIR: &str = "/tmp/dd-migrate-project";
 
 /// 单条卷/归档导出的超时(GB 级数据需要余量)。
-const VOLUME_TAR_TIMEOUT_SECS: u64 = 1800;
+/// 卷打包/解包超时(第二十六批起单卷备份复用,故 pub(crate))
+pub(crate) const VOLUME_TAR_TIMEOUT_SECS: u64 = 1800;
 
 /// 卷 tar 的候选镜像:按序探测,首个「存在且含 tar」者胜出。
 /// busybox 约 2MB 且必带 tar;项目自身镜像作为兜底(distroless 除外)。
@@ -98,6 +99,10 @@ pub struct MigrateProjectRequest {
     pub target_remote_dir: Option<String>,
     pub source_password_plain: Option<String>,
     pub target_password_plain: Option<String>,
+    /// 断点续传(第二十六批):true 时按同键断点从 `step_next` 阶段起跳;
+    /// 缺省 false = 全新迁移(会覆盖同键旧断点)
+    #[serde(default)]
+    pub resume: bool,
 }
 
 /// 预检返回的迁移计划(camelCase;只读,前端据此出确认页)。
@@ -781,6 +786,93 @@ async fn run_migrate_project(
     let src_dir = commands::effective_remote_dir(&source, &project);
     let tgt_dir = resolve_target_dir(&project, &target, req.target_remote_dir.as_deref());
 
+    // ---- 迁移断点(第二十六批「迁移断点续传」)----
+    //
+    // 粒度 = **阶段级**(不细到单卷/单镜像):迁移的每个阶段都有天然的幂等性
+    // (目标已有同 ID 镜像会跳过、卷导入先 create 再解包、compose 上传覆盖写、
+    // 归档搬运逐文件覆盖),故「重跑该阶段」比「精确续到半件产物」更稳 ——
+    // 半件产物(尤其中转目录)的生命周期与三处清理策略耦合(见实现风险),
+    // 阶段级重跑把不确定性收敛到「同内容重放」。
+    //
+    // 阶段号(与 resume_step_label 的文案一一对应):
+    //   1 = 卷搬运(停源/导出/上传/导入/恢复源)
+    //   2 = 镜像搬运
+    //   3 = compose 三件套 + 归档搬运
+    //   4 = 目标 compose up
+    //   5 = 收尾(清临时目录 + 改绑 + 写历史)
+    //
+    // **停机不变量**:阶段 1 内部有 stop → export → start 窗口,任何跳出都
+    // 必须先把源恢复运行 —— 断点只在**该阶段整体成功之后**落盘(见下方
+    // checkpoint_mark),不做阶段内断点。
+    let ck_key = config::migrate_checkpoint_key(
+        &req.source_server_id,
+        &req.target_server_id,
+        &req.project_id,
+        &tgt_dir,
+    );
+    // 已有同键断点(且模式匹配)→ 取其 step_next 作为本次起跳点
+    let resume_from: u32 = if req.resume {
+        config::load_resume_map()
+            .get(&ck_key)
+            .filter(|cp| cp.mode == config::MODE_MIGRATE)
+            .map(|cp| cp.step_next)
+            .unwrap_or(1)
+    } else {
+        1
+    };
+    if resume_from > 1 {
+        emit_line(&format!(
+            "断点续传:从阶段 {} 继续(先前已完成阶段 1-{})",
+            resume_from,
+            resume_from - 1
+        ));
+    }
+
+    // 落一步断点(阶段 N 完成 → step_next = N+1);失败仅告警不阻断迁移
+    // (断点是增强,不该因落盘失败把迁移搞挂 —— 与部署侧 checkpoint_save 同口径)
+    macro_rules! checkpoint_mark {
+        ($next:expr) => {{
+            let cp = config::ResumeCheckpoint {
+                key: ck_key.clone(),
+                mode: config::MODE_MIGRATE.to_string(),
+                step_next: $next,
+                ts: chrono::Local::now().format("%F %T").to_string(),
+                server_id: req.source_server_id.clone(),
+                project_id: req.project_id.clone(),
+                server_name: source.name.clone(),
+                project_name: project.name.clone(),
+                artifacts: serde_json::json!({
+                    "sourceServerId": req.source_server_id,
+                    "targetServerId": req.target_server_id,
+                    "targetDir": tgt_dir,
+                    "resume": true,
+                }),
+            };
+            match config::save_checkpoint(&cp) {
+                Ok(dropped) => {
+                    // 被裁掉的迁移断点:给出提示(其半成品已无断点引用,
+                    // 下次同目标迁移会重跑对应阶段 —— 无需额外清理动作)
+                    for d in dropped {
+                        if d.mode == config::MODE_MIGRATE {
+                            emit_line(&format!("提示:断点上限(10)已满,较早的迁移断点被清理"));
+                        }
+                    }
+                    let _ = $next;
+                }
+                Err(e) => emit_line(&format!("警告:断点落盘失败({}),续传将不可用", e)),
+            }
+        }};
+    }
+    // 阶段完成后的清理(全部成功时删断点;失败/取消保留 —— 与部署侧相反,
+    // 迁移的断点价值全在「失败后能续」)
+    let checkpoint_clear = || {
+        let _ = config::remove_checkpoint(&ck_key);
+    };
+
+    // 镜像搬运清单:阶段 2 内填充;历史写点(阶段 5 之后)也要用 ——
+    // 故在阶段块外声明(否则被 else 块作用域吞掉)
+    let mut transfer_images: Vec<TransferImage> = Vec::new();
+
     let mut warnings: Vec<String> = Vec::new();
 
     // 取消检查:迁移边界生效(与镜像迁移同口径)
@@ -848,7 +940,7 @@ async fn run_migrate_project(
     }
 
     // ---- ① 卷:停源 → 导出 → 恢复源(必须无条件恢复)----
-    if req.include_volumes {
+    if req.include_volumes && resume_from <= 1 {
         check_cancel!();
         let mut mounts: Vec<stack::VolumeMount> = Vec::new();
         match stack::parse_compose_volumes(&local_compose, &dir_basename(&src_dir)) {
@@ -991,6 +1083,12 @@ async fn run_migrate_project(
         }
     }
 
+    // 卷阶段完成 → 落断点(含「无卷可搬」路径;阶段 1 整体成功才落,
+    // 保证停机窗口内不会有断点指向半程状态)
+    checkpoint_mark!(2);
+    if resume_from > 2 {
+        emit_line("断点续传:跳过阶段 2(镜像搬运)");
+    } else {
     // ---- ② 镜像搬运 ----
     check_cancel!();
     // 与预检同口径:注入源镜像列表 + 目录名候选,未设 image 的 build 服务
@@ -1007,7 +1105,7 @@ async fn run_migrate_project(
         .map(|i| (i.repository.clone(), i.tag.clone()))
         .collect();
     let dir_names = migration_dir_name_candidates(&project, &src_dir);
-    let transfer_images: Vec<TransferImage> =
+    transfer_images =
         match stack::parse_compose_file_with_dirs(&local_compose, &scan_pairs, &dir_names) {
             Ok(stack) => collect_transfer_images(&stack).0,
             Err(e) => {
@@ -1101,6 +1199,12 @@ async fn run_migrate_project(
         }
     }
 
+    } // 阶段 2 结束
+    checkpoint_mark!(3);
+
+    if resume_from > 3 {
+        emit_line("断点续传:跳过阶段 3(compose 与归档搬运)");
+    } else {
     // ---- ③ compose 三件套 + 归档落目标 ----
     check_cancel!();
     emit_line("上传 compose 文件(含 .env 与 override)…");
@@ -1150,12 +1254,21 @@ async fn run_migrate_project(
         }
     }
 
+    } // 阶段 3 结束
+    checkpoint_mark!(4);
+
     // ---- ④ 启动 ----
+    if resume_from > 4 {
+        emit_line("断点续传:跳过阶段 4(目标 compose up — 视作已启动)");
+    } else {
     check_cancel!();
     emit_line("在目标服务器启动服务…");
     compose_simple_action(&mut dst, &tgt_dir, "up", &emit_line)
         .await
         .map_err(|e| (e, warnings.clone()))?;
+
+    } // 阶段 4 结束
+    checkpoint_mark!(5);
 
     // ---- ⑤ 清理两端临时产物 ----
     let _ = exec_collect(
@@ -1173,6 +1286,9 @@ async fn run_migrate_project(
     bind_project_to_target(&project.id, &target.id)
         .map_err(|e| (e, warnings.clone()))?;
     emit_line(&format!("项目已改绑到「{}」", target.name));
+
+    // 迁移全部完成 → 清除断点(与部署侧「成功才清」同口径)
+    checkpoint_clear();
 
     commands::append_migration_history(
         &project.name,

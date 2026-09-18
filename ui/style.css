@@ -3712,6 +3712,66 @@ code {
 }
 .dg-actions .btn { flex: none; }
 .dg-fail { margin-top: 12px; }
+/* ===== 卷内容浏览(第二十六批,05 页卷 Tab)=====
+   面包屑 + 逐行列(目录可点击进入);目录/文件徽章 + 路径 + 大小。
+   路径列等宽(含中文时由 --font-cjk 兜底,见全站字体轨道纪律)。 */
+.vol-browse { display: flex; flex-direction: column; gap: 10px; }
+.vol-crumb {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--ark-line);
+}
+.vol-crumb .btn { flex: none; }
+.vol-crumb-sep {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ark-paper-dim-ink);
+}
+.vol-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 52vh;
+  overflow-y: auto;
+}
+.vol-row {
+  display: grid;
+  grid-template-columns: 58px minmax(200px, 1fr) 90px;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--ark-line);
+}
+.vol-row:last-child { border-bottom: none; }
+.vol-row > .badge { flex: none; }
+.btn-link {
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  text-align: left;
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  /* 墨色正文(不是 --ark-signal-dim —— 那个 token 是「青 12% 淡底」,
+     用作前景在纸白上几乎不可见;可读性靠下划线 hover 提示可点) */
+  color: var(--ark-ink);
+  overflow-wrap: anywhere;
+}
+.btn-link:hover { text-decoration: underline; color: var(--ark-paper-ink-65); }
+.vol-file {
+  font-size: 12.5px;
+  color: var(--ark-ink);
+  overflow-wrap: anywhere;
+}
+.vol-size {
+  font-size: 12px;
+  color: var(--ark-paper-dim-ink);
+  text-align: right;
+}
 .dg-fail-line {
   font-size: 11.5px;
   color: var(--ark-paper-dim-ink);

@@ -87,6 +87,8 @@ pub(crate) fn resume_step_label(mode: &str, step_next: u32) -> String {
     let labels: &[&str] = match mode {
         MODE_SINGLE => &["打标签", "导出压缩", "上传镜像", "同步文件", "服务器部署"],
         MODE_STACK => &["分类确认", "打包", "上传", "装载", "拉取", "启动"],
+        // 迁移(第二十六批):阶段级(见 migrate_project::run_migrate_project 的阶段注释)
+        crate::config::MODE_MIGRATE => &["卷搬运", "镜像搬运", "compose 与归档搬运", "目标启动", "收尾"],
         _ => &[],
     };
     if step_next < 1 {
@@ -256,7 +258,14 @@ pub fn deploy_resume_status(
 ) -> Result<Option<ResumeView>, String> {
     Ok(load_resume_map()
         .into_values()
-        .filter(|c| c.server_id == server_id && c.project_id == project_id)
+        // 迁移断点(第二十六批)与部署断点**共用同一张表**,此处按 mode 排除 ——
+        // 否则源服务器 + 项目相同的迁移断点会以「部署未完成」的样子出现在部署页
+        // 续传横幅里,点续传还会走 deploy_resume_start 解析出错误的产物结构。
+        .filter(|c| {
+            c.mode != crate::config::MODE_MIGRATE
+                && c.server_id == server_id
+                && c.project_id == project_id
+        })
         .max_by(|a, b| a.ts.cmp(&b.ts))
         .map(|cp| resume_view_of(&cp)))
 }
@@ -304,6 +313,13 @@ pub fn deploy_resume_start(
     let cp = load_resume_map()
         .remove(&key)
         .ok_or_else(|| format!("断点不存在或已被清理: {}", key))?;
+    // 迁移断点不得走部署续传路径(第二十六批):产物结构与部署不同,
+    // resume_context_of 的 mode 白名单也会拒绝 —— 此处提前给可操作文案。
+    // 注意:上面已 remove,故被拒的断点需要放回(用户没做错什么,不该丢)
+    if cp.mode == crate::config::MODE_MIGRATE {
+        let _ = crate::config::save_checkpoint(&cp);
+        return Err("该断点属于项目迁移,不能作为部署续传;请在迁移面板发起续传".to_string());
+    }
     // 服务器/项目仍存在(被删除的配置无法续传)
     let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
     find_server(&cfg, &cp.server_id)?;

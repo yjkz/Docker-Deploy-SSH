@@ -56,8 +56,11 @@
         appendMigrateProjectLine('—— 警告(' + warns.length + ' 条)——');
         warns.forEach(function (w) { appendMigrateProjectLine('  · ' + w); });
       }
-      // 收尾按钮复位:成功后可关闭;失败允许重试(重新预检)
+      // 收尾按钮复位:成功后可关闭;失败允许重试(重新预检或**续传**)
       setMigrateButtons(ok ? 'done' : 'failed');
+      // 断点续传(第二十六批):失败时露出续传条(断点由后端在失败时保留);
+      // 成功时收起(后端已清断点)
+      renderMigrateResumeRow(!ok);
       window.toast(ok ? '项目迁移完成' : '项目迁移失败: ' + msg, ok ? 'ok' : 'fail');
       // 配置已改绑(成功时),刷新页面数据让项目列表/部署页反映新服务器
       if (ok) loadPageDataOnce();
@@ -69,6 +72,47 @@
   }
 
   /** 迁移模态按钮状态机:'idle'(可预检)| 'previewed'(可执行)| 'running' | 'done' | 'failed' */
+  /**
+   * 迁移中断点续传条(第二十六批)。
+   *
+   * 只做「能不能续」的粗判:后端只在迁移失败/取消时保留断点,且键按
+   * 源/目标/项目/目标目录现算 —— 前端不查键,点「续传」即置 migState.resumeKey
+   * 后走与全新迁移**完全相同**的发起路径(`migrate_project_start` 带 `resume:true`)。
+   * 为什么无需重新预检:断点已含目标目录(用户上次的选择),服务端配置未变时
+   * 直接续是安全的;若配置已变(源/目标被删),后端会以明确错误拒绝。
+   */
+  function renderMigrateResumeRow(show) {
+    var host = document.getElementById('migrate-project-plan');
+    var body = document.getElementById('migrate-project-modal-body');
+    if (!body) return;
+    var existing = document.getElementById('migrate-resume-row');
+    if (!show) {
+      if (existing) existing.remove();
+      return;
+    }
+    if (existing) return; // 已在屏
+    var row = document.createElement('div');
+    row.id = 'migrate-resume-row';
+    row.className = 'form-row';
+    var tip = el('div', 'form-hint',
+      '该迁移留有断点,可从已完成的阶段继续(不必重跑卷/镜像搬运)。' +
+      '若上次失败原因是配置变更,建议先「重新预检」。');
+    row.appendChild(tip);
+    var btn = el('button', 'btn', '从断点续传');
+    btn.type = 'button';
+    btn.id = 'migrate-resume-btn';
+    btn.addEventListener('click', function () {
+      if (migState.active) return;
+      migState.resumeKey = '1'; // 真值标记(键由后端现算)
+      window.toast('将从断点处继续迁移…', 'info');
+      onMigrateStart();
+    });
+    row.appendChild(btn);
+    // 插在计划框之前(失败态计划框可能为空/错误态)
+    if (host && host.parentNode) host.parentNode.insertBefore(row, host);
+    else body.appendChild(row);
+  }
+
   function setMigrateButtons(phase) {
     var previewBtn = document.getElementById('migrate-project-preview-btn');
     var startBtn = document.getElementById('migrate-project-start-btn');
@@ -549,9 +593,12 @@
         releaseCount: releaseCount,
         targetRemoteDir: targetDir || null,
         sourcePasswordPlain: null,
-        targetPasswordPlain: null
+        targetPasswordPlain: null,
+        // 断点续传(第二十六批):true 时后端按同键断点从已完成阶段之后起跳
+        resume: migState.resumeKey === true || !!migState.resumeKey
       }
     }).then(function () {
+      migState.resumeKey = null; // 已消费:下次「开始迁移」是全新迁移
       // 同步返回不代表成功;结果只经 migrate-project-done
     }).catch(function (err) {
       migState.active = false;

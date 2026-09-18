@@ -355,12 +355,12 @@ fn build_http_client(proxy: Option<&str>, no_redirect: bool) -> Result<reqwest::
         .filter(|p| !p.is_empty())
     {
         let proxy = reqwest::Proxy::all(&proxy_url)
-            .map_err(|e| format!("代理地址无效({proxy_url}): {e}"))?;
+            .map_err(|e| internal_err(format!("代理地址无效({proxy_url}): {e}")))?;
         builder = builder.proxy(proxy);
     }
     builder
         .build()
-        .map_err(|e| format!("HTTP 客户端构建失败: {e}"))
+        .map_err(|e| internal_err(format!("HTTP 客户端构建失败: {e}")))
 }
 
 // ===== 外部链接打开 =====
@@ -396,18 +396,34 @@ pub fn open_external(url: String) -> std::result::Result<(), String> {
     #[cfg(not(target_os = "windows"))]
     {
         let _ = &url;
-        Err("当前平台未支持外部链接打开".to_string())
+        Err(internal_err("当前平台未支持外部链接打开"))
     }
 }
 
 /// 把 reqwest 传输层错误归类为中文提示(附原文,便于排查)。
+///
+/// 第二十六批:统一挂 `[dderr:network]` 码 —— 此前这里是全仓最后一批
+/// 无码错误点(第十六批预留),前端只能按文案匹配来区分「网络类失败」;
+/// 挂码后 `errCodeOf` 可直接判定,与部署/迁移侧口径一致。
 fn classify_http_error(err: &reqwest::Error) -> String {
-    let raw = err.to_string();
+    crate::errors::tagged(
+        crate::errors::ErrCode::Network,
+        classify_http_error_text(err.is_timeout(), err.is_connect(), &err.to_string()),
+    )
+}
+
+/// [`classify_http_error`] 的纯函数内核(便于单测:无需构造 reqwest::Error)。
+///
+/// 分类依据 reqwest 的两个判定位 + 原始错误文本关键词:
+/// - 超时 → 提示超时(15 秒,与客户端 timeout 设置一致);
+/// - 连接类再细分:DNS 解析 / 代理不可达 / 一般不可达 —— 三者的处理动作不同
+///   (换 DNS / 换代理 / 查网络),故不能合并成一句「连接失败」;
+/// - 其余归「网络请求失败」兜底。
+fn classify_http_error_text(is_timeout: bool, is_connect: bool, raw: &str) -> String {
     let lower = raw.to_ascii_lowercase();
-    if err.is_timeout() {
+    if is_timeout {
         format!("请求超时(15 秒),请检查网络或代理: {raw}")
-    } else if err.is_connect() {
-        // 连接类失败再细分:DNS 解析失败 / 代理不可达 / 一般网络不可达
+    } else if is_connect {
         if lower.contains("dns error")
             || lower.contains("failed to lookup")
             || lower.contains("getaddrinfo")
@@ -423,6 +439,13 @@ fn classify_http_error(err: &reqwest::Error) -> String {
     } else {
         format!("网络请求失败: {raw}")
     }
+}
+
+/// 更新链路里的本地文件/进程类错误统一挂 `[dderr:internal]`(第二十六批):
+/// 这些失败与环境/权限相关(写安装包、起安装程序),不是网络问题,
+/// 前端按码可给出不同引导(重试下载 vs 手动到 Release 页)。
+fn internal_err(msg: impl Into<String>) -> String {
+    crate::errors::tagged(crate::errors::ErrCode::Internal, msg.into())
 }
 
 /// 截断版本说明至 [`NOTES_MAX_CHARS`] 字符(按 Unicode 字符而非字节,中文安全)。
@@ -592,12 +615,12 @@ pub async fn update_download(
         .filter(|p| !p.is_empty())
     {
         let proxy = reqwest::Proxy::all(&proxy_url)
-            .map_err(|e| format!("代理地址无效({proxy_url}): {e}"))?;
+            .map_err(|e| internal_err(format!("代理地址无效({proxy_url}): {e}")))?;
         builder = builder.proxy(proxy);
     }
     let client = builder
         .build()
-        .map_err(|e| format!("HTTP 客户端构建失败: {e}"))?;
+        .map_err(|e| internal_err(format!("HTTP 客户端构建失败: {e}")))?;
 
     let response = client
         .get(&url)
@@ -622,7 +645,7 @@ pub async fn update_download(
     let dir = std::env::temp_dir()
         .join("DockerDeploy-SSH-update")
         .join(&version);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建下载目录失败: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| internal_err(format!("创建下载目录失败: {e}")))?;
     let setup_path = dir.join("setup.exe");
 
     // 复用:已有同名且大小与 Content-Length 一致(>0)的包 → 跳过下载
@@ -640,21 +663,22 @@ pub async fn update_download(
     use tokio::io::AsyncWriteExt;
     let mut file = tokio::fs::File::create(&setup_path)
         .await
-        .map_err(|e| format!("创建安装包文件失败 ({}): {e}", setup_path.display()))?;
+        .map_err(|e| internal_err(format!("创建安装包文件失败 ({}): {e}", setup_path.display())))?;
     let mut stream = response;
     let mut written: u64 = 0;
     let deadline = std::time::Instant::now() + Duration::from_secs(DOWNLOAD_TIMEOUT_SECS);
     loop {
         if std::time::Instant::now() > deadline {
             let _ = tokio::fs::remove_file(&setup_path).await;
-            return Err(format!(
-                "下载超时({DOWNLOAD_TIMEOUT_SECS} 秒),请检查网络或改用浏览器手动下载"
-            ));
+            return Err(internal_err(format!(
+                "下载超时({} 秒),请检查网络或改用浏览器手动下载",
+                DOWNLOAD_TIMEOUT_SECS
+            )));
         }
         match tokio::time::timeout(Duration::from_secs(60), stream.chunk()).await {
             Err(_) => {
                 let _ = tokio::fs::remove_file(&setup_path).await;
-                return Err("下载停滞超过 60 秒,已中止(可重试或改用浏览器手动下载)".to_string());
+                return Err(internal_err("下载停滞超过 60 秒,已中止(可重试或改用浏览器手动下载)"));
             }
             Ok(Err(e)) => {
                 let _ = tokio::fs::remove_file(&setup_path).await;
@@ -664,14 +688,14 @@ pub async fn update_download(
             Ok(Ok(Some(chunk))) => {
                 file.write_all(&chunk)
                     .await
-                    .map_err(|e| format!("写入安装包失败: {e}"))?;
+                    .map_err(|e| internal_err(format!("写入安装包失败: {e}")))?;
                 written += chunk.len() as u64;
             }
         }
     }
     file.flush()
         .await
-        .map_err(|e| format!("刷新安装包文件失败: {e}"))?;
+        .map_err(|e| internal_err(format!("刷新安装包文件失败: {e}")))?;
     drop(file);
 
     // 完整性:字节数与 Content-Length 一致(声明过就严格校验),且 >0
@@ -802,7 +826,7 @@ pub fn update_install(
             .args(["/c", "start", "", &path_str, "/S", "/R"])
             .creation_flags(0x0800_0000) // CREATE_NO_WINDOW,防闪黑框
             .spawn()
-            .map_err(|e| format!("启动安装程序失败: {e}"))?;
+            .map_err(|e| internal_err(format!("启动安装程序失败: {e}")))?;
         // 给安装器 500ms 拉起时间再退出本应用(避免安装器校验到旧进程文件占用)
         let handle = app.clone();
         tauri::async_runtime::spawn(async move {
@@ -814,13 +838,53 @@ pub fn update_install(
     #[cfg(not(target_os = "windows"))]
     {
         let _ = app;
-        Err("当前平台未支持自动安装".to_string())
+        Err(internal_err("当前平台未支持自动安装"))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ===== 错误码挂点(第二十六批)=====
+
+    #[test]
+    fn test_classify_http_error_text_variants() {
+        // 超时优先(即使同时是 connect)
+        let t = classify_http_error_text(true, true, "operation timed out");
+        assert!(t.contains("请求超时"), "{}", t);
+        // DNS 细分
+        let d = classify_http_error_text(false, true, "dns error: failed to lookup address");
+        assert!(d.contains("DNS 解析失败"), "{}", d);
+        let d2 = classify_http_error_text(false, true, "getaddrinfo ENOTFOUND github.com");
+        assert!(d2.contains("DNS 解析失败"), "{}", d2);
+        // 代理细分
+        let pr = classify_http_error_text(false, true, "socks connect error: connection refused");
+        assert!(pr.contains("代理不可达"), "{}", pr);
+        // 一般连接失败
+        let c = classify_http_error_text(false, true, "connection refused");
+        assert!(c.contains("连接失败"), "{}", c);
+        // 兜底
+        let o = classify_http_error_text(false, false, "some other io error");
+        assert!(o.contains("网络请求失败"), "{}", o);
+    }
+
+    #[test]
+    fn test_classify_http_error_text_preserves_raw() {
+        // 原始错误文本必须保留(现场排查依据),不被分类文案吞掉
+        let raw = "dns error: failed to lookup address information: 不知道这样的主机";
+        let out = classify_http_error_text(false, true, raw);
+        assert!(out.contains(raw), "原文丢失: {}", out);
+    }
+
+    #[test]
+    fn test_internal_err_is_tagged_with_internal_code() {
+        use crate::errors::{code_of, strip, ErrCode};
+        let e = internal_err("写入安装包失败: 磁盘已满");
+        assert_eq!(code_of(&e), Some(ErrCode::Internal));
+        // 用户可见文案不变(挂码只是旁路前缀)
+        assert_eq!(strip(&e), "写入安装包失败: 磁盘已满");
+    }
 
     #[test]
     fn test_update_pending_marker_roundtrip() {

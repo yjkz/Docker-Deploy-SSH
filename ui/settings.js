@@ -289,6 +289,18 @@
       '首次部署无归档时不触发)。续传中不触发;用户取消不触发。' +
       '单镜像部署不产归档,故不适用。回滚结果以日志形式并入本次部署记录'));
 
+    // 扫描识别放宽(第二十六批):自定义 compose 文件名 + 扫描深度。
+    // 名字会拼进远端 find 命令,后端严格校验(仅 [A-Za-z0-9._-]),非法项丢弃、
+    // 全非法回退内置四标准名 —— 前端只做逗号分隔的原始收集
+    main.appendChild(buildField('compose 文件名(逗号分隔)', 'SCAN NAMES',
+      'settings-compose-names-input', 'text', '',
+      '留空 = 内置四标准名(docker-compose.yml/.yaml、compose.yml/.yaml)',
+      '栈列表与清理分析的扫描按这些名字匹配;支持 docker-compose.prod.yml 等自定义命名(仅字母数字与 . _ -,单个 ≤64 字符)'));
+    main.appendChild(buildField('扫描最大深度', 'SCAN DEPTH',
+      'settings-compose-depth-input', 'number', '4',
+      '默认 4;1-8',
+      '扫描部署目录的目录层级上限;栈放得较深时调大(越大扫描越慢)'));
+
     // 终端日志保留(第二十三批):天数,0 = 永久保留(默认 30)。
     // hint 同时说明清理时机(打开终端 / 启动软件时 best-effort 清理)
     main.appendChild(buildField('终端日志保留(天)', 'TERM LOGS',
@@ -562,7 +574,13 @@
         updating = false;
         window.setBtnBusy(btn, false, '自动更新');
         if (!isUpdateModalVisible()) return;
-        setUpdateResult('fail', '下载失败:' + (errText(err) || '未知错误'));
+        // 第二十六批:按错误码分引导 —— network(可重试/换代理)与 internal
+        // (本机写盘/进程问题,重试多数无效 → 引导到 Release 页手动下载)
+        var code = window.errCodeOf(err);
+        var hint = code === 'internal'
+          ? '(本机环境问题,重试多数无效;建议到 Release 页手动下载)'
+          : (code === 'network' ? '(可检查网络或代理后重试,或到 Release 页手动下载)' : '');
+        setUpdateResult('fail', '下载失败:' + (errText(err) || '未知错误') + hint);
       });
   }
 
@@ -606,6 +624,26 @@
     return Math.min(100, Math.max(0, n));
   }
 
+  /**
+   * compose 文件名输入 → 载荷数组(逗号/换行分隔,trim 去空)。
+   * 合法性由后端 `compose_scan::normalize_compose_names` 统一裁决
+   * (安全边界在拼远端命令处,前端不做重复校验 —— 单点权威)。
+   */
+  function composeNamesArg() {
+    var raw = fieldVal('settings-compose-names-input');
+    if (!raw) return [];
+    return raw.split(/[,\n]/).map(function (s) { return s.trim(); })
+      .filter(function (s) { return s !== ''; });
+  }
+
+  /** 扫描深度 → 载荷(空/非数字回退 0 = 后端按默认 4;越界后端夹取 1-8) */
+  function composeDepthArg() {
+    var raw = fieldVal('settings-compose-depth-input').trim();
+    if (raw === '') return 0;
+    var n = parseInt(raw, 10);
+    return isNaN(n) ? 0 : n;
+  }
+
   function onSave() {
     if (st.saving) return;
     var session = st.session; // 捕获模态会话,异步收尾校验是否已过期
@@ -623,7 +661,9 @@
         alertDiskPercent: alertPercentArg('settings-alert-disk-input'),
         alertMemPercent: alertPercentArg('settings-alert-mem-input'),
         alertCpuPercent: alertPercentArg('settings-alert-cpu-input'),
-        autoRollbackOnFailure: isChecked('settings-auto-rollback')
+        autoRollbackOnFailure: isChecked('settings-auto-rollback'),
+        composeFileNames: composeNamesArg(),
+        composeScanMaxDepth: composeDepthArg()
       }
     }).then(function () {
       // 过期会话(保存期间模态被关闭甚至重开)→ 静默丢弃,防旧 promise 回写新模态
@@ -734,6 +774,13 @@
         if (alertIv) alertIv.value = String(s.alertIntervalMins || 0);
         // 自动回滚(第二十五批):缺省视为关闭(与后端 serde default 同口径)
         setChecked('settings-auto-rollback', s.autoRollbackOnFailure === true);
+        // 扫描识别放宽(第二十六批):名字数组回填为逗号分隔;深度 0/缺省显示 4
+        var namesInput = document.getElementById('settings-compose-names-input');
+        if (namesInput) {
+          namesInput.value = Array.isArray(s.composeFileNames) ? s.composeFileNames.join(', ') : '';
+        }
+        var depthInput = document.getElementById('settings-compose-depth-input');
+        if (depthInput) depthInput.value = String(s.composeScanMaxDepth || 4);
         var alertDisk = document.getElementById('settings-alert-disk-input');
         if (alertDisk) alertDisk.value = String(s.alertDiskPercent == null ? 90 : s.alertDiskPercent);
         var alertMem = document.getElementById('settings-alert-mem-input');

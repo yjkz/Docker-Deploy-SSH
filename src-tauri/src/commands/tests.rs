@@ -150,11 +150,24 @@ services:
 
     #[test]
     fn test_cleanup_scan_compose_cmd_excludes_archives() {
-        let cmd = cleanup_scan_compose_cmd("/home/henghao");
+        // 纯函数版本(第二十六批拆出):不读全局设置 —— 测试恒稳定,
+        // 且能直接断言「自定义名字与深度」确实进入命令
+        let cmd = cleanup_scan_compose_cmd_with("/home/henghao", &[], 4);
         assert!(cmd.contains("-maxdepth 4"));
         assert!(cmd.contains("'*/releases/*'"));
         assert!(cmd.contains("'*/.git/*'"));
         assert!(cmd.contains("/home/henghao"));
+        assert!(cmd.contains("'docker-compose.yml'"), "空列表回退默认名: {}", cmd);
+
+        // 自定义名与深度
+        let custom = cleanup_scan_compose_cmd_with(
+            "/srv/app",
+            &["docker-compose.prod.yml".to_string()],
+            6,
+        );
+        assert!(custom.contains("-maxdepth 6"), "{}", custom);
+        assert!(custom.contains("'docker-compose.prod.yml'"), "{}", custom);
+        assert!(!custom.contains("'docker-compose.yaml'"), "默认名不应混入: {}", custom);
     }
 
     // ---- 第七批:回滚明细批量读取 + 版本说明 ----
@@ -2048,6 +2061,12 @@ services:
         assert_eq!(resume_step_label(MODE_STACK, 4), "装载");
         assert_eq!(resume_step_label(MODE_STACK, 5), "拉取");
         assert_eq!(resume_step_label(MODE_STACK, 6), "启动");
+        // 迁移(第二十六批):1..5 阶段级文案
+        assert_eq!(resume_step_label(crate::config::MODE_MIGRATE, 1), "卷搬运");
+        assert_eq!(resume_step_label(crate::config::MODE_MIGRATE, 2), "镜像搬运");
+        assert_eq!(resume_step_label(crate::config::MODE_MIGRATE, 3), "compose 与归档搬运");
+        assert_eq!(resume_step_label(crate::config::MODE_MIGRATE, 4), "目标启动");
+        assert_eq!(resume_step_label(crate::config::MODE_MIGRATE, 5), "收尾");
         // 越界(成功后即清除断点,理论不可达)与未知模式兜底
         assert_eq!(resume_step_label(MODE_SINGLE, 6), "部署收尾");
         assert_eq!(resume_step_label(MODE_SINGLE, 0), "部署收尾");

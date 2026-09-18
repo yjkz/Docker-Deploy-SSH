@@ -1,6 +1,7 @@
 pub mod arch_precheck;
 pub mod auto_rollback;
 pub mod commands;
+pub mod compose_scan;
 pub mod config;
 pub mod config_io;
 pub mod crypto;
@@ -150,6 +151,8 @@ pub fn run() {
       commands::remove_local_images,
       manage_stacks::manage_stack_compose_read,
       manage_stacks::manage_stack_compose_save,
+      manage::manage_volume_browse,
+      manage::manage_volume_backup,
     ])
     .setup(|app| {
       // 日志(不限 debug 构建,release 同样记录,便于现场排查):

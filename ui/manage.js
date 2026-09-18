@@ -1814,6 +1814,23 @@
     viewBtn.addEventListener('click', function () { showResourceInspect('manage_volume_inspect', v.name, '卷详情 — ' + v.name, 'volumeName'); });
     wrap.appendChild(viewBtn);
 
+    // 内容浏览 + 单卷备份(第二十六批)
+    var browseBtn = document.createElement('button');
+    browseBtn.type = 'button';
+    browseBtn.className = 'btn btn-sm';
+    browseBtn.textContent = '内容';
+    browseBtn.title = '浏览卷内文件(逐层展开,只读)';
+    browseBtn.addEventListener('click', function () { showVolumeBrowser(v.name); });
+    wrap.appendChild(browseBtn);
+
+    var backupBtn = document.createElement('button');
+    backupBtn.type = 'button';
+    backupBtn.className = 'btn btn-sm';
+    backupBtn.textContent = '备份';
+    backupBtn.title = '把整个卷打包为 tar.gz 下载到本机';
+    backupBtn.addEventListener('click', function () { confirmVolumeBackup(v.name); });
+    wrap.appendChild(backupBtn);
+
     var rmBtn = document.createElement('button');
     rmBtn.type = 'button';
     rmBtn.className = 'btn btn-sm btn-danger';
@@ -1823,6 +1840,204 @@
 
     tdAction.appendChild(wrap);
     tr.appendChild(tdAction);
+  }
+
+  // ===== 卷内容浏览 + 单卷备份(第二十六批)=====
+  //
+  // 浏览:「内容」按钮 → 模态内逐层列目录(每层一次 manage_volume_browse;
+  // 卷可能有百万文件,全量列会把输出撑爆,故**按需展开**而非一次递归)。
+  // 备份:「备份」按钮 → 两步确认 → 系统保存对话框选本地路径 →
+  // manage_volume_backup 后台跑(进度经 volume-backup-progress 事件)。
+  // 后端两条命令都是**只读**远端(浏览 tar tzvf;备份 tar 打包后拉回、
+  // 临时包用完即删),故不取远程操作互斥位。
+
+  var volBrowse = { name: '', stack: [] };   // stack = 路径栈(面包屑)
+
+  /**
+   * 卷浏览专用元素助手(本地定义)。
+   *
+   * **为什么不用 `el`**:manage.js 里没有全局/模块级 `el` —— 它是其它文件的局部
+   * 助手,且本文件若干函数有 `var el = $('#…')` 的局部遮蔽。裸引用会在**点击时**
+   * 才炸(ReferenceError),静态检查与页面加载都发现不了(与 v5.11「拆分丢 $」
+   * 同一类事故)。本文件新增的卷浏览代码一律走本助手,或直接用 createElement。
+   */
+  function mkEl(tag, className, text) {
+    var node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined && text !== null) node.textContent = String(text);
+    return node;
+  }
+
+  /** 1024 进制字节 → "1.2 MB"(卷浏览行内展示;本地实现,不跨文件依赖) */
+  function volFormatBytes(bytes) {
+    var n = Number(bytes);
+    if (!isFinite(n) || n < 0) n = 0;
+    var units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    var i = 0;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+    return n.toFixed(1) + ' ' + units[i];
+  }
+
+  /** 打开卷浏览模态(根层) */
+  function showVolumeBrowser(volumeName) {
+    volBrowse.name = volumeName;
+    volBrowse.stack = [''];
+    renderVolumeBrowser();
+  }
+
+  /** 拉取当前层并渲染(失败就地给错误与重试) */
+  function renderVolumeBrowser() {
+    var name = volBrowse.name;
+    var sub = volBrowse.stack[volBrowse.stack.length - 1];
+    var body = document.createElement('div');
+    body.className = 'manage-wide-modal';
+    var head = document.createElement('div');
+    head.className = 'log-tail-bar';
+    head.appendChild(mkEl('span', 'manage-env-hint', '卷:' + name + (sub ? '/' + sub : '/')));
+    body.appendChild(head);
+    var box = document.createElement('div');
+    box.className = 'vol-browse';
+    box.appendChild(mkEl('div', 'server-check-hint', '正在读取目录…'));
+    body.appendChild(box);
+    openModal('卷内容 — ' + name, body);
+
+    AppBus.invoke('manage_volume_browse', {
+      serverId: state.serverId,
+      volumeName: name,
+      subPath: sub || null
+    }).then(function (list) {
+      renderVolumeBrowserInto(box, sub, list || []);
+    }).catch(function (err) {
+      box.textContent = '';
+      box.appendChild(mkEl('div', 'cleanup-error',
+        '读取目录失败:' + (err && err.message ? err.message : String(err))));
+      var retry = mkEl('button', 'btn btn-sm', '重试');
+      retry.type = 'button';
+      retry.addEventListener('click', function () { renderVolumeBrowser(); });
+      box.appendChild(retry);
+    });
+  }
+
+  /** 渲染一层:面包屑 + 目录/文件行(目录可点击进入) */
+  function renderVolumeBrowserInto(box, sub, list) {
+    box.textContent = '';
+
+    // 面包屑:卷名 / a / b(每段可点回退)
+    var crumb = mkEl('div', 'vol-crumb');
+    var rootBtn = mkEl('button', 'btn btn-sm', name0());
+    function name0() { return '根'; }
+    rootBtn.type = 'button';
+    rootBtn.addEventListener('click', function () { gotoStack(0); });
+    crumb.appendChild(rootBtn);
+    volBrowse.stack.forEach(function (seg, i) {
+      if (i === 0) return; // 根已在上面
+      crumb.appendChild(mkEl('span', 'vol-crumb-sep', '/'));
+      var btn = mkEl('button', 'btn btn-sm', seg);
+      btn.type = 'button';
+      btn.addEventListener('click', function () { gotoStack(i); });
+      crumb.appendChild(btn);
+    });
+    box.appendChild(crumb);
+
+    function gotoStack(i) {
+      volBrowse.stack = volBrowse.stack.slice(0, i + 1);
+      renderVolumeBrowser();
+    }
+
+    if (list.length === 0) {
+      box.appendChild(mkEl('div', 'server-check-hint', '该目录为空'));
+      return;
+    }
+    var ul = mkEl('div', 'vol-list');
+    list.forEach(function (ent) {
+      var row = mkEl('div', 'vol-row');
+      row.appendChild(window.fillBadge(mkEl('span'), 'info', ent.isDir ? '目录' : '文件'));
+      if (ent.isDir) {
+        var nameBtn = mkEl('button', 'btn-link', ent.path);
+        nameBtn.type = 'button';
+        nameBtn.addEventListener('click', function () {
+          volBrowse.stack.push(ent.path);
+          renderVolumeBrowser();
+        });
+        row.appendChild(nameBtn);
+      } else {
+        row.appendChild(mkEl('span', 'vol-file mono', ent.path));
+      }
+      row.appendChild(mkEl('span', 'vol-size mono nowrap', ent.isDir ? '—' : volFormatBytes(ent.size)));
+      ul.appendChild(row);
+    });
+    box.appendChild(ul);
+  }
+
+  /** 备份确认(两步:确认 → 选路径 → 后台跑) */
+  function confirmVolumeBackup(volumeName) {
+    var div = document.createElement('div');
+    div.appendChild(window.confirmBlock({
+      title: '把卷「' + volumeName + '」打包下载到本机?',
+      facts: [
+        ['内容', '整个卷的全部文件(经临时容器 tar 打包,pull 后临时包自动清理)'],
+        ['时长', '取决于卷大小;大卷可能数分钟']
+      ],
+      risk: '备份期间请勿关闭应用;完成后 tar.gz 落在你选择的位置'
+    }));
+    div.innerHTML +=
+      '<div class="modal-actions">' +
+      '<button id="vol-backup-cancel" class="btn" type="button">取消</button>' +
+      '<button id="vol-backup-ok" class="btn btn-primary" type="button">选择保存位置…</button>' +
+      '</div>';
+    var cancel = div.querySelector('#vol-backup-cancel');
+    if (cancel) cancel.addEventListener('click', closeModal);
+    var ok = div.querySelector('#vol-backup-ok');
+    if (ok) {
+      ok.addEventListener('click', function () {
+        // 系统保存对话框(config-io 先例:AppBus.pickPath 只有 open,save 直调插件)
+        var safeName = String(volumeName).replace(/[^A-Za-z0-9._-]/g, '_');
+        window.__TAURI__.dialog.save({
+          title: '保存卷备份',
+          defaultPath: safeName + '.tar.gz',
+          filters: [{ name: 'tar.gz', extensions: ['tar.gz', 'gz'] }]
+        }).then(function (picked) {
+          if (!picked) return; // 用户取消
+          startVolumeBackup(volumeName, String(picked));
+        }).catch(function (err) {
+          window.toast('打开保存对话框失败:' + window.errText(err), 'fail');
+        });
+      });
+    }
+    openModal('备份卷', div);
+  }
+
+  /** 发起备份:一次性订阅事件(先订阅再 invoke,项目纪律),完成/失败收尾 */
+  function startVolumeBackup(volumeName, localPath) {
+    closeModal();
+    window.toast('开始备份卷「' + volumeName + '」…', 'info');
+    var unlistenP = AppBus.on('volume-backup-progress', function (ev) {
+      var p = (ev && ev.payload) || {};
+      if (p.volumeName !== volumeName) return;
+      // 进度只在 toast 上给个粗提示(大卷时会频繁触发,不做逐帧 UI)
+      state.volBackup = { done: p.done || 0, total: p.total || 0 };
+    });
+    var unlistenD = AppBus.on('volume-backup-done', function (ev) {
+      var p = (ev && ev.payload) || {};
+      if (p.volumeName !== volumeName) return;
+      window.toast(p.ok ? ('卷「' + volumeName + '」' + (p.message || '备份完成'))
+        : ('卷「' + volumeName + '」备份失败:' + (p.message || '未知错误')),
+        p.ok ? 'ok' : 'fail');
+      // 清理订阅(一次性)
+      Promise.all([unlistenP, unlistenD]).then(function (fns) {
+        fns.forEach(function (fn) { try { fn(); } catch (e) { /* 忽略 */ } });
+      });
+    });
+    AppBus.invoke('manage_volume_backup', {
+      serverId: state.serverId,
+      volumeName: volumeName,
+      localPath: localPath
+    }).catch(function (err) {
+      window.toast('发起备份失败:' + (err && err.message ? err.message : String(err)), 'fail');
+      Promise.all([unlistenP, unlistenD]).then(function (fns) {
+        fns.forEach(function (fn) { try { fn(); } catch (e) { /* 忽略 */ } });
+      });
+    });
   }
 
   function confirmRemoveVolume(name) {

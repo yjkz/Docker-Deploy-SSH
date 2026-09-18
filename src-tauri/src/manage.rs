@@ -20,6 +20,7 @@ use crate::commands::{
     persist_host_key_if_needed, resolve_key_passphrase, resolve_password,
 };
 use crate::config::{load_config, AppConfig, ServerConfig};
+use tauri::Emitter;
 use crate::ssh::{exec_collect, SshClient};
 
 // ===== 超时常量 =====
@@ -1284,6 +1285,285 @@ pub async fn manage_network_disconnect(
     .await
 }
 
+// ===== 卷内容浏览 + 单卷备份(第二十六批)=====
+//
+// 复用第六批项目迁移已有的两条命令(volume_export_cmd 起临时容器跑 tar,
+// 不依赖宿主机 tar),此处只做「看内容」与「备份到本机」两个单卷操作 ——
+// 迁移那套要连源与目标两台并搬 compose/归档,对单卷备份过重。
+//
+// 互斥口径:**不取 acquire_remote_op** —— 两者都是**只读**远端(浏览只是
+// `tar tzf` 列目录;备份是 tar 打包后拉回,不写远端业务数据,临时包用完即删),
+// 与部署/回滚/迁移的写路径无冲突;这与 manage 系列既有的 inspect/logs 同款。
+// 临时包落在 `/tmp/dd-volume-backup`(与迁移用不同目录,避免与在跑的迁移互踩)。
+
+/// 卷备份临时目录(远端;与项目迁移的 /tmp/dd-migrate-project 分开)
+const VOLUME_BACKUP_TMP_DIR: &str = "/tmp/dd-volume-backup";
+
+/// 卷浏览条目(前端契约,camelCase)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeEntry {
+    /// 相对卷根的路径(tar 输出原样,已剥 `./` 前缀)
+    pub path: String,
+    /// 字节数(0 = 目录或未知)
+    pub size: u64,
+    /// 是否为目录(tar 明细末字符为 `/`)
+    pub is_dir: bool,
+}
+
+/// 解析 `tar tzvf` 的明细输出 → 条目列表(纯函数)。
+///
+/// GNU tar 形如:`-rw-r--r-- 0/0  1234 2026-08-01 10:00 ./data/file.db`
+/// BusyBox tar 形如:`-rw-r--r-- 0/0  1234 2026-08-01 10:00 data/file.db`
+/// (无 `./` 前缀、无 owner 名)。两者都是「权限 属主 大小 日期 时间 路径」五段,
+/// 前四段之间**可能有多个空格对齐**(GNU 会按列宽补齐,如 `0/0        1234`),
+/// 故按「空白连续段」切分,取前 5 段,路径段保留其内部空格(用 `splitn(6, ...)`
+/// 配 trim 无法处理多空格 —— 会错位)。
+/// 目录判定:权限位首字符 `d`,或路径以 `/` 结尾。
+/// 不合法/不足 6 段的行跳过(不因一行坏输出丢掉整个列表)。
+pub fn parse_tar_listing(out: &str) -> Vec<VolumeEntry> {
+    let mut entries = Vec::new();
+    for line in out.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        // 手写「跳过多空格」切分:取 5 个字段 + 余下整段作路径
+        let mut fields: Vec<&str> = Vec::with_capacity(6);
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while fields.len() < 5 && i < bytes.len() {
+            // 跳过空白
+            while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                break;
+            }
+            let start = i;
+            while i < bytes.len() && bytes[i] != b' ' && bytes[i] != b'\t' {
+                i += 1;
+            }
+            fields.push(&line[start..i]);
+        }
+        // 余下 = 路径(剥前导空白;内部空格原样保留)
+        let raw_path = line.get(i..).unwrap_or("").trim();
+        if fields.len() < 5 || raw_path.is_empty() {
+            continue;
+        }
+        let perms = fields[0];
+        // fields = [权限, 属主, 大小, 日期, 时间]
+        let size = fields[2].parse::<u64>().unwrap_or(0);
+        // 剥 `./` 前缀(GNU tar 默认带)
+        let path = raw_path.strip_prefix("./").unwrap_or(raw_path);
+        let is_dir = perms.starts_with('d') || raw_path.ends_with('/');
+        // 目录路径统一去尾斜杠(GNU 给 `sub/`,BusyBox 给 `sub` —— 两种口径统一,
+        // 便于前端按 path 做 key 与「进入子目录」拼接)
+        let path = if is_dir {
+            path.trim_end_matches('/').to_string()
+        } else {
+            path.to_string()
+        };
+        if path.is_empty() {
+            continue; // 卷根自身(GNU 会输出 `./`)不是一个可展示条目
+        }
+        entries.push(VolumeEntry {
+            path,
+            size,
+            is_dir,
+        });
+    }
+    entries
+}
+
+/// 浏览卷内容:列根目录第一层(经临时容器 `tar tzvf`,宿主无需装 tar)。
+///
+/// 只列一层(`--exclude` 深度控制由 tar 自身不支持,改在结果侧按 `/` 计数截断)
+/// —— 卷可能很大(百万文件),全量列会把输出撑爆;逐层展开由前端按需再调。
+#[tauri::command]
+pub async fn manage_volume_browse(
+    server_id: String,
+    password_plain: Option<String>,
+    volume_name: String,
+    sub_path: Option<String>,
+) -> Result<Vec<VolumeEntry>, String> {
+    let vol = volume_name.trim();
+    if vol.is_empty() {
+        return Err("卷名不能为空".to_string());
+    }
+    // 子路径校验:拒绝绝对路径与 `..`(tar 的成员名,防越出卷根)
+    let sub = sub_path.unwrap_or_default();
+    let sub = sub.trim().trim_matches('/').to_string();
+    if sub.split('/').any(|seg| seg == "..") {
+        return Err("子路径不合法(不允许 ..)".to_string());
+    }
+    let (_server, mut client) = connect_server(&server_id, password_plain.as_deref()).await?;
+
+    // 先确认卷存在(错误文案比 tar 的原始报错友好)
+    let (code, _out) = with_timeout(
+        EXEC_TIMEOUT_SECS,
+        "检查卷是否存在超时",
+        "请检查服务器网络后重试",
+        async {
+            exec_collect(
+                &mut client,
+                &format!("docker volume inspect {} >/dev/null 2>&1", shell_quote(vol)),
+            )
+            .await
+        },
+    )
+    .await?;
+    if code != 0 {
+        return Err(format!("卷「{}」不存在或不可读", vol));
+    }
+
+    // tar 列目录:`-C /from` 后跟要列的子路径(空 = 根)
+    let listing_arg = if sub.is_empty() {
+        ".".to_string()
+    } else {
+        format!("./{}", sub)
+    };
+    let cmd = format!(
+        "docker run --rm --entrypoint tar -v {}:/from {} tzvf /from/{}",
+        shell_quote(&format!("{}:/from", vol)),
+        shell_quote(DEFAULT_TAR_IMAGE),
+        shell_quote(&listing_arg)
+    );
+    let (code, out) = with_timeout(
+        VOLUME_BROWSE_TIMEOUT_SECS,
+        "列卷内容超时",
+        "卷较大时请耐心等待,或改为直接备份",
+        async { exec_collect(&mut client, &cmd).await },
+    )
+    .await?;
+    if code != 0 {
+        return Err(format!("列卷内容失败(退出码 {}): {}", code, crate::commands::tail_lines(&out, 3)));
+    }
+
+    // 只保留该层(相对 sub 的深度 0):tar 递归输出全部后代,按 `/` 计数截断
+    let base_depth = if sub.is_empty() { 0 } else { sub.split('/').count() };
+    let mut entries = parse_tar_listing(&out);
+    entries.retain(|e| {
+        let depth = e.path.split('/').filter(|s| !s.is_empty()).count();
+        // 目录自身深度 = base_depth+1;文件同理;深层后代截掉
+        depth <= base_depth + 1
+    });
+    entries.sort_by(|a, b| {
+        // 目录在前,再按路径
+        b.is_dir.cmp(&a.is_dir).then_with(|| a.path.cmp(&b.path))
+    });
+    Ok(entries)
+}
+
+/// 浏览/备份使用的 tar 镜像(busybox 体积小、绝大多数环境已存在;
+/// 与项目迁移同款口径)。
+const DEFAULT_TAR_IMAGE: &str = "busybox:latest";
+const VOLUME_BROWSE_TIMEOUT_SECS: u64 = 120;
+
+/// 单卷备份:远端 tar.gz 打包 → 拉回本机 `local_path` → 清理远端临时包。
+///
+/// 命令层立即返回,进度经 `volume-backup-progress` 事件推送
+/// `{ volumeName, done, total }`(total 未知时为 0),完成/失败经
+/// `volume-backup-done` 推送 `{ volumeName, ok, message }`。
+/// `local_path` 来自前端系统保存对话框(与 write_text_file 同口径:接受绝对路径)。
+#[tauri::command]
+pub async fn manage_volume_backup(
+    app: tauri::AppHandle,
+    server_id: String,
+    password_plain: Option<String>,
+    volume_name: String,
+    local_path: String,
+) -> Result<(), String> {
+    let vol = volume_name.trim().to_string();
+    if vol.is_empty() {
+        return Err("卷名不能为空".to_string());
+    }
+    let dest = local_path.trim().to_string();
+    if dest.is_empty() {
+        return Err("请选择备份保存路径".to_string());
+    }
+    // 后台执行(大卷可能 GB 级);命令层立即返回,结果经事件
+    tauri::async_runtime::spawn(async move {
+        let result = do_volume_backup(
+            &app,
+            &server_id,
+            password_plain.as_deref(),
+            &vol,
+            std::path::Path::new(&dest),
+        )
+        .await;
+        let (ok, message) = match &result {
+            Ok(size) => (true, format!("备份完成({} MB)", size / 1024 / 1024)),
+            Err(e) => (false, e.clone()),
+        };
+        let _ = app.emit(
+            "volume-backup-done",
+            serde_json::json!({ "volumeName": vol, "ok": ok, "message": message }),
+        );
+    });
+    Ok(())
+}
+
+/// [`manage_volume_backup`] 的后台主体:导出 → 下载 → 清理。
+async fn do_volume_backup(
+    app: &tauri::AppHandle,
+    server_id: &str,
+    password_plain: Option<&str>,
+    volume_name: &str,
+    local_path: &std::path::Path,
+) -> Result<u64, String> {
+    let (_server, mut client) = connect_server(server_id, password_plain).await?;
+    let pkg_name = format!("vol-{}.tar.gz", volume_name.replace('/', "_"));
+    let remote_pkg = format!("{}/{}", VOLUME_BACKUP_TMP_DIR, pkg_name);
+
+    // 1) 远端打包(临时目录先建;tar 走临时容器)
+    let cmd = format!(
+        "mkdir -p {} && {}",
+        shell_quote(VOLUME_BACKUP_TMP_DIR),
+        crate::migrate_project::volume_export_cmd(
+            DEFAULT_TAR_IMAGE,
+            volume_name,
+            &remote_pkg
+        )
+    );
+    let (code, out) = with_timeout(
+        crate::migrate_project::VOLUME_TAR_TIMEOUT_SECS,
+        "导出数据卷超时",
+        "卷数据较大时请耐心等待",
+        async { exec_collect(&mut client, &cmd).await },
+    )
+    .await?;
+    if code != 0 {
+        return Err(format!(
+            "导出卷失败:{}",
+            crate::commands::tail_lines(&out, 3)
+        ));
+    }
+
+    // 2) 拉回本地(进度经事件;远端大小未知时 total=0)
+    let emit = |done: u64, total: u64| {
+        let _ = app.emit(
+            "volume-backup-progress",
+            serde_json::json!({ "volumeName": volume_name, "done": done, "total": total }),
+        );
+    };
+    let download = client
+        .sftp_download(&remote_pkg, local_path, &|done, total| emit(done, total))
+        .await;
+
+    // 3) 清理远端临时包(尽力而为:失败仅告警,不影响备份结果)
+    let cleanup = format!("rm -f {}", shell_quote(&remote_pkg));
+    if let Err(e) = client.exec(&cleanup, &mut |_| {}).await {
+        log::warn!("清理卷备份临时包失败 ({}): {}", remote_pkg, e);
+    }
+
+    download.map_err(|e| format!("下载备份包失败: {}", e))?;
+    let size = std::fs::metadata(local_path)
+        .map(|m| m.len())
+        .map_err(|e| format!("备份包已下载但读取大小失败: {}", e))?;
+    Ok(size)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1451,6 +1731,72 @@ mod tests {
     }
 
     // ===== compose 项目名提取(第二十二批:终端同栈广播用)=====
+
+    // ===== 卷内容浏览:tar 明细解析(第二十六批)=====
+
+    #[test]
+    fn test_parse_tar_listing_gnu_style() {
+        // GNU tar -tvzf 输出(带 ./ 前缀)
+        let out = "-rw-r--r-- 0/0        1234 2026-08-01 10:00 ./data.db\ndrwxr-xr-x 0/0           0 2026-08-01 10:00 ./sub/\n-rw-r--r-- 0/0         512 2026-08-01 10:01 ./sub/inner.txt\n";
+        let got = parse_tar_listing(out);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].path, "data.db");          // ./ 已剥
+        assert_eq!(got[0].size, 1234);
+        assert!(!got[0].is_dir);
+        assert_eq!(got[1].path, "sub");
+        assert!(got[1].is_dir);                       // 权限位 d
+        assert_eq!(got[2].path, "sub/inner.txt");
+    }
+
+    #[test]
+    fn test_parse_tar_listing_busybox_style() {
+        // BusyBox tar:无 ./ 前缀(第八批起 BusyBox 兼容口径)
+        let out = "-rw-r--r-- 0/0         123 2026-08-01 10:00 plain.txt\n";
+        let got = parse_tar_listing(out);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].path, "plain.txt");
+        assert_eq!(got[0].size, 123);
+    }
+
+    #[test]
+    fn test_parse_tar_listing_detects_dir_without_slash() {
+        // 有的 tar 目录行不带结尾 /(权限位仍是 d)
+        let out = "-rwxr-xr-x 0/0 0 2026-08-01 10:00 nodir_marker
+";
+        let got = parse_tar_listing(out);
+        // 无结尾 / 但权限位是 -rwx... → 不是目录
+        assert!(!got[0].is_dir);
+        let out2 = "drwxr-xr-x 0/0 0 2026-08-01 10:00 realdir
+";
+        assert!(parse_tar_listing(out2)[0].is_dir);
+    }
+
+    #[test]
+    fn test_parse_tar_listing_skips_bad_lines_and_keeps_path_with_space() {
+        let out = "not a tar line\n-rw-r--r-- 0/0 10 2026-08-01 10:00 ./has space name.txt\nshort line\n";
+        let got = parse_tar_listing(out);
+        assert_eq!(got.len(), 1, "坏行应跳过: {:?}", got);
+        // 路径含空格:splitn(6) 保末段完整
+        assert_eq!(got[0].path, "has space name.txt");
+    }
+
+    #[test]
+    fn test_parse_tar_listing_empty() {
+        assert!(parse_tar_listing("").is_empty());
+        assert!(parse_tar_listing("
+
+").is_empty());
+    }
+
+    #[test]
+    fn test_parse_tar_listing_unparsable_size_is_zero() {
+        // 大小列异常 → 0(不因一行尺寸坏掉就丢条目)
+        let out = "-rw-r--r-- 0/0 notanumber 2026-08-01 10:00 ./x.bin
+";
+        let got = parse_tar_listing(out);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].size, 0);
+    }
 
     #[test]
     fn test_compose_project_of_labels() {

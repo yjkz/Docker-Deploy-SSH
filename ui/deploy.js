@@ -185,7 +185,10 @@
     active: false,      // 迁移执行中(禁关闭模态/禁重复发起/控制入口禁用)
     previewing: false,  // 预检请求进行中
     plan: null,         // migrate_project_preview 结果(MigrateProjectPlan)
-    listenerBound: false
+    listenerBound: false,
+    // 断点续传(第二十六批):非空 = 本次「开始迁移」按断点起跳(值仅作真值标记;
+    // 真正的键由后端按 源/目标/项目/目标目录 现算 —— 避免前端持有键导致不一致)
+    resumeKey: null
   };
 
   /** 部署事件监听守卫:只注册一次,防止重复绑定 */
@@ -2106,12 +2109,21 @@
     if (!body) return;
     body.innerHTML = '';
     var modeText = st.mode === 'stack' ? '整栈部署' : '单镜像部署';
+    // 标题此前恒为空(index.html 有 title 元素但无人写值,aria-labelledby 指向空文本)
+    // —— 第二十六批顺手补上:模态开者负责填标题,与其它模态同款
+    var titleEl = document.getElementById('deploy-batch-modal-title');
+    if (titleEl) titleEl.textContent = '批量部署 — ' + modeText;
     var hint = document.createElement('p');
     hint.className = 'confirm-msg';
     hint.textContent = '对选中的多台服务器串行执行' + modeText +
       '(项目:「' + (project.name || projectId) + '」),每台独立写历史、可回滚;' +
       '传输选项沿用当前页设置。';
     body.appendChild(hint);
+
+    // 模板驱动批量(第二十六批):批量模态内直接套用模板(模式/传输选项/
+    // 版本标题说明),不必先关模态回首页套用。applyProfileToBatch 只改
+    // 「本批生效的选项」,不动表单也不自动开跑(与首页套用同一纪律)。
+    buildBatchProfileRow(body);
 
     for (var i = 0; i < st.cfg.servers.length; i++) {
       var srv = st.cfg.servers[i];
@@ -2162,6 +2174,82 @@
    */
   function closeBatchModalSafe() {
     closeBatchModal();
+  }
+
+  /**
+   * 批量模态内的模板选择行(第二十六批「模板驱动批量」)。
+   *
+   * 语义:选模板 → 立即套用到本批(模式切换 + 传输选项 + 版本标题/说明);
+   * 项目与服务器**保持用户当前选择**(批量面向多台,模板里的单项目/服务器
+   * 引用在这里是噪音 —— 与首页套用「全量回填」不同,此处是**选项级**套用)。
+   * 模式不同时给出明确提示(模式由当前表单决定,不由模板切换 —— 切换模式要
+   * 重解析栈/重选镜像,在模态里做太隐晦)。
+   */
+  function buildBatchProfileRow(body) {
+    if (!Array.isArray(st.profiles) || st.profiles.length === 0) return; // 无模板不占位
+    var wrap = document.createElement('div');
+    wrap.className = 'form-row';
+
+    var label = document.createElement('label');
+    label.className = 'form-label';
+    label.htmlFor = 'deploy-batch-profile';
+    label.textContent = '套用模板(可选)';
+    wrap.appendChild(label);
+
+    var row = document.createElement('div');
+    row.className = 'deploy-profile-bar';
+
+    var sel = document.createElement('select');
+    sel.id = 'deploy-batch-profile';
+    sel.className = 'text-input form-input-sm';
+    var ph = document.createElement('option');
+    ph.value = '';
+    ph.textContent = '选择模板以套用本批选项…(' + st.profiles.length + ')';
+    sel.appendChild(ph);
+    st.profiles.forEach(function (pf) {
+      var opt = document.createElement('option');
+      opt.value = String(pf.id);
+      // 模式后缀:让用户一眼看出模板与本批模式是否一致
+      opt.textContent = (pf.name || '未命名') + (pf.mode === 'stack' ? '(整栈)' : '(单镜像)');
+      sel.appendChild(opt);
+    });
+    row.appendChild(sel);
+
+    var applyBtn = document.createElement('button');
+    applyBtn.type = 'button';
+    applyBtn.className = 'btn btn-sm';
+    applyBtn.id = 'deploy-batch-profile-apply';
+    applyBtn.textContent = '套用';
+    applyBtn.addEventListener('click', function () { applyProfileToBatch(); });
+    row.appendChild(applyBtn);
+
+    wrap.appendChild(row);
+    wrap.appendChild(el('div', 'form-hint',
+      '套用模板的传输选项(跳过未变化/强制留档)与版本标题说明到本批;' +
+      '项目与服务器保持上方选择,模式不随模板切换'));
+    body.appendChild(wrap);
+  }
+
+  /** 把选中模板的**选项**套用到当前批量(不碰项目/服务器/模式) */
+  function applyProfileToBatch() {
+    var sel = document.getElementById('deploy-batch-profile');
+    var id = sel ? String(sel.value || '') : '';
+    if (!id) { window.toast('请先选择模板', 'warn'); return; }
+    var pf = st.profiles.find(function (p) { return String(p.id) === id; });
+    if (!pf) { window.toast('模板已不存在,请刷新页面', 'warn'); return; }
+
+    setCheckedById('deploy-skip-unchanged', pf.skipUnchanged !== false);
+    setCheckedById('deploy-stack-skip', pf.skipUnchanged !== false);
+    setCheckedById('deploy-stack-archive', pf.forceArchive === true);
+    setAreaValue('deploy-release-title', pf.releaseTitle);
+    setAreaValue('deploy-release-notes', pf.releaseNotes);
+
+    var modeWarn = '';
+    if ((pf.mode === 'stack' ? 'stack' : 'single') !== st.mode) {
+      modeWarn = ';注意该模板是' + (pf.mode === 'stack' ? '整栈' : '单镜像') +
+        '模板,与本批模式不同,模式未切换';
+    }
+    window.toast('已套用模板「' + (pf.name || '未命名') + '」的传输选项' + modeWarn, 'ok');
   }
 
   function onBatchStart() {

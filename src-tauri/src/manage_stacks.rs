@@ -97,17 +97,21 @@ pub async fn manage_list_stacks(
     let include_archived = include_archived.unwrap_or(false);
     let (server, mut client) = connect_server(&server_id, password_plain.as_deref()).await?;
 
-    // find 多 -name 需 \( \) 与 -o 组合;深度 ≤4(第八批:与回滚中心/清理分析的
-    // 项目扫描口径统一,原为 ≤2 —— 部署目录下超过一层子目录的栈会扫不到)。
+    // find 多 -name 需 \( \) 与 -o 组合;默认深度 4(第八批:与回滚中心/清理
+    // 分析的项目扫描口径统一)但**可由设置放宽**(第二十六批:自定义文件名与深度,
+    // 见 compose_scan —— 名字列表在拼命令前经严格校验,非法项已剔除)。
     // 默认追加 ! -path '*/releases/*' 排除归档副本(与项目扫描同一排除口径)。
     let archived_filter = if include_archived {
         String::new()
     } else {
         String::from(" ! -path '*/releases/*'")
     };
+    let (names, depth) = crate::compose_scan::scan_config_from_settings();
     let cmd = format!(
-        "find {} -maxdepth 4 -type f \\( -name 'docker-compose.yml' -o -name 'docker-compose.yaml' -o -name 'compose.yml' -o -name 'compose.yaml' \\){} ",
+        "find {} -maxdepth {} -type f {}{} ",
         shell_quote(&server.remote_dir),
+        depth,
+        crate::compose_scan::find_name_clause(&names),
         archived_filter
     );
     let (code, out) = with_timeout(

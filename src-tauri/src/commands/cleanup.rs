@@ -349,14 +349,23 @@ pub(crate) fn compose_image_repos(yaml_text: &str) -> Vec<String> {
 
 // ===== 分项目扫描拼命令(纯函数,便于单测)=====
 
-/// 扫描含 compose 文件的目录:深度 ≤ [`CLEANUP_SCAN_MAX_DEPTH`],排除
-/// `releases/` 归档与 `.git`(归档里的 compose 副本不是项目)。
-pub fn cleanup_scan_compose_cmd(root: &str) -> String {
+/// 扫描含 compose 文件的目录(**纯函数**:名字与深度由调用方传入 ——
+/// 便于单测,且避免在测试里读全局设置导致环境依赖)。
+/// 排除 `releases/` 归档与 `.git`(归档里的 compose 副本不是项目)。
+pub fn cleanup_scan_compose_cmd_with(root: &str, names: &[String], depth: u32) -> String {
     format!(
-        "find {} -maxdepth {} -type f \\( -name 'docker-compose.yml' -o -name 'docker-compose.yaml' -o -name 'compose.yml' -o -name 'compose.yaml' \\) ! -path '*/releases/*' ! -path '*/.git/*' 2>/dev/null",
+        "find {} -maxdepth {} -type f {} ! -path '*/releases/*' ! -path '*/.git/*' 2>/dev/null",
         shell_single_quote(root),
-        CLEANUP_SCAN_MAX_DEPTH
+        depth,
+        crate::compose_scan::find_name_clause(names)
     )
+}
+
+/// [`cleanup_scan_compose_cmd_with`] 的设置包装:从 AppSettings 读自定义
+/// 文件名与深度(第二十六批;空/非法配置自动回退内置默认)。
+pub fn cleanup_scan_compose_cmd(root: &str) -> String {
+    let (names, depth) = crate::compose_scan::scan_config_from_settings();
+    cleanup_scan_compose_cmd_with(root, &names, depth)
 }
 
 /// 扫描发布归档目录(`<项目>/releases/<YYYYmmdd-HHMMSS>`)的完整路径。
