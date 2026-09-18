@@ -191,12 +191,12 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 | ~~05 页各 Tab 搜索筛选~~ ✅ 已完成 | 第二十四批(三),S1 会话(见 UPGRADE-PLAN) | 小-中 |
 | ~~容器批量操作~~ ✅ 已完成 | 第二十四批(三),S1 会话:pause/unpause/rename + 常显勾选列 + 批量条串行执行 + 改名模态(见 UPGRADE-PLAN) | 中 |
 | ~~资源阈值告警~~ ✅ 已完成 | 第二十四批(一),S1 会话:独立采样任务(SSH 复用 host_metrics 链)+ 连续 2 轮防抖 + `alert` 通知类型;设置中心四字段 + 通知中心勾选(记录见 UPGRADE-PLAN) | 中 |
-| 栈 compose 查看/编辑 | 栈操作区「compose」入口;base64 读写(镜像 .env 口径)+ 保存前远端备份(.ddbak.<ts> 保留 3 份);新命令 ×2 | 中 |
-| 部署失败自动回滚 | 失败且健康检查不过 → 自动回滚上一归档(可选开关);需接 `acquire_remote_op` 互斥、防双失败,先设计 | 大 |
+| ~~栈 compose 查看/编辑~~ ✅ 已完成 | 第二十五批④:`manage_stack_compose_read/save` 两命令(备份 .ddbak.<ts> 保留 3 份)+ 栈行「compose」按钮 + 编辑/确认/保存三段式 | 中 |
+| ~~部署失败自动回滚~~ ✅ 已完成 | 第二十五批⑤:设置项 `autoRollbackOnFailure`(默认关)+ 仅整栈/仅健康检查失败/非续传/非取消;复用 `rollback_execute_stack_inner`(部署 guard 内不可二次 acquire) | 大 |
 | ~~多机巡检汇总~~ ✅ 已完成 | 第二十四批(S2),纯前端串行复用 server_diagnose + 汇总视图(见下「已完成」区) | 小 |
-| 架构预检 | ARM→x86 `exec format error` 预警(镜像架构 vs 服务器架构) | 中 |
-| SSH config/known_hosts 导入 | 新机接入提速 | 小 |
-| 本地镜像清理(02 页) | 悬空镜像扫描/删除(当前清理分析只针对服务器侧) | 中 |
+| ~~架构预检~~ ✅ 已完成 | 第二十五批②:`arch_precheck.rs` 词表归一 + 两条部署路径接入;**只告警不阻断**(多架构镜像与 qemu 会误伤) | 中 |
+| ~~SSH config/known_hosts 导入~~ ✅ 已完成 | 第二十五批①:`ssh_import.rs` 只读扫描 + 勾选批量走 `save_server_entry`;**不预填指纹**(多算法密钥预填致硬失败) | 小 |
+| ~~本地镜像清理(02 页)~~ ✅ 已完成 | 第二十五批③:`list_dangling_images`/`remove_local_images`(逐 ID rmi,校验完整 sha256)+ 02 页模态两步确认 | 中 |
 | 迁移断点续传 | 复用部署断点模式(镜像/卷传输中断续) | 大 |
 | 卷内容浏览/单卷备份 | 单卷导出下载 | 大 |
 | network/internal 错误码挂点 | update.rs reqwest 错误挂错误码(第十六批预留) | 小 |
@@ -381,10 +381,43 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 
 ---
 
+### 第二十五批(2026-09-17)— 五项功能批(单会话)
+
+> 候选池清尾:按「剩余 10 项完成前 5 项」批复交付。真机验证由用户统一处理.
+
+**① SSH config/known_hosts 导入 ✅**(记录见 UPGRADE-PLAN「第二十五批①」)
+- 新模块 `ssh_import.rs`(1 命令)+ 14 单测;只读扫描,导入走既有 `save_server_entry`
+- 前端:页头「从 SSH 配置导入」→ 勾选表(已知主机/私钥/待补录徽章)→ 串行导入
+
+**② 架构预检 ✅**(「第二十五批②」)
+- 新模块 `arch_precheck.rs`(纯函数)+ 5 单测 + 变异验证;两条部署路径接入
+- Docker 口径 ↔ uname 口径词表归一;**只告警不阻断**
+
+**③ 本地镜像清理 ✅**(「第二十五批③」)
+- `docker.rs` 悬空判定 + 4 单测 + 变异验证;2 新命令(`list_dangling_images`/`remove_local_images`)
+- 02 页模态:勾选 + 两步确认 + 帧内失败明细;逐 ID rmi,校验完整 sha256
+
+**④ 栈 compose 查看/编辑 ✅**(「第二十五批④」)
+- `manage_stacks.rs` 两命令(与 .env 同构 + **保存前 .ddbak 备份保留 3 份**)+ 6 单测
+- 栈行「compose」按钮 + 编辑/确认/保存三段式
+
+**⑤ 部署失败自动回滚 ✅**(「第二十五批⑤」)
+- 新模块 `auto_rollback.rs` + 7 单测 + 变异验证;设置项 `autoRollbackOnFailure` 默认关
+- 仅整栈 / 仅健康检查失败 / 非续传 / 非取消;复用 `_inner` 避二次 acquire
+
+**验证**:`cargo test` 377 → **413**(+36)/ clippy 20 条**零新增** /
+verify 六脚本 PASS / 桩验证四项 UI + 载荷断言 / judge 5 图 PASS(1 张 fail→修复后复核 PASS)
+
+**命令数**:106 → **111**(+5:`ssh_config_scan` / `list_dangling_images` /
+`remove_local_images` / `manage_stack_compose_read` / `manage_stack_compose_save`)
+
+---
+
 ## 当前状态速览
 
-- 版本 **v6.6.0**;main = origin/main;基线 `cargo test` **377 passed** / 13 ignored
-- 命令 **106** 个(generate_handler 实测;第二十二批 +3 调度 +2 配置历史)
+- 版本 **v6.7.0**;main = origin/main;基线 `cargo test` **413 passed** / 13 ignored
+- 命令 **111** 个(generate_handler 实测;第二十二批 +3 调度 +2 配置历史;第二十五批 +5 导入/清理/compose)
+- **第二十五批(2026-09-17,五项功能批)已完成**:SSH 配置导入 / 架构预检 / 本地镜像清理 / 栈 compose 查看编辑 / 部署失败自动回滚;测试 377→413,命令 106→111
 - **第二十三批(2026-09-17,双会话并行首发)已完成**:S1 细节补正 7 项 + S2 终端日志保留(时间制);批次收尾由 S2 统一执行(版本 v6.5.0)
 - **第二十四批(进行中,双会话并行第三批)**:S1 资源阈值告警 ✅(「第二十四批(一)」)+ 05页筛选/容器批量 ✅(「第二十四批(三)」)/ S2 多机巡检汇总 ✅ 已合入(f244592);批次收尾由 S1(后完成方)统一执行
 - **第二十二批(v6.4.0)第三梯队三项全完成**:定时部署 / 终端多标签+广播+落盘 / 配置版本历史;文档治理批完成(contract-smoke 上线);**补丁 v6.4.1**:终端多标签可达性修复(「＋新标签」下拉);**遗留待真机验证 8 项全部确认 ✅(2026-09-16),清单清空**

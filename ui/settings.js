@@ -281,6 +281,14 @@
       null,
       '0 = 不告警该项'));
 
+    // 部署失败自动回滚(第二十五批):仅整栈 + 仅健康检查失败时触发;
+    // 默认关(自动回滚会改线上状态,须显式开启)
+    main.appendChild(checkboxRow('settings-auto-rollback', '整栈部署健康检查失败时自动回滚', false));
+    main.appendChild(hint(
+      '仅整栈部署在「健康检查未通过」时触发:自动回滚到上一份完整归档(需存在上一版;' +
+      '首次部署无归档时不触发)。续传中不触发;用户取消不触发。' +
+      '单镜像部署不产归档,故不适用。回滚结果以日志形式并入本次部署记录'));
+
     // 终端日志保留(第二十三批):天数,0 = 永久保留(默认 30)。
     // hint 同时说明清理时机(打开终端 / 启动软件时 best-effort 清理)
     main.appendChild(buildField('终端日志保留(天)', 'TERM LOGS',
@@ -614,7 +622,8 @@
         alertIntervalMins: alertIntervalArg(),
         alertDiskPercent: alertPercentArg('settings-alert-disk-input'),
         alertMemPercent: alertPercentArg('settings-alert-mem-input'),
-        alertCpuPercent: alertPercentArg('settings-alert-cpu-input')
+        alertCpuPercent: alertPercentArg('settings-alert-cpu-input'),
+        autoRollbackOnFailure: isChecked('settings-auto-rollback')
       }
     }).then(function () {
       // 过期会话(保存期间模态被关闭甚至重开)→ 静默丢弃,防旧 promise 回写新模态
@@ -723,6 +732,8 @@
         // 资源告警(第二十四批):无条件回填(同 P1 教训);缺省视为 0/90
         var alertIv = document.getElementById('settings-alert-interval-input');
         if (alertIv) alertIv.value = String(s.alertIntervalMins || 0);
+        // 自动回滚(第二十五批):缺省视为关闭(与后端 serde default 同口径)
+        setChecked('settings-auto-rollback', s.autoRollbackOnFailure === true);
         var alertDisk = document.getElementById('settings-alert-disk-input');
         if (alertDisk) alertDisk.value = String(s.alertDiskPercent == null ? 90 : s.alertDiskPercent);
         var alertMem = document.getElementById('settings-alert-mem-input');

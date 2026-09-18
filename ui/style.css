@@ -3565,6 +3565,158 @@ code {
   color: var(--ark-paper-dim-ink);
   margin-bottom: 10px;
 }
+
+/* ===== 从 SSH 配置导入(第二十五批)=====
+   勾选表:左勾选框 flex:none,列按 grid 对齐(别名/地址/用户/认证)。
+   认证列含私钥路径(等宽纯 ASCII → --font-mono)与「待补录」徽章;
+   长路径 overflow-wrap:anywhere 防溢出(不用省略号——用户要能看全路径)。 */
+.sshimp-box { display: flex; flex-direction: column; gap: 10px; }
+.sshimp-src {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--ark-line);
+}
+.sshimp-path {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--ark-paper-dim-ink);
+}
+.sshimp-skip {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-cjk);
+  font-size: 12px;
+  color: var(--ark-paper-dim-ink);
+}
+.sshimp-head,
+.sshimp-row {
+  display: grid;
+  grid-template-columns: 24px minmax(120px, 1.1fr) minmax(140px, 1.3fr) 90px minmax(160px, 1.6fr);
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.sshimp-head {
+  font-family: var(--font-cjk);
+  font-size: 11.5px;
+  color: var(--ark-paper-dim-ink);
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--ark-line);
+}
+.sshimp-head > input { flex: none; margin: 0; }
+.sshimp-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 44vh;
+  overflow-y: auto;
+}
+.sshimp-row {
+  padding: 7px 0;
+  border-bottom: 1px solid var(--ark-line);
+}
+.sshimp-row:last-child { border-bottom: none; }
+.sshimp-row > input[type=checkbox] { flex: none; margin: 0; }
+.sshimp-name-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.sshimp-name {
+  font-family: var(--font-cjk);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ark-ink);
+  overflow-wrap: anywhere;
+}
+.sshimp-name-wrap > .badge { flex: none; }
+.sshimp-host {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ark-ink);
+  overflow-wrap: anywhere;
+}
+.sshimp-user {
+  font-family: var(--font-cjk);
+  font-size: 12.5px;
+  color: var(--ark-ink);
+}
+.sshimp-auth {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.sshimp-auth > .badge { flex: none; }
+.sshimp-key {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ark-paper-dim-ink);
+  overflow-wrap: anywhere;
+}
+.sshimp-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--ark-line);
+}
+.sshimp-actions .btn { flex: none; }
+
+/* ===== 悬空镜像清理(第二十五批,02 页)=====
+   清单:勾选框 + 短 ID + 大小 + 创建时间;ID/大小/时间为等宽纯 ASCII。
+   交互语言镜像 06 页清理分析(两步确认按钮 + 行内失败明细)。 */
+.dg-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 40vh;
+  overflow-y: auto;
+  margin: 10px 0 4px;
+}
+.dg-row {
+  display: grid;
+  grid-template-columns: 24px 110px 90px minmax(160px, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--ark-line);
+}
+.dg-row:last-child { border-bottom: none; }
+.dg-row > input[type=checkbox] { flex: none; margin: 0; }
+.dg-id {
+  font-size: 12px;
+  color: var(--ark-ink);
+}
+.dg-size {
+  font-size: 12px;
+  color: var(--ark-ink);
+}
+.dg-created {
+  font-size: 11.5px;
+  color: var(--ark-paper-dim-ink);
+}
+.dg-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--ark-line);
+}
+.dg-actions .btn { flex: none; }
+.dg-fail { margin-top: 12px; }
+.dg-fail-line {
+  font-size: 11.5px;
+  color: var(--ark-paper-dim-ink);
+  overflow-wrap: anywhere;
+}
 .cleanup-error {
   font-size: 12.5px;
   color: var(--ark-stat-hot);

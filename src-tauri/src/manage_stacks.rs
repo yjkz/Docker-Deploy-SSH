@@ -444,6 +444,225 @@ pub async fn manage_stack_env_save(
     Ok(result)
 }
 
+// ===== compose 文件查看/编辑(第二十五批)=====
+//
+// 与 .env 两条命令同构(同一套 base64 往返 + 原子写 + 非 UTF-8 无损语义),
+// 差异有二:
+// 1. **保存前自动备份** `.ddbak.<yyyyMMdd-HHMMSS>`(ROADMAP 规格),同一目录
+//    最多保留 3 份 —— 改错 compose 是本页最贵的事故(整个栈起不来),
+//    留最近三份让用户能立刻回滚;
+// 2. 大小上限更大(compose 常比 .env 长),且备份文件不参与上限统计
+//    (备份是纯文本副本,按 basename 前缀过滤)。
+//
+// 复用:路径推导 `parent_dir_of`、原子写命令 `env_write_cmd`(形参即目标路径,
+// 与 .env 无关,名保留历史)、base64 解码 `decode_remote_b64_bytes`、
+// 大小解析 `parse_remote_size`。
+
+/// compose 文件大小上限:1MB(比 .env 宽松;超大 compose 属异常,拒绝并提示)
+const STACK_COMPOSE_MAX_BYTES: usize = 1024 * 1024;
+
+/// 备份保留份数(同目录 `.ddbak.*` 最多留这么多,超出删最旧)
+const STACK_COMPOSE_BACKUP_KEEP: usize = 3;
+
+/// compose 文件读取结果(camelCase 契约,与 [`StackEnv`] 同形)。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StackComposeFile {
+    /// 远端是否存在该 compose 文件(理论上恒 true —— 路径来自扫描)
+    exists: bool,
+    content: String,
+    /// 含非 UTF-8 字节时为 true(content 为 lossy 展示值,不可直接回写)
+    #[serde(default)]
+    not_utf8: bool,
+    /// 原始字节 base64(仅 not_utf8=true 时非空,「未改动」时原样回传)
+    #[serde(default)]
+    raw_b64: String,
+    /// 现有备份文件名(新 → 旧,供界面提示;为空表示无备份)
+    #[serde(default)]
+    backups: Vec<String>,
+}
+
+/// 备份文件名前缀(与目标 compose 同目录):`<原名>.ddbak.`
+fn compose_backup_prefix(compose_file: &str) -> String {
+    format!("{}.ddbak.", compose_file)
+}
+
+/// 构造「备份 + 原子写」命令(纯函数,便于单测):
+/// 先把现有文件复制为 `<file>.ddbak.<ts>`(文件不存在时 cp 失败 → `|| true`
+/// 容忍:首次创建 compose 无旧内容可备份),再裁剪旧备份到 `KEEP` 份,
+/// 最后原子写新内容(复用 [`env_write_cmd`] 的 tmp+mv 形态)。
+///
+/// 裁剪用 `ls -1dt <prefix>*` 按 mtime 倒序 + `tail -n +<KEEP+1>` + `xargs -r rm -f`
+/// (与 deploy.rs 归档裁剪同款;`-r` 保证无输入时不执行 rm)。
+/// `ts` 由调用方传入(便于单测;生产用当前时间)。
+fn compose_save_cmd(compose_file: &str, ts: &str, b64: &str) -> String {
+    let quoted = shell_quote(compose_file);
+    let backup = format!("{}{}", compose_backup_prefix(compose_file), ts);
+    let quoted_backup = shell_quote(&backup);
+    let quoted_prefix = shell_quote(&compose_backup_prefix(compose_file));
+    format!(
+        "cp {} {} 2>/dev/null || true; ls -1dt {}* 2>/dev/null | tail -n +{} | xargs -r rm -f; {}",
+        quoted,
+        quoted_backup,
+        quoted_prefix,
+        STACK_COMPOSE_BACKUP_KEEP + 1,
+        env_write_cmd(compose_file, b64)
+    )
+}
+
+/// 列出同目录现有备份文件名(纯函数:从 `ls -1t <prefix>*` 输出解析 basename,
+/// 已按 mtime 倒序;过滤空行)。返回 (文件名, 全路径) 便于调用方二次使用。
+fn parse_compose_backups(stdout: &str, prefix: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && l.starts_with(prefix))
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// 读取 compose 文件(只读;路径来自扫描结果,不做白名单 —— 与 .env 命令一致,
+/// 由用户经「栈」列表选择,不接受任意手输路径)。
+#[tauri::command]
+pub async fn manage_stack_compose_read(
+    server_id: String,
+    password_plain: Option<String>,
+    compose_file: String,
+) -> Result<StackComposeFile, String> {
+    let quoted = shell_quote(&compose_file);
+    let (_server, mut client) = connect_server(&server_id, password_plain.as_deref()).await?;
+
+    // 1) 存在性
+    let (code, out) = with_timeout(
+        EXEC_TIMEOUT_SECS,
+        "检查 compose 文件是否存在超时",
+        "请检查服务器网络后重试",
+        async { exec_collect(&mut client, &format!("test -f {}", quoted)).await },
+    )
+    .await?;
+    if code > 1 {
+        return Err(format!("检查 compose 文件失败(退出码 {}): {}", code, out.trim()));
+    }
+    if code != 0 {
+        return Ok(StackComposeFile {
+            exists: false,
+            content: String::new(),
+            not_utf8: false,
+            raw_b64: String::new(),
+            backups: Vec::new(),
+        });
+    }
+
+    // 2) 大小
+    let (code, out) = with_timeout(
+        EXEC_TIMEOUT_SECS,
+        "检查 compose 文件大小超时",
+        "请检查服务器网络后重试",
+        async { exec_collect(&mut client, &format!("wc -c <{}", quoted)).await },
+    )
+    .await?;
+    if code != 0 {
+        return Err(format!(
+            "检查 compose 文件大小失败(退出码 {}): {}",
+            code,
+            out.trim()
+        ));
+    }
+    let size = parse_remote_size(&out)?;
+    if size > STACK_COMPOSE_MAX_BYTES {
+        return Err("compose 文件过大(上限 1MB),请在服务器上直接编辑".to_string());
+    }
+
+    // 3) 内容(`base64 <文件`,去换行后解码)
+    let (code, out) = with_timeout(
+        EXEC_TIMEOUT_SECS,
+        "读取 compose 文件超时",
+        "请检查服务器网络后重试",
+        async { exec_collect(&mut client, &format!("base64 <{}", quoted)).await },
+    )
+    .await?;
+    if code != 0 {
+        return Err(format!("读取 compose 文件失败(退出码 {}): {}", code, out.trim()));
+    }
+    let bytes = decode_remote_b64_bytes(&out)?;
+
+    // 4) 现有备份(供界面提示;失败不影响主流程)
+    let prefix = compose_backup_prefix(&compose_file);
+    let backups = match exec_collect(
+        &mut client,
+        &format!("ls -1t {}* 2>/dev/null", shell_quote(&prefix)),
+    )
+    .await
+    {
+        Ok((_, out)) => parse_compose_backups(&out, &prefix),
+        Err(_) => Vec::new(),
+    };
+
+    // 5) UTF-8 分流(与 .env 同语义:非 UTF-8 时 lossy 展示 + 原始字节回传)
+    match String::from_utf8(bytes) {
+        Ok(content) => Ok(StackComposeFile {
+            exists: true,
+            content,
+            not_utf8: false,
+            raw_b64: String::new(),
+            backups,
+        }),
+        Err(e) => {
+            let bytes = e.into_bytes();
+            Ok(StackComposeFile {
+                exists: true,
+                content: String::from_utf8_lossy(&bytes).into_owned(),
+                not_utf8: true,
+                raw_b64: BASE64_STANDARD.encode(&bytes),
+                backups,
+            })
+        }
+    }
+}
+
+/// 保存 compose 文件(备份 + 原子写;语义详见 [`compose_save_cmd`])。
+/// `raw_b64` 语义与 [`manage_stack_env_save`] 完全一致(非 UTF-8 未改动原样回写)。
+#[tauri::command]
+pub async fn manage_stack_compose_save(
+    server_id: String,
+    password_plain: Option<String>,
+    compose_file: String,
+    content: String,
+    raw_b64: Option<String>,
+) -> Result<ActionResult, String> {
+    let bytes: Vec<u8> = match raw_b64.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(b64) => {
+            let decoded = BASE64_STANDARD
+                .decode(b64.as_bytes())
+                .map_err(|e| format!("rawB64 解码失败: {}", e))?;
+            if decoded.len() > STACK_COMPOSE_MAX_BYTES {
+                return Err("compose 内容过大(上限 1MB)".to_string());
+            }
+            decoded
+        }
+        None => {
+            if content.len() > STACK_COMPOSE_MAX_BYTES {
+                return Err("compose 内容过大(上限 1MB)".to_string());
+            }
+            content.into_bytes()
+        }
+    };
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let cmd = compose_save_cmd(&compose_file, &ts, &BASE64_STANDARD.encode(&bytes));
+    let (_server, mut client) = connect_server(&server_id, password_plain.as_deref()).await?;
+    let result = with_timeout(
+        EXEC_TIMEOUT_SECS,
+        "保存 compose 文件超时",
+        "请检查服务器网络后重试",
+        exec_action(&mut client, &cmd),
+    )
+    .await?;
+    if !result.success {
+        return Err(format!("写入失败: {}", result.message));
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,5 +758,73 @@ mod tests {
         assert!(env_content_too_large(&"a".repeat(STACK_ENV_MAX_BYTES + 1)));
         // 多字节字符按字节计(中文 3 字节/字)
         assert!(env_content_too_large(&"中".repeat((STACK_ENV_MAX_BYTES + 3) / 3)));
+    }
+
+    // ===== compose 文件查看/编辑(第二十五批)=====
+
+    #[test]
+    fn test_compose_backup_prefix() {
+        assert_eq!(
+            compose_backup_prefix("/opt/app/docker-compose.yml"),
+            "/opt/app/docker-compose.yml.ddbak."
+        );
+        // 自定义文件名(扫描识别放宽后可能有别的名字)同样工作
+        assert_eq!(compose_backup_prefix("/srv/x/compose.yaml"), "/srv/x/compose.yaml.ddbak.");
+    }
+
+    #[test]
+    fn test_compose_save_cmd_backs_up_then_trims_then_writes() {
+        let cmd = compose_save_cmd("/opt/app/docker-compose.yml", "20260917-120000", "QUJD");
+        // 1. 先备份(cp 原文件 → .ddbak.<ts>;失败容忍 —— 首次创建时无旧文件)
+        assert!(cmd.contains("cp '/opt/app/docker-compose.yml' '/opt/app/docker-compose.yml.ddbak.20260917-120000' 2>/dev/null || true"), "{}", cmd);
+        // 2. 再裁剪:按 mtime 倒序取第 KEEP+1 行起删除(xargs -r 无输入不执行)
+        assert!(cmd.contains("ls -1dt '/opt/app/docker-compose.yml.ddbak.'*"), "{}", cmd);
+        assert!(cmd.contains("tail -n +4"), "保留 3 份 ⇒ 从第 4 行起删: {}", cmd);
+        assert!(cmd.contains("xargs -r rm -f"), "{}", cmd);
+        // 3. 最后原子写(tmp + mv;路径经 shell_quote)
+        assert!(cmd.contains("base64 -d > '/opt/app/docker-compose.yml.ddtmp.'$$"), "{}", cmd);
+        assert!(cmd.contains("mv '/opt/app/docker-compose.yml.ddtmp.'$$ '/opt/app/docker-compose.yml'"), "{}", cmd);
+        // 顺序:备份在裁剪前,裁剪在写入前
+        let i_cp = cmd.find("cp '").unwrap();
+        let i_trim = cmd.find("tail -n +").unwrap();
+        let i_write = cmd.find("base64 -d").unwrap();
+        assert!(i_cp < i_trim && i_trim < i_write, "三段顺序错误: {}", cmd);
+    }
+
+    #[test]
+    fn test_compose_save_cmd_quotes_path_with_quote_char() {
+        // 路径含单引号:shell_quote 必须转义(否则注入/命令断裂)
+        let cmd = compose_save_cmd("/opt/a'pp/docker-compose.yml", "20260917-120000", "QUJD");
+        assert!(!cmd.contains("/opt/a'pp/docker-compose.yml.ddtmp"), "裸单引号未转义: {}", cmd);
+        assert!(cmd.contains("'\\''"), "应使用 '\\'' 转义: {}", cmd);
+    }
+
+    #[test]
+    fn test_parse_compose_backups_filters_and_keeps_order() {
+        let prefix = "/opt/app/docker-compose.yml.ddbak.";
+        let stdout = "\
+/opt/app/docker-compose.yml.ddbak.20260917-120000
+/opt/app/docker-compose.yml.ddbak.20260916-090000
+
+/opt/other/docker-compose.yml.ddbak.20260915-000000
+";
+        let got = parse_compose_backups(stdout, prefix);
+        // 只留同前缀的;空行与其他路径过滤;顺序保持 ls 输出(mtime 倒序)
+        assert_eq!(got.len(), 2);
+        assert!(got[0].ends_with("20260917-120000"));
+        assert!(got[1].ends_with("20260916-090000"));
+    }
+
+    #[test]
+    fn test_compose_keep_is_three() {
+        // ROADMAP 规格:备份保留 3 份(裁剪参数 = KEEP+1 即第 4 行起删)
+        assert_eq!(STACK_COMPOSE_BACKUP_KEEP, 3);
+    }
+
+    #[test]
+    fn test_compose_size_limit_is_generous_but_bounded() {
+        // 两个上限独立(compose 比 .env 宽松 —— 编译期即可断言,故用 const 块)
+        const { assert!(STACK_COMPOSE_MAX_BYTES > STACK_ENV_MAX_BYTES) };
+        assert_eq!(STACK_COMPOSE_MAX_BYTES, 1024 * 1024);
     }
 }

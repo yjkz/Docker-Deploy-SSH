@@ -2801,3 +2801,104 @@ migrate_project.rs:兜底命中入列带标记与识别说明 / 显式声明无�
   预填、提交 rename + newName 载荷、模态关闭);四 Tab 筛选
   (images shop→1 / volumes shop→1 / networks bridge→2 / stacks blog→1);
   截图交 judge **PASS**(勾选列/批量条/筛选/列宽重排逐项核验,零 issue)。
+
+---
+
+# 第二十五批:五项功能批(单会话,2026-09-17)
+
+> 候选池清尾:按「剩余 10 项完成前 5 项」批复,本批交付池内前五项。
+> 真机验证由用户统一处理(本批仅桩验证 + judge)。
+
+## ① SSH config / known_hosts 导入(新模块 `ssh_import.rs`)
+
+- **只读扫描,零新写路径**:`ssh_config_scan` 返回候选清单;前端勾选后逐条走
+  既有 `save_server_entry`(密文 merge / 哨兵 / `update_config` 锁语义完整保留)
+- 解析按 OpenSSH 语义:关键字大小写不敏感、`Key Value`/`Key=Value` 双写法、
+  **同块首个值生效**、`Host` 多模式取首个非通配 token 作别名、通配块整块跳过
+  (计数回显,避免「我配了 10 个怎么只出现 6 个」)、`Include` 不递归、注释空行忽略
+- 容错:`Port` 不可解析/越界 → 22;`HostName` 缺省 → 回退 alias;`%d` 与 `~`
+  在主目录未知时**原样返回**(不猜路径);docker CLI 无关(纯文本解析)
+- **已知取舍 —— 不预填 `host_key_sha256`**:known_hosts 里一个主机常有多条不同
+  算法密钥(ed25519/rsa/ecdsa),预填错一条会让连接硬失败(报「主机密钥已变更」);
+  TOFU 首次连接自然记录才准。`knownInHosts` 仅作「这台以前连过」提示
+- 前端:页头「从 SSH 配置导入」按钮 → 勾选表(默认全选、全选/全不选、已知主机
+  与私钥/待补录徽章、来源路径 + 通配跳过数回显)→ 串行 `save_server_entry`;
+  **同名跳过**(不覆盖用户已录凭据);`port: u16` 由 `Number()` 归一
+- 单测 14(块解析 9 + 路径展开 1 + known_hosts 2 + 候选合成 1 + 空文本 1)
+
+## ② 架构预检(新模块 `arch_precheck.rs`)
+
+- `docker image inspect .Architecture`(Docker 口径 × uname 口径)归一化词表:
+  `x86_64→amd64` / `aarch64→arm64` / `armv7l→armv7` / `i686→386` 等;
+  跨词表等价必须判为匹配(最易误报组合)
+- **只告警不阻断**(设计取舍):多架构 manifest list 在 load 时按目标平台取层,
+  `docker inspect` 常只报宿主平台 → 硬拦会误伤;服务器可能有 qemu/binfmt
+  模拟层 → 架构"不匹配"也能跑。该检查价值在把难懂的 `exec format error`
+  提前翻译成可理解的提示,真不兼容时后续步骤的原始报错给出最终判定
+- 接入:两条部署路径(单镜像 + 整栈,整栈逐个镜像取架构去重后判定)
+- 信息不足(任一为空)静默跳过 —— 纯提示检查不发无依据的告警
+- 单测 5 + **变异验证**(去掉 uname 映射 → 2 测试红,确认测试有效)
+
+## ③ 本地镜像清理(02 页;`docker.rs` + `host_server.rs` + `images.js`)
+
+- **悬空 = `Repository` 与 `Tag` 同时缺失**(`<none>:<none>` 或空串)—— 与
+  `cleanup.rs` 的远端口径一致;单侧缺失不算(那属旧标签镜像,是 06 页清理分析的
+  场景,可能仍被容器引用)
+- **不用 `docker image prune`**:删除范围由 docker 自行判定,与用户勾选不一致;
+  逐 ID `docker rmi` 让执行结果与勾选一一对应(同 06 页清理分析的既有取舍)
+- 后端校验:**ids 非空且全部为 `sha256:` 开头完整 ID**(拒绝 `repo:tag` 形态 ——
+  引用删除可能连带删同名多标签);单个失败不中断,失败项原样回传
+- 前端:02 页页头「清理悬空镜像」→ 模态清单(短 ID/大小/时间)+ 全选 +
+  **两步确认**(首次点击变「确认删除(N 个)」)+ 行内失败明细
+- 单测 4 + **变异验证**(AND→OR → 2 测试红:该变异会误删有标签镜像,已确保护住)
+- 已知取舍:大小合计是各层实际占用之和,多层共享底层时实际释放量可能更小
+  (界面已注明)
+
+## ④ 栈 compose 查看/编辑(`manage_stacks.rs` 两命令 + `manage-stacks.js`)
+
+- 与既有 `.env` 两条命令同构:base64 往返 + 原子写(tmp+mv)+ 非 UTF-8 无损语义
+  (`notUtf8` lossy 展示 + `rawB64` 未改动原样回写;改动后拒绝保存)
+- **差异 = 保存前自动备份** `.ddbak.<yyyyMMdd-HHMMSS>`,同目录**保留 3 份**
+  (超出按 mtime 倒序 `tail -n +4 | xargs -r rm -f` 删最旧);首建无旧文件时
+  `cp` 失败容忍(`|| true`)
+- 上限 1MB(比 .env 的 256KB 宽松);路径全程 `shell_quote`;`$$` 拼在引号外
+- 前端:栈行新增「compose」按钮 → 复用 `.env` 的编辑/确认/保存三段式交互 +
+  会话号防过期回写;hint 回显现有备份数;确认页点明「备份 .ddbak.<ts> 保留 3 份」
+- 单测 6(前缀/命令三段顺序与引用/转义/备份解析/保留数/上限)
+
+## ⑤ 部署失败自动回滚(新模块 `auto_rollback.rs` + 部署管线接入)
+
+- **默认关闭**(`autoRollbackOnFailure`,缺省 false):自动回滚会改线上状态,
+  必须用户显式开启 —— 同时保证升级不改变既有行为
+- **边界(为什么只做整栈 + 只做健康检查失败)**:
+  - 只整栈 —— 归档只在整栈管线写入(单镜像无归档,数据前提不成立)
+  - 只健康检查失败 —— 该失败意味着"新版本起来了但没就绪",止损最典型;
+    更早步骤失败通常线上未被改动,自动回滚反而引入不确定性
+  - 不含取消(用户主动中止是明确意图)、不含续传(与续传意图冲突)
+- **互斥不变量**:部署全程持有 `acquire_remote_op` guard → 自动回滚**不能**调
+  `rollback_execute_stack`(二次 acquire 必被拒),改用其内层
+  `rollback_execute_stack_inner`(`pub(crate)` 提升)
+- **事件不变量**:`deploy-done` 恰好一次(`finish_deploy_run` 负责)→
+  不调 `finish_rollback`(会 emit 第二帧);回滚结果并入部署日志 + 失败文案
+  (「…;已自动回滚到上一份归档 <ts>」)
+- **目标定位**:列归档时用 `manifest.json` 存在性筛"完整归档" —— 本次失败版本
+  的 manifest 在健康检查**之后**才写 → 天然被排除,无需比对时间戳
+- 单测 7 + **变异验证**(去掉开关 gate → 1 红;去掉 ts 排除 → 2 红)
+
+## 验证
+
+- `cargo test` **413 passed / 13 ignored**(377 + 36 新增,现场读 ok 行)
+- `cargo clippy --all-targets` 与 main 基线 **20 条逐条一致,零新增**
+  (过程中自查发现并修正 1 条新告警:`assertions_on_constants` → 改 `const {}` 块)
+- `node --check` 全 16 JS;verify 四脚本(form/bridge/scope/contract-smoke)全 PASS;
+  doc-consistency 全 PASS
+- **桩验证(8798,no-cache)**:四项 UI 端到端 + 载荷断言 ——
+  SSH 导入(4 台:Key×2 带展开路径 / Password×2 待补录;导出载荷逐台核对
+  auth_type/port/key_path/fingerprint 不预填)/
+  悬空清理(3 条 + 两步确认 + 完整 sha256 ID 列表)/
+  compose 查看(12 行内容 + 备份数 hint)+ 编辑保存确认(目标与备份事实行 + 载荷)
+  / 设置勾选(app_settings_set 载荷 `autoRollbackOnFailure: true`)
+- **judge 5 张截图**:4 张首轮 pass;设置中心那张判 fail —— 唯一 issue 是
+  `**健康检查未通过**` markdown 字面量泄漏(截图取自修复前),修源码后重截并
+  复核 **pass**(DOM 断言 `indexOf('**') === -1` 与视觉互证)
+- 桩文件已删、8798 服务已停、预览页已关

@@ -405,6 +405,8 @@ async fn run_deploy_steps(
             // (镜像大小未知 → 告警跳过;不足 → 中文报错中止)
             let need_bytes = image_bytes.map(|size| (size as f64 * 1.5) as u64);
             remote_disk_precheck(app, &mut client, need_bytes).await?;
+            // 架构预检(第二十五批):只告警不阻断,把 exec format error 提前翻译
+            arch_precheck(app, &mut client, crate::docker::image_arch(&image_ref)).await?;
             // 镜像包同名即同内容(uuid 命名),启用断点续传
             upload_tar(app, &mut client, out_path, tar_name).await?;
             emit_log(app, "镜像上传完成");
@@ -1156,6 +1158,45 @@ async fn remote_disk_precheck(
     Ok(())
 }
 
+/// 架构预检(第二十五批):比对本地镜像架构与服务器架构,**只告警不阻断**。
+///
+/// 依据见 [`crate::arch_precheck`] 模块注释:多架构镜像与 qemu 模拟层都会让
+/// "不匹配"仍可正常部署,故硬拦会误伤;该检查的价值在于把难懂的
+/// `exec format error` 提前翻译成可理解的提示,真不兼容时后续 docker load /
+/// compose up 的原始报错会给出最终判定(用户此时已有排查方向)。
+///
+/// 容错:远端 `uname -m` 失败/为空、本地 inspect 失败 → 静默跳过(纯提示检查,
+/// 信息不足时不发无依据的告警);SSH 传输层错误照常 `Err` 传播(连接已坏)。
+async fn arch_precheck(
+    app: &AppHandle,
+    client: &mut SshClient,
+    image_arch: Option<String>,
+) -> Result<(), String> {
+    let Some(local) = image_arch else {
+        return Ok(()); // 本地架构未知(镜像未构建/CLI 异常):静默跳过
+    };
+    let (code, out) = exec_collect(client, &crate::arch_precheck::server_arch_cmd()).await?;
+    if code != 0 {
+        return Ok(());
+    }
+    let remote = out.trim();
+    if remote.is_empty() {
+        return Ok(());
+    }
+    if let Some(hint) = crate::arch_precheck::arch_mismatch_hint(Some(&local), Some(remote)) {
+        emit_log(app, &hint);
+    } else {
+        emit_log(
+            app,
+            &format!(
+                "架构预检通过:镜像与服务器均为 {}",
+                crate::arch_precheck::normalize_arch(&local)
+            ),
+        );
+    }
+    Ok(())
+}
+
 // ===== 智能传输(跳过未变化镜像)=====
 
 /// 智能传输:查询远端镜像列表并构建 `repo:tag` → 镜像 ID 映射。
@@ -1239,7 +1280,12 @@ async fn run_deploy_stack(
         &req.project_id,
         stack_record_images(&req.services),
     );
+    let is_resume = resume.is_some();
     let result = run_deploy_stack_steps(app, req, &mut record, resume, checkpoint).await;
+    // 自动回滚(第二十五批):失败且设置开启且非续传时,尝试回滚上一份归档。
+    // 只改 record.message(追加结果说明),不改变失败语义 —— 部署仍然失败
+    // (deploy-done 恰好一次的不变量由外层 finish_deploy_run 保持)。
+    let result = maybe_auto_rollback(app, &record, result, is_resume).await;
     record.success = result.is_ok();
     record.message = match &result {
         Ok(()) => "部署完成".to_string(),
@@ -1247,6 +1293,153 @@ async fn run_deploy_stack(
     };
     record.duration_secs = started.elapsed().as_secs();
     (result, record, webhook_url)
+}
+
+/// 自动回滚编排(第二十五批;触发条件与边界见 [`crate::auto_rollback`])。
+///
+/// **只被 [`run_deploy_stack`] 调用**(单镜像无归档;调用点唯一可保证
+/// `is_stack = true`)。失败时把回滚结果并入错误文案,成功时保持原错误
+/// (仍是失败 —— 部署确实没成功,只是线上已被救回)。
+///
+/// 互斥不变量:本函数运行在部署管线的 guard 持有期内,故**直接调
+/// [`rollback_execute_stack_inner`]**(它不 acquire —— 再次 acquire 必被拒);
+/// 也**不调** [`finish_rollback`](它会 emit 第二帧 deploy-done)。
+async fn maybe_auto_rollback(
+    app: &AppHandle,
+    record: &DeployRecord,
+    result: Result<(), String>,
+    is_resume: bool,
+) -> Result<(), String> {
+    let Err(err) = result else { return Ok(()) };
+    let enabled = crate::config::load_app_settings().auto_rollback_on_failure;
+    if !crate::auto_rollback::should_auto_rollback(enabled, true, is_resume, &err) {
+        return Err(err);
+    }
+    let (Some(server_id), Some(project_id)) = (record.server_id.clone(), record.project_id.clone())
+    else {
+        // 前置失败(连服务器/项目都没解析出来)→ 无从回滚,原样返回
+        return Err(err);
+    };
+
+    emit_log(app, "部署失败,正在查找可回滚的上一份归档…");
+    let releases = match list_complete_release_ts(&server_id, &project_id).await {
+        Ok(list) => list,
+        Err(e) => {
+            emit_log(app, &format!("自动回滚跳过:读取归档列表失败({})", e));
+            return Err(err);
+        }
+    };
+    // 目标 = 最近一份**完整**归档。完整性判定用 manifest.json 存在性:
+    // 本次失败版本的归档在健康检查**之后**才写入 manifest(步骤 6 之后),
+    // 健康检查失败时它必然不完整 → 天然被排除,无需再比对时间戳。
+    let Some(target) = crate::auto_rollback::pick_rollback_target("", &releases) else {
+        emit_log(app, "自动回滚跳过:没有可回滚的完整归档(可能是首次部署)");
+        return Err(err);
+    };
+
+    emit_log(
+        app,
+        &format!(
+            "自动回滚:部署失败,正在回滚到上一份归档 {}。回滚期间请勿关闭应用",
+            target
+        ),
+    );
+    match rollback_execute_stack_inner(app, &server_id, None, &project_id, &target).await {
+        Ok(_) => {
+            emit_log(
+                app,
+                &format!(
+                    "自动回滚完成:已回到 {} 的版本;部署仍按失败记录(原始错误: {})",
+                    target, err
+                ),
+            );
+            Err(format!(
+                "{};已自动回滚到上一份归档 {}",
+                err,
+                target
+            ))
+        }
+        Err(rollback_err) => {
+            emit_log(
+                app,
+                &format!(
+                    "自动回滚失败:{}(原始部署错误: {})。请手动检查服务器状态后回滚",
+                    rollback_err, err
+                ),
+            );
+            Err(format!(
+                "{};自动回滚也未成功({})",
+                err, rollback_err
+            ))
+        }
+    }
+}
+
+/// 列出项目的**完整**归档时间戳(新 → 旧;完整 = 目录内有 `manifest.json`)。
+///
+/// 自动回滚定位目标用。完整性判定是关键:整栈管线在**健康检查通过后**才写
+/// manifest + compose 副本(见步骤 6 之后的 write_release_artifacts),故本次
+/// 失败版本的归档必然缺 manifest → 天然被排除;回滚到缺 manifest 的目录
+/// 会因 compose 副本缺失而无法恢复(rollback_execute_stack_inner 会报错)。
+///
+/// 实现:一条远端命令同时输出目录名与 manifest 是否存在,避免 N 次往返。
+async fn list_complete_release_ts(
+    server_id: &str,
+    project_id: &str,
+) -> Result<Vec<String>, String> {
+    let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    let server = find_server(&cfg, server_id)?.clone();
+    let project = find_project(&cfg, project_id)?.clone();
+    let password = resolve_password(
+        &server.auth.auth_type,
+        None,
+        server.auth.password_enc.as_deref(),
+    )?;
+    let key_pass = resolve_key_passphrase(&server)?;
+    let mut client = with_timeout(
+        SSH_CONNECT_TIMEOUT_SECS,
+        "连接超时",
+        "请检查服务器地址与网络",
+        SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default()),
+    )
+    .await?;
+    let releases_root = remote_join(&effective_remote_dir(&server, &project), "releases");
+    // 输出形如 `20260917-120000 yes` / `20260916-100000 no`(一行一条);
+    // 目录不存在时整条命令静默无输出(2>/dev/null)→ 首次部署即空列表
+    let cmd = format!(
+        "cd {} 2>/dev/null && for d in */; do d=${{d%/}}; [ -f \"$d/manifest.json\" ] && echo \"$d yes\" || echo \"$d no\"; done",
+        shell_single_quote(&releases_root)
+    );
+    let (_, out) = with_timeout(
+        SSH_EXEC_TIMEOUT_SECS,
+        "读取归档列表超时",
+        "请检查服务器网络后重试",
+        exec_collect(&mut client, &cmd),
+    )
+    .await?;
+    let mut list: Vec<String> = out
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let ts = parts.next()?;
+            let complete = parts.next()?;
+            // 只收完整归档;目录名做基本形态校验(时间戳口径,防路径成分)
+            if complete == "yes"
+                && !ts.is_empty()
+                && ts.len() <= 32
+                && !ts.contains('/')
+                && !ts.contains("..")
+            {
+                Some(ts.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    // `for d in */` 按名字升序 = 时间戳升序(旧 → 新);倒置成新 → 旧
+    list.reverse();
+    Ok(list)
 }
 
 /// 整栈部署管线主体(六步,任一步失败即中止)。`record` 为组装中的部署历史
@@ -1539,6 +1732,27 @@ async fn run_deploy_stack_steps(
             .collect();
         let need_bytes = sum_sizes(&local_sizes).map(|total| (total as f64 * 1.5) as u64);
         remote_disk_precheck(app, &mut client, need_bytes).await?;
+        // 架构预检(第二十五批):整栈服务镜像可能架构各异,逐个查本地架构、
+        // 去重后对服务器判一次(只告警不阻断;详见 arch_precheck 注释)
+        {
+            let mut archs: Vec<String> = Vec::new();
+            for s in &local_choices {
+                if let Some(a) = crate::docker::image_arch(&s.image) {
+                    let norm = crate::arch_precheck::normalize_arch(&a);
+                    if !norm.is_empty() && !archs.contains(&norm) {
+                        archs.push(norm);
+                    }
+                }
+            }
+            if archs.len() == 1 {
+                arch_precheck(app, &mut client, Some(archs[0].clone())).await?;
+            } else if archs.len() > 1 {
+                // 多架构混合:逐个给出各自判定(相同结构,仅镜像侧取值不同)
+                for a in archs {
+                    arch_precheck(app, &mut client, Some(a)).await?;
+                }
+            }
+        }
 
         // 远端建本次发布目录 <remote_dir>/releases/<时间戳>/(mkdir -p 连带创建
         // remote_dir;断点续传复用同目录,mkdir -p 幂等)

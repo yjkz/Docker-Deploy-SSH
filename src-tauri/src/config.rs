@@ -666,6 +666,11 @@ pub struct AppSettings {
     /// CPU 占用阈值(百分比,默认 90;`0` = 该项不告警)
     #[serde(default = "default_alert_percent")]
     pub alert_cpu_percent: u32,
+    /// 整栈部署**健康检查失败**时自动回滚到上一份归档(第二十五批;
+    /// 缺省 **false** —— 自动回滚会改线上状态,必须用户显式开启,
+    /// 同时保证升级不改变既有行为)。设计与边界见 `auto_rollback` 模块注释。
+    #[serde(default)]
+    pub auto_rollback_on_failure: bool,
 }
 
 /// `AppSettings::default` 的手写实现:`auto_update_from_source` 缺省为 **true**
@@ -683,6 +688,7 @@ impl Default for AppSettings {
             alert_disk_percent: default_alert_percent(),
             alert_mem_percent: default_alert_percent(),
             alert_cpu_percent: default_alert_percent(),
+            auto_rollback_on_failure: false,
         }
     }
 }
@@ -1213,6 +1219,7 @@ mod tests {
             alert_disk_percent: 80,
             alert_mem_percent: 85,
             alert_cpu_percent: 0,
+            auto_rollback_on_failure: true,
         };
         save_app_settings(&settings).unwrap();
         assert!(dir.join("config/settings.json").exists());
@@ -1264,11 +1271,13 @@ mod tests {
             alert_disk_percent: 90,
             alert_mem_percent: 90,
             alert_cpu_percent: 90,
+            auto_rollback_on_failure: false,
         };
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains("\"closeToTray\":true"));
         assert!(json.contains("\"proxy\":\"http://127.0.0.1:7890\""));
         assert!(json.contains("\"termLogKeepDays\":30"));
+        assert!(json.contains("\"autoRollbackOnFailure\":false"));
 
         let partial: AppSettings = serde_json::from_str(r#"{"closeToTray":true}"#).unwrap();
         assert!(partial.close_to_tray);
@@ -1278,6 +1287,9 @@ mod tests {
         assert!(AppSettings::default().auto_update_from_source);
         // 旧配置无 termLogKeepDays → 默认 30(第二十三批)
         assert_eq!(partial.term_log_keep_days, 30);
+        // 旧配置无 autoRollbackOnFailure → 默认 false(自动回滚须显式开启)
+        assert!(!partial.auto_rollback_on_failure);
+        assert!(!AppSettings::default().auto_rollback_on_failure);
         assert_eq!(AppSettings::default().term_log_keep_days, 30);
         // 旧配置无 alert 系列 → 间隔 0(关)/ 阈值 90(第二十四批)
         assert_eq!(partial.alert_interval_mins, 0);

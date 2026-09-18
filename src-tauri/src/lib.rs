@@ -1,3 +1,5 @@
+pub mod arch_precheck;
+pub mod auto_rollback;
 pub mod commands;
 pub mod config;
 pub mod config_io;
@@ -16,6 +18,7 @@ pub mod notify;
 pub mod probe;
 pub mod profiles;
 pub mod ssh;
+pub mod ssh_import;
 pub mod stack;
 pub mod tray_status;
 pub mod update;
@@ -142,6 +145,11 @@ pub fn run() {
       config::open_logs_dir,
       config::write_text_file,
       update::open_external,
+      ssh_import::ssh_config_scan,
+      commands::list_dangling_images,
+      commands::remove_local_images,
+      manage_stacks::manage_stack_compose_read,
+      manage_stacks::manage_stack_compose_save,
     ])
     .setup(|app| {
       // 日志(不限 debug 构建,release 同样记录,便于现场排查):

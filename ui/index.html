@@ -124,6 +124,8 @@
           <div class="page-tools">
             <input id="images-search" class="text-input" type="search"
                    placeholder="搜索仓库名或标签…" autocomplete="off">
+            <!-- 悬空镜像清理(第二十五批):扫描 <none>:<none> 层并删除 -->
+            <button id="images-cleanup-btn" class="btn" type="button">清理悬空镜像</button>
             <button id="images-refresh-btn" class="btn" type="button">刷新</button>
           </div>
         </header>
@@ -158,6 +160,9 @@
           </div>
           <div class="page-tools">
             <button id="servers-add-btn" class="btn btn-primary" type="button">新增服务器</button>
+            <!-- 从 SSH 配置导入(第二十五批):扫描 ~/.ssh/config + known_hosts,
+                 勾选主机批量建服务器(模态内容由 servers.js 构建) -->
+            <button id="servers-ssh-import-btn" class="btn" type="button">从 SSH 配置导入</button>
             <button id="projects-add-btn" class="btn" type="button">新增项目</button>
             <!-- 配置中心:导出 / 导入 / 清除数据(模态内容由 config-io.js 构建) -->
             <button id="config-io-btn" class="btn" type="button">配置中心</button>
@@ -832,6 +837,17 @@
         <button id="cleanup-modal-close" class="modal-close" type="button" title="关闭">关闭</button>
       </div>
       <div id="cleanup-modal-body" class="modal-body"></div>
+    </div>
+  </div>
+
+  <!-- 悬空镜像清理模态(02 页本地镜像,内容由 images.js 构建;第二十五批) -->
+  <div id="dangling-modal" class="modal-overlay hidden">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="dangling-modal-title">
+      <div class="modal-head">
+        <div id="dangling-modal-title" class="modal-title">清理悬空镜像</div>
+        <button id="dangling-modal-close" class="modal-close" type="button" title="关闭">关闭</button>
+      </div>
+      <div id="dangling-modal-body" class="modal-body"></div>
     </div>
   </div>
 

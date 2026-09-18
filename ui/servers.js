@@ -898,6 +898,218 @@
     openFleetModal(btn);
   }
 
+  // ===== 从 SSH 配置导入(第二十五批)=====
+  //
+  // 只读扫描 `~/.ssh/config` + `known_hosts`(后端 ssh_config_scan 纯解析),
+  // 勾选后**逐条走既有 save_server_entry** —— 密文 merge / 哨兵 / update_config
+  // 锁语义全部复用,不新增任何写路径。
+  //
+  // 已知取舍:不预填 host_key_sha256 —— known_hosts 里一个主机常有多条不同
+  // 算法的密钥,预填错一条会让连接硬失败(报「主机密钥已变更」),而 TOFU
+  // 首次连接自然记录才准确。known_in_hosts 只作「这台机器以前连过」的提示。
+
+  /** 导入模态状态(模块级:关闭即复位) */
+  var sshImportState = null;
+
+  /** servers-modal 当前是否可见(异步收尾守卫:照 settings.js 同款) */
+  function isModalVisible() {
+    var overlay = document.getElementById('servers-modal');
+    return !!(overlay && !overlay.classList.contains('hidden'));
+  }
+
+  /** 打开「从 SSH 配置导入」模态:扫描 → 勾选列表 → 批量导入 */
+  function openSshImportModal() {
+    sshImportState = { rows: [], selected: {}, importing: false, session: 0 };
+    var session = ++sshImportState.session;
+    // wide:导入表 5 列(勾选/别名/地址/用户/认证),560px 下别名与私钥路径
+    // 会折行折断(实测);放大到 modal-wide(1000px)后单行可读
+    openModal('从 SSH 配置导入', function (body) {
+      var box = el('div', 'sshimp-box');
+      box.appendChild(el('div', 'server-check-hint', '正在读取 ~/.ssh/config…'));
+      body.appendChild(box);
+
+      window.AppBus.invoke('ssh_config_scan')
+        .then(function (scan) {
+          if (session !== sshImportState.session || !isModalVisible()) return;
+          renderSshImport(box, scan || {});
+        })
+        .catch(function (err) {
+          if (session !== sshImportState.session) return;
+          box.textContent = '';
+          box.appendChild(el('div', 'server-check-hint',
+            '读取 SSH 配置失败:' + (errText(err) || '未知错误')));
+        });
+    }, { wide: true });
+  }
+
+  /** 渲染扫描结果:来源行 + 勾选表 + 底部导入按钮 */
+  function renderSshImport(box, scan) {
+    box.textContent = '';
+    var hosts = Array.isArray(scan.hosts) ? scan.hosts : [];
+
+    // 来源回显:读的哪个文件、通配块跳过了几个(避免「我配了 10 个怎么只出现 6 个」)
+    var src = el('div', 'sshimp-src');
+    src.appendChild(el('span', 'sshimp-path', String(scan.configPath || '~/.ssh/config')));
+    if (!scan.configExists) {
+      box.appendChild(src);
+      box.appendChild(el('div', 'server-check-hint',
+        '未找到 SSH 配置文件;可在向导里手工新增服务器,或先在 ~/.ssh/config 配置主机'));
+      return;
+    }
+    if (scan.skippedWildcards > 0) {
+      src.appendChild(el('span', 'sshimp-skip',
+        '已跳过 ' + scan.skippedWildcards + ' 个通配配置块(Host * 等全局默认)'));
+    }
+    if (!scan.knownHostsExists) {
+      src.appendChild(el('span', 'sshimp-skip', '未找到 known_hosts(不影响导入)'));
+    }
+    box.appendChild(src);
+
+    if (hosts.length === 0) {
+      box.appendChild(el('div', 'server-check-hint',
+        '配置文件里没有可导入的具体主机(只有通配块或空配置)'));
+      return;
+    }
+
+    // 表头:全选 + 列名
+    var head = el('div', 'sshimp-head');
+    var allBox = document.createElement('input');
+    allBox.type = 'checkbox';
+    allBox.id = 'sshimp-all';
+    allBox.checked = true;
+    allBox.addEventListener('change', function () {
+      hosts.forEach(function (h) { sshImportState.selected[h.alias] = allBox.checked; });
+      box.querySelectorAll('.sshimp-row input[type=checkbox]').forEach(function (cb) {
+        cb.checked = allBox.checked;
+      });
+      updateImportBtn();
+    });
+    head.appendChild(allBox);
+    head.appendChild(el('span', 'sshimp-col-name', '别名 / ALIAS'));
+    head.appendChild(el('span', 'sshimp-col-host', '地址 / HOST'));
+    head.appendChild(el('span', 'sshimp-col-user', '用户'));
+    head.appendChild(el('span', 'sshimp-col-auth', '认证'));
+    box.appendChild(head);
+
+    var listBox = el('div', 'sshimp-list');
+    hosts.forEach(function (h) {
+      sshImportState.selected[h.alias] = true; // 默认全选
+      var row = el('div', 'sshimp-row');
+
+      var cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = true;
+      cb.id = 'sshimp-' + (('0' + (listBox.children.length + 1)).slice(-2));
+      cb.addEventListener('change', function () {
+        sshImportState.selected[h.alias] = cb.checked;
+        updateImportBtn();
+      });
+      row.appendChild(cb);
+
+      var nameWrap = el('div', 'sshimp-name-wrap');
+      nameWrap.appendChild(el('span', 'sshimp-name', String(h.alias || '')));
+      if (h.knownInHosts) {
+        nameWrap.appendChild(window.fillBadge(el('span'), 'info', '已知主机'));
+      }
+      row.appendChild(nameWrap);
+
+      row.appendChild(el('span', 'sshimp-host', String(h.host || '') +
+        (h.port && h.port !== 22 ? ':' + h.port : '')));
+      row.appendChild(el('span', 'sshimp-user', h.user ? String(h.user) : '—'));
+
+      // 认证:有 IdentityFile 走 Key(并把展开后的路径带进表单),否则提示补录
+      var authCell = el('div', 'sshimp-auth');
+      if (h.identityFile) {
+        authCell.appendChild(window.fillBadge(el('span'), 'ok', '私钥'));
+        authCell.appendChild(el('span', 'sshimp-key', String(h.identityFile)));
+      } else {
+        authCell.appendChild(window.fillBadge(el('span'), 'info', '待补录'));
+        authCell.appendChild(el('span', 'sshimp-key', '导入后在服务器设置里填密码/私钥'));
+      }
+      row.appendChild(authCell);
+      listBox.appendChild(row);
+    });
+    box.appendChild(listBox);
+
+    // 底部:导入选中项
+    var actions = el('div', 'sshimp-actions');
+    var importBtn = el('button', 'btn btn-primary', '导入选中项');
+    importBtn.type = 'button';
+    importBtn.id = 'sshimp-import-btn';
+    importBtn.addEventListener('click', function () { doSshImport(hosts, importBtn); });
+    actions.appendChild(importBtn);
+    box.appendChild(actions);
+
+    function updateImportBtn() {
+      var n = hosts.filter(function (h) { return sshImportState.selected[h.alias]; }).length;
+      importBtn.textContent = n > 0 ? '导入选中项(' + n + ')' : '未选中任何主机';
+      importBtn.disabled = n === 0 || sshImportState.importing;
+    }
+    updateImportBtn();
+  }
+
+  /**
+   * 逐条导入选中主机:串行走 save_server_entry(后端 merge 语义完整保留)。
+   * 已存在同名服务器时跳过(不覆盖用户已录凭据)——按 name 去重。
+   */
+  function doSshImport(hosts, importBtn) {
+    if (sshImportState.importing) return;
+    var picked = hosts.filter(function (h) { return sshImportState.selected[h.alias]; });
+    if (picked.length === 0) return;
+
+    var existing = {};
+    ((st.cfg && st.cfg.servers) || []).forEach(function (s) { existing[s.name] = true; });
+
+    sshImportState.importing = true;
+    window.setBtnBusy(importBtn, true, '导入中…');
+    var added = 0, skipped = 0, failed = [];
+    var chain = Promise.resolve();
+
+    picked.forEach(function (h) {
+      chain = chain.then(function () {
+        var name = String(h.alias || h.host || '');
+        if (existing[name]) { skipped += 1; return; }
+        var server = {
+          id: uuid(),
+          name: name,
+          host: String(h.host || ''),
+          port: Number(h.port) || 22,
+          username: h.user ? String(h.user) : '',
+          auth: {
+            auth_type: h.identityFile ? 'Key' : 'Password',
+            key_path: h.identityFile ? String(h.identityFile) : null,
+            password_enc: null,  // 后端 merge:新建无既有密文,留空待用户补录
+            key_pass_enc: null
+          },
+          remote_dir: '',
+          host_key_sha256: null   // 不预填指纹(见本节顶部已知取舍)
+        };
+        return window.AppBus.invoke('save_server_entry', { server: server })
+          .then(function () { added += 1; })
+          .catch(function (err) {
+            failed.push(name + ':' + (errText(err) || '未知错误'));
+          });
+      });
+    });
+
+    chain.then(function () {
+      sshImportState.importing = false;
+      var parts = [];
+      if (added > 0) parts.push('已导入 ' + added + ' 台');
+      if (skipped > 0) parts.push('跳过同名 ' + skipped + ' 台');
+      if (failed.length > 0) parts.push('失败 ' + failed.length + ' 台');
+      var summary = parts.join(',') || '没有可导入的主机';
+      window.toast(summary, failed.length > 0 ? 'warn' : 'ok');
+      closeModal();
+      return loadConfig();
+    }).then(function () {
+      if (failed.length > 0) window.toast('导入失败:' + failed.join(';'), 'fail');
+    }).catch(function (err) {
+      sshImportState.importing = false;
+      window.toast('导入失败:' + (errText(err) || '未知错误'), 'fail');
+    });
+  }
+
   function runEnvCheck(server, mode, extras) {
     var id = server.id;
     if (st.checking[id] || st.installing[id] || st.pruning[id]) return;
@@ -1506,6 +1718,12 @@
     var titleEl = document.getElementById('servers-modal-title');
     var bodyEl = document.getElementById('servers-modal-body');
     if (!overlay || !titleEl || !bodyEl) return;
+    var card = overlay.querySelector('.modal-card');
+    // 放大标记(第二十五批;移自 manage.js 的同款约定:body 带
+    // `servers-wide-modal` 时给卡片加 .modal-wide,否则显式移除 —— 防上一个
+    // 宽弹窗的类残留到下一个普通弹窗)。窄窗口由 CSS 媒体查询兜底。
+    var wide = !!(opts && opts.wide);
+    if (card) card.classList.toggle('modal-wide', wide);
     titleEl.textContent = title;
     if (opts && opts.form) {
       // 表单模态:内容进 <form>,body 自身只作滚动容器
@@ -1529,6 +1747,8 @@
       st.fleet.cancel = true;
       if (st.fleet.btn) window.setBtnBusy(st.fleet.btn, false, '全部巡检');
     }
+    // SSH 导入:关闭即作废会话(在途扫描回调按 session 丢弃,不回写已关模态)
+    if (sshImportState) sshImportState.session += 1;
     var overlay = document.getElementById('servers-modal');
     if (overlay) {
       overlay.classList.add('hidden');
@@ -2934,6 +3154,11 @@
 
   function bindStaticEvents() {
     installFleetButton();
+    // 从 SSH 配置导入(第二十五批)
+    var sshImportBtn = document.getElementById('servers-ssh-import-btn');
+    if (sshImportBtn) {
+      sshImportBtn.addEventListener('click', function () { openSshImportModal(); });
+    }
     var addServer = document.getElementById('servers-add-btn');
     if (addServer) {
       addServer.addEventListener('click', function () { openServerModal(null); });

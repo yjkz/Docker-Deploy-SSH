@@ -229,6 +229,95 @@ pub fn tag_image(image: &str, new_tag: &str) -> Result<(), String> {
         .map_err(|e| format!("打标签失败: {}", e))
 }
 
+// ===== 本地悬空镜像清理(第二十五批)=====
+//
+// 「悬空」(dangling)= 无 repo:tag 引用的镜像层(`<none>:<none>`),通常是
+// 重新构建同名镜像后残留的旧层,只占磁盘不参与任何运行。
+//
+// 为什么**不用** `docker image prune`:与远端清理分析同一取舍(见 cleanup.rs
+// `rmi_ids_cmd` 注释)—— prune 的删除范围由 docker 自行判定,与用户在预览里
+// 看到/勾选的条目未必一致;逐 ID `docker rmi` 让执行结果与勾选一一对应。
+//
+// 安全前提:悬空镜像**必然不被任何容器引用**(有容器用着就有 ID 引用,
+// 不会显示为 `<none>:<none>`)—— 这与清理分析要额外查 `in_use_image_ids`
+// 的场景(旧标签镜像可能仍被容器引用)不同,故此处无需容器引用查询。
+
+/// 一条本地悬空镜像(前端契约,camelCase)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DanglingImage {
+    /// `docker images --no-trunc` 的完整 ID(含 `sha256:` 前缀)
+    pub id: String,
+    pub size_bytes: u64,
+    pub created: String,
+}
+
+/// 从 `docker images --no-trunc --format {{json .}}` 输出筛出悬空镜像(纯函数)。
+///
+/// 判定:Repository **与** Tag 同时为 `<none>` 才算悬空(与 cleanup.rs 的
+/// `Repository == "<none>" || Tag == "<none>"` 口径一致;任一侧为 `<none>`
+/// 都表示没有可引用的 `repo:tag` 名)。
+/// 同一 ID 的多行(理论上不会出现,防御性)按首次出现去重。
+/// 坏行跳过(不因一行解析失败丢掉整份列表)。
+pub fn select_dangling_images(stdout: &str) -> Vec<DanglingImage> {
+    let mut out: Vec<DanglingImage> = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(raw) = serde_json::from_str::<ImageJsonLine>(line) else {
+            continue;
+        };
+        if !is_dangling_names(&raw.repository, &raw.tag) {
+            continue;
+        }
+        let id = raw.id.trim().to_string();
+        if id.is_empty() || out.iter().any(|d| d.id == id) {
+            continue;
+        }
+        out.push(DanglingImage {
+            id,
+            size_bytes: size_to_bytes(&raw.size),
+            created: raw.created_at,
+        });
+    }
+    out
+}
+
+/// 镜像名是否为悬空(Repository 与 Tag 同时为 `<none>`;空串按悬空算,
+/// 与前端 `isNone` 口径一致)。纯函数。
+pub(crate) fn is_dangling_names(repository: &str, tag: &str) -> bool {
+    fn none_like(s: &str) -> bool {
+        let s = s.trim();
+        s.is_empty() || s == "<none>"
+    }
+    none_like(repository) && none_like(tag)
+}
+
+/// 列出本地悬空镜像(`docker images --no-trunc`,客户端过滤)。
+pub fn list_dangling_images() -> Result<Vec<DanglingImage>, String> {
+    let (stdout, _) = run_docker(&["images", "--no-trunc", "--format", "{{json .}}"])?;
+    Ok(select_dangling_images(&stdout))
+}
+
+/// 删除指定 ID 的本地镜像(逐 ID `docker rmi`,不经 shell)。
+///
+/// 返回 (成功删除数, 失败项与原因);单个失败不中断其余(与远端清理
+/// 的执行语义一致)。`force=false`:悬空镜像本无引用,非强制即可删;
+/// 真被引用时 docker 会拒绝,该拒绝原文回传用户。
+pub fn remove_images_by_id(ids: &[String]) -> (usize, Vec<String>) {
+    let mut ok = 0;
+    let mut failed = Vec::new();
+    for id in ids {
+        match run_docker(&["rmi", id]) {
+            Ok(_) => ok += 1,
+            Err(e) => failed.push(format!("{}: {}", id, e)),
+        }
+    }
+    (ok, failed)
+}
+
 /// 判断本地是否存在指定镜像/标签:`docker image inspect` 退出码 0 即存在。
 pub fn image_exists(image: &str) -> bool {
     new_command("docker")
@@ -250,6 +339,29 @@ pub fn image_size(image: &str) -> Option<u64> {
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     stdout.trim().parse::<u64>().ok()
+}
+
+/// 获取本地镜像架构(第二十五批,架构预检用):
+/// `docker image inspect --format {{.Architecture}}`(Docker 口径:`amd64`/`arm64`…,
+/// 归一化与比对见 `arch_precheck`)。镜像不存在/CLI 缺失/输出空 → None
+/// (预检是提示性检查,信息不足时静默跳过,不做无依据告警)。
+///
+/// 已知局限:多架构 manifest list 经 buildx 构建的镜像,此处报的可能是
+/// 宿主平台而非全部平台 —— 故预检**只告警不阻断**(见 arch_precheck 模块注释)。
+pub fn image_arch(image: &str) -> Option<String> {
+    let output = new_command("docker")
+        .args(["image", "inspect", "--format", "{{.Architecture}}", image])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let arch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if arch.is_empty() {
+        None
+    } else {
+        Some(arch)
+    }
 }
 
 /// 查询本地镜像 ID(`docker image inspect <ref> --format {{.Id}}`),供部署管线
@@ -528,6 +640,63 @@ mod tests {
     #[test]
     fn test_parse_image_line_bad_json() {
         assert!(parse_image_line("not json").is_err());
+    }
+
+    // ===== 本地悬空镜像清理(第二十五批)=====
+
+    #[test]
+    fn test_select_dangling_images_filters_none_only() {
+        let stdout = "\
+{\"Containers\":\"N/A\",\"CreatedAt\":\"2026-08-01 10:00:00 +0800 CST\",\"ID\":\"sha256:aa11\",\"Repository\":\"<none>\",\"Tag\":\"<none>\",\"Size\":\"120MB\"}
+{\"Containers\":\"N/A\",\"CreatedAt\":\"2026-08-02 10:00:00 +0800 CST\",\"ID\":\"sha256:bb22\",\"Repository\":\"myapp\",\"Tag\":\"latest\",\"Size\":\"300MB\"}
+{\"Containers\":\"N/A\",\"CreatedAt\":\"2026-08-03 10:00:00 +0800 CST\",\"ID\":\"sha256:cc33\",\"Repository\":\"<none>\",\"Tag\":\"v1\",\"Size\":\"50MB\"}
+";
+        let out = select_dangling_images(stdout);
+        // 只有第一行 Repository 与 Tag 同时 <none> 才算悬空
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "sha256:aa11");
+        assert_eq!(out[0].size_bytes, 125_829_120); // 120MB
+        assert_eq!(out[0].created, "2026-08-01 10:00:00 +0800 CST");
+    }
+
+    #[test]
+    fn test_select_dangling_images_dedupes_and_skips_bad_lines() {
+        let stdout = "\
+not json at all
+{\"Containers\":\"N/A\",\"CreatedAt\":\"t1\",\"ID\":\"sha256:dup\",\"Repository\":\"<none>\",\"Tag\":\"<none>\",\"Size\":\"10MB\"}
+
+{\"Containers\":\"N/A\",\"CreatedAt\":\"t2\",\"ID\":\"sha256:dup\",\"Repository\":\"<none>\",\"Tag\":\"<none>\",\"Size\":\"10MB\"}
+";
+        let out = select_dangling_images(stdout);
+        // 坏行与空行跳过;同 ID 去重
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "sha256:dup");
+    }
+
+    #[test]
+    fn test_select_dangling_images_treats_empty_names_as_dangling() {
+        // 空串与 <none> 同义(前端 isNone 口径一致)
+        let stdout = "\
+{\"Containers\":\"N/A\",\"CreatedAt\":\"t\",\"ID\":\"sha256:e1\",\"Repository\":\"\",\"Tag\":\"<none>\",\"Size\":\"1MB\"}
+{\"Containers\":\"N/A\",\"CreatedAt\":\"t\",\"ID\":\"sha256:e2\",\"Repository\":\"<none>\",\"Tag\":\"\",\"Size\":\"1MB\"}
+{\"Containers\":\"N/A\",\"CreatedAt\":\"t\",\"ID\":\"\",\"Repository\":\"<none>\",\"Tag\":\"<none>\",\"Size\":\"1MB\"}
+";
+        let out = select_dangling_images(stdout);
+        // 前两条算悬空;第三条 ID 为空丢弃(没 ID 删不了)
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].id, "sha256:e1");
+        assert_eq!(out[1].id, "sha256:e2");
+    }
+
+    #[test]
+    fn test_is_dangling_names() {
+        assert!(is_dangling_names("<none>", "<none>"));
+        assert!(is_dangling_names("", ""));
+        assert!(is_dangling_names("  <none> ", ""));
+        // 任一有名字就**不是**悬空(旧标签镜像属清理分析的场景,不在此处删)
+        assert!(!is_dangling_names("myapp", "<none>"));
+        assert!(!is_dangling_names("<none>", "v1"));
+        assert!(!is_dangling_names("myapp", "latest"));
     }
 
     // 注:brief 原测试为与第二次 chrono::Local::now() 精确比较时间字符串,

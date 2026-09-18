@@ -313,7 +313,7 @@ pub async fn rollback_execute_stack(
 
 /// [`rollback_execute_stack`] 的管线主体:成功返回组装好的部署历史记录
 /// (由 [`finish_rollback`] 落历史),失败返回中文错误。
-async fn rollback_execute_stack_inner(
+pub(crate) async fn rollback_execute_stack_inner(
     app: &AppHandle,
     server_id: &str,
     password_plain: Option<&str>,

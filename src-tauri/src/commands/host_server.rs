@@ -26,6 +26,50 @@ pub async fn list_images() -> Result<Vec<ImageInfo>, String> {
         .map_err(|e| format!("获取镜像列表任务失败: {}", e))?
 }
 
+/// 扫描本地悬空镜像(第二十五批;`<none>:<none>` 层,只读)。
+#[tauri::command]
+pub async fn list_dangling_images() -> Result<Vec<crate::docker::DanglingImage>, String> {
+    tauri::async_runtime::spawn_blocking(crate::docker::list_dangling_images)
+        .await
+        .map_err(|e| format!("扫描悬空镜像任务失败: {}", e))?
+}
+
+/// 删除指定 ID 的本地镜像(第二十五批;逐个 `docker rmi`,返回执行摘要)。
+///
+/// 校验:ids 非空且**全部**为 `sha256:` 开头的完整 ID(id 来自
+/// [`list_dangling_images`] 的 `--no-trunc` 输出;拒绝 `repo:tag` 形态 ——
+/// 用引用删除可能连带删掉同名多标签,与用户勾选不符)。单个失败不中断。
+#[tauri::command]
+pub async fn remove_local_images(ids: Vec<String>) -> Result<LocalImageRemoval, String> {
+    if ids.is_empty() {
+        return Err("未指定要删除的镜像".to_string());
+    }
+    if let Some(bad) = ids
+        .iter()
+        .find(|i| !i.starts_with("sha256:") || i.len() <= "sha256:".len())
+    {
+        return Err(format!(
+            "镜像 ID 格式不合法({}):须为 sha256: 开头的完整 ID",
+            bad
+        ));
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let (removed, failed) = crate::docker::remove_images_by_id(&ids);
+        LocalImageRemoval { removed, failed }
+    })
+    .await
+    .map_err(|e| format!("删除本地镜像任务失败: {}", e))
+}
+
+/// [`remove_local_images`] 的执行摘要(camelCase 契约)。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalImageRemoval {
+    pub removed: usize,
+    /// 失败项(格式 `id: 原因`),前端原样展示
+    pub failed: Vec<String>,
+}
+
 // ===== 服务器一键诊断(第二十批阶段三)=====
 
 /// 诊断步骤的结果(前端红绿灯渲染;camelCase)。

@@ -222,6 +222,15 @@
     envBtn.addEventListener('click', function () { showStackEnv(st); });
     wrap.appendChild(envBtn);
 
+    // 第二十五批:compose 文件本体查看/编辑(保存前自动备份 .ddbak.<ts> 保留 3 份)
+    var composeBtn = document.createElement('button');
+    composeBtn.type = 'button';
+    composeBtn.className = 'btn btn-sm';
+    composeBtn.textContent = 'compose';
+    composeBtn.title = '查看/编辑该栈的 compose 文件;保存前自动备份(保留最近 3 份)';
+    composeBtn.addEventListener('click', function () { showStackCompose(st); });
+    wrap.appendChild(composeBtn);
+
     tdAction.appendChild(wrap);
     tr.appendChild(tdAction);
   }
@@ -383,6 +392,196 @@
   // 非 UTF-8 字节告警文案:读回内容含 U+FFFD(后端 from_utf8_lossy 替换所致)时
   // 在提示区展示;未改动保存走原样回写无损落盘,改动后保存会被拒绝(见 doStackEnvSave)
   var ENV_FFFD_WARN = '文件包含非 UTF-8 字节(可能为 GBK 编码),显示为替换符;未改动保存将按原始字节无损回写,改动后需在服务器上以正确编码编辑';
+
+  // ===== compose 文件查看/编辑(第二十五批)=====
+  // 与 .env 同构的一套状态与流程(同一份编辑/确认/保存交互语言),
+  // 差异:后端保存前会自动备份 .ddbak.<ts>(保留 3 份),故确认文案里点明这一点。
+  var composeState = { session: 0, busy: false, loaded: '', known: false, rawB64: '', notUtf8: false, backups: [] };
+
+  function showStackCompose(st) {
+    var session = ++composeState.session;
+    composeState.busy = false;
+    openModal('compose — ' + (st.dir || st.compose_file), buildStackComposeBody(st, session));
+    loadStackCompose(st, session);
+  }
+
+  function buildStackComposeBody(st, session) {
+    var body = document.createElement('div');
+    body.className = 'manage-wide-modal';
+    // textarea 复用 .manage-env-editor 样式(等宽 + 同款尺寸约束)
+    body.innerHTML =
+      '<div class="log-tail-bar manage-env-bar">' +
+      '<span id="stack-compose-hint" class="manage-env-hint hidden"></span>' +
+      '<div class="manage-env-actions">' +
+      '<button id="stack-compose-edit-btn" class="btn btn-sm" type="button">编辑</button>' +
+      '<button id="stack-compose-save-btn" class="btn btn-sm btn-danger hidden" type="button">保存 compose</button>' +
+      '<button id="stack-compose-cancel-btn" class="btn btn-sm hidden" type="button">取消编辑</button>' +
+      '</div>' +
+      '</div>' +
+      '<textarea id="stack-compose-editor" class="manage-env-editor" spellcheck="false" readonly></textarea>';
+
+    var editBtn = body.querySelector('#stack-compose-edit-btn');
+    if (editBtn) editBtn.addEventListener('click', function () { setStackComposeMode(true); });
+
+    var saveBtn = body.querySelector('#stack-compose-save-btn');
+    if (saveBtn) saveBtn.addEventListener('click', function () { onStackComposeSave(st, session); });
+
+    var cancelBtn = body.querySelector('#stack-compose-cancel-btn');
+    if (cancelBtn) {
+      cancelBtn.addEventListener('click', function () {
+        var ta = $('stack-compose-editor');
+        if (!ta) return;
+        setStackComposeMode(false);
+        if (composeState.known) ta.value = composeState.loaded;
+        else loadStackCompose(st, session);
+      });
+    }
+    return body;
+  }
+
+  function loadStackCompose(st, session) {
+    composeState.loaded = '';
+    composeState.known = false;
+    var ta = $('stack-compose-editor');
+    if (ta) { ta.value = ''; ta.placeholder = '加载中…'; }
+    AppBus.invoke('manage_stack_compose_read', { serverId: state.serverId, composeFile: st.compose_file })
+      .then(function (res) {
+        if (session !== composeState.session) return;
+        var ta2 = $('stack-compose-editor');
+        if (!ta2) return;
+        var exists = !!(res && res.exists);
+        composeState.loaded = exists ? String(res.content || '') : '';
+        composeState.known = true;
+        composeState.notUtf8 = !!(res && res.notUtf8);
+        composeState.rawB64 = composeState.notUtf8 ? String(res.rawB64 || '') : '';
+        composeState.backups = (res && Array.isArray(res.backups)) ? res.backups : [];
+        if (ta2.readOnly) ta2.value = composeState.loaded;
+        ta2.placeholder = '';
+        if (exists && composeState.notUtf8) {
+          setStackComposeHint(ENV_FFFD_WARN);
+        } else if (!exists) {
+          setStackComposeHint('该路径的 compose 文件不存在(理论上不应发生)');
+        } else if (composeState.backups.length > 0) {
+          // 备份提示:让用户知道上次改坏可回滚(取最新一份 basename 展示)
+          var latest = String(composeState.backups[0]).split('/').pop();
+          setStackComposeHint('已有 ' + composeState.backups.length + ' 份备份,最近一份:' + latest);
+        } else {
+          setStackComposeHint('保存前会自动备份(保留最近 3 份)');
+        }
+      })
+      .catch(function (err) {
+        if (session !== composeState.session) return;
+        var ta2 = $('stack-compose-editor');
+        if (ta2 && ta2.readOnly) { ta2.value = ''; ta2.placeholder = ''; }
+        var msg = err && err.message ? err.message : String(err);
+        setStackComposeHint('读取 compose 失败: ' + msg);
+      });
+  }
+
+  function setStackComposeMode(editing) {
+    var ta = $('stack-compose-editor');
+    var editBtn = $('stack-compose-edit-btn');
+    var saveBtn = $('stack-compose-save-btn');
+    var cancelBtn = $('stack-compose-cancel-btn');
+    if (!ta || !editBtn || !saveBtn || !cancelBtn) return;
+    ta.readOnly = !editing;
+    editBtn.classList.toggle('hidden', editing);
+    saveBtn.classList.toggle('hidden', !editing);
+    cancelBtn.classList.toggle('hidden', !editing);
+    if (editing) ta.focus();
+  }
+
+  function setStackComposeHint(text) {
+    var hint = $('stack-compose-hint');
+    if (!hint) return;
+    if (text) { hint.textContent = text; hint.classList.remove('hidden'); }
+    else { hint.textContent = ''; hint.classList.add('hidden'); }
+  }
+
+  function onStackComposeSave(st, session) {
+    if (composeState.busy) return;
+    var ta = $('stack-compose-editor');
+    if (!ta) return;
+    var draft = ta.value;
+    var bytes = window.TextEncoder ? new TextEncoder().encode(draft).length : draft.length;
+    if (bytes > 1024 * 1024) {
+      toast('compose 内容过大(上限 1MB),请精简后再保存', 'warn');
+      return;
+    }
+    // 非 UTF-8 处理与 .env 完全一致:未改动 → 原样回写;改过 → 拒绝
+    if (composeState.notUtf8) {
+      if (draft === composeState.loaded) {
+        doStackComposeSave(st, session, draft, composeState.rawB64);
+        return;
+      }
+      toast('内容已修改但原文件含非 UTF-8 字节,保存会把替换字符写入文件;请在服务器上以正确编码编辑,或取消修改后原样保存', 'fail');
+      return;
+    }
+    openModal('保存 compose', buildStackComposeSaveConfirm(st, session, draft));
+  }
+
+  // 保存确认:点明「保存前自动备份(保留 3 份)」与「影响下次 compose up」
+  function buildStackComposeSaveConfirm(st, session, draft) {
+    var div = document.createElement('div');
+    div.appendChild(window.confirmBlock({
+      title: '保存将覆盖服务器上的 compose 文件,影响下次 compose up,确定?',
+      facts: [
+        ['目标', st.compose_file],
+        ['备份', '保存前自动备份 .ddbak.<时间戳>(保留最近 3 份)']
+      ]
+    }));
+    div.innerHTML +=
+      '<div class="modal-actions">' +
+      '<button id="compose-confirm-cancel-btn" class="btn" type="button">取消</button>' +
+      '<button id="compose-confirm-ok-btn" class="btn btn-danger" type="button">保存</button>' +
+      '</div>';
+    var cancelBtn = div.querySelector('#compose-confirm-cancel-btn');
+    if (cancelBtn) {
+      cancelBtn.addEventListener('click', function () {
+        reopenStackComposeEdit(st, draft, session, '已取消保存,编辑内容已保留;可重试保存或取消编辑');
+      });
+    }
+    var okBtn = div.querySelector('#compose-confirm-ok-btn');
+    if (okBtn) okBtn.addEventListener('click', function () { doStackComposeSave(st, session, draft); });
+    return div;
+  }
+
+  function doStackComposeSave(st, session, draft, rawB64) {
+    composeState.busy = true;
+    closeModal();
+    var payload = {
+      serverId: state.serverId,
+      composeFile: st.compose_file,
+      content: draft
+    };
+    if (rawB64) payload.rawB64 = rawB64;
+    AppBus.invoke('manage_stack_compose_save', payload).then(function (res) {
+      composeState.busy = false;
+      if (session !== composeState.session) return;
+      if (res && res.success) {
+        toast('已保存 compose,并已备份上一版;下次 compose up 生效', 'ok');
+        showStackCompose(st);
+      } else {
+        toast('保存 compose 失败: ' + ((res && res.message) || '未知错误'), 'fail');
+        reopenStackComposeEdit(st, draft, session);
+      }
+    }).catch(function (err) {
+      composeState.busy = false;
+      if (session !== composeState.session) return;
+      var msg = err && err.message ? err.message : String(err);
+      toast('保存 compose 失败: ' + msg, 'fail');
+      reopenStackComposeEdit(st, draft, session);
+    });
+  }
+
+  function reopenStackComposeEdit(st, draft, session, hint) {
+    if (session !== composeState.session) return;
+    openModal('compose — ' + (st.dir || st.compose_file), buildStackComposeBody(st, session));
+    var ta = $('stack-compose-editor');
+    if (ta) ta.value = draft;
+    setStackComposeMode(true);
+    setStackComposeHint(hint || '保存失败,已保留你的修改;可重试保存或取消编辑');
+  }
 
   function showStackEnv(st) {
     var session = ++envState.session; // 开启新会话:此前打开的旧 promise 收尾失效
