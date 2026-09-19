@@ -403,8 +403,13 @@ pub fn save_config_cmd(cfg: AppConfig) -> Result<(), String> {
 ///   非空真实值 → 用新值(改密码场景);
 /// - `host_key_sha256` 为空 → 沿用现有指纹(前端不承载指纹,防整对象替换清空)。
 /// 不存在则按新增插入(密文/指纹以入参为准;哨兵落为 None)。返回保存后的服务器 id。
+///
+/// 第二十七批 B3:`tags` 在此归一(`config::normalize_tags`:trim / 去空 /
+/// 去重保序 / cap 8 条 / 每条 24 字符)。这是服务器配置的唯一写入口,归一放这里
+/// 才能覆盖编辑、新增与导入后的全部路径。
 #[tauri::command]
 pub fn save_server_entry(mut server: crate::config::ServerConfig) -> Result<String, String> {
+    server.tags = crate::config::normalize_tags(&server.tags);
     // update_config 收口(第二十批 P2-4):「取现值 merge → 落盘」整体持锁,
     // 与并发的其它配置保存命令串行,后写不再覆盖先写
     let id = server.id.clone();
@@ -923,6 +928,17 @@ pub fn test_file_cmd(path: &str) -> String {
 /// 拼装 `ls -1 '<path>'`(逐行列出远端目录内容)。
 pub fn ls_dir_cmd(path: &str) -> String {
     format!("ls -1 {}", shell_single_quote(path))
+}
+
+/// 拼装「列出 `<path>` 下的**子目录**,按 mtime 倒序」命令。
+///
+/// 用于发布归档等「按时间取舍」的场景(第二十七批 A2 起统一口径)。
+/// **不得用 `find ... | sort` 代替**:归档名放宽后字典序不再等于时间序,
+/// 名字排序会把真正最新的归档挤出 `take(N)`/`head -n N`。
+/// 与部署侧收尾裁剪 [`cleanup_releases_cmd`] 的 `ls -1dt <dir>/*/` 同源。
+/// 输出条目带尾斜杠,解析用 [`parse_release_lines`] 归一化。
+pub fn ls_subdirs_mtime_cmd(path: &str) -> String {
+    format!("ls -1dt {}/*/ 2>/dev/null", shell_single_quote(path))
 }
 
 /// 拼装 `cat '<path>'`。

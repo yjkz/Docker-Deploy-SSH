@@ -368,13 +368,45 @@ pub fn cleanup_scan_compose_cmd(root: &str) -> String {
     cleanup_scan_compose_cmd_with(root, &names, depth)
 }
 
-/// 扫描发布归档目录(`<项目>/releases/<YYYYmmdd-HHMMSS>`)的完整路径。
+/// 扫描发布归档目录(`<项目>/releases/<归档名>`)的完整路径,**按 mtime 倒序**。
+///
+/// **归档名不做形态过滤**(第二十七批 A2):此前用 `-name '20*-*'` 硬编码
+/// 「归档名 = 时间戳」,自定义命名(如 `prod-2026-09-18`)整个不可见。
+///
+/// **排序 = mtime 倒序**:归档名不再保证是时间戳,字典序不再等于时间序 ——
+/// 必须与部署侧收尾裁剪 [`crate::commands::cleanup_releases_cmd`] 的 mtime 口径
+/// 一致,否则「保留最新 N 个」会删错。逐个 `releases` 目录一次 `ls -1dt`
+/// (不用 `xargs` —— 批拆分会让倒序只在批内成立)。
 pub fn cleanup_scan_releases_cmd(root: &str) -> String {
     format!(
-        "find {} -maxdepth {} -type d -path '*/releases/*' -name '20*-*' 2>/dev/null",
+        "find {} -maxdepth {} -type d -path '*/releases' -print0 2>/dev/null \
+         | while IFS= read -r -d '' d; do ls -1dt \"$d\"/*/ 2>/dev/null; done",
         shell_single_quote(root),
         CLEANUP_SCAN_MAX_DEPTH + 2
     )
+}
+
+/// 解析归档路径行(纯函数,便于单测):`ls -1dt` 的目录条目带尾斜杠,
+/// 去尾斜杠后仅保留绝对路径(丢弃提示行/空行),**保持远端给出的 mtime 顺序**。
+pub(crate) fn parse_release_lines(out: &str) -> Vec<String> {
+    out.lines()
+        .map(str::trim)
+        .map(|l| l.trim_end_matches('/'))
+        .filter(|l| l.starts_with('/') && !l.starts_with("…"))
+        .map(String::from)
+        .collect()
+}
+
+/// 从全量归档路径中筛出属于某项目目录的归档,**保持输入顺序**(纯函数,便于单测)。
+///
+/// 输入顺序即远端 mtime 倒序 —— 调用方**不得**再按路径名排序:归档名放宽后
+/// 字典序不再等于时间序(第二十七批 A2)。
+pub(crate) fn releases_of_project(all: &[String], project_dir: &str) -> Vec<String> {
+    let want = project_dir.trim_end_matches('/');
+    all.iter()
+        .filter(|r| project_dir_of_release(r) == want)
+        .cloned()
+        .collect()
 }
 
 /// 拼 `du -sh <dir>...`(一次调用取多个目录占用;取不到的目录由 du 自行跳过)。
@@ -455,9 +487,12 @@ pub struct ReleasesDump {
     pub images: String,
 }
 
-/// 拼「归档明细单次往返」命令:远端 `find` 枚举 `<dir>/releases` 下的归档
-/// (新 → 旧,`head` 截断),`while read` 循环逐归档输出文件清单、manifest 与
-/// release-notes;可选附加 compose 候选文本与全量 `docker images`。
+/// 拼「归档明细单次往返」命令:远端枚举 `<dir>/releases` 下的归档
+/// (**mtime 新 → 旧**,`head` 截断),`while read` 循环逐归档输出文件清单、
+/// manifest 与 release-notes;可选附加 compose 候选文本与全量 `docker images`。
+///
+/// 排序 = mtime **而非名字**(第二十七批 A2):归档名放宽后字典序不再等于
+/// 时间序,按名截断会把真正最新的归档挤出前 N 条(列表与明细不一致)。
 ///
 /// 标记行格式(解析见 [`parse_releases_dump`]):`==RELEASE:<ts>` /
 /// `==MANIFEST:<ts>` / `==NOTES:<ts>` / `==COMPOSE:<path>` / `==IMAGES`。
@@ -471,8 +506,8 @@ pub fn releases_scan_cmd(
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "find {} -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -r | head -n {} \
-         | while IFS= read -r d; do \
+        "ls -1dt {}/*/ 2>/dev/null | head -n {} \
+         | while IFS= read -r d; do d=${{d%/}}; \
          printf '==RELEASE:%s\\n' \"${{d##*/}}\"; ls -1 \"$d\" 2>/dev/null; printf '\\n'; \
          printf '==MANIFEST:%s\\n' \"${{d##*/}}\"; cat \"$d/manifest.json\" 2>/dev/null; printf '\\n'; \
          printf '==NOTES:%s\\n' \"${{d##*/}}\"; cat \"$d/release-notes.json\" 2>/dev/null; printf '\\n'; \
@@ -646,7 +681,9 @@ pub(crate) fn parse_rollback_scan(out: &str) -> RollbackScanDump {
                     }
                 }
                 S_RELEASES => {
-                    let t = line.trim();
+                    // `ls -1dt <dir>/*/` 的条目带尾斜杠:去尾斜杠后路径才能被
+                    // project_dir_of_release / 目录名取段正确解析(A2)
+                    let t = line.trim().trim_end_matches('/');
                     if t.starts_with('/') {
                         dump.release_paths.push(t.to_string());
                     }
@@ -682,6 +719,37 @@ pub(crate) fn compose_working_dirs(items: &[serde_json::Value]) -> Vec<String> {
         }
     }
     out
+}
+
+/// 该项目目录下**运行中**的容器数(精确归属;纯函数,便于单测)。
+///
+/// 归属判定用 `docker ps -a` NDJSON 里的
+/// `Labels."com.docker.compose.project.working_dir"`(对象形态,与
+/// [`compose_working_dirs`] 同源),而**不是**容器名包含目录名的近似 ——
+/// 后者在 `/opt/app` 与 `/opt/app-staging` 这类同前缀项目间会互相串数
+/// (第二十七批 A1)。无标签的非 compose 容器不计入任何项目。
+/// 目录比较忽略尾斜杠。
+pub(crate) fn running_container_count(items: &[serde_json::Value], project_dir: &str) -> usize {
+    let want = project_dir.trim_end_matches('/');
+    if want.is_empty() {
+        return 0;
+    }
+    items
+        .iter()
+        .filter(|v| {
+            if !jstr(v, "Status").to_lowercase().starts_with("up") {
+                return false;
+            }
+            let wd = v
+                .get("Labels")
+                .and_then(|l| l.get("com.docker.compose.project.working_dir"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .trim()
+                .trim_end_matches('/');
+            !wd.is_empty() && wd == want
+        })
+        .count()
 }
 
 /// 项目目录 = 发布归档路径去末尾两级(`<dir>/releases/<ts>` → `<dir>`)。
@@ -1004,7 +1072,7 @@ async fn scan_cleanup_projects(
         false,
     )
     .await;
-    let release_paths = abs_path_lines(&rel_q.full_output);
+    let release_paths = parse_release_lines(&rel_q.full_output);
     diags.push(rel_q.diag);
 
     // 5.5 全量镜像列表(取日期标签镜像;含 ID/大小/创建时间)
@@ -1038,13 +1106,9 @@ async fn scan_cleanup_projects(
             .map(|(_, s)| s.clone())
             .unwrap_or_else(|| "?".to_string());
 
-        // 该项目下的归档目录(新→旧,按目录名时间戳倒序)
-        let mut releases: Vec<String> = release_paths
-            .iter()
-            .filter(|r| project_dir_of_release(r) == *dir)
-            .cloned()
-            .collect();
-        releases.sort_by(|a, b| b.cmp(a));
+        // 该项目下的归档目录(新→旧 = 远端 mtime 倒序;
+        // 不得再按路径名排序 —— 归档名放宽后字典序 ≠ 时间序,会删错归档)
+        let releases: Vec<String> = releases_of_project(&release_paths, dir);
 
         // 该项目可清理的日期标签镜像(仓库名匹配 + 未被容器引用)
         let tag_images: Vec<CleanupTagImage> = all_images

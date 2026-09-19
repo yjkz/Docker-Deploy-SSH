@@ -46,6 +46,39 @@ pub struct ServerConfig {
     /// 旧版配置无此字段,serde default 兼容。
     #[serde(default)]
     pub host_key_sha256: Option<String>,
+    /// 服务器标签(第二十七批 B3;空列表 = 未分组)。
+    ///
+    /// 用途:03 页列表按**首标签**分节、部署页等服务器下拉用 `<optgroup>`
+    /// 分组。旧配置无此字段 → serde default 兼容。写路径一律经
+    /// [`save_server_entry`](crate::commands::save_server_entry)(内部调
+    /// [`normalize_tags`] 归一:trim、去空、去重保序、cap 8 条 / 每条 24 字符)。
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// 标签上限(条数 / 单条字符数;第二十七批 B3)。超限截断而非报错 ——
+/// 标签是展示性元数据,不值得为超长阻断保存。
+pub const MAX_SERVER_TAGS: usize = 8;
+pub const MAX_SERVER_TAG_CHARS: usize = 24;
+
+/// 归一化服务器标签(纯函数):trim → 去空 → 去重保序 → cap 条数 / 截断长度。
+/// 截断按**字符数**(非字节),保证不会切断多字节字符。
+pub fn normalize_tags(raw: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in raw {
+        let s = t.trim();
+        if s.is_empty() {
+            continue;
+        }
+        let s: String = s.chars().take(MAX_SERVER_TAG_CHARS).collect();
+        if !out.iter().any(|x| x == &s) {
+            out.push(s);
+        }
+        if out.len() >= MAX_SERVER_TAGS {
+            break;
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -681,6 +714,13 @@ pub struct AppSettings {
     /// 扫描最大深度(第二十六批;0/缺省 = 4,夹取 1..=8)。
     #[serde(default)]
     pub compose_scan_max_depth: u32,
+    /// 卷搬运(tar)所用镜像引用(第二十七批;空串 = 内置候选链
+    /// busybox → alpine → ubuntu)。服务器有私有 registry / 只允许白名单镜像时,
+    /// 可指定服务器上已存在的自备 tar 能力镜像。**读取侧经
+    /// `migrate_project::normalize_tar_image` 严格校验**(镜像引用字符集,
+    /// 拒绝 shell 元字符与 `-` 开头),非法值回退内置候选。
+    #[serde(default)]
+    pub tar_image: String,
 }
 
 /// `AppSettings::default` 的手写实现:`auto_update_from_source` 缺省为 **true**
@@ -701,6 +741,7 @@ impl Default for AppSettings {
             auto_rollback_on_failure: false,
             compose_file_names: Vec::new(),
             compose_scan_max_depth: 0,
+            tar_image: String::new(),
         }
     }
 }
@@ -1016,6 +1057,7 @@ mod tests {
             auth: AuthConfig { auth_type: AuthType::Key, key_path: Some("C:/k".into()), password_enc: None, key_pass_enc: None },
             remote_dir: "/opt/app".into(),
             host_key_sha256: None,
+            tags: Vec::new(),
         });
         cfg.projects.push(ProjectConfig {
             id: "p1".into(), name: "栈项目".into(), image_filter: String::new(),
@@ -1209,6 +1251,59 @@ mod tests {
     }
 
     #[test]
+    fn test_server_tags_serde_default_and_roundtrip() {
+        // B3(第二十七批):旧配置无 tags 字段 → serde default 补齐为空列表
+        let json = r#"{
+            "id":"s1","name":"n","host":"1.2.3.4","port":22,"username":"root",
+            "auth":{"auth_type":"Password","key_path":null,"password_enc":null},
+            "remote_dir":"/opt/app"
+        }"#;
+        let s: ServerConfig = serde_json::from_str(json).unwrap();
+        assert!(s.tags.is_empty(), "旧配置 tags 缺省为空");
+
+        // roundtrip:tags 原样保留
+        let mut s = s;
+        s.tags = vec!["华东".into(), "生产".into()];
+        let text = serde_json::to_string(&s).unwrap();
+        let back: ServerConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, s);
+        assert!(text.contains("\"tags\""), "字段名须为 snake_case: {}", text);
+    }
+
+    #[test]
+    fn test_normalize_tags_rules() {
+        // B3:trim → 去空 → 去重保序 → cap 8 条 / 每条 24 字符(超出截断)
+        let got = normalize_tags(&[
+            "  华东  ".to_string(),
+            "".to_string(),
+            "生产".to_string(),
+            "华东".to_string(), // 与首项重复(trim 后)
+            "   ".to_string(),
+        ]);
+        assert_eq!(got, vec!["华东".to_string(), "生产".to_string()]);
+
+        // cap 8 条:超出丢弃(保序保留前 8)
+        let many: Vec<String> = (1..=12).map(|i| format!("t{}", i)).collect();
+        let capped = normalize_tags(&many);
+        assert_eq!(capped.len(), 8);
+        assert_eq!(capped[0], "t1");
+        assert_eq!(capped[7], "t8");
+
+        // 每条 24 字符:超长截断(按字符数,不破坏 UTF-8)
+        let long = "中".repeat(30);
+        let got2 = normalize_tags(&[long]);
+        assert_eq!(got2.len(), 1);
+        assert_eq!(got2[0].chars().count(), 24, "按字符数截断: {}", got2[0]);
+        // 全角/多字节不得被截成半个字符
+        let mixed = format!("{}汉字", "x".repeat(23));
+        let got3 = normalize_tags(&[mixed]);
+        assert_eq!(got3[0].chars().count(), 24);
+
+        // 空输入 → 空列表
+        assert!(normalize_tags(&[]).is_empty());
+    }
+
+    #[test]
     fn test_auth_config_and_host_key_serde_defaults() {
         // 阶段三:旧版配置文件无 key_pass_enc / host_key_sha256 字段
         // → serde default 补齐为 None,旧行为不变
@@ -1259,6 +1354,7 @@ mod tests {
             auto_rollback_on_failure: true,
             compose_file_names: vec!["docker-compose.prod.yml".into(), "app.yml".into()],
             compose_scan_max_depth: 6,
+            tar_image: "registry.local/tar:1".into(),
         };
         save_app_settings(&settings).unwrap();
         assert!(dir.join("config/settings.json").exists());
@@ -1313,6 +1409,7 @@ mod tests {
             auto_rollback_on_failure: false,
             compose_file_names: Vec::new(),
             compose_scan_max_depth: 0,
+            tar_image: String::new(),
         };
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains("\"closeToTray\":true"));
@@ -1517,6 +1614,7 @@ mod tests {
                             },
                             remote_dir: "/opt/app".into(),
                             host_key_sha256: None,
+                            tags: Vec::new(),
                         };
                         update_config(|cfg| {
                             cfg.servers.push(server.clone());
@@ -1563,6 +1661,7 @@ mod tests {
                 auth: AuthConfig { auth_type: AuthType::Password, key_path: None, password_enc: None, key_pass_enc: None },
                 remote_dir: "/opt/app".into(),
                 host_key_sha256: None,
+                tags: Vec::new(),
             });
             Ok(())
         })
@@ -1579,6 +1678,7 @@ mod tests {
                 auth: AuthConfig { auth_type: AuthType::Password, key_path: None, password_enc: None, key_pass_enc: None },
                 remote_dir: "/opt/app".into(),
                 host_key_sha256: None,
+                tags: Vec::new(),
             });
             Err("业务校验失败".to_string())
         });
@@ -1694,6 +1794,7 @@ mod tests {
             auth: AuthConfig { auth_type: AuthType::Key, key_path: None, password_enc: None, key_pass_enc: None },
             remote_dir: "/opt".into(),
             host_key_sha256: None,
+            tags: Vec::new(),
         });
         save_config(&cfg).unwrap();
 

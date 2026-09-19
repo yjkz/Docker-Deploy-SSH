@@ -2995,3 +2995,111 @@ migrate_project.rs:兜底命中入列带标记与识别说明 / 显式声明无�
   ④ 卷浏览根层与子目录钻取(面包屑/path 载荷)+ **实测抓到并修复对比度缺陷**
 - **judge 2 图 PASS**(卷浏览 / 批量模板),并借其复核补了批量模态标题缺口
 - 桩文件已删、8798 服务已停、预览页已关
+
+# 第二十七批:A 组清尾四项 + B3 服务器标签(单会话,2026-09-19)
+
+> 来源:候选池(2026-09-18 入库)用户批复「A 组 + B3」。A 组每项先写测试看 RED,
+> 关键安全/默认值逻辑做变异验证;B3 走 brainstorming 澄清(字段形态/下拉范围/录入方式
+> 三问均为用户裁决)。
+
+## A1 回滚中心容器计数精确归属
+
+- 新增纯函数 `cleanup::running_container_count(items, project_dir)`:按 `docker ps -a`
+  NDJSON 的 `Labels."com.docker.compose.project.working_dir"` 精确匹配项目目录
+  (对象形态标签解析,与 `compose_working_dirs` 同源;不能套 manage 的字符串形态
+  `compose_project_of_labels`),目录比较忽略尾斜杠,空目录名恒 0。
+- **反例构造成本关键**:测试用 `/opt/app` 与 `/opt/app-staging` 两个同前缀项目 ——
+  旧口径(容器名 contains 目录名)会把 staging 的容器算进 app;新口径各归各的。
+- **变异验证两轮**:①删掉 `wd == want` 精确比较 → 计数变 3(应 2)❌ 被抓;
+  ②删掉 `Status` 前缀判定 → 停止容器与 Restarting 被计入 ❌ 被抓。
+- 调用点 `rollback.rs` 的近似过滤整段删除。
+
+## A2 清理分析归档名放宽 + mtime 排序口径全链收口
+
+- `cleanup_scan_releases_cmd` 去掉 `-name '20*-*'`,改为逐 `releases` 目录
+  `find … -path '*/releases' -print0 | while read -d '' ; do ls -1dt "$d"/*/; done`。
+  **不用 `xargs`**:批拆分会让 mtime 倒序只在批内成立。
+- **排序口径是本次真正的决策点**:归档名放宽后字典序 ≠ 时间序,凡「取最近 N 个」
+  的路径都不能按名字排序,否则会删错归档。逐点收口(全部改为「保持远端 mtime 序」):
+  1. 清理分析分项目归档列表(`releases_of_project` 纯函数,不再 `sort_by(b.cmp(a))`)
+  2. 回滚中心项目列表(`rollback.rs` 同款)
+  3. 回滚明细 `releases_scan_cmd`:`sort -r | head -n N` → `ls -1dt | head -n N`
+     (按名截断会把真正最新的挤出前 N 条)
+  4. 新增共享助手 `commands::ls_subdirs_mtime_cmd` + `parse_release_lines`
+     (去尾斜杠归一),迁移侧两处「取最近 N 个归档」接入
+- 口径来源 = **部署侧收尾裁剪本来就是 mtime**(`deploy.rs:cleanup_releases_cmd`
+  的 `ls -1dt …/*/ | tail | xargs rm -rf`)。清理分析与它同源才不会「预览说删 A、
+  部署时已删 B」。
+- **变异验证两轮**:①去掉尾斜杠归一化 → 路径带 `/` 解析失败 ❌;②把名字倒序塞回
+  `releases_of_project` → 顺序变 `zzz-old-…, prod-…, 2026…` ❌(名字最大但时间最旧
+  的归档排到最前 —— 正是会删错的那条)。
+
+## A3 tar 镜像可配置
+
+- `AppSettings.tar_image`(serde default;空串 = 内置候选链)+ `normalize_tar_image`
+  严格校验(镜像引用字符集;拒绝空/`-` 开头/shell 元字符/`..`/尾 `:`、`/`/
+  末段多冒号/空 digest/空 tag)+ `tar_image_candidates`(自填优先,内置去重补位)。
+- 校验必要性:该值会拼进远端 `docker run --entrypoint tar … <image>`;沿用
+  `compose_scan::is_valid_compose_name` 的「拼命令前置校验」纪律。
+- 非法自填**不静默忽略**:日志明示「设置中的 tar 镜像「X」不是合法的镜像引用,
+  已忽略并使用内置候选」。
+- **变异验证暴露了测试本身太弱**:首版拒绝清单没有 `..`/尾斜杠/空 digest/空 tag 类
+  用例 → 删掉守卫变异**未被抓住**。补齐 9 个用例后:变异的实现红、真实现也暴露
+  漏网项 `busybox:@tag`(空 tag 未拦)→ 补 `name_part.ends_with(':')` 判定。
+  这正是「变异验证防的是测试覆盖的是另一条防线」。
+- 前端:设置中心「卷搬运 tar 镜像」文本输入(与 compose 文件名同纪律:前端只收集,
+  合法性后端单点裁决)。
+
+## A4 归档搬运注释与实现对齐
+
+- 只改注释:`copy_remote_dir` 的文档说「子目录跳过并计入警告」,实现实为
+  「`sftp_download` 目录失败 → 该次调用返回 Err → 调用方把**该归档整体**记为失败
+  并降级 warning」。注释改为与实现一致,并注明递归支持已裁决不做(见 ROADMAP)。
+
+## B3 服务器标签(用户批复三项口径)
+
+**设计裁决**(brainstorming 三问):字段形态 = **多标签 `tags: Vec<String>`**;
+下拉范围 = **全部服务器下拉**;表单录入 = **下拉选择 +「＋新建标签…」分支**。
+追问三问:归属 = **首标签**(`<select>` 的 option 只能属一个 optgroup,取首标签
+使 03 页分节与全部下拉分组语义一致);部署页**批量勾选列表也分节**;
+**不做全局标签管理**(无引用的标签自然消失)。
+
+- **契约**:`ServerConfig.tags: Vec<String>`(snake_case,serde default 兼容旧配置);
+  归一 `config::normalize_tags`(trim / 去空 / 去重保序 / cap 8 条 / 每条 24 字符
+  **按字符截断**)收口在 `save_server_entry` —— 服务器配置的唯一写入口。
+- **config_io**:`ExportServer.tags` 同步(`serde(default)` → **旧导出文件导入为
+  空标签**,向后兼容;有单测用 `seal_blob` 手造旧载荷验证)。
+- **前端四个共享助手**(app.js):`serverTagsOf` / `serverPrimaryTag` /
+  `groupServersByTag`(03 页与批量列表共用分节口径,未分组置末)/
+  `serverOptionsFor` + `appendGroupedOptions`(分组 DOM 的**全站唯一实现**)。
+- **五处下拉接入**:部署页 `fillSelect`(扩展支持 `group`)、回滚中心、定时部署、
+  项目迁移源+目标(`withHost` + `excludeId`,目标不能等于源)、查询/其余标签在
+  选项文字里以 `[标签]` 后缀展示。
+- **03 页**:列表按标签分节(`.server-group-head`,**单组不渲染组头**保持旧观感;
+  SRV-XX 编号用原始下标不随分组重排)+ 卡片标签徽章 + 表单标签编辑器
+  (chips 可删 + 下拉 + 新建展开;保存走 `readTagChips()` 读 DOM 的 `data-tag`,
+  **不用模块级状态** —— 表单可被重开,隐藏状态会串台)。
+- **桩验证自检抓到两个真实缺陷**(judge 之前):
+  1. `serverOptionsFor` 保持输入顺序 → **同标签被拆成多个 optgroup**
+     (`华东 … 华北 … 华东`)。修复 = 输出时按组归并(组序 = 首次出现,未分组置末),
+     与 03 页分节同口径。judge 抓不到的形态,靠 DOM 结构断言。
+  2. 批量勾选行是 `inline-flex` → 加了标签后缀后**相邻行粘连**
+     (`[生产]☑ db-01`)。修复 = 限定 `#deploy-batch-modal-body` 内每行独占。
+- **回归守护**:`verify/form-validation.js` 第 10 节新增 13 项断言(分组数/首标签归属/
+  未分组置末/**同标签选项连续(离开组后不得再回来)**/excludeId/withHost/optgroup 结构)。
+  变异(把归并改回输入顺序)→ 3 项 FAIL ❌ 被抓。
+
+## 验证
+
+- `cargo test` **444 passed / 13 ignored**(432 + 12 新增:running_container_count×2 /
+  parse_release_lines / releases_of_project / cleanup_scan_releases_cmd /
+  normalize_tar_image×2 / tar_image_candidates / server_tags serde / normalize_tags /
+  旧导出文件导入 / save_server_entry 归一)
+- `cargo clippy --all-targets` 与基线 **20 条逐条一致,零新增**(按新增行逐行核对)
+- `node --check` 全部改动 JS;verify 六脚本全 PASS(form-validation 67 项)
+- **桩验证(8798)**:03 页分节(华东 2/华北 1/未分组 1)、标签编辑器(chips +
+  下拉排除已选 + 新建展开)、部署页下拉结构(OPTGROUP×2 + 未分组内联)、
+  批量模态分节头(华东(2)/华北(1)/未分组(1))+ 多标签后缀
+- **judge 4 图 PASS**(前两张因采集问题重拍:动效空帧 / 文件重复;重拍后 2/2 pass,
+  另 2 张首轮即 pass)
+- 桩文件已删、8798 服务已停、预览页已关

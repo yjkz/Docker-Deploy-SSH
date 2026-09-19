@@ -434,11 +434,8 @@
     var servers = (st.cfg && Array.isArray(st.cfg.servers)) ? st.cfg.servers : [];
     var prj = findById(st.cfg ? st.cfg.projects : [], projectId);
     var defaultSrv = prj && prj.default_server_id ? String(prj.default_server_id) : '';
-    servers.forEach(function (s) {
-      var o = el('option', '', s.name);
-      o.value = String(s.id);
-      srvSel.appendChild(o);
-    });
+    // B3:按归属标签(首标签)分组成 optgroup(与部署页/回滚中心同口径)
+    window.appendGroupedOptions(srvSel, window.serverOptionsFor(servers));
     var pick = preferServerId || defaultSrv;
     if (pick && findById(servers, pick)) srvSel.value = String(pick);
   }

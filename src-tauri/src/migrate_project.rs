@@ -589,12 +589,13 @@ async fn build_plan(
             SSH_EXEC_TIMEOUT_SECS,
             "查询发布归档超时",
             "请检查服务器网络后重试",
-            exec_collect(client, &commands::ls_dir_cmd(&releases_root)),
+            exec_collect(client, &commands::ls_subdirs_mtime_cmd(&releases_root)),
         )
         .await?;
         if code == 0 {
-            let mut ts_list = commands::parse_ls_lines(&out);
-            ts_list.sort_by(|a, b| b.cmp(a)); // 倒序 = 新 → 旧
+            // mtime 倒序(新 → 旧)由远端 ls -1dt 给出,保持原序 —— 不得按名字
+            // 重排:归档名放宽后字典序 ≠ 时间序,会取错「最近 N 个」归档(A2)
+            let ts_list = commands::parse_release_lines(&out);
             let paths: Vec<String> = ts_list
                 .iter()
                 .take(keep as usize)
@@ -1225,12 +1226,12 @@ async fn run_migrate_project(
         check_cancel!();
         emit_line(&format!("搬运最近 {} 个发布归档…", keep));
         let releases_root = commands::remote_join(&src_dir, "releases");
-        let (code, out) = exec_collect(&mut src, &commands::ls_dir_cmd(&releases_root))
+        let (code, out) = exec_collect(&mut src, &commands::ls_subdirs_mtime_cmd(&releases_root))
             .await
             .map_err(|e| (format!("查询源发布归档失败: {}", e), warnings.clone()))?;
         if code == 0 {
-            let mut ts_list = commands::parse_ls_lines(&out);
-            ts_list.sort_by(|a, b| b.cmp(a)); // 倒序 = 新 → 旧
+            // mtime 倒序保持原序(不得按名字重排,见上段注释 —— A2)
+            let ts_list = commands::parse_release_lines(&out);
             let tgt_releases = commands::remote_join(&tgt_dir, "releases");
             let (code, _) = exec_collect(&mut dst, &mkdir_p_cmd(&tgt_releases))
                 .await
@@ -1338,18 +1339,87 @@ async fn remote_image_id(client: &mut SshClient, image: &str) -> Result<Option<S
     Ok(commands::parse_inspect_id(&out))
 }
 
+/// 校验并归一化用户自填的 tar 镜像引用(纯函数;非法/空 → 空串 = 用内置候选)。
+///
+/// 为什么严格:该值会拼进远端 `docker run --entrypoint tar … <image>` 命令
+/// (虽经 [`shell_single_quote`] 包裹),但形态必须限定在镜像引用字符集内 ——
+/// 与 [`crate::compose_scan::is_valid_compose_name`] 同款「拼命令前置校验」纪律。
+/// 拒绝:空、以 `-` 开头(docker 会当 flag)、空白与 shell 元字符
+/// (`;|&$\`'"()` 换行等)、`..`、以及不符合 `[registry[:port]/]name[:tag][@digest]`
+/// 结构的写法(末段多冒号堆叠、空 digest 等)。
+pub(crate) fn normalize_tar_image(raw: &str) -> String {
+    let s = raw.trim();
+    if s.is_empty() || s.len() > 255 || s.starts_with('-') {
+        return String::new();
+    }
+    // 镜像引用字符集:字母数字 + . _ - / : @ ;其余(shell 元字符、空白、引号)一律拒绝
+    let ok = s.chars().all(|c| {
+        c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | ':' | '@')
+    });
+    if !ok || s.contains("..") || s.ends_with('/') || s.ends_with(':') {
+        return String::new();
+    }
+    // 结构校验:`[registry[:port]/]name[:tag][@digest]`
+    // `@` 至多一次且 digest 段非空;名字/标签段的**末段**至多一个 `:`
+    // (registry 端口的冒号在 `/` 之前,不算违规)
+    let mut at_parts = s.splitn(2, '@');
+    let name_part = at_parts.next().unwrap_or("");
+    if let Some(digest) = at_parts.next() {
+        if digest.is_empty() || digest.contains('@') || digest.starts_with(':') {
+            return String::new();
+        }
+    }
+    if name_part.is_empty() {
+        return String::new();
+    }
+    // `@` 之前的名字段不得以 `:` 结尾(如 `busybox:@tag` = 空 tag)
+    if name_part.ends_with(':') {
+        return String::new();
+    }
+    let tail = name_part.rsplit('/').next().unwrap_or("");
+    if tail.matches(':').count() > 1 {
+        return String::new();
+    }
+    s.to_string()
+}
+
+/// tar 镜像候选列表:自填镜像(经校验)优先,其后补内置候选并去重(纯函数)。
+/// 自填非法/为空时与旧行为完全一致(仅内置三项)。
+pub(crate) fn tar_image_candidates(configured: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let custom = normalize_tar_image(configured);
+    if !custom.is_empty() {
+        out.push(custom);
+    }
+    for c in TAR_IMAGE_CANDIDATES {
+        if !out.iter().any(|x| x == c) {
+            out.push(c.to_string());
+        }
+    }
+    out
+}
+
 /// 选一个可用于 tar 的镜像:优先服务器上已有的,其次尝试拉取 busybox。
 async fn pick_tar_image(
     client: &mut SshClient,
     emit_line: &Arc<dyn Fn(&str) + Send + Sync>,
 ) -> Result<String, String> {
-    for cand in TAR_IMAGE_CANDIDATES {
-        let (code, _) = exec_collect(client, &commands::docker_inspect_cmd(cand))
+    let configured = config::load_app_settings().tar_image;
+    let candidates = tar_image_candidates(&configured);
+    if !configured.trim().is_empty() && candidates.first().map(String::as_str) != Some(configured.trim()) {
+        // 自填值非法:明示并继续用内置候选(不静默忽略)
+        emit_line(&format!(
+            "设置中的 tar 镜像「{}」不是合法的镜像引用,已忽略并使用内置候选",
+            configured.trim()
+        ));
+    }
+    for cand in candidates {
+        let (code, _) = exec_collect(client, &commands::docker_inspect_cmd(&cand))
             .await
             .map_err(|e| format!("探测 {} 失败: {}", cand, e))?;
         if code == 0 {
             emit_line(&format!("卷搬运将使用镜像 {} 执行 tar", cand));
-            return Ok(cand.to_string());
+            return Ok(cand);
         }
     }
     // 都没有:尝试拉取 busybox(约 2MB,需服务器出网)
@@ -1556,7 +1626,10 @@ async fn upload_compose_bundle(
 /// 远端目录整体搬运(经本地中转):逐文件下载 → 上传。
 ///
 /// 归档目录是**单层**的(镜像包 + manifest.json + compose 副本,无子目录),
-/// 故只处理文件;遇到子目录会跳过并计入警告(由调用方汇总)。
+/// 故只处理文件、**不做递归支持**。遇到子目录时 `sftp_download` 会失败:
+/// 该次调用返回 Err(失败文案含文件名与原因),由调用方把**该归档整体**记为
+/// 「搬运失败」并降级为 warning —— 不是"跳过子目录继续搬其余文件"
+/// (第二十七批 A4 仅对齐此注释与实现;递归支持已裁决不做,理由见 ROADMAP)。
 async fn copy_remote_dir(
     src: &mut SshClient,
     dst: &mut SshClient,
@@ -1734,6 +1807,73 @@ mod tests {
         // 空串的显式值等同未指定
         project.remote_dir = Some("/opt/proj".to_string());
         assert_eq!(resolve_target_dir(&project, &target, Some("  ")), "/opt/proj");
+    }
+
+    #[test]
+    fn test_normalize_tar_image_accepts_valid_refs() {
+        // A3(第二十七批):服务器有私有 registry 时允许自填 tar 镜像
+        for ok in [
+            "busybox:latest",
+            "registry.example.com:5000/tools/tar-runner:1.2",
+            "myregistry/local/tar:2026-09",
+            "tar-runner",
+            "registry:5000/img@sha256:abc123",
+            "a.b-c_d/e:f",
+        ] {
+            assert_eq!(normalize_tar_image(ok), ok, "应接受: {}", ok);
+        }
+        // 首尾空白归一
+        assert_eq!(normalize_tar_image("  busybox:latest  "), "busybox:latest");
+    }
+
+    #[test]
+    fn test_normalize_tar_image_rejects_injection_and_junk() {
+        // 该值会拼进远端 docker run 命令(经 shell_single_quote),
+        // 但形态仍必须严格:拒绝空、可疑字符、以 - 开头(会被当 flag)
+        for bad in [
+            "",
+            "   ",
+            "-rm",
+            "--entrypoint=sh",
+            "busybox; rm -rf /",
+            "busybox && curl evil.sh",
+            "busybox`whoami`",
+            "busybox$(id)",
+            "busybox|cat",
+            "busybox\nx",
+            "busy box",
+            "busybox'quote",
+            "busybox\"dquote",
+            "busybox:tag:extra:too",
+            // 路径穿越与结构残缺(变异验证补:首版清单漏了这两类,变异漏网)
+            "../../etc/passwd",
+            "busybox/../other",
+            "busybox/",
+            "busybox:",
+            "/",
+            "@/x",
+            "busybox@",
+            "busybox@x@y",
+            "busybox:@tag",
+        ] {
+            assert_eq!(normalize_tar_image(bad), "", "应拒绝: {:?}", bad);
+        }
+    }
+
+    #[test]
+    fn test_tar_image_candidates_custom_first() {
+        // 自填镜像优先,其后是内置候选(去重:自填已是内置项时不重复)
+        let c = tar_image_candidates("registry.local/tar:1");
+        assert_eq!(c[0], "registry.local/tar:1");
+        assert_eq!(c.len(), 4, "自填 + 三个内置: {:?}", c);
+
+        let c2 = tar_image_candidates("alpine:latest");
+        assert_eq!(c2[0], "alpine:latest");
+        assert_eq!(c2.len(), 3, "自填与内置重复应去重: {:?}", c2);
+
+        // 空/非法 → 纯内置候选(与旧行为一致)
+        let c3 = tar_image_candidates("");
+        assert_eq!(c3, TAR_IMAGE_CANDIDATES.map(String::from).to_vec());
     }
 
     #[test]
@@ -2015,6 +2155,7 @@ mod tests {
             },
             remote_dir: dir.into(),
             host_key_sha256: None,
+            tags: Vec::new(),
         }
     }
 }

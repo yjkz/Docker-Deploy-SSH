@@ -173,12 +173,71 @@ services:
     // ---- 第七批:回滚明细批量读取 + 版本说明 ----
 
     #[test]
+    fn test_cleanup_scan_releases_cmd_accepts_custom_names() {
+        // A2(第二十七批):归档名放宽 —— 不再要求 `20*-*` 时间戳形态,
+        // 自定义命名(如 prod-2026-09-18)也应被列出;排序退回 mtime
+        // (与部署侧收尾裁剪 cleanup_releases_cmd 的 `ls -1dt` 同源)。
+        let cmd = cleanup_scan_releases_cmd("/srv/app");
+        assert!(cmd.contains("'/srv/app'"), "{}", cmd);
+        assert!(cmd.contains("-path '*/releases'"), "{}", cmd);
+        // 名字过滤必须消失(自定义命名归档否则不可见)
+        assert!(!cmd.contains("-name"), "不应再按名字过滤: {}", cmd);
+        assert!(!cmd.contains("20*-*"), "时间戳模式必须移除: {}", cmd);
+        // mtime 倒序:每个 releases 目录一次 ls -1dt(不经 xargs —— 批拆分会让
+        // 排序只在批内成立,全局顺序失真)
+        assert!(cmd.contains("ls -1dt"), "需 mtime 倒序: {}", cmd);
+        assert!(cmd.contains("while IFS= read -r"), "{}", cmd);
+    }
+
+    #[test]
+    fn test_parse_release_lines_normalizes() {
+        // 远端 `ls -1dt` 的目录条目带尾斜杠;解析须去尾斜杠、丢坏行、保序
+        let out = "/srv/app/releases/prod-2026-09-18/\n\
+                   \n\
+                   not-a-path\n\
+                   /srv/app/releases/20260905-101010/\n";
+        let rows = parse_release_lines(out);
+        assert_eq!(
+            rows,
+            vec![
+                "/srv/app/releases/prod-2026-09-18".to_string(),
+                "/srv/app/releases/20260905-101010".to_string(),
+            ]
+        );
+        assert!(parse_release_lines("").is_empty());
+    }
+
+    #[test]
+    fn test_releases_of_project_preserves_mtime_order_with_custom_names() {
+        // 输入 = 远端 mtime 倒序(自定义命名使字典序与时间序分离):
+        // 实现若退回按名字排序,本测试必红 —— 而「保留最新 N 个」会删错归档。
+        let all = vec![
+            "/srv/app/releases/prod-2026-09-18".to_string(), // 最新
+            "/srv/app/releases/20260901-101010".to_string(),
+            "/srv/app/releases/zzz-old-name-sorts-last".to_string(), // 名字最大、时间最旧
+            "/srv/other/releases/20260905-101010".to_string(),      // 别的项目:剔除
+        ];
+        let got = releases_of_project(&all, "/srv/app");
+        assert_eq!(
+            got,
+            vec![
+                "/srv/app/releases/prod-2026-09-18",
+                "/srv/app/releases/20260901-101010",
+                "/srv/app/releases/zzz-old-name-sorts-last",
+            ]
+        );
+        assert!(releases_of_project(&all, "/srv/none").is_empty());
+    }
+
+    #[test]
     fn test_releases_scan_cmd_markers_and_flags() {
         let candidates = vec!["/app/docker-compose.yml".to_string()];
         let with_images = releases_scan_cmd("/app", 50, &candidates, true);
-        // find 循环 + 截断 + 三类归档段 + compose 段 + 镜像段
-        assert!(with_images.contains("find '/app/releases' -mindepth 1 -maxdepth 1 -type d"));
-        assert!(with_images.contains("sort -r | head -n 50"));
+        // mtime 倒序 + 截断 + 三类归档段 + compose 段 + 镜像段
+        // (A2:归档名放宽后不能再按名字排序/截断,否则最新归档会被挤出前 N 条)
+        assert!(with_images.contains("ls -1dt '/app/releases'/*/"));
+        assert!(with_images.contains("| head -n 50"));
+        assert!(!with_images.contains("sort -r"), "不得按名字排序: {}", with_images);
         assert!(with_images.contains("while IFS= read -r d"));
         assert!(with_images.contains("==RELEASE:%s"));
         assert!(with_images.contains("==MANIFEST:%s"));
@@ -284,6 +343,41 @@ services:
     }
 
     #[test]
+    fn test_running_container_count_exact_working_dir() {
+        // A1(第二十七批):精确归属 —— 计数按 compose working_dir 标签匹配项目目录,
+        // 不再按容器名包含目录名的近似。反例构造成本关键:同前缀的两个项目
+        // (app / app-staging)在旧口径下会互相串数,新口径必须各归各的。
+        let items: Vec<serde_json::Value> = vec![
+            serde_json::json!({"Names":"app-web-1","Status":"Up 3 hours","Labels":{"com.docker.compose.project.working_dir":"/opt/app"}}),
+            serde_json::json!({"Names":"app-db-1","Status":"Up 3 hours","Labels":{"com.docker.compose.project.working_dir":"/opt/app"}}),
+            // 名字含 "app" 但归属 app-staging:旧口径会被算进 /opt/app
+            serde_json::json!({"Names":"app-staging-web-1","Status":"Up 2 hours","Labels":{"com.docker.compose.project.working_dir":"/opt/app-staging"}}),
+            // 已停止:不计
+            serde_json::json!({"Names":"app-old-1","Status":"Exited (0) 2 days ago","Labels":{"com.docker.compose.project.working_dir":"/opt/app"}}),
+            // 非 compose 容器(无标签):不计入任何项目
+            serde_json::json!({"Names":"loose-container","Status":"Up 1 min"}),
+        ];
+        assert_eq!(running_container_count(&items, "/opt/app"), 2);
+        assert_eq!(running_container_count(&items, "/opt/app-staging"), 1);
+        assert_eq!(running_container_count(&items, "/opt/other"), 0);
+        // 尾斜杠等价(扫描根可能带 / 结尾)
+        assert_eq!(running_container_count(&items, "/opt/app/"), 2);
+        // 空目录名不得匹配到任何容器
+        assert_eq!(running_container_count(&items, ""), 0);
+    }
+
+    #[test]
+    fn test_running_container_count_status_variants() {
+        // Status 前缀判定:Up / up 混合大小写都算运行中;Restarting 不算
+        let items: Vec<serde_json::Value> = vec![
+            serde_json::json!({"Names":"a","Status":"up 5 seconds","Labels":{"com.docker.compose.project.working_dir":"/d"}}),
+            serde_json::json!({"Names":"b","Status":"Restarting (1) 2 seconds ago","Labels":{"com.docker.compose.project.working_dir":"/d"}}),
+            serde_json::json!({"Names":"c","Status":"Up 1 hour (healthy)","Labels":{"com.docker.compose.project.working_dir":"/d"}}),
+        ];
+        assert_eq!(running_container_count(&items, "/d"), 2);
+    }
+
+    #[test]
     fn test_compose_working_dirs_dedupe_and_skip_empty() {
         let items: Vec<serde_json::Value> = vec![
             serde_json::json!({"Labels": {"com.docker.compose.project.working_dir": "/a"}}),
@@ -369,6 +463,7 @@ services:
             },
             remote_dir: "/home/henghao".into(),
             host_key_sha256: None,
+            tags: Vec::new(),
         };
         let mk_project = |dir: Option<&str>| ProjectConfig {
             id: "p1".into(),
@@ -435,6 +530,7 @@ services:
             },
             remote_dir: "/opt/legacy".into(),
             host_key_sha256: None,
+            tags: Vec::new(),
         };
         assert_eq!(effective_remote_dir(&server, &p), "/opt/legacy");
     }
@@ -899,6 +995,7 @@ services:
             },
             remote_dir: "/opt/app".into(),
             host_key_sha256: None,
+            tags: Vec::new(),
         }
     }
 
@@ -2378,7 +2475,37 @@ services:
             },
             remote_dir: "/opt/app".into(),
             host_key_sha256: fp.map(|s| s.to_string()),
+            tags: Vec::new(),
         }
+    }
+
+    /// B3(第二十七批):`save_server_entry` 是服务器配置唯一写入口 ——
+    /// 标签在此归一(trim/去空/去重保序/cap),脏输入不得落盘。
+    #[test]
+    fn test_save_server_entry_normalizes_tags() {
+        let _guard = crate::config::TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ddtest-tags-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
+
+        let mut s = server_entry("s1", None, None, None);
+        s.tags = vec![
+            "  华东  ".into(),
+            "".into(),
+            "生产".into(),
+            "华东".into(),   // 去重
+            "   ".into(),
+            "x".repeat(40),  // 超长 → 截断 24 字符
+        ];
+        save_server_entry(s).unwrap();
+        let cfg = load_config().unwrap();
+        assert_eq!(
+            cfg.servers[0].tags,
+            vec!["华东".to_string(), "生产".to_string(), "x".repeat(24)]
+        );
+
+        std::env::remove_var("DD_CONFIG_DIR");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

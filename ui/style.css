@@ -1062,6 +1062,101 @@ select.text-input option,
 
 .server-list { display: flex; flex-direction: column; gap: 16px; }
 
+/* 分节头(B3):标签归属的节标题 —— 微标签 + 计数,上行 1px 墨线。
+   仅当存在多个分组时渲染(单组保持与旧版一致的观感)。 */
+.server-group-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding-top: 6px;
+  border-top: 1px solid var(--ark-line);
+}
+.server-group-head:first-child { border-top: none; padding-top: 0; }
+.server-group-name {
+  /* 标签是用户输入的中文/中英混排主体 → CJK 轨道 */
+  font-family: var(--font-cjk);
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--ark-ink);
+}
+.server-group-count {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--ark-paper-dim-ink);
+}
+
+/* 卡片头部的标签徽章组(B3):1px 墨线空心,与 badge-info 同族 */
+.server-tags {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.server-tag {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 7px;
+  font-family: var(--font-cjk);
+  font-size: 11px;
+  line-height: 1;
+  color: var(--ark-ink);
+  border: 1px solid var(--ark-line-soft);
+  background: var(--ark-paper-dim);
+  white-space: nowrap;
+}
+
+/* ===== 标签编辑器(服务器表单;B3)===== */
+.tag-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  min-height: 22px;
+  width: 100%;
+}
+.tag-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  padding: 0 4px 0 8px;
+  font-family: var(--font-cjk);
+  font-size: 12px;
+  line-height: 1;
+  color: var(--ark-ink);
+  background: var(--ark-signal-dim);
+  white-space: nowrap;
+}
+.tag-chip-text { color: var(--ark-on-signal-dim); }
+/* 删除钮:方角小按钮,悬停反白(与全站按钮同族) */
+.tag-chip-del {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1;
+  color: var(--ark-ink);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  transition: background var(--ark-dur-press) var(--ark-ease-out),
+              color var(--ark-dur-press) var(--ark-ease-out);
+}
+.tag-chip-del:hover { background: var(--ark-ink); color: var(--ark-paper); }
+.tag-chip-del:focus-visible {
+  outline: 2px solid var(--ark-signal);
+  outline-offset: 1px;
+}
+.tag-chips-empty {
+  font-family: var(--font-cjk);
+  font-size: 12px;
+  color: var(--ark-ink-faint);
+}
+
 .server-card {
   background: var(--ark-surface);
   border: 1px solid var(--ark-line-soft);
@@ -3136,6 +3231,28 @@ code {
 /* 「跳过未变化镜像」随「打日期标签」联动禁用时整体置灰(含文字) */
 .deploy-checkbox input:disabled { cursor: not-allowed; }
 .deploy-checkbox input:disabled + span { color: var(--ark-paper-ink-65); cursor: not-allowed; }
+
+/* 批量勾选列表的分节头(B3):服务器多时给出位置感;非 label,不参与勾选 */
+.deploy-group-head {
+  margin-top: 10px;
+  padding-top: 6px;
+  border-top: 1px solid var(--ark-line-soft);
+  font-family: var(--font-cjk);
+  font-weight: 600;
+  font-size: 12px;
+  letter-spacing: .04em;
+  color: var(--ark-paper-dim-ink);
+}
+.deploy-group-head:first-child { margin-top: 0; border-top: none; padding-top: 0; }
+
+/* 批量模态内的勾选行改为每行独占(B3):分节后行内流式排布会让相邻行挤在一起
+   (标签后缀加宽了行内容,实测出现「[生产]☑ db-01」粘连),且与分节头的
+   列表语义不符。限定在批量模态体内,不影响其它复用 .deploy-checkbox 的地方。 */
+#deploy-batch-modal-body .deploy-checkbox {
+  display: flex;
+  width: 100%;
+  padding: 6px 0;
+}
 
 /* ---- 回滚模态(#deploy-modal):沿用 .modal-overlay/.modal-card,仅加宽 ---- */
 .deploy-modal-card { width: min(720px, 94vw); }

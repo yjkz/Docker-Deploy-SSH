@@ -326,8 +326,23 @@
       list.appendChild(el('div', 'list-hint', '暂无服务器,点击右上角「新增服务器」添加'));
       return;
     }
-    st.cfg.servers.forEach(function (server, i) {
-      list.appendChild(serverCard(server, i));
+    // B3:按归属标签(首标签)分节;未分组恒在最后(与下拉口径一致)。
+    // SRV-XX 编号用**原始下标**(全站唯一编号,不随分组重排)——
+    // 单组(全部未分组 / 只有一个标签)时不渲染组头,保持与旧版一致的观感。
+    var groups = window.groupServersByTag(st.cfg.servers);
+    var showHeads = groups.length > 1;
+    groups.forEach(function (group) {
+      if (showHeads) {
+        var head = el('div', 'server-group-head');
+        head.appendChild(el('span', 'server-group-name', group.label));
+        head.appendChild(el('span', 'server-group-count', String(group.servers.length)));
+        list.appendChild(head);
+      }
+      group.servers.forEach(function (server) {
+        // 原始下标:分节后卡片顺序变了,编号仍须与配置数组一致
+        var idx = st.cfg.servers.indexOf(server);
+        list.appendChild(serverCard(server, idx < 0 ? 0 : idx));
+      });
     });
   }
 
@@ -351,6 +366,16 @@
     var head = el('div', 'server-head');
     head.appendChild(el('span', 'server-index', 'SRV-' + ('0' + (index + 1)).slice(-2)));
     head.appendChild(el('span', 'server-name', server.name));
+    // B3:标签徽章(首标签已由分节头承载,仍逐枚展示 —— 卡片可脱离分组
+    // 单独阅读,且多标签服务器在这里能看全)
+    var tags = window.serverTagsOf(server);
+    if (tags.length > 0) {
+      var tagRow = el('span', 'server-tags');
+      tags.forEach(function (tag) {
+        tagRow.appendChild(el('span', 'server-tag', tag));
+      });
+      head.appendChild(tagRow);
+    }
 
     var actions = el('div', 'server-actions');
 
@@ -1082,7 +1107,8 @@
             key_pass_enc: null
           },
           remote_dir: '',
-          host_key_sha256: null   // 不预填指纹(见本节顶部已知取舍)
+          host_key_sha256: null,  // 不预填指纹(见本节顶部已知取舍)
+          tags: []                // B3:导入的服务器从无标签开始(用户后续自行打)
         };
         return window.AppBus.invoke('save_server_entry', { server: server })
           .then(function () { added += 1; })
@@ -1785,6 +1811,166 @@
   }
 
   /**
+   * 全部已有标签(跨服务器聚合;去重、保序 = 首次出现顺序)。B3 无全局标签
+   * 管理:标签由服务器表单维护,无人引用的标签自然消失。
+   */
+  function allKnownTags() {
+    var servers = (st.cfg && Array.isArray(st.cfg.servers)) ? st.cfg.servers : [];
+    var out = [];
+    servers.forEach(function (s) {
+      window.serverTagsOf(s).forEach(function (t) {
+        if (out.indexOf(t) === -1) out.push(t);
+      });
+    });
+    return out;
+  }
+
+  /**
+   * 标签编辑器(B3):chips(可删) + 选择器。
+   *
+   * 选择器两态(同一 `<select>`):
+   * - 普通态:占位项 + 已有标签(排除已选)+ 「＋新建标签…」
+   * - 新建成态:占位项切换为「输入后按 Enter / 失焦确认」+ 输入框出现
+   * 选择已有标签 → 立即加入 chips;选「＋新建标签…」→ 展开输入框;
+   * 输入框失焦或 Enter → 加入 chips 并复位选择器。
+   * 归一(去重/去空/上限)与卡片渲染共用 `window.serverTagsOf` 同口径的
+   * 前端兜底,最终以后端 `normalize_tags` 为准。
+   */
+  function appendTagEditor(body, prev) {
+    var row = el('div', 'form-row');
+    row.id = 'srvf-tags-block';
+    row.appendChild(window.formLabel('标签(可选)', 'TAGS', false, 'srvf-tag-select'));
+
+    var chips = el('div', 'tag-chips');
+    chips.id = 'srvf-tag-chips';
+    var chosen = window.serverTagsOf(prev); // 当前已选(编辑态 = 已有标签)
+
+    var sel = document.createElement('select');
+    sel.className = 'form-input';
+    sel.id = 'srvf-tag-select';
+
+    var newRow = el('div', 'input-btn-row hidden');
+    var newInput = document.createElement('input');
+    newInput.className = 'form-input';
+    newInput.id = 'srvf-tag-new';
+    newInput.type = 'text';
+    newInput.autocomplete = 'off';
+    newInput.placeholder = '输入新标签后按 Enter';
+    newRow.appendChild(newInput);
+
+    function renderChips() {
+      chips.textContent = '';
+      chosen.forEach(function (tag) {
+        var chip = el('span', 'tag-chip');
+        chip.setAttribute('data-tag', tag);
+        chip.appendChild(el('span', 'tag-chip-text', tag));
+        var del = document.createElement('button');
+        del.className = 'tag-chip-del';
+        del.type = 'button';
+        del.setAttribute('aria-label', '移除标签 ' + tag);
+        del.textContent = '×';
+        del.addEventListener('click', function () {
+          var i = chosen.indexOf(tag);
+          if (i !== -1) chosen.splice(i, 1);
+          renderChips();
+          renderSelect();
+        });
+        chip.appendChild(del);
+        chips.appendChild(chip);
+      });
+      if (chosen.length === 0) {
+        chips.appendChild(el('span', 'tag-chips-empty', '未设置标签(将归入「未分组」)'));
+      }
+    }
+
+    function renderSelect() {
+      sel.textContent = '';
+      var ph = document.createElement('option');
+      ph.value = '';
+      ph.textContent = chosen.length >= 8 ? '标签已达上限(8 个)' : '选择已有标签或新建…';
+      sel.appendChild(ph);
+      allKnownTags().forEach(function (t) {
+        if (chosen.indexOf(t) !== -1) return; // 已选的不重复列出
+        var o = document.createElement('option');
+        o.value = 'tag:' + t;
+        o.textContent = t;
+        sel.appendChild(o);
+      });
+      var add = document.createElement('option');
+      add.value = '__new__';
+      add.textContent = '＋新建标签…';
+      sel.appendChild(add);
+    }
+
+    function addTag(raw) {
+      var t = String(raw || '').trim();
+      if (t === '') return;
+      if (chosen.indexOf(t) !== -1) { window.toast('标签「' + t + '」已存在', 'warn'); return; }
+      if (chosen.length >= 8) { window.toast('标签最多 8 个', 'warn'); return; }
+      chosen.push(t);
+      renderChips();
+      renderSelect();
+    }
+
+    sel.addEventListener('change', function () {
+      var v = sel.value;
+      if (v === '__new__') {
+        newRow.classList.remove('hidden');
+        newInput.value = '';
+        newInput.focus();
+        return;
+      }
+      if (v.indexOf('tag:') === 0) {
+        addTag(v.slice(4));
+      }
+      sel.value = '';
+    });
+
+    function commitNew() {
+      var v = newInput.value;
+      addTag(v);
+      newInput.value = '';
+      newRow.classList.add('hidden');
+      sel.value = '';
+    }
+    newInput.addEventListener('keydown', function (evt) {
+      if (evt.key === 'Enter') { evt.preventDefault(); commitNew(); }
+      if (evt.key === 'Escape') { newInput.value = ''; newRow.classList.add('hidden'); }
+    });
+    newInput.addEventListener('blur', function () {
+      if (newInput.value.trim() !== '') commitNew();
+      else newRow.classList.add('hidden');
+    });
+
+    row.appendChild(chips);
+    row.appendChild(sel);
+    row.appendChild(newRow);
+    row.appendChild(el('div', 'form-hint',
+      '用于服务器列表分节与部署页下拉分组(按第一个标签归属);' +
+      '最多 8 个,每个最长 24 字符'));
+    body.appendChild(row);
+
+    renderChips();
+    renderSelect();
+  }
+
+  /**
+   * 从表单 DOM 读标签(保存路径用):以 chips 的 `data-tag` 为唯一事实来源 ——
+   * 不依赖模块级状态(表单可被重开,隐藏状态会串台)。容器缺失时返回空数组。
+   */
+  function readTagChips() {
+    var box = document.getElementById('srvf-tag-chips');
+    if (!box) return [];
+    var out = [];
+    var nodes = box.querySelectorAll('.tag-chip');
+    for (var i = 0; i < nodes.length; i++) {
+      var t = nodes[i].getAttribute('data-tag');
+      if (t) out.push(t);
+    }
+    return out;
+  }
+
+  /**
    * 「默认服务器」下拉(第四批):选中后,部署页选中该项目时会自动带出该服务器。
    * 选项含「(不指定)」;已删除的服务器 id 会退化为不指定并在提示里说明。
    */
@@ -2288,6 +2474,11 @@
       appendField(body, '用户名', 'srvf-username', 'text',
         prev ? prev.username : '', '如:root', null, null, 'USERNAME', true);
 
+      // B3:标签编辑(分节/下拉分组的依据)。形态 = 已选 chips + 下拉选已有标签
+      // + 「＋新建标签…」展开输入框 —— 已有标签列表由全部服务器聚合得出,
+      // 无全局标签管理(本批范围);标签的归一与截断由后端 normalize_tags 收口
+      appendTagEditor(body, prev);
+
       // 认证方式单选
       body.appendChild(window.formGroupTitle('认证', 'AUTHENTICATION'));
       var authRow = el('div', 'form-row');
@@ -2598,7 +2789,9 @@
           username: username,
           auth: auth,
           remote_dir: remoteDir,
-          host_key_sha256: null // 指纹由后端 merge 保留(前端不承载)
+          host_key_sha256: null, // 指纹由后端 merge 保留(前端不承载)
+          // B3:标签(归一与截断由后端 normalize_tags 收口)
+          tags: readTagChips()
         };
         savedId = pid;
         return window.AppBus.invoke('save_server_entry', { server: server });

@@ -468,6 +468,9 @@
    * 渲染有缺陷 —— 弹层高度塌缩且选项文字不显示,表现为「点开只下拉一点点、
    * 无任何内容」。改为普通 option(空值)+ 未选中时置于选择态,弹层即可
    * 正常按选项数撑开并显示文字;空值在提交校验处已被拦截(「请先选择…」)。
+   *
+   * 分组(B3):选项可带 `group` 字段,分组 DOM 由共享助手
+   * [`window.appendGroupedOptions`] 实现(全站唯一口径)。
    */
   function fillSelect(select, placeholderText, options, restoreValue) {
     if (!select) return;
@@ -482,12 +485,7 @@
     ph.textContent = placeholderText;
     select.appendChild(ph);
 
-    options.forEach(function (opt) {
-      var node = document.createElement('option');
-      node.value = opt.value;
-      node.textContent = opt.text;
-      select.appendChild(node);
-    });
+    window.appendGroupedOptions(select, options);
 
     var restored = false;
     for (var i = 0; i < select.options.length; i++) {
@@ -546,10 +544,9 @@
 
     // 服务器 / 项目下拉:恢复上次选择(localStorage),项目按当前服务器排序
     // (先于镜像下拉填充 —— 镜像过滤依赖当前选中项目,见下)
+    // B3:服务器下拉按归属标签(首标签)分组;其余标签并在选项文字后缀
     fillSelect(srvSel, '请选择服务器',
-      (st.cfg ? st.cfg.servers : []).map(function (s) {
-        return { value: String(s.id), text: String(s.name) };
-      }), readPref(PREF_SERVER_KEY));
+      window.serverOptionsFor(st.cfg ? st.cfg.servers : []), readPref(PREF_SERVER_KEY));
     fillSelect(prjSel, '请选择项目',
       projectOptionsFor(srvSel ? srvSel.value : ''), readPref(PREF_PROJECT_KEY));
 
@@ -2125,19 +2122,32 @@
     // 「本批生效的选项」,不动表单也不自动开跑(与首页套用同一纪律)。
     buildBatchProfileRow(body);
 
-    for (var i = 0; i < st.cfg.servers.length; i++) {
-      var srv = st.cfg.servers[i];
-      var row = document.createElement('label');
-      row.className = 'deploy-checkbox';
-      var chk = document.createElement('input');
-      chk.type = 'checkbox';
-      chk.setAttribute('data-batch-server', srv.id);
-      chk.checked = true;
-      row.appendChild(chk);
-      var span = document.createElement('span');
-      span.textContent = (srv.name || srv.id) + ' (' + (srv.host || '') + ')';
-      row.appendChild(span);
-      body.appendChild(row);
+    // B3:勾选列表按归属标签分节(与 03 页/下拉同一口径:首标签归属、未分组置末)。
+    // 平铺时服务器多容易勾错台,分节头给位置感;分节头不是 label,不参与勾选。
+    var groups = window.groupServersByTag(st.cfg.servers);
+    for (var gi = 0; gi < groups.length; gi++) {
+      if (groups.length > 1) {
+        var ghead = document.createElement('div');
+        ghead.className = 'deploy-group-head';
+        ghead.textContent = groups[gi].label + '(' + groups[gi].servers.length + ')';
+        body.appendChild(ghead);
+      }
+      for (var i = 0; i < groups[gi].servers.length; i++) {
+        var srv = groups[gi].servers[i];
+        var row = document.createElement('label');
+        row.className = 'deploy-checkbox';
+        var chk = document.createElement('input');
+        chk.type = 'checkbox';
+        chk.setAttribute('data-batch-server', srv.id);
+        chk.checked = true;
+        row.appendChild(chk);
+        var span = document.createElement('span');
+        var tags = window.serverTagsOf(srv);
+        span.textContent = (srv.name || srv.id) + ' (' + (srv.host || '') + ')'
+          + (tags.length > 1 ? '  [' + tags.slice(1).join('][') + ']' : '');
+        row.appendChild(span);
+        body.appendChild(row);
+      }
     }
 
     var actions = document.createElement('div');

@@ -144,6 +144,9 @@ struct ExportServer {
     remote_dir: String,
     #[serde(default)]
     host_key_sha256: Option<String>,
+    /// 服务器标签(第二十七批 B3);旧导出文件缺字段 → serde default 空列表。
+    #[serde(default)]
+    tags: Vec<String>,
 }
 
 /// SMTP 邮箱配置(blob 内明文镜像):`password_enc` 为明文。
@@ -254,6 +257,7 @@ fn export_server(s: &ServerConfig) -> Result<ExportServer, String> {
         },
         remote_dir: s.remote_dir.clone(),
         host_key_sha256: s.host_key_sha256.clone(),
+        tags: s.tags.clone(),
     })
 }
 
@@ -279,6 +283,7 @@ fn import_server(s: ExportServer) -> Result<ServerConfig, String> {
         },
         remote_dir: s.remote_dir,
         host_key_sha256: s.host_key_sha256,
+        tags: s.tags,
     })
 }
 
@@ -624,6 +629,7 @@ mod tests {
             },
             remote_dir: "/opt/app".into(),
             host_key_sha256: Some("SHA256:abc".into()),
+            tags: vec!["华东".into(), "生产".into()],
         });
         cfg.projects.push(ProjectConfig {
             id: "p1".into(),
@@ -692,6 +698,8 @@ mod tests {
         assert_eq!(loaded.servers.len(), 1);
         assert_eq!(loaded.servers[0].host, "1.2.3.4");
         assert_eq!(loaded.servers[0].host_key_sha256.as_deref(), Some("SHA256:abc"));
+        // B3:标签随导出/导入往返(第二十七批)
+        assert_eq!(loaded.servers[0].tags, vec!["华东".to_string(), "生产".to_string()]);
         assert_eq!(
             dpapi_unprotect(loaded.servers[0].auth.password_enc.as_deref().unwrap()).unwrap(),
             "ssh-pw"
@@ -708,6 +716,44 @@ mod tests {
             "smtp-pw"
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// B3(第二十七批):**旧导出文件**(本版前导出,blob 内无 tags 字段)
+    /// 导入不报错,标签落为空列表(向后兼容),其余字段照常。
+    #[test]
+    fn test_import_legacy_export_without_tags() {
+        let _guard = crate::config::TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ddtest-legacy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
+        crate::config::save_config(&crate::config::AppConfig::default()).unwrap();
+
+        // 手工构造旧版载荷:服务器对象**不含** tags 字段
+        let payload = r#"{
+            "servers":[{
+                "id":"old1","name":"旧机","host":"9.9.9.9","port":22,"username":"root",
+                "auth":{"auth_type":"Password","key_path":null,"password_enc":null,"key_pass_enc":null},
+                "remote_dir":"/opt/old","host_key_sha256":null
+            }],
+            "projects":[],
+            "notify":{
+                "desktop":{"enabled":false},
+                "email":{"enabled":false,"smtp_host":"","port":465,"username":"",
+                         "password_enc":null,"security":"ssl","from":"","to":[]},
+                "events":{}
+            }
+        }"#;
+        let env = seal_blob("pw", payload).unwrap();
+        let path = dir.join("legacy.json");
+        std::fs::write(&path, serde_json::to_string(&env).unwrap()).unwrap();
+
+        let summary = config_import_file(path.to_str().unwrap().into(), "pw".into())
+            .expect("旧导出文件必须可导入(serde default 兼容)");
+        assert_eq!(summary.servers, 1);
+        let loaded = crate::config::load_config().unwrap();
+        assert_eq!(loaded.servers[0].id, "old1");
+        assert!(loaded.servers[0].tags.is_empty(), "旧文件导入后标签为空列表");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -731,6 +777,7 @@ mod tests {
             auth: AuthConfig { auth_type: AuthType::Password, key_path: None, password_enc: None, key_pass_enc: None },
             remote_dir: "/opt/cur".into(),
             host_key_sha256: None,
+            tags: Vec::new(),
         });
         cfg.projects.push(ProjectConfig {
             id: "p-cur".into(),
@@ -769,12 +816,14 @@ mod tests {
                     username: "root".into(),
                     auth: ExportAuth { auth_type: AuthType::Password, key_path: None, password_enc: None, key_pass_enc: None },
                     remote_dir: "/opt/b1".into(), host_key_sha256: None,
+                    tags: vec!["备份组".into()],
                 },
                 ExportServer {
                     id: "b2".into(), name: "备份2".into(), host: "2.2.2.2".into(), port: 22,
                     username: "root".into(),
                     auth: ExportAuth { auth_type: AuthType::Password, key_path: None, password_enc: None, key_pass_enc: None },
                     remote_dir: "/opt/b2".into(), host_key_sha256: None,
+                    tags: Vec::new(),
                 },
             ],
             projects: (0..3)

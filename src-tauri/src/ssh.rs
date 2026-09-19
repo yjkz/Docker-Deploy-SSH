@@ -1016,6 +1016,7 @@ W3hdnIKXGhKqXUN1AAAAFTE5OTMzQExBUFRPUC00SlVPMUwxMwECAwQF\n\
             auth,
             remote_dir: "/tmp/dd-ssh-test".into(),
             host_key_sha256: None,
+            tags: Vec::new(),
         })
     }
 

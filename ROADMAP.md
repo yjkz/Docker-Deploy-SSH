@@ -222,10 +222,10 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 
 | # | 项 | 落点与要点 | 规模 | 侦察依据(2026-09-18) |
 |---|---|---|---|---|
-| A1 | 回滚中心容器计数**精确归属** | `rollback.rs:813-821` 现按「容器名包含目录名」近似 → 改用同一条命令已返回的 `com.docker.compose.project.working_dir` 标签精确匹配(与 `cleanup.rs:670-685` 的 `compose_working_dirs` 同口径) | 小 | 精确数据**已在同一份 `ps_items` 里**,只是计数没用它;需仿写对象形态标签解析(NDJSON 对象 ≠ manage 的字符串形态,不能直接套 `compose_project_of_labels`) |
-| A2 | 清理分析**归档名放宽** | `cleanup.rs:374` 的 `-name '20*-*'` 是**全仓唯一**模式定义;放宽后自定义命名归档(如 `prod-2026-09-18`)可被列出 | 小-中 | 唯一硬解析点 `project_dir_of_release`(`cleanup.rs:687`)按 `/` 切分,与目录名内容无关 → 兼容。**真正要决策的是排序口径**:字典序不再等于时间序,需退回按 mtime(`ls -t`)或混合排序。`is_valid_release_dir_target` 不依赖该模式,删除安全性不受影响 |
-| A3 | **tar 镜像可配置** | `migrate_project.rs:1342-1373` 的 `pick_tar_image` 现只在内置候选(busybox/alpine/ubuntu)里挑;加设置字段允许自填(服务器有私有 registry 时用) | 小 | 改动面 = 配置字段 + 候选取值 + 表单;校验复用既有「镜像引用」形态 |
-| A4 | 归档搬运**注释与实现对齐** | `migrate_project.rs:1556-1559` 注释说「子目录跳过并计入警告」,实现实为「`sftp_download` 目录失败 → 该归档中断 + 降级 warning」 | 微小 | **只改注释**(不做递归支持;理由见「已裁决不做」表的「归档子目录支持」行) |
+| ~~A1~~ ✅ 已完成(第二十七批) | 回滚中心容器计数**精确归属** | `rollback.rs:813-821` 现按「容器名包含目录名」近似 → 改用同一条命令已返回的 `com.docker.compose.project.working_dir` 标签精确匹配(与 `cleanup.rs:670-685` 的 `compose_working_dirs` 同口径) | 小 | 精确数据**已在同一份 `ps_items` 里**,只是计数没用它;需仿写对象形态标签解析(NDJSON 对象 ≠ manage 的字符串形态,不能直接套 `compose_project_of_labels`) |
+| ~~A2~~ ✅ 已完成(第二十七批) | 清理分析**归档名放宽** | `cleanup.rs:374` 的 `-name '20*-*'` 是**全仓唯一**模式定义;放宽后自定义命名归档(如 `prod-2026-09-18`)可被列出 | 小-中 | 唯一硬解析点 `project_dir_of_release`(`cleanup.rs:687`)按 `/` 切分,与目录名内容无关 → 兼容。**真正要决策的是排序口径**:字典序不再等于时间序,需退回按 mtime(`ls -t`)或混合排序。`is_valid_release_dir_target` 不依赖该模式,删除安全性不受影响 |
+| ~~A3~~ ✅ 已完成(第二十七批) | **tar 镜像可配置** | `migrate_project.rs:1342-1373` 的 `pick_tar_image` 现只在内置候选(busybox/alpine/ubuntu)里挑;加设置字段允许自填(服务器有私有 registry 时用) | 小 | 改动面 = 配置字段 + 候选取值 + 表单;校验复用既有「镜像引用」形态 |
+| ~~A4~~ ✅ 已完成(第二十七批) | 归档搬运**注释与实现对齐** | `migrate_project.rs:1556-1559` 注释说「子目录跳过并计入警告」,实现实为「`sftp_download` 目录失败 → 该归档中断 + 降级 warning」 | 微小 | **只改注释**(不做递归支持;理由见「已裁决不做」表的「归档子目录支持」行) |
 
 #### B 组|产品向新功能
 
@@ -233,7 +233,7 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 |---|---|---|---|---|
 | B1 | **多项目编排**(一次部署 N 个项目,按序) | **前端队列**,复用批量部署成熟形态(`deploy.js` 的 `st.batch`:逐台预检 → 复用单发 → deferred 收尾 → 停止/续传);项目多选替代服务器多选 | 中 | `ProjectConfig` 无项目间关联字段;后端 `StackDeployRequest` 是单项目的(`deploy.rs:1466`)。前端队列先例已被第十四批验证(含逐台续传/停止/报告导出),**后端零改动**是最大优势。若要求后端持久化编排/依赖图 → 规模变大,不推荐 |
 | B2 | **部署日报/汇总** | 按天聚合 `DeployRecord`(`ts` 前 10 字符即日期)成一条摘要,经通知管道发一次 | 中 | 通知现为逐事件即时发送(五种 kind 固定,`notify.rs:539-549`);**无聚合结构**,需新 kind(白名单外会被 `log::warn` 跳过)或新发送函数。主要工程点是**触发源**(复用调度 tick? 手动?)与 kind 语义 |
-| B3 | **服务器分组/标签** | `ServerConfig` 加 `tags`/`group`;03 页渲染分组头;部署页下拉用 `<optgroup>` | 小-中 | `fillSelect`(`deploy.js:472-502`)是纯 option 追加,**无 optgroup 支持需扩展**;`config_io.rs` 是显式字段镜像,导入/导出需同步;服务器 >10 台时收益明显 |
+| ~~B3~~ ✅ 已完成(第二十七批) | **服务器分组/标签** | **实施口径**:`ServerConfig.tags: Vec<String>`(多标签,归一 cap 8/24 字);归属 = **首标签**使分节与下拉语义一致;五处下拉(部署/回滚中心/定时/迁移×2)+ 批量勾选列表分节 + 03 页分节/徽章 + 表单 chips 编辑器;不做全局标签管理 | 小-中 | `fillSelect`(`deploy.js:472-502`)是纯 option 追加,**无 optgroup 支持需扩展**;`config_io.rs` 是显式字段镜像,导入/导出需同步;服务器 >10 台时收益明显 |
 | B4 | **部署窗口/维护窗** | 调度日程加「允许执行时段」;`is_due`(`deploy_schedule.rs:149-164`)外再判定 | 小-中 | 现只有「到点触发」(90s 窗口)。**主要设计成本是错过语义**:「窗口内没到点」vs「到点但不在窗口」的处置需明确(参见既有 `missed_disposition` 172-198 的口径) |
 
 #### C 组|交互中风险(动共享接口,单列)
@@ -475,10 +475,43 @@ verify 六脚本 PASS / 桩验证 ②③④ + judge 2 图 PASS
 
 ---
 
+### 第二十七批(2026-09-19)— A 组清尾四项 + B3 服务器标签(单会话)
+
+> **来源**:候选池(2026-09-18 入库)用户批复「A 组 + B3」。B3 经 brainstorming 澄清
+> 三项口径(多标签 / 全部下拉 / 下拉+新建),追问三项(首标签归属 / 批量列表也分节 /
+> 不做全局标签管理)。
+
+**A1 回滚容器计数精确归属 ✅** — 新纯函数 `running_container_count` 按
+`com.docker.compose.project.working_dir` 精确匹配(回滚中心整段近似过滤删除);
+反例用同前缀项目 `/opt/app` vs `/opt/app-staging`;**两轮变异均被抓**
+**A2 归档名放宽 + mtime 排序全链 ✅** — 去掉 `-name '20*-*'`;
+**排序口径是真正决策点**:凡「取最近 N 个」的路径一律不得按名字排序 →
+四处收口(清理分析 / 回滚列表 / 回滚明细截断 / 迁移取 N 个)+ 共享助手
+`ls_subdirs_mtime_cmd`/`parse_release_lines`;口径来源 = 部署侧收尾裁剪本就是 mtime;
+**两轮变异均被抓**(去尾斜杠归一 / 名字倒序塞回)
+**A3 tar 镜像可配置 ✅** — `AppSettings.tarImage` + `normalize_tar_image` 严格校验
+(拼远端命令前置校验纪律);**变异验证暴露首版测试太弱**(漏 `..`/空 digest 类)→
+补 9 用例后连真实现的漏网项 `busybox:@tag` 一并抓到
+**A4 归档搬运注释对齐 ✅** — 仅注释(递归支持已裁决不做)
+**B3 服务器标签 ✅** — `ServerConfig.tags`(归一 cap 8 条/24 字符,收口
+`save_server_entry`)+ config_io 同步(旧导出文件导入为空标签)+ 四个共享助手
+(`serverTagsOf`/`serverPrimaryTag`/`groupServersByTag`/`serverOptionsFor`+
+`appendGroupedOptions`)+ 五处下拉 optgroup + 03 页分节/徽章 + 表单标签编辑器;
+**桩自检抓到两个真实缺陷**(同标签重复 optgroup / 批量勾选行粘连),均已修并补回归断言
+
+**验证**:`cargo test` 432 → **444**(+12)/ clippy 20 条零新增(按新增行逐行核对)/
+node --check / verify 六脚本 PASS(form-validation 67 项,含 B3 新增 13 项 + 变异被抓)/
+桩验证 03 页分节·标签编辑器·部署下拉结构·批量分节 + judge 4 图 PASS(2 张采集问题重拍)
+
+**命令数**:113 不变(无新命令)
+
+---
+
 ## 当前状态速览
 
-- 版本 **v6.8.0**;main = origin/main;基线 `cargo test` **432 passed** / 13 ignored
+- 版本 **v6.9.0**;main = origin/main;基线 `cargo test` **444 passed** / 13 ignored
 - 命令 **113** 个(generate_handler 实测;第二十二批 +3 调度 +2 配置历史;第二十五批 +5 导入/清理/compose)
+- **第二十七批(2026-09-19)已完成**:A 组清尾四项(回滚容器计数精确归属 / 清理归档名放宽+ mtime 排序全链收口 / tar 镜像可配置 / 归档搬运注释对齐)+ B3 服务器标签(tags + 03 页分节+ 四处下拉 optgroup + 批量勾选分节 + 标签编辑器);测试 432→444,命令 113 不变
 - **第二十六批(2026-09-18)已完成**:池内后五项(错误码挂点/扫描放宽/模板批量/卷浏览备份/迁移断点)——**功能候选池就此清空**;测试 413→432,命令 111→113
 - **第二十五批(2026-09-17,五项功能批)已完成**:SSH 配置导入 / 架构预检 / 本地镜像清理 / 栈 compose 查看编辑 / 部署失败自动回滚;测试 377→413,命令 106→111
 - **第二十三批(2026-09-17,双会话并行首发)已完成**:S1 细节补正 7 项 + S2 终端日志保留(时间制);批次收尾由 S2 统一执行(版本 v6.5.0)

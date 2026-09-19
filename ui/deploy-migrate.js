@@ -219,13 +219,9 @@
     // 墨线 + 底边 2px + 45° 三角的规范控件明显不一致)
     srcSel.className = 'form-input';
     srcSel.id = 'migrate-project-source';
-    servers.forEach(function (s) {
-      var opt = document.createElement('option');
-      opt.value = s.id;
-      opt.textContent = (s.name || s.id) + ' (' + (s.host || '') + ')';
-      if (s.id === defaultSrc) opt.selected = true;
-      srcSel.appendChild(opt);
-    });
+    // B3:按归属标签(首标签)分组成 optgroup(与部署页/回滚中心同口径);
+    // 迁移下拉额外带主机地址,标签仍在选项文字括号前展示
+    window.appendGroupedOptions(srcSel, window.serverOptionsFor(servers, { withHost: true }));
     srcRow.appendChild(srcSel);
     grid.appendChild(srcRow);
 
@@ -234,13 +230,8 @@
     var tgtSel = document.createElement('select');
     tgtSel.className = 'form-input';   // 同 srcSel:补回缺失的控件样式
     tgtSel.id = 'migrate-project-target';
-    servers.forEach(function (s) {
-      if (s.id === defaultSrc) return; // 目标不能等于源
-      var opt = document.createElement('option');
-      opt.value = s.id;
-      opt.textContent = (s.name || s.id) + ' (' + (s.host || '') + ')';
-      tgtSel.appendChild(opt);
-    });
+    // 目标不能等于源
+    window.appendGroupedOptions(tgtSel, window.serverOptionsFor(servers, { withHost: true, excludeId: defaultSrc }));
     tgtRow.appendChild(tgtSel);
     grid.appendChild(tgtRow);
 
@@ -249,13 +240,7 @@
       var cur = String(srcSel.value);
       var prev = String(tgtSel.value);
       tgtSel.innerHTML = '';
-      servers.forEach(function (s) {
-        if (s.id === cur) return;
-        var opt = document.createElement('option');
-        opt.value = s.id;
-        opt.textContent = (s.name || s.id) + ' (' + (s.host || '') + ')';
-        tgtSel.appendChild(opt);
-      });
+      window.appendGroupedOptions(tgtSel, window.serverOptionsFor(servers, { withHost: true, excludeId: cur }));
       if (prev && prev !== cur) tgtSel.value = prev;
     });
 

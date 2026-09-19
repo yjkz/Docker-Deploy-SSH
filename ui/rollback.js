@@ -141,12 +141,9 @@
           sel.appendChild(opt);
           return [];
         }
-        servers.forEach(function (s) {
-          var o = document.createElement('option');
-          o.value = s.id;
-          o.textContent = s.name || s.host;
-          sel.appendChild(o);
-        });
+        // B3:按归属标签(首标签)分组成 optgroup(与部署页/03 页同一口径:
+        // 未分组内联在其首次出现处,组顺序 = 首次出现顺序)
+        window.appendGroupedOptions(sel, window.serverOptionsFor(servers));
         // 保留原选择(仍存在时)
         if (prev && servers.some(function (s) { return s.id === prev; })) sel.value = prev;
         return servers;

@@ -786,13 +786,9 @@ pub async fn rollback_scan_projects(
             .find(|p| p.rsplit_once('/').map(|(d, _)| d) == Some(dir.as_str()))
             .cloned()
             .unwrap_or_default();
-        let mut releases: Vec<String> = scan
-            .release_paths
-            .iter()
-            .filter(|r| project_dir_of_release(r) == dir)
-            .cloned()
-            .collect();
-        releases.sort_by(|a, b| b.cmp(a));
+        // 归档列表(新→旧):远端 mtime 倒序直接沿用 —— 不得按路径名排序,
+        // 归档名放宽后字典序 ≠ 时间序(A2),回滚选「最近一版」会选错
+        let releases: Vec<String> = releases_of_project(&scan.release_paths, &dir);
         let latest = releases
             .first()
             .and_then(|r| r.rsplit('/').next().map(String::from))
@@ -810,15 +806,9 @@ pub async fn rollback_scan_projects(
             })
             .map(|p| p.name.clone())
             .unwrap_or_default();
-        // 运行容器数:以 Names 前缀/目录名近似归属(无 labels 时的兜底)
-        let running = scan
-            .ps_items
-            .iter()
-            .filter(|c| {
-                let status = jstr(c, "Status").to_lowercase();
-                status.starts_with("up") && jstr(c, "Names").contains(dir_name)
-            })
-            .count();
+        // 运行容器数:按 compose working_dir 标签精确归属(第二十七批 A1;
+        // 此前按容器名包含目录名近似,同前缀项目会互相串数)
+        let running = running_container_count(&scan.ps_items, &dir);
         projects.push(RollbackProject {
             dir,
             compose_file,

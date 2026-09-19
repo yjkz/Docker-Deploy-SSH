@@ -305,6 +305,157 @@
   };
 
   /**
+   * 服务器标签(B3)。契约:`ServerConfig.tags`(string[],snake_case,
+   * 后端 `normalize_tags` 已归一:trim/去空/去重保序/cap 8 条/每条 24 字符)。
+   * 旧配置/未设置 → 空数组,此处兜底归一防 undefined 传播。
+   * @param {object} server 服务器对象(get_config 的 servers[] 项)
+   * @returns {string[]} 标签列表(永不为 null)
+   */
+  window.serverTagsOf = function (server) {
+    if (!server || !Array.isArray(server.tags)) return [];
+    return server.tags
+      .map(function (t) { return String(t).trim(); })
+      .filter(function (t) { return t !== ''; });
+  };
+
+  /**
+   * 服务器的「归属标签」= **首个标签**(B3 约定)。
+   *
+   * 为什么取首标签而不是多归属展示:`<select>` 的一个 `<option>` 只能属于
+   * 一个 `<optgroup>`,取首标签使 03 页分节与所有下拉的分组**语义一致**
+   * (同一台服务器在任何分组视图里都落在同一组下);其余标签只作展示。
+   * @param {object} server 服务器对象
+   * @returns {string} 归属标签;'' = 未分组
+   */
+  window.serverPrimaryTag = function (server) {
+    var tags = window.serverTagsOf(server);
+    return tags.length > 0 ? tags[0] : '';
+  };
+
+  /** 未分组在分节/下拉里的显示名(全站统一) */
+  window.UNGROUPED_LABEL = '未分组';
+
+  /**
+   * 按归属标签(首标签)把服务器分组(B3)。
+   *
+   * 返回 `[{ tag, label, servers }]`:tag 为 '' 的组恒在**最后**(未分组),
+   * 其余组按标签**首次出现顺序**排列(与 servers 输入顺序一致,不额外排序 ——
+   * 用户眼里的顺序应稳定可预期)。纯函数:无 DOM、无全局状态,便于验证脚本
+   * 直接驱动。
+   * @param {Array} servers get_config 的 servers[]
+   * @returns {Array<{tag: string, label: string, servers: Array}>}
+   */
+  window.groupServersByTag = function (servers) {
+    var list = Array.isArray(servers) ? servers : [];
+    var order = [];
+    var buckets = {};
+    var ungrouped = [];
+    for (var i = 0; i < list.length; i++) {
+      var srv = list[i];
+      var tag = window.serverPrimaryTag(srv);
+      if (tag === '') {
+        ungrouped.push(srv);
+        continue;
+      }
+      if (!Object.prototype.hasOwnProperty.call(buckets, tag)) {
+        buckets[tag] = [];
+        order.push(tag);
+      }
+      buckets[tag].push(srv);
+    }
+    var out = order.map(function (tag) {
+      return { tag: tag, label: tag, servers: buckets[tag] };
+    });
+    if (ungrouped.length > 0) {
+      out.push({ tag: '', label: window.UNGROUPED_LABEL, servers: ungrouped });
+    }
+    return out;
+  };
+
+  /**
+   * 按归属标签把服务器映射为下拉选项(B3 全站统一口径,五处消费点共用)。
+   *
+   * - `group` = 归属标签(首标签),驱动 [`window.appendGroupedOptions`] 的 `<optgroup>`
+   * - `text` = 名称(可选 `{withHost:true}` 时附 ` (host)`);**其余标签**以
+   *   `[标签]` 后缀展示(首标签已由分组承载,不重复展示)—— 一台服务器可属
+   *   多标签,下拉里也能看全
+   * - 未分组服务器的 group 为 `''`(不分组)
+   *
+   * **输出顺序已按组归并**:同一组的选项连续排列,组序 = 标签首次出现顺序,
+   * 未分组恒在最后(`<select>` 里同组必须连续,否则会出现重复的 optgroup ——
+   * 与 03 页分节的「未分组置末」同口径)。
+   * @param {Array} servers get_config 的 servers[]
+   * @param {{withHost?: boolean, excludeId?: string}} [opts] 变体开关:
+   *   withHost 附主机地址(项目迁移需要);excludeId 排除某台(目标不能等于源)
+   * @returns {Array<{value: string, text: string, group: string}>}
+   */
+  window.serverOptionsFor = function (servers, opts) {
+    var o = opts || {};
+    var list = Array.isArray(servers) ? servers : [];
+    var order = [];       // 标签首次出现顺序
+    var byTag = {};       // tag → 选项数组
+    var ungrouped = [];
+    list.forEach(function (s) {
+      if (o.excludeId && String(s.id) === String(o.excludeId)) return;
+      var tags = window.serverTagsOf(s);
+      var primary = tags.length > 0 ? tags[0] : '';
+      var rest = tags.slice(1);
+      var name = String((s && (s.name || s.id)) || '');
+      if (o.withHost) name += ' (' + String((s && s.host) || '') + ')';
+      var text = rest.length > 0 ? name + '  [' + rest.join('][') + ']' : name;
+      var option = { value: String(s.id), text: text, group: primary };
+      if (primary === '') {
+        ungrouped.push(option);
+        return;
+      }
+      if (!Object.prototype.hasOwnProperty.call(byTag, primary)) {
+        byTag[primary] = [];
+        order.push(primary);
+      }
+      byTag[primary].push(option);
+    });
+    var out = [];
+    order.forEach(function (tag) {
+      out = out.concat(byTag[tag]);
+    });
+    return out.concat(ungrouped); // 未分组置末(与 03 页分节同口径)
+  };
+
+  /**
+   * 把带可选分组的选项追加进 `<select>`(B3)。
+   *
+   * 分组规则:同一 `group` 的连续选项包进一个 `<optgroup label>`;组的顺序 =
+   * 各标签**首次出现**的顺序;未分组项(`group` 为空)按出现位置**内联**排布
+   * (不归并到末尾)—— 与传入顺序一致,视觉上不跳变。这是全站唯一的分组 DOM
+   * 实现:`deploy.js` 的 `fillSelect`(带占位项)与回滚中心/定时部署/项目迁移
+   * 的手写下拉都经此,避免「一处口径、多处复刻」漂移。
+   * @param {HTMLSelectElement} select 目标下拉(调用方负责先清空)
+   * @param {Array<{value:any,text:string,group?:string}>} options 选项列表
+   */
+  window.appendGroupedOptions = function (select, options) {
+    if (!select) return;
+    var curGroup = null;
+    var host = select;
+    (Array.isArray(options) ? options : []).forEach(function (o) {
+      var group = (o.group === undefined || o.group === null) ? '' : String(o.group);
+      if (group !== curGroup) {
+        curGroup = group;
+        host = select;
+        if (group !== '') {
+          var og = document.createElement('optgroup');
+          og.label = group;
+          select.appendChild(og);
+          host = og;
+        }
+      }
+      var node = document.createElement('option');
+      node.value = o.value;
+      node.textContent = o.text;
+      host.appendChild(node);
+    });
+  };
+
+  /**
    * 填充状态徽章:同步类名 + 前置图标 + 文本(kind 对应图标:ok=check fail=cross warn=run info=无)
    * @param {HTMLElement} node 徽章元素(通常为新建 span)
    * @param {string} kind 'ok' | 'fail' | 'warn' | 'info'

@@ -252,6 +252,62 @@ console.log('\n=== 9. select 走 change ===');
   ok(!sel.classList.contains('has-error'), 'select 改值后清除错误');
 }
 
+console.log('\n=== 10. 服务器标签分组(B3) ===');
+{
+  // 回归来源:桩验证自检抓到「serverOptionsFor 输出保持输入顺序 → 同标签被拆成
+  // 多个 optgroup」。下拉里同标签必须归并成一组,否则分组失去意义。
+  const servers = [
+    { id: 'a', name: 'A', host: 'h1', tags: ['华东', '生产'] },
+    { id: 'b', name: 'B', host: 'h2', tags: ['华北'] },
+    { id: 'c', name: 'C', host: 'h3', tags: [] },
+    { id: 'd', name: 'D', host: 'h4', tags: ['华东'] },
+    { id: 'e', name: 'E', host: 'h5', tags: null }
+  ];
+
+  // groupServersByTag:首标签归属 + 未分组置末
+  const groups = W.groupServersByTag(servers);
+  ok(groups.length === 3, 'groupServersByTag 产生 3 组', JSON.stringify(groups.map(g => g.label)));
+  ok(groups[0].tag === '华东' && groups[0].servers.length === 2, '华东组含 2 台(首标签归属)');
+  ok(groups[1].tag === '华北' && groups[1].servers.length === 1, '华北组含 1 台');
+  ok(groups[2].tag === '' && groups[2].label === '未分组' && groups[2].servers.length === 2,
+    '未分组置末且含 2 台(tags 为 null 也算未分组)');
+
+  // serverPrimaryTag
+  ok(W.serverPrimaryTag(servers[0]) === '华东', '首标签即归属标签');
+  ok(W.serverPrimaryTag(servers[2]) === '', '无标签 → 空归属');
+
+  // serverOptionsFor:同组选项必须连续(optgroup 不能重复)
+  // 判定 = 「离开某组后不得再回到该组」(连续重复是正常的,不算重复组)
+  const opts = W.serverOptionsFor(servers);
+  const closed = new Set();
+  let prev = null;
+  let repeated = false;
+  opts.forEach(o => {
+    if (o.group !== prev) {
+      if (o.group !== '' && closed.has(o.group)) repeated = true;
+      if (prev) closed.add(prev);
+      prev = o.group;
+    }
+  });
+  ok(!repeated, '同标签选项连续(无重复 optgroup)', JSON.stringify(opts.map(o => o.group)));
+  ok(opts[opts.length - 1].group === '' && opts[opts.length - 2].group === '',
+    '未分组选项置末');
+  ok(opts[0].text.indexOf('[生产]') !== -1, '其余标签以后缀展示(首标签由分组承载)');
+
+  // excludeId + withHost
+  const opts2 = W.serverOptionsFor(servers, { withHost: true, excludeId: 'a' });
+  ok(opts2.every(o => o.value !== 'a'), 'excludeId 排除指定服务器');
+  ok(opts2[0].text.indexOf('(h2)') !== -1, 'withHost 附主机地址');
+
+  // appendGroupedOptions:DOM 结构
+  const sel = D.createElement('select');
+  W.appendGroupedOptions(sel, opts);
+  const tags = sel.children.map(c => c.tagName);
+  ok(tags.filter(t => t === 'OPTGROUP').length === 2, '生成 2 个 optgroup(华东/华北)',
+    JSON.stringify(tags));
+  ok(tags[tags.length - 1] === 'OPTION', '未分组选项直接在 select 下(非组内)');
+}
+
 console.log('\n---------------------------------------');
 console.log('PASS ' + pass + ' / FAIL ' + fail);
 process.exit(fail === 0 ? 0 : 1);

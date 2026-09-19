@@ -301,6 +301,15 @@
       '默认 4;1-8',
       '扫描部署目录的目录层级上限;栈放得较深时调大(越大扫描越慢)'));
 
+    // 卷搬运 tar 镜像(第二十七批):服务器有私有 registry / 镜像白名单时,
+    // 内置候选(busybox/alpine/ubuntu)都可能取不到 —— 允许指定自备 tar 能力镜像。
+    // 形态合法性由后端 normalize_tar_image 单点裁决(与 compose 文件名同纪律)
+    main.appendChild(buildField('卷搬运 tar 镜像', 'TAR IMAGE',
+      'settings-tar-image-input', 'text', '',
+      '留空 = 内置候选(busybox → alpine → ubuntu)',
+      '项目迁移搬运数据卷时用哪个镜像执行 tar;服务器有私有 registry 或镜像白名单时填自备镜像' +
+      '(如 registry.local/tools/tar:1)。该镜像需已存在于服务器且自带 tar'));
+
     // 终端日志保留(第二十三批):天数,0 = 永久保留(默认 30)。
     // hint 同时说明清理时机(打开终端 / 启动软件时 best-effort 清理)
     main.appendChild(buildField('终端日志保留(天)', 'TERM LOGS',
@@ -663,7 +672,8 @@
         alertCpuPercent: alertPercentArg('settings-alert-cpu-input'),
         autoRollbackOnFailure: isChecked('settings-auto-rollback'),
         composeFileNames: composeNamesArg(),
-        composeScanMaxDepth: composeDepthArg()
+        composeScanMaxDepth: composeDepthArg(),
+        tarImage: fieldVal('settings-tar-image-input').trim()
       }
     }).then(function () {
       // 过期会话(保存期间模态被关闭甚至重开)→ 静默丢弃,防旧 promise 回写新模态
@@ -781,6 +791,9 @@
         }
         var depthInput = document.getElementById('settings-compose-depth-input');
         if (depthInput) depthInput.value = String(s.composeScanMaxDepth || 4);
+        // 卷搬运 tar 镜像(第二十七批):无条件回填(同 P1 教训);缺省空串
+        var tarImg = document.getElementById('settings-tar-image-input');
+        if (tarImg) tarImg.value = String(s.tarImage || '');
         var alertDisk = document.getElementById('settings-alert-disk-input');
         if (alertDisk) alertDisk.value = String(s.alertDiskPercent == null ? 90 : s.alertDiskPercent);
         var alertMem = document.getElementById('settings-alert-mem-input');
