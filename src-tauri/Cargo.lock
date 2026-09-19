@@ -136,7 +136,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "app"
-version = "6.10.0"
+version = "6.9.0"
 dependencies = [
  "aes-gcm 0.10.3",
  "argon2",
