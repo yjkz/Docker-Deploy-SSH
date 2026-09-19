@@ -71,6 +71,8 @@ pub struct NotifyEventsView {
     pub on_cancel: bool,
     pub on_probe: bool,
     pub on_alert: bool,
+    /// 部署日报(第二十八批 B2)
+    pub on_digest: bool,
 }
 
 /// `notify_get_config` 的返回(camelCase 序列化给前端)。
@@ -129,6 +131,9 @@ pub struct NotifyEventsInput {
     pub on_probe: bool,
     #[serde(default)]
     pub on_alert: bool,
+    /// 部署日报(第二十八批 B2;缺省关)
+    #[serde(default)]
+    pub on_digest: bool,
 }
 
 /// `notify_save_config` 的入参(camelCase)。
@@ -268,6 +273,7 @@ pub async fn notify_save_config(cfg: NotifyConfigInput) -> Result<(), String> {
             on_cancel: cfg.events.on_cancel,
             on_probe: cfg.events.on_probe,
             on_alert: cfg.events.on_alert,
+            on_digest: cfg.events.on_digest,
         },
         // 第二十批阶段五:成功通知的最小部署耗时(0 = 恒通知;上限夹取)
         min_duration_secs: cfg.min_duration_secs.min(MIN_DURATION_SECS_MAX),
@@ -616,6 +622,7 @@ fn to_view(cfg: &NotifyConfig) -> NotifyConfigView {
             on_cancel: cfg.events.on_cancel,
             on_probe: cfg.events.on_probe,
             on_alert: cfg.events.on_alert,
+            on_digest: cfg.events.on_digest,
         },
         min_duration_secs: cfg.min_duration_secs.min(MIN_DURATION_SECS_MAX),
     }

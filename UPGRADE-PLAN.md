@@ -3103,3 +3103,100 @@ migrate_project.rs:兜底命中入列带标记与识别说明 / 显式声明无�
 - **judge 4 图 PASS**(前两张因采集问题重拍:动效空帧 / 文件重复;重拍后 2/2 pass,
   另 2 张首轮即 pass)
 - 桩文件已删、8798 服务已停、预览页已关
+
+# 第二十八批:候选池余项四项(单会话,2026-09-19)
+
+> 来源:候选池(2026-09-18 入库)用户批复「继续完成剩余的所有事项」——B1 多项目编排 /
+> B2 部署日报 / B4 部署窗口 / C1 传输中可取消。四项各自 TDD,关键安全与默认值逻辑
+> 做变异验证。实现顺序:B4 → B2 → B1 → C1(按风险从低到高)。
+
+## B4 允许执行时段(维护窗)
+
+- `DeploySchedule` 加 `window_start` / `window_end`(`"HH:MM"`,serde default 兼容旧文件);
+  两个纯函数 `window_configured`(两边都填才算配置)与 `in_allowed_window`(半开 `[start, end)`,
+  **`start > end` 视为跨 0 点**)。
+- **语义设计(本项的核心决策)**:到点但不在时段内 → **当天跳过,且不算错过**。
+  这是 ROADMAP 侦察里点名的「主要设计成本」:
+  - `is_due` 用**到点时刻**(`fire_secs`)而非当前 tick 时刻判窗口 —— 否则 tick 抖动到
+    边界之外会漏触发(「到点是过点瞬间的事实」);
+  - `missed_disposition` 对「到点不在时段内」返回 `None`。若不在此分流,daily 会被
+    **每天**写一次「已错过(应用未运行)」、once 还会被误停用 —— 用户明确设的时段
+    是**有意跳过**,不是意外错过。
+- 保存侧校验:两字段同填或同空;各自合法;不相等(退化区间语义含糊)。
+- 前端:表单加「允许执行时段」行(两个 mono 输入 + 「至」分隔 + 跨 0 点 hint);
+  列表行在时刻后附 `[时段 23:00-02:00]` 后缀。
+- **变异验证两轮**:①把跨 0 点分支换成朴素 `start <= now < end`(跨天时变空集)→ 红;
+  ②删掉 `missed_disposition` 的窗口分流 → once 被误判 `Some(true)`(停用)→ 红。
+- 新增 7 个测试(窗口形态/同日区间/跨 0 点/退化与非法/is_due 尊重窗口/missed 语义/旧文件 serde 默认)。
+
+## B2 部署日报(按天聚合)
+
+- 新模块 `digest.rs`:`build_digest`(纯函数,按 `ts` 前缀取当天;成功/**取消**/失败三分,
+  取消单独计数不算失败)+ `digest_text`(标题正文拼装)+ `should_fire`(到点判定)+
+  `tick_once`(聚合→`notify::fire("digest")`→记状态)。
+- **触发源 = 独立常驻任务**(仿 probe/alert 的 `sync_from_settings` 模式,不复用部署日程
+  tick —— 那是「到点执行部署」的语义);`AppSettings.digest_hour: Option<u32>`(缺省 `None`
+  = 关闭)+ setup / `app_settings_set` 两处 sync(保存即生效)。
+- **发送标记放独立文件** `config/digest-state.json` 而非 `AppSettings`:settings 表单保存
+  会整量覆盖未知字段 → 标记被静默清空 → **当天重发**。这是本项最容易被漏的坑。
+- 通知管道:`fire_with_duration` 的 kind match 加 `"digest"` 臂(白名单外会被 `log::warn`
+  跳过 —— 与既有 5 种同纪律);`NotifyConfig.events.on_digest`(**默认关**,不改变既有用户
+  的通知量)+ View/Input/to_view/保存映射四处同步。
+- 「已到/过该小时」而非「恰在整点」:应用晚启动/休眠唤醒也补发;**当天无部署不发空日报**
+  (但仍记状态,避免每分钟重查)。
+- 前端:通知中心「事件订阅」区加一行 checkbox;设置中心「通用」区加「部署日报时刻」
+  数字输入(`digestHour`,空串 ↔ `null` 互转,夹取 0-23)。
+- **变异验证两轮**:①把取消折进失败计数 → 红(日报会把「我主动取消的」报成失败);
+  ②删掉 `last_sent_date == today` 防重 → 红(当天重发)。
+- 新增 7 个测试(计数与去重/空日 None/前缀匹配/空名跳过/正文形态/到点规则/状态 serde)。
+
+## B1 多项目编排(前端队列,后端零改动)
+
+- 形态决策:**批量模态内加「维度切换」radio**(服务器多选 = 既有 / 项目多选 = B1),
+  队列机制零复制 —— 逐项仍复用单发 `deploy` + `server_env_check` 预检,停止/续传/
+  重跑失败项/报告导出全部沿用 `st.batch`。
+- 每项目标服务器 = **项目自己的 `default_server_id`**(与「项目默认服务器」既有概念一致);
+  未配置的项目在勾选列表**禁用并注明**,组装队列时再跳过一次(双保险)。
+- **整栈模式暂不支持多项目**:`st.stack` 是全局单项目缓存(`startStackDeploy` 读它),
+  每项目需独立 `parse_compose` —— 这是侦察标出的「隐藏硬依赖」。当前以提示拦下
+  (「多项目批量目前支持单镜像模式」),不冒险半实现。
+- **复合键是本项真正的正确性改动**:队列的待续传登记、carried 去重、行内「续传此台」索引、
+  重跑失败项映射在 B1 前**只比 `serverId``**。同服务器挂多项目(本批引入的新形态)时,
+  第二个项目的续传入口会被第一个吞掉。新增 `window.batchItemKey(serverId, projectId)`
+  统一四处 + `verify/form-validation.js` 第 11 节 5 项断言(含数字/字符串 id 归一)。
+- 面板行名与导出报告在项目维度显示「项目 → 服务器」+ 增「项目」列;维度记忆 `dd_batch_dim`。
+
+## C1 传输中可取消
+
+- **接口设计(本项的核心决策)**:ROADMAP 原案是「改 `sftp_upload` / `save_gzip_remote`
+  签名,波及 14 个调用点」。实测当前工作区是 **17 处直连 + 2 处经 `sftp_upload_dir`**,
+  且两边取消位形态不同(部署侧在 `DeployState.cancelled`,迁移侧在 `Arc<MigrateStateInner>`)。
+  最终改为**客户端级取消探针**:
+  - `SshClient` 加 `cancel_probe: Option<Arc<dyn Fn() -> bool + Send + Sync>>` +
+    builder `with_cancel_probe`(默认 `None` = 不启用);
+  - `copy_file_to_remote` 的 64KB 循环、`sftp_download` 的读循环、`save_gzip_remote` 的
+    `channel.wait()` 循环各加一次 `transfer_cancel_check`;
+  - **19 处调用点零签名改动**;`connect_server_with_probe` 仅供部署/迁移两条长管线用。
+- 取消判定抽成**纯函数** `transfer_cancel_check(Option<&Probe>)`(方法需要真实 SSH 连接,
+  无法单测);命令层 `save_gzip_remote` 也复用它。
+- 块间取消的**副产品**:已写入的远端前缀保留 → 天然可被既有断点续传接着用(与断点语义一致)。
+- **残留(写入 wiki/07)**:卷 tar 的**打包**阶段(`docker run --entrypoint tar` 远端执行)
+  仍以命令为粒度。
+- **变异验证**:把「探针返回 true 才取消」改成「挂了探针就取消」→ 2 项测试红
+  (未取消也报错 = 所有长管线一发起就挂)。
+- 新增 3 个测试(未挂探针恒 Ok / 探针动态翻转 / 恒 false 不误报)。
+
+## 验证
+
+- `cargo test` **461 passed / 13 ignored**(444 + 17 新增:B4 七 / B2 七 / C1 三)
+- `cargo clippy --all-targets` 与基线 **20 条逐条一致,零新增**
+  (过程中新出现的 2 条 `too_many_arguments` / `needless_borrow` 已就地消除:
+  前者加 allow 并注明「拆结构体会遮蔽三条独立关注点」,后者修正借用)
+- `node --check` 全部改动 JS;verify 五脚本 PASS(form-validation 72 项,含 B1 新增 5 项)
+- **桩验证(8798)**:多项目维度切换(3 项目 / 未配置默认服务器的行禁用 / 标题与按钮文案)、
+  设置中心日报字段(值 8 正确回填)、调度时段字段(23:00 至 02:00 + 跨 0 点 hint)、
+  通知中心日报订阅行(勾选状态正确)
+- **judge 4 图 PASS**(多项目模态 / 设置日报字段 / 时段字段 / 通知订阅行;judge 逐图核对了
+  选中态、禁用态、hint 文案与「无红 / 无青色前景 / 圆角 0 / 无裁切」)
+- 桩文件已删、8798 服务已停、预览页已关
+- **候选池清空**:A/B/C 三组 9 项至此全部完成(v6.9.0 五项 + 本批四项)

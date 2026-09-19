@@ -3253,6 +3253,11 @@ code {
   width: 100%;
   padding: 6px 0;
 }
+/* B1:多项目模式下未配置默认服务器的项目行(不可勾选) */
+#deploy-batch-modal-body .deploy-checkbox.is-disabled span {
+  color: var(--ark-paper-dim-ink);
+  cursor: not-allowed;
+}
 
 /* ---- 回滚模态(#deploy-modal):沿用 .modal-overlay/.modal-card,仅加宽 ---- */
 .deploy-modal-card { width: min(720px, 94vw); }
@@ -4633,6 +4638,22 @@ tr.stat-flash > td:first-child {
   font-size: 13px;
   color: var(--ark-ink);
   cursor: pointer;
+}
+/* 允许执行时段行(B4;第二十八批):起-止两个 mono 输入 + 中间「至」 */
+.sched-window-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.sched-window-row .form-input {
+  width: 96px;
+  flex: none;
+}
+.sched-window-sep {
+  flex: none;
+  font-family: var(--font-cjk);
+  font-size: 12px;
+  color: var(--ark-paper-dim-ink);
 }
 .sched-check-col {
   display: flex;

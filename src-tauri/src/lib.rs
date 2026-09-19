@@ -6,6 +6,7 @@ pub mod config;
 pub mod config_io;
 pub mod crypto;
 pub mod deploy_schedule;
+pub mod digest;
 pub mod docker;
 pub mod errors;
 pub mod history;
@@ -185,6 +186,8 @@ pub fn run() {
       crate::probe::sync_alert_from_settings(app.handle());
       // 定时部署调度器(第二十二批):常驻 tick(30s),按日程表到点发起部署
       crate::deploy_schedule::start_scheduler(app.handle());
+      // 部署日报(第二十八批 B2):按设置启停(缺省关)
+      crate::digest::sync_from_settings(app.handle());
       // 终端日志保留(第二十三批):启动时按设置 best-effort 清理过期会话日志
       // (与终端会话创建时的清理互补;失败仅告警,不阻断启动)
       crate::manage_exec::cleanup_term_logs_from_settings();

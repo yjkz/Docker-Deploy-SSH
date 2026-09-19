@@ -106,6 +106,8 @@ pub(crate) const CANCELLED_MSG: &str = "部署已取消";
 #[path = "compose_sources.rs"]
 mod compose_sources;
 pub use compose_sources::*;
+// C1(第二十八批):带传输级取消探针的建连(部署/迁移长管线用;无探针版见 manage)
+pub(crate) use crate::manage::connect_server_with_probe;
 #[path = "host_server.rs"]
 mod host_server;
 pub use host_server::*;
@@ -1193,6 +1195,14 @@ fn is_cancelled(app: &AppHandle) -> bool {
     app.state::<DeployState>()
         .cancelled
         .load(Ordering::SeqCst)
+}
+
+/// 传输级取消探针(C1;第二十八批):把部署取消位包装成闭包,挂到 [`SshClient`]
+/// 上实现 64KB 块级取消。`AppHandle` 是 `Send + Sync` 且 clone 成本低,
+/// 闭包内按需取 `DeployState`(不持有 `State` 引用,避免生命周期纠缠)。
+pub(crate) fn deploy_cancel_probe(app: &AppHandle) -> Arc<dyn Fn() -> bool + Send + Sync> {
+    let app = app.clone();
+    Arc::new(move || is_cancelled(&app))
 }
 
 /// 部署开始时重置取消标志。

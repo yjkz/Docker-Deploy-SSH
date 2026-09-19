@@ -265,6 +265,10 @@ pub struct NotifyEvents {
     /// 阈值与采样间隔在设置中心配(`alert_*` 系列字段)
     #[serde(default)]
     pub on_alert: bool,
+    /// 部署日报(第二十八批 B2;默认关)—— 每天在设置中心指定的整点后,
+    /// 聚合当天部署记录为一条摘要发一次(当天无部署不发空日报)
+    #[serde(default)]
+    pub on_digest: bool,
 }
 
 impl Default for NotifyEvents {
@@ -275,6 +279,7 @@ impl Default for NotifyEvents {
             on_cancel: false,
             on_probe: false,
             on_alert: false,
+            on_digest: false,
         }
     }
 }
@@ -721,6 +726,15 @@ pub struct AppSettings {
     /// 拒绝 shell 元字符与 `-` 开头),非法值回退内置候选。
     #[serde(default)]
     pub tar_image: String,
+    /// 部署日报发送时刻(第二十八批 B2;`None` = 关闭,默认关)。
+    ///
+    /// 到该整点后(含应用晚启动的补发)聚合当天 `DeployRecord` 为一条摘要,
+    /// 经通知管道以 `kind = "digest"` 发出;发送标记存独立文件
+    /// `config/digest-state.json`(**不放本结构** —— settings 表单保存会整量
+    /// 覆盖未知字段,标记会被静默清空导致当天重发)。
+    /// 越界值(>23)按关闭处理。
+    #[serde(default)]
+    pub digest_hour: Option<u32>,
 }
 
 /// `AppSettings::default` 的手写实现:`auto_update_from_source` 缺省为 **true**
@@ -742,6 +756,7 @@ impl Default for AppSettings {
             compose_file_names: Vec::new(),
             compose_scan_max_depth: 0,
             tar_image: String::new(),
+            digest_hour: None,
         }
     }
 }
@@ -805,6 +820,8 @@ pub fn app_settings_set(app: tauri::AppHandle, settings: AppSettings) -> std::re
     crate::probe::sync_from_settings(&app);
     // 资源阈值告警(第二十四批):保存即按新设置启停(同探活口径)
     crate::probe::sync_alert_from_settings(&app);
+    // 部署日报(第二十八批 B2):小时字段变更即时启停(同探活口径)
+    crate::digest::sync_from_settings(&app);
     Ok(())
 }
 
@@ -1147,6 +1164,7 @@ mod tests {
             on_cancel: true,
             on_probe: false,
             on_alert: true,
+            on_digest: false,
         };
         std::env::set_var("DD_CONFIG_DIR", dir.to_str().unwrap());
         save_config(&cfg).unwrap();
@@ -1355,6 +1373,7 @@ mod tests {
             compose_file_names: vec!["docker-compose.prod.yml".into(), "app.yml".into()],
             compose_scan_max_depth: 6,
             tar_image: "registry.local/tar:1".into(),
+            digest_hour: None,
         };
         save_app_settings(&settings).unwrap();
         assert!(dir.join("config/settings.json").exists());
@@ -1410,6 +1429,7 @@ mod tests {
             compose_file_names: Vec::new(),
             compose_scan_max_depth: 0,
             tar_image: String::new(),
+            digest_hour: None,
         };
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains("\"closeToTray\":true"));

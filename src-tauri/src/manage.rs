@@ -56,9 +56,15 @@ pub(crate) async fn with_timeout<T>(
     }
 }
 
-pub(crate) async fn connect_server(
+/// 建连(命令层共用入口)。
+///
+/// `cancel_probe`:传输级取消探针(C1;第二十八批)。`None`(绝大多数调用点)
+/// = 不启用块级取消,行为与加该功能前一致;部署/迁移等会传大文件的长管线
+/// 传入探针后,其 SFTP 上传与下载按 64KB 块检查取消位。
+pub(crate) async fn connect_server_with_probe(
     server_id: &str,
     password_plain: Option<&str>,
+    cancel_probe: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 ) -> Result<(ServerConfig, SshClient), String> {
     let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
     let server = find_server(&cfg, server_id)?.clone();
@@ -78,7 +84,19 @@ pub(crate) async fn connect_server(
     )
     .await?;
     persist_host_key_if_needed(&server, &observed.get().cloned());
+    let client = match cancel_probe {
+        Some(probe) => client.with_cancel_probe(probe),
+        None => client,
+    };
     Ok((server, client))
+}
+
+/// [`connect_server_with_probe`] 的无探针版本(既有 47 处调用点不变)。
+pub(crate) async fn connect_server(
+    server_id: &str,
+    password_plain: Option<&str>,
+) -> Result<(ServerConfig, SshClient), String> {
+    connect_server_with_probe(server_id, password_plain, None).await
 }
 
 pub(crate) fn shell_quote(s: &str) -> String {

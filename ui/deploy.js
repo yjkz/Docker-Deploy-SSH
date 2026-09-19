@@ -2082,6 +2082,41 @@
     return n ? String(n.value) : '';
   }
 
+  /**
+   * 批量维度(B1;第二十八批):'server' = 多台服务器 × 单项目(既有批量),
+   * 'project' = 多个项目 × 各自默认服务器。会话内记忆(切换维度不丢选择)。
+   */
+  var BATCH_DIM_KEY = 'dd_batch_dim';
+  function batchDim() {
+    try {
+      return localStorage.getItem(BATCH_DIM_KEY) === 'project' ? 'project' : 'server';
+    } catch (_) { return 'server'; }
+  }
+  function setBatchDim(v) {
+    try { localStorage.setItem(BATCH_DIM_KEY, v === 'project' ? 'project' : 'server'); } catch (_) {}
+  }
+  /** 维度切换:记忆后重开模态(勾选列表数据源整体更换) */
+  function reopenBatchForDim(dim) {
+    setBatchDim(dim);
+    closeBatchModal();
+    openBatchModal();
+  }
+  function batchDimRadio(id, labelText) {
+    var input = document.createElement('input');
+    input.type = 'radio';
+    input.id = id;
+    input.name = 'batch-dim';
+    var label = el('label', 'sched-radio', '');
+    label.setAttribute('for', id);
+    label.appendChild(input);
+    label.appendChild(document.createTextNode(' ' + labelText));
+    return { input: input, label: label };
+  }
+  /** 批量项复合键(B1):实现见 app.js `window.batchItemKey`(纯函数,可单测) */
+  function batchItemKey(serverId, projectId) {
+    return window.batchItemKey(serverId, projectId);
+  }
+
   function openBatchModal() {
     if (st.deploying || st.checking || (st.batch && st.batch.active)) return;
     var projectId = batchVal('deploy-project');
@@ -2097,8 +2132,21 @@
       window.toast('整栈批量需要先完成服务分类(解析 compose)', 'warn');
       return;
     }
-    if (!Array.isArray(st.cfg.servers) || st.cfg.servers.length < 2) {
+    // B1(第二十八批):维度切换 —— 「多台服务器 × 单项目」/「单个模块 × 多项目」。
+    // 多项目模式:每个项目部署到它自己配置的 default_server_id(未配置的项目
+    // 在勾选列表里禁用);**整栈模式暂不支持多项目**(每项目需独立解析 compose,
+    // 见 startDeployStack 的 per-item stack 说明)。
+    var multiProject = batchDim() === 'project';
+    if (multiProject && st.mode === 'stack') {
+      window.toast('多项目批量目前支持单镜像模式(整栈请逐项目部署)', 'warn');
+      return;
+    }
+    if (!multiProject && (!Array.isArray(st.cfg.servers) || st.cfg.servers.length < 2)) {
       window.toast('服务器不足两台,无需批量部署', 'warn');
+      return;
+    }
+    if (multiProject && (!Array.isArray(st.cfg.projects) || st.cfg.projects.length < 2)) {
+      window.toast('项目不足两个,无需多项目部署', 'warn');
       return;
     }
 
@@ -2109,12 +2157,19 @@
     // 标题此前恒为空(index.html 有 title 元素但无人写值,aria-labelledby 指向空文本)
     // —— 第二十六批顺手补上:模态开者负责填标题,与其它模态同款
     var titleEl = document.getElementById('deploy-batch-modal-title');
-    if (titleEl) titleEl.textContent = '批量部署 — ' + modeText;
+    if (titleEl) {
+      titleEl.textContent = multiProject
+        ? '多项目部署 — ' + modeText
+        : '批量部署 — ' + modeText;
+    }
     var hint = document.createElement('p');
     hint.className = 'confirm-msg';
-    hint.textContent = '对选中的多台服务器串行执行' + modeText +
-      '(项目:「' + (project.name || projectId) + '」),每台独立写历史、可回滚;' +
-      '传输选项沿用当前页设置。';
+    hint.textContent = multiProject
+      ? '按序对选中的项目各执行一次' + modeText + '(每项部署到该项目配置的默认服务器),' +
+        '每项独立写历史、可回滚;传输选项沿用当前页设置。'
+      : '对选中的多台服务器串行执行' + modeText +
+        '(项目:「' + (project.name || projectId) + '」),每台独立写历史、可回滚;' +
+        '传输选项沿用当前页设置。';
     body.appendChild(hint);
 
     // 模板驱动批量(第二十六批):批量模态内直接套用模板(模式/传输选项/
@@ -2122,31 +2177,67 @@
     // 「本批生效的选项」,不动表单也不自动开跑(与首页套用同一纪律)。
     buildBatchProfileRow(body);
 
-    // B3:勾选列表按归属标签分节(与 03 页/下拉同一口径:首标签归属、未分组置末)。
-    // 平铺时服务器多容易勾错台,分节头给位置感;分节头不是 label,不参与勾选。
-    var groups = window.groupServersByTag(st.cfg.servers);
-    for (var gi = 0; gi < groups.length; gi++) {
-      if (groups.length > 1) {
-        var ghead = document.createElement('div');
-        ghead.className = 'deploy-group-head';
-        ghead.textContent = groups[gi].label + '(' + groups[gi].servers.length + ')';
-        body.appendChild(ghead);
+    // 维度切换(B1):服务器多选 / 项目多选
+    var dimRow = document.createElement('div');
+    dimRow.className = 'sched-radio-row';
+    var dimSrv = batchDimRadio('batch-dim-server', '服务器多选(同一项目,多台串行)');
+    var dimPrj = batchDimRadio('batch-dim-project', '项目多选(各部署到自己的默认服务器)');
+    (multiProject ? dimPrj : dimSrv).input.checked = true;
+    dimRow.appendChild(dimSrv.label);
+    dimRow.appendChild(dimPrj.label);
+    body.appendChild(dimRow);
+    // 切换维度即重开模态(勾选列表整体换数据源);开关期间禁用
+    dimSrv.input.addEventListener('change', function () { reopenBatchForDim('server'); });
+    dimPrj.input.addEventListener('change', function () { reopenBatchForDim('project'); });
+
+    if (multiProject) {
+      // 项目勾选列表:按项目列表顺序;目标服务器 = 项目 default_server_id
+      var projects = Array.isArray(st.cfg.projects) ? st.cfg.projects : [];
+      for (var pi = 0; pi < projects.length; pi++) {
+        var prj = projects[pi];
+        var defSrv = findById(st.cfg.servers, prj.default_server_id);
+        var pRow = document.createElement('label');
+        pRow.className = 'deploy-checkbox';
+        var pChk = document.createElement('input');
+        pChk.type = 'checkbox';
+        pChk.setAttribute('data-batch-project', prj.id);
+        pChk.checked = !!defSrv;
+        pChk.disabled = !defSrv;
+        pRow.appendChild(pChk);
+        var pSpan = document.createElement('span');
+        pSpan.textContent = (prj.name || prj.id)
+          + (defSrv ? '  → ' + (defSrv.name || defSrv.id) : '  (未配置默认服务器,不可选)');
+        pRow.appendChild(pSpan);
+        if (!defSrv) pRow.classList.add('is-disabled');
+        body.appendChild(pRow);
       }
-      for (var i = 0; i < groups[gi].servers.length; i++) {
-        var srv = groups[gi].servers[i];
-        var row = document.createElement('label');
-        row.className = 'deploy-checkbox';
-        var chk = document.createElement('input');
-        chk.type = 'checkbox';
-        chk.setAttribute('data-batch-server', srv.id);
-        chk.checked = true;
-        row.appendChild(chk);
-        var span = document.createElement('span');
-        var tags = window.serverTagsOf(srv);
-        span.textContent = (srv.name || srv.id) + ' (' + (srv.host || '') + ')'
-          + (tags.length > 1 ? '  [' + tags.slice(1).join('][') + ']' : '');
-        row.appendChild(span);
-        body.appendChild(row);
+    } else {
+      // B3:勾选列表按归属标签分节(与 03 页/下拉同一口径:首标签归属、未分组置末)。
+      // 平铺时服务器多容易勾错台,分节头给位置感;分节头不是 label,不参与勾选。
+      var groups = window.groupServersByTag(st.cfg.servers);
+      for (var gi = 0; gi < groups.length; gi++) {
+        if (groups.length > 1) {
+          var ghead = document.createElement('div');
+          ghead.className = 'deploy-group-head';
+          ghead.textContent = groups[gi].label + '(' + groups[gi].servers.length + ')';
+          body.appendChild(ghead);
+        }
+        for (var i = 0; i < groups[gi].servers.length; i++) {
+          var srv = groups[gi].servers[i];
+          var row = document.createElement('label');
+          row.className = 'deploy-checkbox';
+          var chk = document.createElement('input');
+          chk.type = 'checkbox';
+          chk.setAttribute('data-batch-server', srv.id);
+          chk.checked = true;
+          row.appendChild(chk);
+          var span = document.createElement('span');
+          var tags = window.serverTagsOf(srv);
+          span.textContent = (srv.name || srv.id) + ' (' + (srv.host || '') + ')'
+            + (tags.length > 1 ? '  [' + tags.slice(1).join('][') + ']' : '');
+          row.appendChild(span);
+          body.appendChild(row);
+        }
       }
     }
 
@@ -2156,7 +2247,7 @@
     startBtn.id = 'deploy-batch-start-btn';
     startBtn.className = 'btn btn-primary';
     startBtn.type = 'button';
-    startBtn.textContent = '开始批量部署';
+    startBtn.textContent = multiProject ? '开始多项目部署' : '开始批量部署';
     startBtn.addEventListener('click', onBatchStart);
     actions.appendChild(startBtn);
     body.appendChild(actions);
@@ -2263,28 +2354,45 @@
   }
 
   function onBatchStart() {
-    var nodes = document.querySelectorAll('#deploy-batch-modal-body input[data-batch-server]');
-    var ids = [];
-    for (var i = 0; i < nodes.length; i++) {
-      if (nodes[i].checked) ids.push(nodes[i].getAttribute('data-batch-server'));
-    }
-    if (ids.length === 0) { window.toast('请至少勾选一台服务器', 'warn'); return; }
-    var projectId = batchVal('deploy-project');
-    var project = findById(st.cfg ? st.cfg.projects : [], projectId);
-    if (!project) { window.toast('所选项目已变化,请重试', 'warn'); return; }
     var img = st.mode === 'single' ? findImageByRef(batchVal('deploy-image')) : null;
     if (st.mode === 'single' && !img) { window.toast('所选镜像已变化,请重试', 'warn'); return; }
 
     var queue = [];
-    for (var j = 0; j < ids.length; j++) {
-      var srv = findById(st.cfg ? st.cfg.servers : [], ids[j]);
-      if (srv) queue.push({ serverId: srv.id, server: srv, project: project, img: img });
+    if (batchDim() === 'project') {
+      // B1:项目多选 —— 每项目标服务器取该项目配置的 default_server_id
+      var pNodes = document.querySelectorAll('#deploy-batch-modal-body input[data-batch-project]');
+      for (var pi = 0; pi < pNodes.length; pi++) {
+        if (!pNodes[pi].checked || pNodes[pi].disabled) continue;
+        var prj = findById(st.cfg ? st.cfg.projects : [], pNodes[pi].getAttribute('data-batch-project'));
+        if (!prj) continue;
+        var srv = findById(st.cfg ? st.cfg.servers : [], prj.default_server_id);
+        if (!srv) continue; // 默认服务器缺失:跳过该项(勾选列表已禁用,双保险)
+        queue.push({ serverId: srv.id, server: srv, project: prj, img: img });
+      }
+      if (queue.length === 0) {
+        window.toast('请至少勾选一个已配置默认服务器的项目', 'warn');
+        return;
+      }
+    } else {
+      var nodes = document.querySelectorAll('#deploy-batch-modal-body input[data-batch-server]');
+      var ids = [];
+      for (var i = 0; i < nodes.length; i++) {
+        if (nodes[i].checked) ids.push(nodes[i].getAttribute('data-batch-server'));
+      }
+      if (ids.length === 0) { window.toast('请至少勾选一台服务器', 'warn'); return; }
+      var projectId = batchVal('deploy-project');
+      var project = findById(st.cfg ? st.cfg.projects : [], projectId);
+      if (!project) { window.toast('所选项目已变化,请重试', 'warn'); return; }
+      for (var j = 0; j < ids.length; j++) {
+        var srv2 = findById(st.cfg ? st.cfg.servers : [], ids[j]);
+        if (srv2) queue.push({ serverId: srv2.id, server: srv2, project: project, img: img });
+      }
+      if (queue.length === 0) { window.toast('没有可用的服务器', 'warn'); return; }
     }
-    if (queue.length === 0) { window.toast('没有可用的服务器', 'warn'); return; }
 
     closeBatchModal();
     st.batch = {
-      active: true, mode: st.mode, queue: queue, idx: 0,
+      active: true, mode: st.mode, dim: batchDim(), queue: queue, idx: 0,
       success: 0, failed: 0, skipped: 0, aborted: false,
       deferred: null, results: [], resumable: []
     };
@@ -2449,10 +2557,14 @@
     //  判定看 state —— 'skipped' 只在取消时产生,不再比对文案)
     var interrupted = (state === 'failed' || state === 'skipped');
     if (interrupted && item && item.serverId && item.project) {
-      var sid = String(item.serverId);
+      // 复合键去重(B1):同一服务器可能挂多个项目,只比 serverId 会互相吞
+      var key = batchItemKey(item.serverId, item.project.id);
       var exists = false;
       for (var k = 0; k < st.batch.resumable.length; k++) {
-        if (String(st.batch.resumable[k].serverId) === sid) { exists = true; break; }
+        if (batchItemKey(st.batch.resumable[k].serverId, st.batch.resumable[k].projectId) === key) {
+          exists = true;
+          break;
+        }
       }
       if (!exists) {
         st.batch.resumable.push({
@@ -2536,13 +2648,18 @@
     // 覆盖,其余失败台的「续传」按钮就消失了(用户只能一台一台地碰运气)。
     var carried = [];
     var prev = (st.batch && Array.isArray(st.batch.resumable)) ? st.batch.resumable : [];
-    var resumingIds = items.map(function (x) { return x.serverId; });
+    // 复合键(B1):同服务器多项目时只比 serverId 会把别的项目的待续传项吞掉
+    var resumingKeys = items.map(function (x) { return batchItemKey(x.serverId, x.projectId); });
     for (var i = 0; i < prev.length; i++) {
-      if (resumingIds.indexOf(String(prev[i].serverId)) === -1) carried.push(prev[i]);
+      if (resumingKeys.indexOf(batchItemKey(prev[i].serverId, prev[i].projectId)) === -1) {
+        carried.push(prev[i]);
+      }
     }
 
     st.batch = {
       active: true, resume: true, mode: items[0].resumeMode || st.mode,
+      // 续传批次沿用上一批的维度标记(行名/报告口径一致;B1)
+      dim: (st.batch && st.batch.dim) || batchDim(),
       queue: items, idx: 0,
       success: 0, failed: 0, skipped: 0, aborted: false,
       deferred: null, results: [], resumable: carried
@@ -2595,14 +2712,22 @@
     lines.push('- 结果: ' + st.batch.success + ' 成功 / ' + st.batch.failed + ' 失败 / ' +
       st.batch.skipped + ' 跳过(共 ' + st.batch.results.length + ' 台)');
     lines.push('');
-    lines.push('| 服务器 | 结果 | 说明 |');
-    lines.push('|---|---|---|');
+    var isPrjDim = st.batch.dim === 'project';
+    lines.push(isPrjDim ? '| 项目 | 服务器 | 结果 | 说明 |' : '| 服务器 | 结果 | 说明 |');
+    lines.push(isPrjDim ? '|---|---|---|---|' : '|---|---|---|');
     st.batch.results.forEach(function (r) {
       var stateText = r.state === 'success' ? '成功'
         : (r.state === 'skipped' ? '跳过' : '失败');
-      var msg = String(r.message || '').replace(/\|/g, '\\|').replace(/\n/g, ' ');
-      lines.push('| ' + String(r.serverName || '').replace(/\|/g, '\\|') +
-        ' | ' + stateText + ' | ' + msg + ' |');
+      var esc = function (v) {
+        return String(v || '').replace(/\|/g, '\\|').replace(/\n/g, ' ');
+      };
+      var msg = esc(r.message);
+      if (isPrjDim) {
+        lines.push('| ' + esc(r.projectName) + ' | ' + esc(r.serverName) +
+          ' | ' + stateText + ' | ' + msg + ' |');
+      } else {
+        lines.push('| ' + esc(r.serverName) + ' | ' + stateText + ' | ' + msg + ' |');
+      }
     });
     var resumable = Array.isArray(st.batch.resumable) ? st.batch.resumable : [];
     if (resumable.length > 0) {
@@ -2786,10 +2911,10 @@
     }
     panel.appendChild(head);
 
-    // 待续传台集合(按 serverId 查,用于行内「续传」按钮的出现判定)
+    // 待续传集合(复合键 serverId|projectId 索引 —— B1;行内「续传」按钮的出现判定)
     var resumableIds = {};
     for (var ri = 0; ri < resumable.length; ri++) {
-      resumableIds[String(resumable[ri].serverId)] = resumable[ri];
+      resumableIds[batchItemKey(resumable[ri].serverId, resumable[ri].projectId)] = resumable[ri];
     }
 
     for (var i = 0; i < st.batch.queue.length; i++) {
@@ -2797,7 +2922,14 @@
       var row = document.createElement('div');
       row.className = 'batch-row';
       var name = document.createElement('span');
-      name.textContent = (item.server.name || item.server.id) + ' (' + (item.server.host || '') + ')';
+      // B1 项目维度:行名以「项目 → 服务器」呈现(否则多项目列表全是服务器名,
+      // 分不清哪行是哪个项目)
+      if (st.batch.dim === 'project') {
+        name.textContent = (item.project.name || item.project.id)
+          + ' → ' + (item.server.name || item.server.id);
+      } else {
+        name.textContent = (item.server.name || item.server.id) + ' (' + (item.server.host || '') + ')';
+      }
       row.appendChild(name);
       var badge = document.createElement('span');
       var state, kind;
@@ -2832,7 +2964,7 @@
       // 偏左」的错列(judge 第十四批截图验收打回)。
       var actionSlot = document.createElement('span');
       actionSlot.className = 'batch-row-action';
-      var entry = resumableIds[String(item.serverId)];
+      var entry = resumableIds[batchItemKey(item.serverId, item.project && item.project.id)];
       if (entry && !st.batch.active) {
         var oneBtn = document.createElement('button');
         oneBtn.className = 'btn btn-sm';
@@ -3343,7 +3475,9 @@
     LOG_MAX_LINES: LOG_MAX_LINES, refreshHistory: refreshHistory,
     renderHistory: renderHistory, handleDone: handleDone,
     // deploy-migrate.js 消费
-    migState: migState, loadPageData: loadPageData
+    migState: migState, loadPageData: loadPageData,
+    // B1:多项目维度(桩验证需要驱动维度切换)
+    batchDim: batchDim, setBatchDim: setBatchDim, openBatchModal: openBatchModal
   };
   var openRollbackModal = function () { return window.DeployRollback.openRollbackModal.apply(null, arguments); };
   var closeRollbackModal = function () { return window.DeployRollback.closeRollbackModal.apply(null, arguments); };

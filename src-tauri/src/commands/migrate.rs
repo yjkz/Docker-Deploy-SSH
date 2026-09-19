@@ -102,6 +102,14 @@ impl MigrateState {
     }
 }
 
+/// 迁移取消位 → 传输级取消探针(C1;第二十八批)。两个迁移管线共用。
+pub(crate) fn migrate_cancel_probe(
+    state: &Arc<MigrateStateInner>,
+) -> Arc<dyn Fn() -> bool + Send + Sync> {
+    let st = Arc::clone(state);
+    Arc::new(move || st.is_cancelled_pub())
+}
+
 impl MigrateStateInner {
     fn is_cancelled(&self) -> bool {
         self.cancelled
@@ -227,7 +235,7 @@ pub async fn migrate_status(
 /// `Err((errors::cancelled()("部署已取消"), 已完成部分))`。
 async fn run_migrate(
     app: &AppHandle,
-    state: &MigrateStateInner,
+    state: &Arc<MigrateStateInner>,
     migrate_id: u64,
     req: &MigrateRequest,
     images: Vec<String>,
@@ -252,13 +260,24 @@ async fn run_migrate(
         "连接源服务器…(共 {} 个镜像待迁移)",
         images.len()
     ));
-    let (src_server, mut src) = connect_server(&req.source_id, req.source_password_plain.as_deref(), None)
-        .await
-        .map_err(|e| (e, done.clone()))?;
+    // C1(第二十八批):迁移取消位 → 传输级探针(镜像包 SFTP 与 docker save 流
+    // 按块检查),两条迁移管线共用同一份取消位
+    let cancel_probe = migrate_cancel_probe(state);
+    let (src_server, mut src) = connect_server_with_probe(
+        &req.source_id,
+        req.source_password_plain.as_deref(),
+        Some(cancel_probe.clone()),
+    )
+    .await
+    .map_err(|e| (e, done.clone()))?;
     emit_line(&format!("已连接源服务器「{}」", src_server.name));
-    let (dst_server, mut dst) = connect_server(&req.target_id, req.target_password_plain.as_deref(), None)
-        .await
-        .map_err(|e| (e, done.clone()))?;
+    let (dst_server, mut dst) = connect_server_with_probe(
+        &req.target_id,
+        req.target_password_plain.as_deref(),
+        Some(cancel_probe),
+    )
+    .await
+    .map_err(|e| (e, done.clone()))?;
     emit_line(&format!("已连接目标服务器「{}」", dst_server.name));
 
     let total = images.len();
@@ -405,6 +424,10 @@ pub(crate) async fn save_gzip_remote(
     let mut stderr_tail: Vec<String> = Vec::new();
     let mut exit_code: i32 = -1;
     loop {
+        // 块级取消(C1;第二十八批):`docker save | gzip` 的流式输出按块到达,
+        // 每块之间检查取消位 —— 大镜像导出中置位可即时停(此前只在镜像边界生效)。
+        // 取消位由调用方经 [`SshClient::with_cancel_flag`] 挂载;未挂载时无开销。
+        src.check_transfer_cancelled()?;
         match channel.wait().await {
             Some(ChannelMsg::Data { ref data }) => {
                 file.write_all(data)

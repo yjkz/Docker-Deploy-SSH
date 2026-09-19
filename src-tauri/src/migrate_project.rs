@@ -39,7 +39,8 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
 use crate::commands::{
-    self, connect_server, exec_forwarded_via_event, format_log_line, query_remote_images_full,
+    self, connect_server, connect_server_with_probe, exec_forwarded_via_event, format_log_line,
+    query_remote_images_full,
     save_gzip_remote, same_image_id, shell_single_quote, with_timeout, TempFileGuard,
     SSH_EXEC_TIMEOUT_SECS, STACK_COMPOSE_TIMEOUT_SECS,
 };use crate::config::{self, ProjectConfig, ServerConfig};
@@ -892,15 +893,24 @@ async fn run_migrate_project(
     emit_line(&format!("源部署目录:{}", src_dir));
     emit_line(&format!("目标部署目录:{}", tgt_dir));
 
-    let (_srv_s, mut src) =
-        connect_server(&req.source_server_id, req.source_password_plain.as_deref(), None)
-            .await
-            .map_err(|e| (e, warnings.clone()))?;
+    // C1(第二十八批):迁移取消位 → 传输级探针(卷包/镜像包/归档的 SFTP 与
+    // docker save 流按块检查取消,大件传输中可即时中断)
+    let cancel_probe = commands::migrate_cancel_probe(state);
+    let (_srv_s, mut src) = connect_server_with_probe(
+        &req.source_server_id,
+        req.source_password_plain.as_deref(),
+        Some(cancel_probe.clone()),
+    )
+    .await
+    .map_err(|e| (e, warnings.clone()))?;
     emit_line(&format!("已连接源服务器「{}」", source.name));
-    let (_srv_t, mut dst) =
-        connect_server(&req.target_server_id, req.target_password_plain.as_deref(), None)
-            .await
-            .map_err(|e| (e, warnings.clone()))?;
+    let (_srv_t, mut dst) = connect_server_with_probe(
+        &req.target_server_id,
+        req.target_password_plain.as_deref(),
+        Some(cancel_probe),
+    )
+    .await
+    .map_err(|e| (e, warnings.clone()))?;
     emit_line(&format!("已连接目标服务器「{}」", target.name));
 
     // 源 compose 文本(目标要复现源实际部署的状态)

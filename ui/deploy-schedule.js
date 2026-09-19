@@ -152,7 +152,11 @@
       row.appendChild(nameCell);
 
       row.appendChild(el('td', '', modeLabel(s.mode) + (s.mode === 'stack' ? (s.forceArchive ? ' · 强制留档' : '') : '')));
-      row.appendChild(el('td', 'mono', s.time + ' · ' + kindLabel(s.kind)));
+      // 时刻 · 类型(+ 时段后缀;B4 —— 有时段时在列表里一眼可见)
+      var winSuffix = (String(s.windowStart || '') && String(s.windowEnd || ''))
+        ? ' [时段 ' + s.windowStart + '-' + s.windowEnd + ']'
+        : '';
+      row.appendChild(el('td', 'mono', s.time + ' · ' + kindLabel(s.kind) + winSuffix));
 
       // 启用开关(点按即保存,不改编辑态)
       var toggleCell = el('td', 'sched-op-cell');
@@ -325,6 +329,35 @@
     timeRow.appendChild(timeHint);
     form.appendChild(timeRow);
 
+    // 允许执行时段(B4;第二十八批):到点但不在时段内 → 当天跳过(不算错过)。
+    // 两字段同填或同空;支持跨 0 点(如 23:00–02:00);空 = 不限制
+    var winRow = el('div', 'form-row');
+    winRow.appendChild(window.formLabel('允许执行时段', 'WINDOW', false));
+    var winWrap = el('div', 'sched-window-row');
+    var winStart = document.createElement('input');
+    winStart.id = 'schedf-window-start';
+    winStart.className = 'form-input mono';
+    winStart.type = 'text';
+    winStart.maxLength = 5;
+    winStart.placeholder = 'HH:MM';
+    winStart.autocomplete = 'off';
+    var winSep = el('span', 'sched-window-sep', '至');
+    var winEnd = document.createElement('input');
+    winEnd.id = 'schedf-window-end';
+    winEnd.className = 'form-input mono';
+    winEnd.type = 'text';
+    winEnd.maxLength = 5;
+    winEnd.placeholder = 'HH:MM';
+    winEnd.autocomplete = 'off';
+    winWrap.appendChild(winStart);
+    winWrap.appendChild(winSep);
+    winWrap.appendChild(winEnd);
+    winRow.appendChild(winWrap);
+    winRow.appendChild(el('div', 'form-hint',
+      '留空 = 不限制;仅在该时段内允许执行(到点不在时段内则当天跳过,不算错过)。' +
+      '支持跨 0 点,如 23:00 至 02:00'));
+    form.appendChild(winRow);
+
     // --- 选项 ---
     var optRow = el('div', 'form-row');
     optRow.appendChild(window.formLabel('选项', 'OPTIONS', false));
@@ -360,6 +393,8 @@
       kindDaily.input.checked = editing.kind !== 'once';
       kindOnce.input.checked = editing.kind === 'once';
       timeInput.value = editing.time || '';
+      winStart.value = String(editing.windowStart || '');
+      winEnd.value = String(editing.windowEnd || '');
       skipChk.input.checked = !!editing.skipUnchanged;
       archChk.input.checked = !!editing.forceArchive;
       if (editing.imageRef) {
@@ -410,6 +445,25 @@
         window.toast('单镜像模式需要选择镜像', 'warn');
         return;
       }
+      var winStartVal = String(winStart.value || '').trim();
+      var winEndVal = String(winEnd.value || '').trim();
+      if ((winStartVal === '') !== (winEndVal === '')) {
+        window.toast('允许执行时段需同时填写开始与结束时间(或都留空)', 'warn');
+        (winStartVal === '' ? winStart : winEnd).focus();
+        return;
+      }
+      if (winStartVal !== '') {
+        var reTime = /^([01][0-9]|2[0-3]):[0-5][0-9]$/;
+        if (!reTime.test(winStartVal) || !reTime.test(winEndVal)) {
+          window.toast('时段格式应为 HH:MM(00:00-23:59)', 'warn');
+          return;
+        }
+        if (winStartVal === winEndVal) {
+          window.toast('允许执行时段的开始与结束时间不能相同', 'warn');
+          winEnd.focus();
+          return;
+        }
+      }
       var sched = {
         id: editing ? editing.id : newUuid(),
         projectId: prjSel.value,
@@ -423,7 +477,9 @@
         enabled: editing ? !!editing.enabled : true,
         createdAt: editing ? editing.createdAt : '',
         lastRunDate: editing ? editing.lastRunDate : '',
-        lastResult: editing ? editing.lastResult : ''
+        lastResult: editing ? editing.lastResult : '',
+        windowStart: winStartVal,
+        windowEnd: winEndVal
       };
       save(sched, false);
     });

@@ -39,6 +39,23 @@ pub const INSTALL_DOCKER_CMD: &str = "curl -fsSL https://get.docker.com | sh";
 /// SFTP 单次读写块大小:64KB。
 const CHUNK_SIZE: usize = 64 * 1024;
 
+/// 传输块级取消判定(纯函数,便于单测;C1 第二十八批)。
+///
+/// - 未挂探针(`None`)→ `Ok(())`:不启用块级取消,**行为与加该功能前一致**
+///   (这是默认路径 —— 47 处 `connect_server` 调用点零改动);
+/// - 探针返回 false → `Ok(())`;返回 true → `Err(cancelled())`。
+///
+/// 提取为自由函数而非方法:方法需要真实 `SshClient`(含 SSH 连接),无法在
+/// 单测里构造;而判定逻辑本身与连接无关。
+pub(crate) fn transfer_cancel_check(
+    probe: Option<&Arc<dyn Fn() -> bool + Send + Sync>>,
+) -> Result<(), String> {
+    match probe {
+        Some(p) if p() => Err(crate::errors::cancelled()),
+        _ => Ok(()),
+    }
+}
+
 /// 主机密钥处理器(携带状态):按 TOFU 策略校验服务器主机密钥。
 ///
 /// - `expected`:`ServerConfig.host_key_sha256`(期望指纹);`None` = 首次连接,
@@ -137,6 +154,20 @@ impl client::Handler for ClientHandler {
 /// 一条已完成认证的 SSH 连接(exec / SFTP 每次各自开通道,可复用连接)。
 pub struct SshClient {
     handle: Handle<ClientHandler>,
+    /// 传输级取消位(C1;第二十八批):`Some` 时块循环逐块检查,置位即中止。
+    ///
+    /// 为什么放在客户端而不是改 `sftp_upload` 签名:该函数有 19 处调用点
+    /// (deploy 8 / migrate_project 5 / migrate 1 / rollback 1 / ssh 内部 2 /
+    /// 真机测试 2),加参数会波及全部调用点且大量是 noop 回调位置;而
+    /// 「谁发起传输」天然知道该看哪个取消位 —— 由发起方在建连后
+    /// [`SshClient::with_cancel_probe`] 挂上,传输函数内部读取,调用点零改动。
+    /// `None`(默认)= 不做传输级取消,行为与加该功能前完全一致。
+    ///
+    /// 为什么是谓词而非 `Arc<AtomicBool>`:两套取消位形态不同 —— 部署侧是
+    /// `DeployState.cancelled`(tauri State 持有)、迁移侧在
+    /// `Arc<MigrateStateInner>` 内部;统一成「返回是否已取消」的闭包即可两处
+    /// 共用,无需改动任何状态的所有权结构。
+    cancel_probe: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl SshClient {
@@ -245,7 +276,22 @@ impl SshClient {
             }
         }
 
-        Ok(SshClient { handle })
+        Ok(SshClient { handle, cancel_probe: None })
+    }
+
+    /// 挂上传本级取消探针(C1;第二十八批)。Builder 形态:`connect` 后一行挂载,
+    /// 传输函数(含目录上传与下载)在**每个 64KB 块**之间调用一次,返回 true
+    /// 即返回取消错误。默认 `None` = 不启用(既有调用点零改动、行为不变)。
+    pub fn with_cancel_probe(mut self, probe: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        self.cancel_probe = Some(probe);
+        self
+    }
+
+    /// 传输循环的块级取消检查:已取消 → `Err(取消文案)`。
+    /// `pub(crate)`:命令层(migrate 的 save_gzip_remote)也要在循环里调用。
+    /// 未挂取消位时恒 `Ok`(默认路径无额外开销 —— 一次 Option 判空)。
+    pub(crate) fn check_transfer_cancelled(&self) -> Result<(), String> {
+        transfer_cancel_check(self.cancel_probe.as_ref())
     }
 
     /// 在远端执行 `cmd`。
@@ -323,6 +369,8 @@ impl SshClient {
             .map_err(|e| crate::errors::tagged(crate::errors::ErrCode::Fs, format!("读取本地文件元数据失败 ({}): {}", local.display(), e)))?
             .len();
         let remote_path = join_remote(remote_dir, remote_name);
+        // 入口检查(C1):已取消就不必开 SFTP 会话与查远端大小
+        self.check_transfer_cancelled()?;
 
         let sftp = self.open_sftp().await?;
         // 仅在启用续传时查询远端大小(全新上传无需一次额外往返)
@@ -343,12 +391,31 @@ impl SshClient {
                 // 进度基数 = 远端已有字节
                 sent = offset;
                 on_progress(sent, total);
-                copy_file_to_remote(&sftp, local, &remote_path, offset, &mut sent, total, on_progress)
-                    .await
+                copy_file_to_remote(
+                    &sftp,
+                    local,
+                    &remote_path,
+                    offset,
+                    &mut sent,
+                    total,
+                    on_progress,
+                    self.cancel_probe.as_ref(),
+                )
+                .await
             }
             ResumePlan::Fresh => {
                 on_progress(0, total);
-                copy_file_to_remote(&sftp, local, &remote_path, 0, &mut sent, total, on_progress).await
+                copy_file_to_remote(
+                    &sftp,
+                    local,
+                    &remote_path,
+                    0,
+                    &mut sent,
+                    total,
+                    on_progress,
+                    self.cancel_probe.as_ref(),
+                )
+                .await
             }
         }
     }
@@ -402,6 +469,9 @@ impl SshClient {
         let mut sent: u64 = 0;
         on_progress(0, total);
         for (local_path, remote_path, _len) in &files {
+            // 每个文件前检查一次(块循环内还会逐块检查;此处避免为零字节
+            // 文件或在块循环开始前多走一次 SFTP 打开)
+            self.check_transfer_cancelled()?;
             copy_file_to_remote(
                 &sftp,
                 local_path,
@@ -410,6 +480,7 @@ impl SshClient {
                 &mut sent,
                 total,
                 on_progress,
+                self.cancel_probe.as_ref(),
             )
             .await?;
         }
@@ -631,6 +702,9 @@ async fn stat_remote_size(sftp: &SftpSession, remote_path: &str) -> Result<Optio
 /// `start_offset = 0` → CREATE|WRITE|TRUNCATE 全新写;
 /// `start_offset > 0` → CREATE|WRITE(不截断)打开,本地读指针与远端写指针
 /// 均 seek 到偏移处续写(断点续传;russh-sftp 的写句柄按内部偏移发包)。
+// 8 参数(含 C1 加的 cancel_probe):拆结构体反而遮蔽「进度/取消/偏移」三条
+// 独立关注点,调用处也会变啰嗦(仅 3 处内部调用点)
+#[allow(clippy::too_many_arguments)]
 async fn copy_file_to_remote(
     sftp: &SftpSession,
     local: &Path,
@@ -639,6 +713,7 @@ async fn copy_file_to_remote(
     sent: &mut u64,
     total: u64,
     on_progress: &(dyn Fn(u64, u64) + Send + Sync),
+    cancel_probe: Option<&Arc<dyn Fn() -> bool + Send + Sync>>,
 ) -> Result<(), String> {
     let mut local_file = tokio::fs::File::open(local)
         .await
@@ -667,6 +742,10 @@ async fn copy_file_to_remote(
 
     let mut buf = vec![0u8; CHUNK_SIZE];
     loop {
+        // 块级取消(C1;第二十八批):每 64KB 块之间检查一次 —— 大镜像/大卷
+        // 传输中置取消位可在**一个块内**停下(此前只能等整件传完)。
+        // 已写入的远端前缀保留 → 天然可被断点续传接着用(与既有断点语义一致)。
+        transfer_cancel_check(cancel_probe)?;
         let n = local_file
             .read(&mut buf)
             .await
@@ -728,6 +807,38 @@ mod tests {
     }
 
     // ===== Task 4:resume_plan 续传决策 =====
+
+    // ===== 传输块级取消(C1;第二十八批)=====
+
+    #[test]
+    fn test_transfer_cancel_check_unarmed_is_ok() {
+        // 未挂探针:恒 Ok —— 这是 47 处既有 connect_server 调用点的默认路径,
+        // 「不启用 = 行为与加该功能前完全一致」是 C1 的零回归前提
+        assert!(transfer_cancel_check(None).is_ok());
+    }
+
+    #[test]
+    fn test_transfer_cancel_check_follows_probe() {
+        // 探针可动态翻转(真实场景 = 用户点「取消部署」置位取消位):
+        // 未取消 → Ok;取消后 → Err(且文案带取消码)
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let f2 = Arc::clone(&flag);
+        let probe: Arc<dyn Fn() -> bool + Send + Sync> =
+            Arc::new(move || f2.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(transfer_cancel_check(Some(&probe)).is_ok(), "未取消应放行");
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = transfer_cancel_check(Some(&probe)).unwrap_err();
+        assert_eq!(crate::errors::code_of(&err), Some(crate::errors::ErrCode::Cancelled));
+    }
+
+    #[test]
+    fn test_transfer_cancel_check_probe_false_stays_ok() {
+        // 探针恒 false(取消位存在但未置位)不应误报取消
+        let probe: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(|| false);
+        for _ in 0..3 {
+            assert!(transfer_cancel_check(Some(&probe)).is_ok());
+        }
+    }
 
     #[test]
     fn test_resume_plan_remote_missing_is_fresh() {
@@ -1490,6 +1601,8 @@ impl SshClient {
         let mut received: u64 = 0;
         let mut buf = vec![0u8; CHUNK_SIZE];
         loop {
+            // 块级取消(C1;第二十八批):下载侧同款逐块检查(大卷包下载中可即时停)
+            self.check_transfer_cancelled()?;
             let n = remote_file
                 .read(&mut buf)
                 .await

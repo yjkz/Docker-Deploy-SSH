@@ -75,6 +75,19 @@ pub struct DeploySchedule {
     /// 最近一次结果描述(展示用)
     #[serde(default)]
     pub last_result: String,
+    /// 允许执行时段 **起**(`"HH:MM"`;空串 = 不限制;第二十八批 B4)。
+    ///
+    /// 语义:与 [`DeploySchedule::window_end`] 成对使用。到点但不在时段内 →
+    /// **当天跳过**(不算错过、不写「已错过」、不停用 once);两字段必须同时
+    /// 填写或同时留空(保存侧校验,单边填写会被拒)。
+    /// 与之区分:触发窗口 [`FIRE_WINDOW_SECS`] 是「到点后多久内仍算到点」的
+    /// 容差,不是用户可配的时段 —— 两者在文档与代码里不得混称。
+    #[serde(default)]
+    pub window_start: String,
+    /// 允许执行时段 **止**(`"HH:MM"`;空串 = 不限制)。**半开区间**
+    /// `[start, end)`;`start > end` 视为跨 0 点(如 23:00–02:00)。
+    #[serde(default)]
+    pub window_end: String,
 }
 
 fn default_true() -> bool {
@@ -139,13 +152,46 @@ pub fn validate_time(t: &str) -> Result<(u32, u32), String> {
     Ok((hh, mm))
 }
 
+/// 允许执行时段是否**已完整配置**(纯函数;两边都非空才算配置,单边视为未配置)。
+/// 单边填写在保存侧被拒;此处兜底(旧文件/手工改文件不得因残缺时段而永不触发)。
+pub fn window_configured(start: &str, end: &str) -> bool {
+    !start.trim().is_empty() && !end.trim().is_empty()
+}
+
+/// 判断 `now_secs`(当日 0 点起秒数)是否落在允许执行时段内(纯函数)。
+///
+/// - 未配置(任一为空)→ **恒在窗口内**(与加该功能前的行为完全一致);
+/// - 时间非法 / `start == end` → 同样返回 false(= 不阻断,防御损坏文件);
+/// - 区间 **半开** `[start, end)`;`start > end` 视为**跨 0 点**
+///   (如 23:00–02:00 = `[23:00,24:00) ∪ [00:00,02:00)`)——朴素
+///   `start <= now < end` 在跨天时会得到空集,是此处最容易写错的分支。
+pub fn in_allowed_window(start: &str, end: &str, now_secs: i64) -> bool {
+    if !window_configured(start, end) {
+        return false; // 未配置:调用方据此视为「不限制」
+    }
+    let (Ok((sh, sm)), Ok((eh, em))) = (validate_time(start), validate_time(end)) else {
+        return false; // 非法:不阻断
+    };
+    let s = i64::from(sh) * 3600 + i64::from(sm) * 60;
+    let e = i64::from(eh) * 3600 + i64::from(em) * 60;
+    if s == e {
+        return false; // 退化区间(语义含糊):不阻断
+    }
+    if s < e {
+        now_secs >= s && now_secs < e
+    } else {
+        now_secs >= s || now_secs < e // 跨 0 点
+    }
+}
+
 /// 判断某条目在 `now`(本地时间)时点是否应当触发。纯函数,便于单测。
 ///
 /// 触发条件(`now_secs` = 当日 0 点起的秒数):
 /// - enabled;`last_run_date != today`(daily 防重 / once 同字段);
 /// - `now_secs >= fire_secs && now_secs < fire_secs + FIRE_WINDOW_SECS`;
 /// - **once 额外要求 `today == 创建日`**(目标日 = 保存当天;跨天不触发,
-///   防「昨天的一次性在今天迟到执行」——错过不补跑的语义延伸)。
+///   防「昨天的一次性在今天迟到执行」——错过不补跑的语义延伸);
+/// - **到点时刻须落在允许执行时段内**(第二十八批 B4;未配置时段 = 不限制)。
 pub fn is_due(s: &DeploySchedule, today: &str, now_secs: i64) -> bool {
     if !s.enabled {
         return false;
@@ -160,7 +206,13 @@ pub fn is_due(s: &DeploySchedule, today: &str, now_secs: i64) -> bool {
         return false; // 非法时间不触发(保存时已校验,防御损坏文件)
     };
     let fire_secs = i64::from(hh) * 3600 + i64::from(mm) * 60;
-    now_secs >= fire_secs && now_secs < fire_secs + FIRE_WINDOW_SECS
+    if !(now_secs >= fire_secs && now_secs < fire_secs + FIRE_WINDOW_SECS) {
+        return false;
+    }
+    // B4:到点即在窗口内 —— 判定用**到点时刻**(fire_secs)而非当前时刻,
+    // 否则 tick 抖动到窗口边界之外会漏触发(到点是过点瞬间的事实)
+    !window_configured(&s.window_start, &s.window_end)
+        || in_allowed_window(&s.window_start, &s.window_end, fire_secs)
 }
 
 /// 启动扫描用:判断条目是否**已错过**(错过不补跑,写结果)。
@@ -168,7 +220,10 @@ pub fn is_due(s: &DeploySchedule, today: &str, now_secs: i64) -> bool {
 /// 返回 `Some(disable)`:disable=true 表示还应同时停用该条目。
 /// - daily:超过触发窗口且今天未跑 → `Some(false)`(保持启用,明天照常);
 /// - once:创建日已过仍未跑(或创建日当天已过窗口)→ `Some(true)`(停用,
-///   一次性日程不会跨天迟到执行)。
+///   一次性日程不会跨天迟到执行);
+/// - **B4:到点时刻不在允许执行时段内 → `None`(不算错过)**。用户明确设了
+///   「这段时间不许跑」,那是**有意跳过**而非意外错过;若不在此分流,daily
+///   每天会被写一次「已错过」、once 还会被误停用。
 pub fn missed_disposition(s: &DeploySchedule, today: &str, now_secs: i64) -> Option<bool> {
     if !s.enabled || s.last_run_date == today {
         return None;
@@ -177,6 +232,12 @@ pub fn missed_disposition(s: &DeploySchedule, today: &str, now_secs: i64) -> Opt
         return None;
     };
     let fire_secs = i64::from(hh) * 3600 + i64::from(mm) * 60;
+    // 到点时刻本身就不在允许时段内 → 有意跳过,不判错过(与 is_due 同口径)
+    if window_configured(&s.window_start, &s.window_end)
+        && !in_allowed_window(&s.window_start, &s.window_end, fire_secs)
+    {
+        return None;
+    }
     match s.kind.as_str() {
         "daily" => {
             if now_secs >= fire_secs + FIRE_WINDOW_SECS {
@@ -234,6 +295,21 @@ pub fn deploy_schedules_save(schedule: DeploySchedule) -> Result<(), String> {
         return Err(format!("未知的日程类型:{}", schedule.kind));
     }
     validate_time(&schedule.time)?;
+    // B4:允许执行时段 —— 要么都不填(不限制),要么都填且合法
+    let ws = schedule.window_start.trim();
+    let we = schedule.window_end.trim();
+    if ws.is_empty() != we.is_empty() {
+        return Err("允许执行时段需同时填写开始与结束时间(或都留空)".to_string());
+    }
+    if !ws.is_empty() {
+        validate_time(ws)?;
+        validate_time(we)?;
+        let (sh, sm) = validate_time(ws)?;
+        let (eh, em) = validate_time(we)?;
+        if sh == eh && sm == em {
+            return Err("允许执行时段的开始与结束时间不能相同".to_string());
+        }
+    }
     let _guard = SCHED_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut list = load_schedules();
     if let Some(existing) = list.iter_mut().find(|s| s.id == schedule.id) {
@@ -475,7 +551,96 @@ mod tests {
             created_at: "2026-09-15 10:00:00".into(),
             last_run_date: String::new(),
             last_result: String::new(),
+            window_start: String::new(),
+            window_end: String::new(),
         }
+    }
+
+    // ===== 允许执行时段(B4;第二十八批)=====
+
+    #[test]
+    fn test_window_configured_rules() {
+        // 两个都空 / 都填 / 只填一个的形态判定
+        assert!(!window_configured("", ""));
+        assert!(!window_configured("  ", " "));
+        assert!(window_configured("01:00", "05:00"));
+        // 单边填写 = 配置不完整 → 视为未配置(保存侧会拒绝,此处兜底)
+        assert!(!window_configured("01:00", ""));
+        assert!(!window_configured("", "05:00"));
+    }
+
+    #[test]
+    fn test_in_allowed_window_same_day() {
+        // 01:00-05:00 常规同日区间(半开 [start, end))
+        assert!(!in_allowed_window("", "", secs(0, 0)), "未配置 = 恒在窗口内");
+        assert!(!in_allowed_window("01:00", "05:00", secs(0, 59)));
+        assert!(in_allowed_window("01:00", "05:00", secs(1, 0)), "起点含");
+        assert!(in_allowed_window("01:00", "05:00", secs(3, 30)));
+        assert!(!in_allowed_window("01:00", "05:00", secs(5, 0)), "终点不含(半开)");
+        assert!(!in_allowed_window("01:00", "05:00", secs(23, 59)));
+    }
+
+    #[test]
+    fn test_in_allowed_window_crossing_midnight() {
+        // 23:00-02:00 跨 0 点:窗口 = [23:00, 24:00) ∪ [00:00, 02:00)
+        // (这是 B4 最容易写错的分支:朴素的 start <= now < end 会得到空集)
+        assert!(in_allowed_window("23:00", "02:00", secs(23, 0)));
+        assert!(in_allowed_window("23:00", "02:00", secs(23, 59)));
+        assert!(in_allowed_window("23:00", "02:00", secs(0, 0)));
+        assert!(in_allowed_window("23:00", "02:00", secs(1, 59)));
+        assert!(!in_allowed_window("23:00", "02:00", secs(2, 0)), "终点不含");
+        assert!(!in_allowed_window("23:00", "02:00", secs(12, 0)));
+        assert!(!in_allowed_window("23:00", "02:00", secs(22, 59)));
+    }
+
+    #[test]
+    fn test_in_allowed_window_degenerate_and_invalid() {
+        // start == end:非法形态(等价于空窗或全天,语义含糊)→ 视为未配置(不阻断)
+        assert!(!in_allowed_window("05:00", "05:00", secs(5, 0)));
+        // 非法时间:不阻断(保存侧已校验,此处防御损坏文件)
+        assert!(!in_allowed_window("25:00", "05:00", secs(3, 0)));
+        assert!(!in_allowed_window("01:00", "aa:bb", secs(3, 0)));
+    }
+
+    #[test]
+    fn test_is_due_respects_window() {
+        // 到点在窗口内 → 触发
+        let mut s = mk("1", "daily", "10:00", true);
+        s.window_start = "08:00".into();
+        s.window_end = "12:00".into();
+        assert!(is_due(&s, "2026-09-15", secs(10, 0)));
+        // 到点但不在窗口内 → 不触发(当天跳过,不算错过)
+        let mut s2 = mk("2", "daily", "10:00", true);
+        s2.window_start = "20:00".into();
+        s2.window_end = "22:00".into();
+        assert!(!is_due(&s2, "2026-09-15", secs(10, 0)));
+        // 未配置 → 与旧行为完全一致
+        let s3 = mk("3", "daily", "10:00", true);
+        assert!(is_due(&s3, "2026-09-15", secs(10, 0)));
+    }
+
+    #[test]
+    fn test_missed_disposition_skips_when_outside_window() {
+        // B4 核心语义:到点但不在允许时段 → **不算错过**(不写「已错过」,
+        // 也不停用 once —— 用户明确说了那时段不许跑,不是"意外错过")
+        let mut s = mk("1", "once", "10:00", true);
+        s.window_start = "20:00".into();
+        s.window_end = "22:00".into();
+        assert_eq!(
+            missed_disposition(&s, "2026-09-15", secs(23, 0)),
+            None,
+            "窗口外不判错过(否则每天误标已错过且 once 被停用)"
+        );
+        // 对照:daily 在窗口内且已过触发窗口 → 正常判错过
+        let mut s2 = mk("2", "daily", "10:00", true);
+        s2.window_start = "08:00".into();
+        s2.window_end = "12:00".into();
+        assert_eq!(missed_disposition(&s2, "2026-09-15", secs(13, 0)), Some(false));
+        // once 在窗口内且已过窗口 → 停用(与旧行为一致)
+        let mut s3 = mk("3", "once", "10:00", true);
+        s3.window_start = "08:00".into();
+        s3.window_end = "12:00".into();
+        assert_eq!(missed_disposition(&s3, "2026-09-15", secs(13, 0)), Some(true));
     }
 
     /// 10:00 对应秒数
@@ -577,11 +742,29 @@ mod tests {
             "createdAt",
             "lastRunDate",
             "lastResult",
+            "windowStart",
+            "windowEnd",
         ] {
             assert!(v.get(key).is_some(), "缺字段 {}: {:?}", key, v);
         }
         // 往返
         let back: DeploySchedule = serde_json::from_value(v).unwrap();
         assert_eq!(back, s);
+    }
+
+    #[test]
+    fn test_schedule_window_fields_serde_default() {
+        // B4:旧日程文件无 windowStart/windowEnd → serde default 补齐为空串
+        // (= 不限制,与加该功能前行为完全一致)
+        let json = r#"{
+            "id":"old","projectId":"p","serverId":"s","mode":"stack",
+            "kind":"daily","time":"08:00","enabled":true,
+            "createdAt":"2026-09-01 10:00:00"
+        }"#;
+        let s: DeploySchedule = serde_json::from_str(json).unwrap();
+        assert_eq!(s.window_start, "");
+        assert_eq!(s.window_end, "");
+        // 未配置窗口 → 照常触发
+        assert!(is_due(&s, "2026-09-15", secs(8, 0)));
     }
 }

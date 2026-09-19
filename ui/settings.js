@@ -312,6 +312,12 @@
 
     // 终端日志保留(第二十三批):天数,0 = 永久保留(默认 30)。
     // hint 同时说明清理时机(打开终端 / 启动软件时 best-effort 清理)
+    // 部署日报(第二十八批 B2):留空 = 关闭;填 0-23 = 该整点后发一条汇总
+    main.appendChild(buildField('部署日报时刻', 'DIGEST HOUR',
+      'settings-digest-hour', 'number', '',
+      '留空 = 关闭;填 0-23 表示每天该整点后发一条当天部署汇总',
+      '需在通知中心勾选「部署日报」订阅;当天无部署时不发空日报'));
+
     main.appendChild(buildField('终端日志保留(天)', 'TERM LOGS',
       'settings-term-keep-days', 'number', '30',
       '0 = 永久保留;例如 30 表示只保留最近 30 天',
@@ -638,6 +644,18 @@
    * 合法性由后端 `compose_scan::normalize_compose_names` 统一裁决
    * (安全边界在拼远端命令处,前端不做重复校验 —— 单点权威)。
    */
+  /**
+   * 部署日报时刻(B2):空/非法 → null(关闭);否则夹取 0-23。
+   * 后端 `digest_hour: Option<u32>`(camelCase `digestHour`)。
+   */
+  function digestHourArg() {
+    var raw = fieldVal('settings-digest-hour').trim();
+    if (raw === '') return null;
+    var n = parseInt(raw, 10);
+    if (isNaN(n)) return null;
+    return Math.min(23, Math.max(0, n));
+  }
+
   function composeNamesArg() {
     var raw = fieldVal('settings-compose-names-input');
     if (!raw) return [];
@@ -673,7 +691,8 @@
         autoRollbackOnFailure: isChecked('settings-auto-rollback'),
         composeFileNames: composeNamesArg(),
         composeScanMaxDepth: composeDepthArg(),
-        tarImage: fieldVal('settings-tar-image-input').trim()
+        tarImage: fieldVal('settings-tar-image-input').trim(),
+        digestHour: digestHourArg()
       }
     }).then(function () {
       // 过期会话(保存期间模态被关闭甚至重开)→ 静默丢弃,防旧 promise 回写新模态
@@ -794,6 +813,9 @@
         // 卷搬运 tar 镜像(第二十七批):无条件回填(同 P1 教训);缺省空串
         var tarImg = document.getElementById('settings-tar-image-input');
         if (tarImg) tarImg.value = String(s.tarImage || '');
+        // 部署日报(第二十八批 B2):无条件回填(同 P1 教训);null/缺省 = 关
+        var digestH = document.getElementById('settings-digest-hour');
+        if (digestH) digestH.value = (s.digestHour === null || s.digestHour === undefined) ? '' : String(s.digestHour);
         var alertDisk = document.getElementById('settings-alert-disk-input');
         if (alertDisk) alertDisk.value = String(s.alertDiskPercent == null ? 90 : s.alertDiskPercent);
         var alertMem = document.getElementById('settings-alert-mem-input');

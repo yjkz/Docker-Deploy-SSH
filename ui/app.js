@@ -456,6 +456,21 @@
   };
 
   /**
+   * 批量 / 多项目队列项的复合键(B1;第二十八批):`serverId|projectId`。
+   *
+   * 为什么需要:多项目部署允许**同一台服务器挂多个项目**,而批量队列的
+   * 待续传登记、carried 去重、行内「续传此台」索引在 B1 之前**只按 serverId**
+   * 比对 —— 同服务器第二个项目会与第一个互相吞(后者的续传入口消失)。
+   * 复合键是这三处的统一口径。纯函数,便于回归测试。
+   * @param {string} serverId 服务器 id
+   * @param {string} projectId 项目 id
+   * @returns {string} `"<serverId>|<projectId>"`
+   */
+  window.batchItemKey = function (serverId, projectId) {
+    return String(serverId) + '|' + String(projectId);
+  };
+
+  /**
    * 填充状态徽章:同步类名 + 前置图标 + 文本(kind 对应图标:ok=check fail=cross warn=run info=无)
    * @param {HTMLElement} node 徽章元素(通常为新建 span)
    * @param {string} kind 'ok' | 'fail' | 'warn' | 'info'

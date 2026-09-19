@@ -395,7 +395,9 @@ async fn run_deploy_steps(
             "请检查服务器地址与网络",
             SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default()),
         )
-        .await?;
+        .await?
+        // C1(第二十八批):传输级取消探针 —— 步骤 3 的 tar 上传按 64KB 块检查
+        .with_cancel_probe(deploy_cancel_probe(app));
         if resume_step > 3 {
             // 断点续传:上次已完成上传 → 仅建连(后续步骤复用连接),不重复上传
             // (远端 tar 仍由步骤 5.6 在装载后清理,行为不变)
@@ -1704,7 +1706,10 @@ async fn run_deploy_stack_steps(
         "请检查服务器地址与网络",
         SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default()),
     )
-    .await?;
+    .await?
+    // C1(第二十八批):挂传输级取消探针 —— 上传/下载在 64KB 块间检查取消位,
+    // 大镜像传输中可即时中止(此前只在步骤边界生效)
+    .with_cancel_probe(deploy_cancel_probe(app));
 
     // 发布时间戳:断点续传复用断点记录的 ts(同一发布目录,已上传镜像包才能
     // 按名续传/按镜像幂等装载);正常部署每次新生成(旧行为)。续传且步骤 3

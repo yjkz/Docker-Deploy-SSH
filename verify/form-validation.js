@@ -308,6 +308,21 @@ console.log('\n=== 10. 服务器标签分组(B3) ===');
   ok(tags[tags.length - 1] === 'OPTION', '未分组选项直接在 select 下(非组内)');
 }
 
+console.log('\n=== 11. 多项目复合键(B1) ===');
+{
+  // 回归来源:B1 之前队列的待续传登记 / carried 去重 / 行内续传索引只比
+  // serverId —— 同一服务器挂多个项目时,第二个项目的续传入口被第一个吞掉。
+  const k1 = W.batchItemKey('s1', 'p1');
+  const k2 = W.batchItemKey('s1', 'p2');
+  const k3 = W.batchItemKey('s2', 'p1');
+  ok(k1 !== k2, '同服务器不同项目 → 键不同');
+  ok(k1 !== k3, '同项目不同服务器 → 键不同');
+  ok(k1 === W.batchItemKey('s1', 'p1'), '确定性:同输入同输出');
+  ok(k1 === 's1|p1', '键形态 serverId|projectId');
+  // 类型稳健:数字 id 与字符串 id 归一同键(后端 id 恒 string)
+  ok(W.batchItemKey(1, 2) === W.batchItemKey('1', '2'), '数字 id 与字符串 id 同键');
+}
+
 console.log('\n---------------------------------------');
 console.log('PASS ' + pass + ' / FAIL ' + fail);
 process.exit(fail === 0 ? 0 : 1);
