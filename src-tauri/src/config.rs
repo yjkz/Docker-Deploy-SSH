@@ -726,6 +726,14 @@ pub struct AppSettings {
     /// 拒绝 shell 元字符与 `-` 开头),非法值回退内置候选。
     #[serde(default)]
     pub tar_image: String,
+    /// 开机自启(第二十九批 S1;默认关)。
+    ///
+    /// **注意真值来源**:实际生效状态存在 Windows 注册表
+    /// (`HKCU\...\Run\DockerDeploySSH`),用户可能在任务管理器里禁用 ——
+    /// 故 `app_settings_get` 返回时用 `autostart::with_actual_state` **覆盖**
+    /// 本字段为注册表实况;**本字段只记录「上次意图」**,不作为判定依据。
+    #[serde(default)]
+    pub auto_start: bool,
     /// 部署日报发送时刻(第二十八批 B2;`None` = 关闭,默认关)。
     ///
     /// 到该整点后(含应用晚启动的补发)聚合当天 `DeployRecord` 为一条摘要,
@@ -757,6 +765,7 @@ impl Default for AppSettings {
             compose_scan_max_depth: 0,
             tar_image: String::new(),
             digest_hour: None,
+            auto_start: false,
         }
     }
 }
@@ -809,7 +818,11 @@ pub fn save_app_settings(settings: &AppSettings) -> Result<()> {
 /// 读取应用设置(关闭到托盘 / 更新代理)。
 #[tauri::command]
 pub fn app_settings_get() -> AppSettings {
-    load_app_settings()
+    let mut s = load_app_settings();
+    // 开机自启第二十九批 S1:注册表是唯一真值 —— 用户可能在任务管理器里
+    // 禁用或手工删掉注册表值,若照配置回显会与系统实际状态不符
+    crate::autostart::with_actual_state(&mut s);
+    s
 }
 
 /// 保存应用设置(关闭到托盘 / 更新代理 / 定时探活间隔;托盘拦截在关闭事件
@@ -822,6 +835,10 @@ pub fn app_settings_set(app: tauri::AppHandle, settings: AppSettings) -> std::re
     crate::probe::sync_alert_from_settings(&app);
     // 部署日报(第二十八批 B2):小时字段变更即时启停(同探活口径)
     crate::digest::sync_from_settings(&app);
+    // 开机自启(第二十九批 S1):写/删注册表项。**失败要报错** —— 用户点了
+    // 开关却什么都没发生是最糟的体验;此刻设置文件已保存,但自启没生效,
+    // 必须让用户知道(前端 toast 原文)。
+    crate::autostart::apply(settings.auto_start)?;
     Ok(())
 }
 
@@ -1374,6 +1391,7 @@ mod tests {
             compose_scan_max_depth: 6,
             tar_image: "registry.local/tar:1".into(),
             digest_hour: None,
+            auto_start: false,
         };
         save_app_settings(&settings).unwrap();
         assert!(dir.join("config/settings.json").exists());
@@ -1430,6 +1448,7 @@ mod tests {
             compose_scan_max_depth: 0,
             tar_image: String::new(),
             digest_hour: None,
+            auto_start: false,
         };
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains("\"closeToTray\":true"));

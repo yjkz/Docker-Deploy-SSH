@@ -1346,7 +1346,9 @@ async fn maybe_auto_rollback(
             target
         ),
     );
-    match rollback_execute_stack_inner(app, &server_id, None, &project_id, &target).await {
+    // 自动回滚传 allow_partial=false(第二十九批 R1):预检发现「有服务回不去」
+    // 时**不强行回滚** —— 自动路径无人值守,部分回滚会留下混合版本状态更糟
+    match rollback_execute_stack_inner(app, &server_id, None, &project_id, &target, false).await {
         Ok(_) => {
             emit_log(
                 app,

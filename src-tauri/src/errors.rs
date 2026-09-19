@@ -64,6 +64,9 @@ pub(crate) enum ErrCode {
     Input,
     /// 内部错误(panic 兜底、不变量破坏;文案统一提示看日志)
     Internal,
+    /// 回滚可用性预检未通过(第二十九批 R1):归档里有服务回不去,
+    /// 前端据此弹「仍要回滚(部分)」确认,并以 `allowPartial=true` 重发
+    RollbackPrecheck,
 }
 
 impl ErrCode {
@@ -82,6 +85,7 @@ impl ErrCode {
             ErrCode::Fs => "fs",
             ErrCode::Input => "input",
             ErrCode::Internal => "internal",
+            ErrCode::RollbackPrecheck => "rollback_precheck",
         }
     }
 
@@ -101,6 +105,7 @@ impl ErrCode {
             "fs" => Some(ErrCode::Fs),
             "input" => Some(ErrCode::Input),
             "internal" => Some(ErrCode::Internal),
+            "rollback_precheck" => Some(ErrCode::RollbackPrecheck),
             _ => None,
         }
     }

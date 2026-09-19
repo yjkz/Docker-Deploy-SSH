@@ -1793,10 +1793,24 @@ select.text-input option,
   padding-bottom: 18px;
   border-bottom: 1px solid var(--ark-line);
 }
+/* 执行区(L1;第二十九批):**常驻底部**,不让「开始部署」掉出屏幕。
+   背景与舞台同色 + 顶线分隔,滚动时覆盖下方内容(视觉上属于"操作条",
+   与配置区明确分开);整栈模式加服务分类表后按钮原本会落到折叠线以下。 */
 .deploy-actions {
   margin-top: 16px;
   display: flex;
   gap: 12px;
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  padding: 12px 0 10px;
+  background: var(--ark-paper);
+  border-top: 1px solid var(--ark-line);
+}
+/* 配置区与执行区的分隔:执行区之前留白 + 细线,让"改配置"与"按按钮"
+   在视觉上是两件事(此前所有控件挤在同一列排队) */
+.deploy-config {
+  padding-bottom: 4px;
 }
 
 /* 打日期标签勾选框 */
@@ -3289,6 +3303,71 @@ code {
   color: var(--ark-ink);
 }
 .rb-plan-sub { font-size: 12.5px; color: var(--ark-paper-ink-65); }
+
+/* ===== 回滚确认区缩小 + 回滚预检结果(R1;第二十九批)===== */
+/* 用户反馈:回滚确认块太高会挤到下方日志框 → 压缩内边距与行距 */
+.rb-confirm-compact {
+  margin: 6px 0 2px;
+  padding: 8px 10px;
+}
+.rb-confirm-compact .confirm-title {
+  font-size: 13px;
+  line-height: 1.45;
+}
+.rb-confirm-compact .confirm-msg {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.rb-confirm-compact .confirm-facts {
+  margin-top: 4px;
+}
+.rb-confirm-compact .confirm-facts .kv-key,
+.rb-confirm-compact .confirm-facts .kv-val {
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+/* 预检结果区:与服务列表同族的紧凑表 */
+.rb-precheck {
+  margin: 8px 0 2px;
+  padding: 8px 10px;
+  border: 1px solid var(--ark-line-soft);
+  background: var(--ark-surface);
+  max-height: 190px;
+  overflow-y: auto;
+}
+.rb-precheck-title {
+  font-family: var(--font-cjk);
+  font-size: 12px;
+  color: var(--ark-ink);
+  margin-bottom: 6px;
+}
+.rb-precheck-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.rb-precheck-row.is-blocking {
+  border-left: 3px solid var(--ark-ink);
+  padding-left: 6px;
+}
+.rb-precheck-svc {
+  flex: none;
+  min-width: 0;
+  font-family: var(--font-cond);
+  font-weight: 600;
+  color: var(--ark-ink);
+}
+.rb-precheck-detail {
+  min-width: 0;
+  color: var(--ark-paper-ink-65);
+  word-break: break-word;
+}
+
 
 /* 模态内等宽日志区:复用 .deploy-log 常暗表面,压缩高度适配弹窗 */
 .deploy-modal-log { height: 200px; }

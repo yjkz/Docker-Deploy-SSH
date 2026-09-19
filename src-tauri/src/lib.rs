@@ -1,5 +1,6 @@
 pub mod arch_precheck;
 pub mod auto_rollback;
+pub mod autostart;
 pub mod commands;
 pub mod compose_scan;
 pub mod config;
@@ -91,6 +92,7 @@ pub fn run() {
       commands::preview_stack_changes,
       commands::rollback_list_releases,
       commands::rollback_list_tags,
+      commands::rollback_precheck,
       commands::rollback_execute_stack,
       commands::rollback_execute_single,
       commands::rollback_scan_projects,

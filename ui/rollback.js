@@ -74,6 +74,34 @@
 
   // ===== 日志面板 =====
 
+  /**
+   * 置 04 页「部署中」标志(R3;第二十九批)。
+   *
+   * 为什么需要:04 页「取消部署」按钮判 `st.deploying`,托盘「停止当前部署」
+   * 另有独立判据 —— 06 页发起回滚时两者都不成立,用户无法中止(只能等
+   * `docker load` 逐个跑完)。标志经 DeployKit 拿到的是**同一份** st(非副本),
+   * 置位后 04 页 refreshControls 即让取消按钮可用。
+   */
+  function beginRemoteOpFlag() {
+    try {
+      var K = window.DeployKit;
+      if (K && K.st) K.st.deploying = true;
+      if (K && typeof K.refreshControls === 'function') K.refreshControls();
+    } catch (e) {
+      // 04 页模块未加载(理论上不会):退化为不可取消,不阻断回滚本身
+      if (window.console && console.warn) console.warn('[rollback] 置取消标志失败:', e);
+    }
+  }
+
+  /** 清 04 页「部署中」标志(收尾;与 beginRemoteOpFlag 成对) */
+  function endRemoteOpFlag() {
+    try {
+      var K = window.DeployKit;
+      if (K && K.st) K.st.deploying = false;
+      if (K && typeof K.refreshControls === 'function') K.refreshControls();
+    } catch (e) { /* 不影响收尾 */ }
+  }
+
   function bindLogEvents() {
     if (logBound) return;
     logBound = true;
@@ -94,6 +122,7 @@
       // 不应触发 06 页整页重扫或写日志(来源过滤)
       if (!busy) return;
       window.ddRemoteOp = null; // 释放跨页互斥锁(本页回滚已收尾)
+      endRemoteOpFlag();        // R3:复位 04 页「部署中」(取消入口随之禁用)
       var msg = window.errStripCode ? window.errStripCode(p.message) : (p.message || '');
       appendLog(p.success ? ('✔ ' + (msg || '回滚完成')) : ('✘ ' + (msg || '回滚失败')));
       setBusy(false);
@@ -869,6 +898,10 @@
           return Promise.resolve();
         }
         window.ddRemoteOp = 'rollback';
+        // R3(第二十九批):同步置 04 页「部署中」—— 04 页取消按钮与托盘停止
+        // 都以此为条件;此前 06 页发起的回滚无法取消(只能硬等 docker load
+        // 逐个跑完)。复位在 deploy-done 监听里(见下)。
+        beginRemoteOpFlag();
         clearLog();
         setBusy(true);
         appendLog('开始整栈回滚:' + dir + ' → ' + ts);
@@ -925,6 +958,7 @@
             return Promise.resolve();
           }
           window.ddRemoteOp = 'rollback';
+          beginRemoteOpFlag(); // R3:同整栈路径(见上)
           clearLog();
           setBusy(true);
           appendLog('开始镜像回滚:' + repository + ':' + dateTag + ' → ' + targetRef);

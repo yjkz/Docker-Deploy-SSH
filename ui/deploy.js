@@ -3477,7 +3477,10 @@
     // deploy-migrate.js 消费
     migState: migState, loadPageData: loadPageData,
     // B1:多项目维度(桩验证需要驱动维度切换)
-    batchDim: batchDim, setBatchDim: setBatchDim, openBatchModal: openBatchModal
+    batchDim: batchDim, setBatchDim: setBatchDim, openBatchModal: openBatchModal,
+    // R3(第二十九批):06 页回滚也可以取消 —— 由本页发起(它知道 st.deploying
+    // 与取消入口),06 页经此调用而不是自己实现一份
+    cancelDeploy: onCancelDeploy
   };
   var openRollbackModal = function () { return window.DeployRollback.openRollbackModal.apply(null, arguments); };
   var closeRollbackModal = function () { return window.DeployRollback.closeRollbackModal.apply(null, arguments); };

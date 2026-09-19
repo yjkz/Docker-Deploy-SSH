@@ -2723,6 +2723,165 @@ services:
         assert_eq!(m[1].id, None);
     }
 
+    // ===== 回滚可用性预检(第二十九批 R1)=====
+
+    /// 构造 manifest 条目
+    fn mimg(service: &str, tag: &str, file: Option<&str>, id: Option<&str>) -> ManifestImage {
+        ManifestImage {
+            service: service.into(),
+            tag: tag.into(),
+            file: file.map(String::from),
+            id: id.map(String::from),
+        }
+    }
+
+    #[test]
+    fn test_rollback_precheck_archived_package() {
+        // 归档内有包(本次变化):回滚用它,docker load 即可 —— 不依赖远端任何东西
+        let images = vec![mimg("web", "myapp:20260919", Some("web.tar.gz"), Some("aaa"))];
+        let remote: Vec<(String, String)> = vec![]; // 远端空也不影响
+        let plan = plan_rollback(&images, &remote);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].source, RollbackImageSource::Archived);
+        assert!(!plan[0].blocking, "有包可用不阻断");
+    }
+
+    #[test]
+    fn test_rollback_precheck_skipped_but_present_by_id() {
+        // 智能传输跳过的服务(file=null):manifest 记了 ID,远端按 ID 找得到
+        // → 可直接用,**不需要重新上传包**(R1 的核心场景)
+        let images = vec![mimg("db", "postgres:16", None, Some("sha256:bbb"))];
+        let remote = vec![("postgres:16".to_string(), "sha256:bbb".to_string())];
+        let plan = plan_rollback(&images, &remote);
+        assert_eq!(plan[0].source, RollbackImageSource::RemoteById);
+        assert!(!plan[0].blocking, "远端正有该 ID 镜像 → 可用");
+    }
+
+    #[test]
+    fn test_rollback_precheck_skipped_but_id_gone() {
+        // 跳过且远端已无该 ID(被人手动删/清理过):阻断项,须让用户知道
+        // 「这个服务回不去」—— 静默沿用当前镜像正是本批要根除的失效路径
+        let images = vec![mimg("db", "postgres:16", None, Some("sha256:bbb"))];
+        let remote = vec![("postgres:16".to_string(), "sha256:ccc".to_string())];
+        let plan = plan_rollback(&images, &remote);
+        assert_eq!(plan[0].source, RollbackImageSource::Missing);
+        assert!(plan[0].blocking, "ID 不存在 → 阻断(用户确认后才继续)");
+        // 提示要点出「同 tag 已被别的 ID 占用」(即版本已被覆盖)
+        assert!(plan[0].detail.contains("覆盖") || plan[0].detail.contains("不一致"),
+            "detail 应说明 tag 被占用: {}", plan[0].detail);
+    }
+
+    #[test]
+    fn test_rollback_precheck_skipped_tag_absent_entirely() {
+        // 跳过且远端连同 tag 都没有:同样是阻断项(镜像真的没了)
+        let images = vec![mimg("db", "postgres:16", None, Some("sha256:bbb"))];
+        let remote: Vec<(String, String)> = vec![];
+        let plan = plan_rollback(&images, &remote);
+        assert_eq!(plan[0].source, RollbackImageSource::Missing);
+        assert!(plan[0].blocking);
+    }
+
+    #[test]
+    fn test_rollback_precheck_legacy_manifest_without_id() {
+        // 旧归档:file=null 且 id=null(本功能引入前的 manifest 没记 ID)
+        // → 无从查证,保守标阻断并给出「重新部署一次以记录镜像 ID」的指引
+        let images = vec![mimg("db", "postgres:16", None, None)];
+        let remote = vec![("postgres:16".to_string(), "sha256:bbb".to_string())];
+        let plan = plan_rollback(&images, &remote);
+        assert_eq!(plan[0].source, RollbackImageSource::Unknown);
+        assert!(plan[0].blocking, "旧归档无法核对,须显式告知");
+        assert!(plan[0].detail.contains("重新部署"), "应给可执行指引: {}", plan[0].detail);
+    }
+
+    #[test]
+    fn test_rollback_precheck_mixed_and_summary() {
+        // 混合场景:1 个有包 + 1 个按 ID 命中 + 1 个丢失
+        let images = vec![
+            mimg("web", "myapp:20260919", Some("web.tar.gz"), Some("aaa")),
+            mimg("cache", "redis:7", None, Some("sha256:ddd")),
+            mimg("db", "postgres:16", None, Some("sha256:bbb")),
+        ];
+        let remote = vec![
+            ("redis:7".to_string(), "sha256:ddd".to_string()),
+            ("postgres:16".to_string(), "sha256:ccc".to_string()),
+        ];
+        let plan = plan_rollback(&images, &remote);
+        assert_eq!(plan.len(), 3);
+        assert_eq!(plan.iter().filter(|p| p.blocking).count(), 1, "仅 1 项阻断");
+        // 计数汇总(供 UI 文案与阻断判定)
+        let s = rollback_precheck_summary(&plan);
+        assert_eq!(s.archived, 1);
+        assert_eq!(s.remote_by_id, 1);
+        assert_eq!(s.missing, 1);
+        assert_eq!(s.unknown, 0);
+        assert!(s.has_blocking(), "存在阻断项");
+        // 全可用时不阻断
+        let ok_plan = plan_rollback(&images[..2], &remote);
+        assert!(!rollback_precheck_summary(&ok_plan).has_blocking());
+    }
+
+    #[test]
+    fn test_rollback_precheck_id_matching_is_prefix_tolerant() {
+        // ID 比较与既有 same_image_id 同口径:一方带 sha256: 前缀、一方不带也算同
+        let images = vec![mimg("db", "postgres:16", None, Some("sha256:bbb"))];
+        let remote = vec![("postgres:16".to_string(), "bbb".to_string())];
+        let plan = plan_rollback(&images, &remote);
+        assert_eq!(plan[0].source, RollbackImageSource::RemoteById,
+            "前缀差异不应误判为丢失(与跨端比较同口径)");
+    }
+
+    #[test]
+    fn test_archived_override_original_filter() {
+        // R2:归档内 <名>.ddbak → 原名的识别规则(只认 compose override 形态)
+        assert_eq!(
+            archived_override_original("docker-compose.override.yml.ddbak"),
+            Some("docker-compose.override.yml")
+        );
+        assert_eq!(
+            archived_override_original("compose.prod.yaml.ddbak"),
+            Some("compose.prod.yaml")
+        );
+        // 非 override 形态:不恢复(防误把别的 .ddbak 物写回项目目录)
+        assert_eq!(archived_override_original("foo.ddbak"), None);
+        assert_eq!(archived_override_original("docker-compose.yml.ddbak"), None,
+            "base compose 不是 override(它走 compose 副本通道)");
+        assert_eq!(archived_override_original("docker-compose.override.txt.ddbak"), None);
+        assert_eq!(archived_override_original("docker-compose.override.yml"), None,
+            "没有 .ddbak 后缀的不是归档副本");
+    }
+
+    #[test]
+    fn test_rollback_precheck_block_message_lists_each_item() {
+        // 阻断文案必须逐条列出「回不去」的服务 + 给出两条出路 —— 只报「N 项阻断」
+        // 对用户无行动价值(这是本批要根除的「说不清」)
+        let images = vec![
+            mimg("web", "myapp:20260919", Some("web.tar.gz"), Some("aaa")),
+            mimg("db", "postgres:16", None, Some("sha256:bbb")),
+            mimg("old", "legacy:1", None, None),
+        ];
+        let remote = vec![("postgres:16".to_string(), "sha256:ccc".to_string())];
+        let plan = plan_rollback(&images, &remote);
+        let sum = rollback_precheck_summary(&plan);
+        let msg = rollback_precheck_block_message(&plan, &sum);
+        assert!(msg.contains("2 个服务无法回退"), "{}", msg);
+        assert!(msg.contains("postgres:16"), "应点名缺失服务: {}", msg);
+        assert!(msg.contains("legacy:1"), "应点名无法核对的服务: {}", msg);
+        assert!(msg.contains("仍要回滚"), "应给出出路: {}", msg);
+        // 可用服务不应出现在阻断清单里(避免噪音)
+        assert!(!msg.contains("myapp:20260919"), "可用项不该混进阻断清单: {}", msg);
+    }
+
+    #[test]
+    fn test_rollback_precheck_error_code_roundtrip() {
+        // 前端按码分流(项目纪律):阻断错误必须可被 code_of 识别
+        let tagged = crate::errors::tagged(crate::errors::ErrCode::RollbackPrecheck, "x");
+        assert_eq!(
+            crate::errors::code_of(&tagged),
+            Some(crate::errors::ErrCode::RollbackPrecheck)
+        );
+        assert_eq!(crate::errors::ErrCode::RollbackPrecheck.as_str(), "rollback_precheck");
+    }
+
     #[test]
     fn test_manifest_image_legacy_json_without_id() {
         // 旧归档(本字段引入前)的 manifest.json 无 id 字段 → serde default 兼容 None

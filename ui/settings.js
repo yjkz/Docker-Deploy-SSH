@@ -313,6 +313,13 @@
     // 终端日志保留(第二十三批):天数,0 = 永久保留(默认 30)。
     // hint 同时说明清理时机(打开终端 / 启动软件时 best-effort 清理)
     // 部署日报(第二十八批 B2):留空 = 关闭;填 0-23 = 该整点后发一条汇总
+    // 开机自启(第二十九批 S1):真值在注册表(用户可能在任务管理器里禁用),
+    // 回填与保存都以读到的实况为准 —— 见后端 autostart::with_actual_state
+    main.appendChild(checkboxRow('settings-auto-start', '开机时自动启动', false));
+    main.appendChild(hint(
+      '登录 Windows 后自动启动本软件(仅当前用户,不需要管理员权限)。' +
+      '若在「任务管理器 → 启动」里禁用过,这里的勾选状态会跟随系统实际设置'));
+
     main.appendChild(buildField('部署日报时刻', 'DIGEST HOUR',
       'settings-digest-hour', 'number', '',
       '留空 = 关闭;填 0-23 表示每天该整点后发一条当天部署汇总',
@@ -692,7 +699,8 @@
         composeFileNames: composeNamesArg(),
         composeScanMaxDepth: composeDepthArg(),
         tarImage: fieldVal('settings-tar-image-input').trim(),
-        digestHour: digestHourArg()
+        digestHour: digestHourArg(),
+        autoStart: isChecked('settings-auto-start')
       }
     }).then(function () {
       // 过期会话(保存期间模态被关闭甚至重开)→ 静默丢弃,防旧 promise 回写新模态
@@ -813,6 +821,8 @@
         // 卷搬运 tar 镜像(第二十七批):无条件回填(同 P1 教训);缺省空串
         var tarImg = document.getElementById('settings-tar-image-input');
         if (tarImg) tarImg.value = String(s.tarImage || '');
+        // 开机自启(第二十九批 S1):值来自注册表实况(后端已覆盖),无条件回填
+        setChecked('settings-auto-start', s.autoStart === true);
         // 部署日报(第二十八批 B2):无条件回填(同 P1 教训);null/缺省 = 关
         var digestH = document.getElementById('settings-digest-hour');
         if (digestH) digestH.value = (s.digestHour === null || s.digestHour === undefined) ? '' : String(s.digestHour);

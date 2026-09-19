@@ -7,7 +7,7 @@
 Windows 桌面客户端（Tauri 2）：把本地构建的 Docker 镜像一键部署到自己的服务器 —— `docker save → gzip → SFTP → docker load → compose up`，不依赖镜像仓库与 CI/CD。
 
 - 后端：纯 Rust（`src-tauri/src/`，全部业务逻辑）；前端：原生 HTML/CSS/JS（`ui/`，**无框架、无打包器、无 npm 运行时依赖**）。
-- 主分支 `main`；当前版本 v6.9.0，`cargo test` 基线 **461 passed / 13 ignored**，命令 **113** 个（实测口径 = 数 `lib.rs` 的 `generate_handler![]`）。
+- 主分支 `main`；当前版本 v6.11.0，`cargo test` 基线 **474 passed / 13 ignored**，命令 **114** 个（实测口径 = 数 `lib.rs` 的 `generate_handler![]`）。
 
 ## 目录导览
 

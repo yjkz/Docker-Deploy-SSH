@@ -19,6 +19,205 @@ pub struct ManifestImage {
     pub id: Option<String>,
 }
 
+/// 回滚时某个服务的镜像来源(第二十九批 R1;纯判定,便于单测)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollbackImageSource {
+    /// 归档内有镜像包 → `docker load` 使用(本次部署变化过的服务)
+    Archived,
+    /// 归档内无包(**智能传输跳过**),但远端仍持有 manifest 记录的镜像 ID
+    /// → 直接可用,无需重新上传(这是 R1 要支持的核心场景)
+    RemoteById,
+    /// 跳过且远端已无该 ID:旧镜像已被覆盖或清理 —— **回滚不了这个服务**,
+    /// 必须让用户知道(此前是静默沿用当前镜像,界面还报「回滚完成」)
+    Missing,
+    /// 旧归档(manifest 无 id 记录):无从核对,保守标阻断并给指引
+    Unknown,
+}
+
+/// 单个服务的回滚可用性结论。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollbackImagePlan {
+    pub service: String,
+    pub tag: String,
+    pub source: RollbackImageSource,
+    /// 阻断项(须用户确认后才继续)
+    pub blocking: bool,
+    /// 面向用户的说明(缺失原因 / 可用来源)
+    pub detail: String,
+}
+
+/// 回滚预检汇总(供 UI 文案与「是否有阻断项」判定)。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RollbackPrecheckSummary {
+    pub archived: usize,
+    pub remote_by_id: usize,
+    pub missing: usize,
+    pub unknown: usize,
+}
+
+impl RollbackPrecheckSummary {
+    pub fn has_blocking(&self) -> bool {
+        self.missing > 0 || self.unknown > 0
+    }
+}
+
+/// 判断远端镜像列表里**是否存在**给定 ID(忽略 `sha256:` 前缀差异;纯函数)。
+fn remote_has_image_id(remote: &[(String, String)], id: &str) -> bool {
+    let want = id.trim().strip_prefix("sha256:").unwrap_or(id.trim());
+    if want.is_empty() {
+        return false;
+    }
+    remote.iter().any(|(_, rid)| {
+        let got = rid.trim().strip_prefix("sha256:").unwrap_or(rid.trim());
+        got == want
+    })
+}
+
+/// 生成回滚可用性计划(纯函数,便于单测;第二十九批 R1)。
+///
+/// **为什么需要**:智能传输会跳过未变化镜像的打包,归档里因此没有它们的包
+/// (`ManifestImage.file = null`);而回滚此前只按「目录里实际有哪些 tar.gz」
+/// 装载 —— 缺包的服务被**静默跳过**,`docker compose up -d` 用服务器上当前的
+/// 镜像成功启动,界面报「回滚完成」而服务其实没回退。本函数把这件事变成
+/// 显式的三态结论,让调用方要么按 ID 用上仍然存在的镜像,要么明确告知用户。
+///
+/// `remote` = 服务器当前镜像列表 `(repo:tag, id)`(由 `query_remote_images_full`
+/// 取得)。**跳过服务的镜像只要还在远端,就能直接用**(部署时之所以能跳过,正是
+/// 因为远端已有同 ID 镜像)。
+pub fn plan_rollback(
+    images: &[ManifestImage],
+    remote: &[(String, String)],
+) -> Vec<RollbackImagePlan> {
+    images
+        .iter()
+        .map(|img| {
+            if img.file.is_some() {
+                // 归档内有包:最可靠来源
+                return RollbackImagePlan {
+                    service: img.service.clone(),
+                    tag: img.tag.clone(),
+                    source: RollbackImageSource::Archived,
+                    blocking: false,
+                    detail: "归档内有镜像包,docker load 后使用".to_string(),
+                };
+            }
+            match img.id.as_deref() {
+                Some(id) if !id.trim().is_empty() => {
+                    if remote_has_image_id(remote, id) {
+                        RollbackImagePlan {
+                            service: img.service.clone(),
+                            tag: img.tag.clone(),
+                            source: RollbackImageSource::RemoteById,
+                            blocking: false,
+                            detail: format!(
+                                "智能传输跳过打包,服务器上仍持有该镜像({}),直接使用",
+                                short_id(id)
+                            ),
+                        }
+                    } else {
+                        // 同 tag 是否被别的 ID 占用,决定给哪句提示
+                        let tag_taken = remote.iter().any(|(r, _)| r == &img.tag);
+                        RollbackImagePlan {
+                            service: img.service.clone(),
+                            tag: img.tag.clone(),
+                            source: RollbackImageSource::Missing,
+                            blocking: true,
+                            detail: if tag_taken {
+                                format!(
+                                    "{}:镜像 {} 已不在服务器上(该标签现指向其它镜像,版本已被覆盖),无法回退到本次归档的版本",
+                                    img.tag,
+                                    short_id(id)
+                                )
+                            } else {
+                                format!(
+                                    "{}:镜像 {} 已不在服务器上(可能被清理),无法回退",
+                                    img.tag,
+                                    short_id(id)
+                                )
+                            },
+                        }
+                    }
+                }
+                _ => RollbackImagePlan {
+                    service: img.service.clone(),
+                    tag: img.tag.clone(),
+                    source: RollbackImageSource::Unknown,
+                    blocking: true,
+                    detail: format!(
+                        "{}:该归档未记录镜像 ID(早于本功能),无法核对是否可用;                         如需可回滚请重新部署一次(新归档会记录 ID)",
+                        img.tag
+                    ),
+                },
+            }
+        })
+        .collect()
+}
+
+/// 汇总计划(纯函数)。
+pub fn rollback_precheck_summary(plan: &[RollbackImagePlan]) -> RollbackPrecheckSummary {
+    let mut s = RollbackPrecheckSummary::default();
+    for p in plan {
+        match p.source {
+            RollbackImageSource::Archived => s.archived += 1,
+            RollbackImageSource::RemoteById => s.remote_by_id += 1,
+            RollbackImageSource::Missing => s.missing += 1,
+            RollbackImageSource::Unknown => s.unknown += 1,
+        }
+    }
+    s
+}
+
+/// 阻断时的错误文案(纯函数,便于单测):**必须把回不去的服务逐条列出**,
+/// 并给出两条出路(接受部分回滚 / 重新部署记录 ID),不能只说「有 N 项阻断」。
+/// 前端据前缀 `[dderr:rollback-precheck]` 识别,并弹「仍要回滚」确认。
+pub fn rollback_precheck_block_message(
+    plan: &[RollbackImagePlan],
+    sum: &RollbackPrecheckSummary,
+) -> String {
+    let mut lines = vec![format!(
+        "回滚可用性预检未通过:{} 个服务无法回退到该归档(归档内有包 {} 个、服务器上按镜像 ID 命中 {} 个)",
+        sum.missing + sum.unknown,
+        sum.archived,
+        sum.remote_by_id
+    )];
+    for p in plan.iter().filter(|p| p.blocking) {
+        lines.push(format!("· {}", p.detail));
+    }
+    lines.push(
+        "如仍要回滚,其余服务会正常恢复,上述服务将沿用服务器当前镜像(版本可能与归档不一致)。选择「仍要回滚」继续,或在命令后重试时附带确认。".to_string(),
+    );
+    lines.join("
+")
+}
+
+/// 归档内的 override 副本名 → 原始文件名(纯函数,便于单测)。
+///
+/// 只认 `<compose 前缀>*.yml|.yaml.ddbak` 形态(避免把归档里其它
+/// `.ddbak` 后缀物误当 override 恢复到项目目录);非该形态返回 `None`。
+pub fn archived_override_original(archived_name: &str) -> Option<&str> {
+    let orig = archived_name.strip_suffix(".ddbak")?;
+    let is_yaml = orig.ends_with(".yml") || orig.ends_with(".yaml");
+    if !is_yaml {
+        return None;
+    }
+    let stem = orig.rsplit_once('.').map(|(s, _)| s).unwrap_or(orig);
+    // override 形态 = 前缀是 compose 族名,且**点号后不止一个段**
+    // (docker-compose.yml / compose.yml 是 base 本体,走 compose 副本通道,
+    // 不在此恢复;docker-compose.override.yml / compose.prod.yml 才是 override)
+    let is_override_like = stem.starts_with("docker-compose.") || stem.starts_with("compose.");
+    if is_override_like {
+        Some(orig)
+    } else {
+        None
+    }
+}
+
+/// 镜像 ID 短哈希(展示用;纯函数)。
+fn short_id(id: &str) -> String {
+    let bare = id.trim().strip_prefix("sha256:").unwrap_or(id.trim());
+    bare.chars().take(12).collect()
+}
+
 /// 整栈部署成功时写入发布目录的 `manifest.json` 结构(回滚列表页据此展示
 /// 各 release 包含的服务;`docker-compose.yml` 副本随清单一并归档)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +305,33 @@ pub(crate) async fn write_release_artifacts(
                 e
             ),
         ),
+    }
+
+    // 1b) override 副本(R2;第二十九批):override 参与 compose 语义(服务定义/
+    //     端口/环境可能被它改写),不同步归档会让回滚后的合并结果与部署当时不一致。
+    //     **`.env` 刻意不入归档**(用户裁决):它是环境变量,回滚它可能把密钥退回旧值,
+    //     且服务器上本就保有明文;回滚不动 `.env`,由用户自理。
+    //     命名加 `.ddbak.` 前缀,与根目录的同名 override 区分,回滚时按原名恢复。
+    if let Some(parent) = PathBuf::from(&project.compose_file).parent() {
+        for ov in find_override_files(parent) {
+            let Some(name) = ov.file_name().map(|n| n.to_string_lossy().to_string()) else {
+                continue;
+            };
+            let archived_name = format!("{}.ddbak", name);
+            match client
+                .sftp_upload(&ov, release_dir, &archived_name, false, &|_, _| {})
+                .await
+            {
+                Ok(()) => emit_log(
+                    app,
+                    &format!("已存档 override 文件 {} 到发布目录(回滚时一并恢复)", name),
+                ),
+                Err(e) => emit_log(
+                    app,
+                    &format!("警告:存档 override 文件 {} 失败(回滚时该文件保持现状): {}", name, e),
+                ),
+            }
+        }
     }
 
     // 2) manifest.json:echo <b64> | base64 -d > '<release_dir>/manifest.json'
@@ -283,6 +509,130 @@ pub async fn rollback_list_tags(
     Ok(tags)
 }
 
+/// 回滚预检的单条结果(camelCase 契约;第二十九批 R1)。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RollbackPrecheckItem {
+    pub service: String,
+    pub tag: String,
+    /// `"archived"` | `"remoteById"` | `"missing"` | `"unknown"`
+    pub source: String,
+    pub blocking: bool,
+    pub detail: String,
+}
+
+/// 回滚预检结果(camelCase)。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RollbackPrecheck {
+    pub items: Vec<RollbackPrecheckItem>,
+    pub archived: usize,
+    pub remote_by_id: usize,
+    pub missing: usize,
+    pub unknown: usize,
+    /// 存在阻断项(前端据此把「开始回滚」变为「仍要回滚(部分)」)
+    pub has_blocking: bool,
+    /// 归档无 manifest(极旧/半成品):无法逐服务核对
+    pub no_manifest: bool,
+}
+
+/// 回滚预检(只读;第二十九批 R1):列出该归档每个服务的镜像来源,
+/// 让用户**在执行前**看清「哪些服务回不去」。
+///
+/// 与执行链内的同款预检共用 [`plan_rollback`] 纯函数 —— 单一事实来源,
+/// 避免「预检说可用、执行时拦下」两套判定漂移。
+#[tauri::command]
+pub async fn rollback_precheck(
+    server_id: String,
+    password_plain: Option<String>,
+    project_id: String,
+    release_ts: String,
+) -> Result<RollbackPrecheck, String> {
+    // 与执行链同款 ts 校验(防逃逸;预检也要挡住非法输入)
+    if release_ts.contains('/')
+        || release_ts.contains("..")
+        || release_ts.contains('\\')
+        || release_ts.trim().is_empty()
+    {
+        return Err(format!("发布标识不合法:{}", release_ts));
+    }
+    let cfg = load_config().map_err(|e| format!("读取配置失败: {}", e))?;
+    let server = find_server(&cfg, &server_id)?.clone();
+    let project = find_project(&cfg, &project_id)?.clone();
+    let password = resolve_password(
+        &server.auth.auth_type,
+        password_plain.as_deref(),
+        server.auth.password_enc.as_deref(),
+    )?;
+    let key_pass = resolve_key_passphrase(&server)?;
+    let mut client = with_timeout(
+        SSH_CONNECT_TIMEOUT_SECS,
+        "连接超时",
+        "请检查服务器地址与网络",
+        SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default()),
+    )
+    .await?;
+
+    let release_dir = releases_dir(&effective_remote_dir(&server, &project), &release_ts);
+    let manifest_path = remote_join(&release_dir, "manifest.json");
+    let (code, out) = with_timeout(
+        SSH_EXEC_TIMEOUT_SECS,
+        "读取发布清单超时",
+        "请检查服务器网络后重试",
+        exec_collect(&mut client, &cat_file_cmd(&manifest_path)),
+    )
+    .await?;
+    if code != 0 {
+        // 归档不存在 / 无 manifest(旧版本或半成品)
+        return Ok(RollbackPrecheck {
+            items: Vec::new(),
+            archived: 0,
+            remote_by_id: 0,
+            missing: 0,
+            unknown: 0,
+            has_blocking: false,
+            no_manifest: true,
+        });
+    }
+    let m = parse_release_manifest(&out)
+        .ok_or_else(|| "发布清单已损坏,无法预检".to_string())?;
+
+    let remote = query_remote_images_full(&mut client)
+        .await
+        .map_err(|e| format!("查询服务器镜像列表失败: {}", e))?;
+    let remote_pairs: Vec<(String, String)> = remote
+        .into_iter()
+        .map(|i| (format!("{}:{}", i.repository, i.tag), i.id))
+        .collect();
+    let plan = plan_rollback(&m.images, &remote_pairs);
+    let sum = rollback_precheck_summary(&plan);
+    let items = plan
+        .iter()
+        .map(|p| RollbackPrecheckItem {
+            service: p.service.clone(),
+            tag: p.tag.clone(),
+            source: match p.source {
+                RollbackImageSource::Archived => "archived",
+                RollbackImageSource::RemoteById => "remoteById",
+                RollbackImageSource::Missing => "missing",
+                RollbackImageSource::Unknown => "unknown",
+            }
+            .to_string(),
+            blocking: p.blocking,
+            detail: p.detail.clone(),
+        })
+        .collect();
+    Ok(RollbackPrecheck {
+        items,
+        archived: sum.archived,
+        remote_by_id: sum.remote_by_id,
+        missing: sum.missing,
+        unknown: sum.unknown,
+        has_blocking: sum.has_blocking(),
+        no_manifest: false,
+    })
+}
+
 /// 整栈一键回滚:把指定历史 release 的镜像包重新 `docker load`(自动恢复
 /// 镜像原标签),恢复 compose 副本并 `compose up -d`。复用 deploy-log /
 /// deploy-done 事件体系,`deploy-done` 恰好 emit 一次;成功后落一条
@@ -294,18 +644,24 @@ pub async fn rollback_execute_stack(
     password_plain: Option<String>,
     project_id: String,
     release_ts: String,
+    // 预检发现阻断项时仍继续(用户已在预检结果里确认「部分回滚」);
+    // false/缺省 = 有阻断项即中止并回传预检明细,由前端展示
+    allow_partial: Option<bool>,
 ) -> Result<(), String> {
     // 远程操作互斥(第二十二批):回滚与部署/迁移互斥;被拒返回命令 Err
     // (前端 toast 原文),不进入管线
     let _guard = acquire_remote_op()?;
-    finish_rollback(
+    let failed = rollback_failure_skeleton(&server_id, Some(&project_id));
+    finish_rollback_with(
         &app,
+        failed,
         rollback_execute_stack_inner(
             &app,
             &server_id,
             password_plain.as_deref(),
             &project_id,
             &release_ts,
+            allow_partial.unwrap_or(false),
         ),
     )
     .await
@@ -319,6 +675,7 @@ pub(crate) async fn rollback_execute_stack_inner(
     password_plain: Option<&str>,
     project_id: &str,
     release_ts: &str,
+    allow_partial: bool,
 ) -> Result<DeployRecord, String> {
     let started = std::time::Instant::now();
     // 每次回滚开始时重置取消标志(与部署管线一致)
@@ -402,6 +759,7 @@ pub(crate) async fn rollback_execute_stack_inner(
     let has_compose_copy = files.iter().any(|f| f == "docker-compose.yml");
 
     // ---- 读 manifest(存在才解析):校验留档归属并登记镜像引用,供回滚历史展示 ----
+    let mut manifest: Option<ReleaseManifest> = None;
     if files.iter().any(|f| f == "manifest.json") {
         let manifest_path = remote_join(&release_dir, "manifest.json");
         let (code, out) = with_timeout(
@@ -422,10 +780,66 @@ pub(crate) async fn rollback_execute_stack_inner(
                         release_ts, m.project, project.name
                     ));
                 }
-                record.images = m.images.into_iter().map(|i| i.tag).collect();
+                record.images = m.images.iter().map(|i| i.tag.clone()).collect();
+                manifest = Some(m);
             }
         } else {
             emit_log(app, "警告:读取发布清单失败,按无清单处理");
+        }
+    }
+
+    // ---- 回滚可用性预检(R1;第二十九批)----
+    // 为什么需要:智能传输会跳过未变化镜像的打包,归档里因此没有它们的包;
+    // 而装载此前只按「目录里实际有哪些 tar.gz」—— 缺包服务被静默跳过,
+    // `up -d` 用服务器当前镜像成功启动,界面却报「回滚完成」,服务实际没回退。
+    // 这里按 manifest 逐服务核对来源,把「回不去的」显式暴露给用户。
+    let plan = match &manifest {
+        Some(m) => {
+            let remote = match query_remote_images_full(&mut client).await {
+                Ok(list) => list
+                    .into_iter()
+                    .map(|i| (format!("{}:{}", i.repository, i.tag), i.id))
+                    .collect::<Vec<_>>(),
+                Err(e) => {
+                    // 查不到远端列表:不能据此判定「镜像丢失」(可能是查询失败),
+                    // 但也无法放行 —— 保守起见按 Unknown 逐项阻断,并说明原因
+                    emit_log(
+                        app,
+                        &format!("警告:查询服务器镜像列表失败({}),无法核对回滚可用性", e),
+                    );
+                    Vec::new()
+                }
+            };
+            plan_rollback(&m.images, &remote)
+        }
+        None => Vec::new(),
+    };
+    if !plan.is_empty() {
+        let sum = rollback_precheck_summary(&plan);
+        emit_log(
+            app,
+            &format!(
+                "回滚可用性预检:归档内有包 {} 个 / 服务器上按 ID 命中 {} 个 / 回不去 {} 个 / 无法核对 {} 个",
+                sum.archived, sum.remote_by_id, sum.missing, sum.unknown
+            ),
+        );
+        for p in plan.iter().filter(|p| p.blocking) {
+            emit_log(app, &format!("  [回不去] {}", p.detail));
+        }
+        for p in plan.iter().filter(|p| !p.blocking) {
+            emit_log(app, &format!("  [可用] {}:{} — {}", p.service, p.tag, p.detail));
+        }
+        if sum.has_blocking() && !allow_partial {
+            return Err(crate::errors::tagged(
+                crate::errors::ErrCode::RollbackPrecheck,
+                rollback_precheck_block_message(&plan, &sum),
+            ));
+        }
+        if sum.has_blocking() {
+            emit_log(
+                app,
+                "用户已确认部分回滚:以下服务将沿用服务器现有镜像,其余服务正常回退",
+            );
         }
     }
 
@@ -486,12 +900,49 @@ pub(crate) async fn rollback_execute_stack_inner(
         emit_log(app, "发布目录无 compose 副本,沿用服务器现有 compose 文件");
     }
 
-    // ---- compose up -d(镜像标签已恢复,up 按引用重建容器)----
-    ensure_not_cancelled(app)?;
     // override 文件名与单镜像回滚同口径:部署时 upload_compose_files 已把
     // override 上传到远端根目录,回滚按文件名直接引用,保证 -f 文件链与
     // 部署时 pull/up 一致(override-only 服务不逃逸)
     let override_names = compose_override_names(&project.compose_file);
+
+    // ---- 恢复 override 副本(R2;第二十九批)----
+    // 归档内的 override 以 `<原名>.ddbak` 存放(与根目录同名文件区分),
+    // 恢复时按原名覆盖回部署目录 —— 保证回滚后的 compose 合并结果与
+    // 部署当时一致(override 可改服务定义,旧 compose + 新 override 会得到
+    // 一个两边都不对的合并结果)。旧归档无此文件 → 保持现状并注明。
+    ensure_not_cancelled(app)?;
+    let mut restored_overrides = 0usize;
+    for ov_name in &override_names {
+        let archived = remote_join(&release_dir, &format!("{}.ddbak", ov_name));
+        // 存在性检查(旧归档没有;不存在时保持服务器现状)
+        let (code, _) = exec_collect(&mut client, &test_file_cmd(&archived)).await?;
+        if code != 0 {
+            continue;
+        }
+        let cp_cmd = format!(
+            "cp {} {}",
+            shell_single_quote(&archived),
+            shell_single_quote(&remote_join(&effective_remote_dir(&server, &project), ov_name))
+        );
+        emit_log(app, &format!("恢复 override 文件 {}: {}", ov_name, cp_cmd));
+        if let Err(e) = exec_forwarded(app, &mut client, &cp_cmd, SSH_EXEC_TIMEOUT_SECS).await {
+            emit_log(
+                app,
+                &format!("警告:恢复 override 文件 {} 失败({}),该文件保持现状", ov_name, e),
+            );
+        } else {
+            restored_overrides += 1;
+        }
+    }
+    if restored_overrides == 0 && !override_names.is_empty() {
+        emit_log(
+            app,
+            "发布目录无 override 副本(旧归档);override 文件保持服务器现状",
+        );
+    }
+
+    // ---- compose up -d(镜像标签已恢复,up 按引用重建容器)----
+    ensure_not_cancelled(app)?;
     let up_cmd = compose_up_cmd(&effective_remote_dir(&server, &project), &remote_compose, &override_names);
     emit_log(app, &format!("启动服务: {}", up_cmd));
     exec_forwarded(app, &mut client, &up_cmd, STACK_COMPOSE_TIMEOUT_SECS).await?;
@@ -519,8 +970,10 @@ pub async fn rollback_execute_single(
 ) -> Result<(), String> {
     // 远程操作互斥(第二十二批):与部署/迁移互斥
     let _guard = acquire_remote_op()?;
-    finish_rollback(
+    let failed = rollback_failure_skeleton(&server_id, Some(&project_id));
+    finish_rollback_with(
         &app,
+        failed,
         rollback_execute_single_inner(
             &app,
             &server_id,
@@ -1250,8 +1703,11 @@ pub async fn rollback_execute_stack_at(
 ) -> Result<(), String> {
     // 远程操作互斥(第二十二批):与部署/迁移互斥
     let _guard = acquire_remote_op()?;
-    finish_rollback(
+    // 06 页路径无 projectId:骨架里项目名留空(留痕仍有服务器与目标归档)
+    let failed = rollback_failure_skeleton(&server_id, None);
+    finish_rollback_with(
         &app,
+        failed,
         rollback_execute_stack_at_inner(
             &app,
             &server_id,
@@ -1399,6 +1855,38 @@ async fn rollback_execute_stack_at_inner(
         emit_log(app, "发布目录无 compose 副本,沿用现有 compose 文件");
     }
 
+    // ---- 恢复 override 副本(R2;第二十九批;06 页路径)----
+    // 本路径由目录驱动、无 ProjectConfig,故在**远端**枚举归档内的
+    // `<名>.ddbak` 再按原名恢复 —— 比本地文件名枚举更稳(不依赖本地副本),
+    // 且旧归档(无 `.ddbak`)自然跳过。
+    ensure_not_cancelled(app)?;
+    let (code, bak_out) = exec_collect(&mut client, &ls_dir_cmd(&release_dir)).await?;
+    if code == 0 {
+        let mut restored = 0usize;
+        for name in parse_ls_lines(&bak_out) {
+            // 只处理 compose override 形态(避免误恢复其它 .ddbak 后缀物)
+            let Some(orig) = archived_override_original(&name) else {
+                continue;
+            };
+            let cp_cmd = format!(
+                "cp {} {}",
+                shell_single_quote(&remote_join(&release_dir, &name)),
+                shell_single_quote(&remote_join(&dir, orig))
+            );
+            emit_log(app, &format!("恢复 override 文件 {}: {}", orig, cp_cmd));
+            match exec_forwarded(app, &mut client, &cp_cmd, SSH_EXEC_TIMEOUT_SECS).await {
+                Ok(()) => restored += 1,
+                Err(e) => emit_log(
+                    app,
+                    &format!("警告:恢复 override 文件 {} 失败({}),该文件保持现状", orig, e),
+                ),
+            }
+        }
+        if restored == 0 {
+            emit_log(app, "发布目录无 override 副本(旧归档);override 文件保持现状");
+        }
+    }
+
     // compose up -d:cd 到项目目录,按目录内 compose 文件启动
     // (override 文件按远端同名约定自动生效,无需显式 -f 链)
     ensure_not_cancelled(app)?;
@@ -1453,7 +1941,40 @@ pub(crate) fn rollback_notify_text(
 /// 仅告警,不影响回滚结果);emit 之后调 [`crate::notify::fire`] 分发通知
 /// 中心通知(成功/失败/取消,事件订阅复用部署的 AppConfig.notify.events,
 /// 失败仅告警,不影响回滚结果)。
-async fn finish_rollback<F>(app: &AppHandle, fut: F) -> Result<(), String>
+/// 组装回滚失败的留痕骨架(R4;第二十九批;纯查配置,失败给 `None`)。
+///
+/// 为什么在命令层组装:管线失败时没有 record 返回,而失败留痕需要
+/// 「服务器名 / 项目名」这类上下文 —— 命令层刚好能拿到配置(管线内失败点
+/// 各不相同,不宜在每处 error 里携带)。
+fn rollback_failure_skeleton(
+    server_id: &str,
+    project_id: Option<&str>,
+) -> Option<DeployRecord> {
+    let cfg = load_config().ok()?;
+    let server = cfg.servers.iter().find(|s| s.id == server_id)?;
+    let project_name = project_id
+        .and_then(|pid| cfg.projects.iter().find(|p| p.id == pid))
+        .map(|p| p.name.clone())
+        .unwrap_or_default();
+    let mut rec = DeployRecord::new_skeleton(
+        MODE_ROLLBACK,
+        &server.name,
+        &project_name,
+        Vec::new(),
+    );
+    rec.server_id = Some(server.id.clone());
+    rec.project_id = project_id.map(String::from);
+    Some(rec)
+}
+
+/// 失败时用于留痕的记录骨架(R4;第二十九批):`inner` 失败时没有 record
+/// 可返回,故由调用方提供一个**带上下文的骨架**(服务器/项目名),收尾时写入
+/// 失败原因。`None` = 该入口拿不到上下文(如早期校验失败),不留痕。
+async fn finish_rollback_with<F>(
+    app: &AppHandle,
+    failed_record: Option<DeployRecord>,
+    fut: F,
+) -> Result<(), String>
 where
     F: std::future::Future<Output = Result<DeployRecord, String>> + Send,
 {
@@ -1511,6 +2032,15 @@ where
             );
             // 通知中心:回滚失败/取消(emit deploy-done 之后异步分发)
             crate::notify::fire(app.clone(), kind, title, body).await;
+            // R4(第二十九批):**失败也留痕**。此前只有成功才落历史,失败的回滚
+            // 在界面上"从世上消失"(刷新页面后无法复盘发生了什么),而回滚失败
+            // 恰恰是最需要事后排查的场景。取消单独记(与部署历史口径一致:
+            // mode 仍为 rollback,message 说明取消/失败原因)。
+            if let Some(mut rec) = failed_record {
+                rec.success = false;
+                rec.message = crate::errors::strip(&e).to_string();
+                append_record(rec);
+            }
             Err(e)
         }
     }

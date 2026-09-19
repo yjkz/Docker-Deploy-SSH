@@ -130,6 +130,8 @@
     st.rbLogs = [];
     st.rbReleases = [];
     st.rbTags = [];
+    // 预检结果(R1;模态重开时清空,避免上次的结果被当成这次的)
+    st.rbPrecheck = null;
 
     var overlay = rbOverlay();
     if (!overlay) return;
@@ -497,12 +499,22 @@
     body.appendChild(actions);
   }
 
-  /** 整栈执行前二次确认(确认后才真正发起 rollback_execute_stack) */
+  /**
+   * 整栈回滚确认视图(第二十九批 R1):确认区 + **回滚预检**按钮。
+   *
+   * 预检的意义:智能传输会跳过未变化镜像的打包,归档里可能缺包;此前缺包的
+   * 服务会被静默跳过、界面报「回滚完成」而服务其实没回退。预检让用户在**执行前**
+   * 看到每个服务的镜像来源与「回不去」的清单,再决定是否继续。
+   * 预检结果就地展示(不弹新模态),有阻断项时执行按钮改为「仍要回滚(部分)」。
+   */
   function confirmRbStack() {
     var rel = selectedRbRelease();
     if (!rel || st.rbBusy) return;
     var rec = st.rbRecord || {};
-    renderRbConfirm({
+    var body = rbBody();
+    if (!body) return;
+    body.textContent = '';
+    var block = window.confirmBlock({
       title: '确认把项目「' + String(rec.project_name || '') + '」@ 服务器「' +
         String(rec.server_name || '') + '」回滚到发布 ' + String(rel.ts || '') + '?',
       facts: [
@@ -512,13 +524,137 @@
         ['恢复方式', rel.hasComposeCopy ? '恢复 compose 副本后 compose up 重建' : '沿用服务器现有 compose 文件重建']
       ],
       risk: '期间服务会短暂重启;目标侧容器将被该归档版本重建。'
-    }, function () {
+    });
+    // 缩小确认块(用户要求:别挤到下方日志框)
+    block.classList.add('rb-confirm-compact');
+    body.appendChild(block);
+
+    // 预检结果区(初始为空;点击预检后填充)
+    var pre = el('div', 'rb-precheck hidden');
+    pre.id = 'rb-precheck-box';
+    body.appendChild(pre);
+
+    var actions = el('div', 'modal-actions');
+    var cancel = el('button', 'btn', '取消');
+    cancel.type = 'button';
+    cancel.addEventListener('click', renderRbStackList);
+
+    var preBtn = el('button', 'btn', '回滚预检');
+    preBtn.type = 'button';
+    preBtn.id = 'rb-precheck-btn';
+    preBtn.title = '核对每个服务在该归档里的镜像来源(归档内有包 / 服务器上按镜像 ID 命中 / 回不去)';
+    preBtn.addEventListener('click', function () { runRbPrecheck(rel, preBtn); });
+
+    var exec = el('button', 'btn btn-danger', '确认执行');
+    exec.type = 'button';
+    exec.id = 'rb-exec-btn';
+    exec.disabled = true; // 必须先预检(用户要求:预检后再确认是否继续)
+    exec.title = '请先点「回滚预检」';
+    exec.addEventListener('click', function () {
       beginRbExecution('rollback_execute_stack', {
         serverId: st.rbIds.serverId,
         projectId: st.rbIds.projectId,
-        releaseTs: String(rel.ts || '')
+        releaseTs: String(rel.ts || ''),
+        // 预检已确认(阻断项已展示给用户)→ 允许部分回滚
+        allowPartial: !!(st.rbPrecheck && st.rbPrecheck.hasBlocking)
       });
-    }, renderRbStackList);
+    });
+    actions.appendChild(cancel);
+    actions.appendChild(preBtn);
+    actions.appendChild(exec);
+    body.appendChild(actions);
+  }
+
+  /**
+   * 跑回滚预检并在确认视图内展示结果(第二十九批 R1)。
+   * 结果三态:归档内有包 / 服务器上按镜像 ID 命中(智能传输跳过的服务,
+   * 镜像仍在服务器上,直接可用)/ 回不去(须显式告知)。
+   */
+  function runRbPrecheck(rel, btn) {
+    if (st.rbBusy) return;
+    var box = document.getElementById('rb-precheck-box');
+    var exec = document.getElementById('rb-exec-btn');
+    if (!box) return;
+    st.rbBusy = true;
+    window.setBtnBusy(btn, true, '预检中…');
+    box.textContent = '';
+    box.appendChild(el('div', 'rb-precheck-title', '回滚可用性预检中…'));
+    box.classList.remove('hidden');
+    // 预检期间禁用执行按钮(结果未出,不能让用户盲点)
+    if (exec) exec.disabled = true;
+    window.AppBus.invoke('rollback_precheck', {
+      serverId: st.rbIds.serverId,
+      projectId: st.rbIds.projectId,
+      releaseTs: String(rel.ts || '')
+    })
+      .then(function (res) {
+        if (st.rbKind !== 'stack') return; // 模态已关,丢弃
+        if (exec) window.setBtnBusy(btn, false, '回滚预检');
+        st.rbBusy = false;
+        renderRbPrecheckResult(res || {}, exec);
+      })
+      .catch(function (err) {
+        if (st.rbKind !== 'stack') return;
+        if (exec) window.setBtnBusy(btn, false, '回滚预检');
+        st.rbBusy = false;
+        box.textContent = '';
+        box.appendChild(el('div', 'rb-precheck-title', '预检失败'));
+        box.appendChild(el('div', 'rb-precheck-detail',
+          errText(err) || '未知错误'));
+        if (exec) {
+          exec.disabled = false; // 预检本身失败不阻断执行(用户可自行判断)
+          exec.title = '预检失败,可直接执行(结果未核对)';
+        }
+        st.rbPrecheck = null;
+      });
+  }
+
+  /** 渲染预检结果(每服务一行:可用 / 回不去) */
+  function renderRbPrecheckResult(res, exec) {
+    var box = document.getElementById('rb-precheck-box');
+    if (!box) return;
+    st.rbPrecheck = res;
+    box.textContent = '';
+    if (res.noManifest) {
+      box.appendChild(el('div', 'rb-precheck-title',
+        '该归档无发布清单(旧版本或未完成的部署),无法逐服务核对;将按目录内的镜像包恢复'));
+      if (exec) {
+        exec.disabled = false;
+        exec.textContent = '确认执行';
+        exec.title = '';
+      }
+      return;
+    }
+    var items = Array.isArray(res.items) ? res.items : [];
+    var head = el('div', 'rb-precheck-title',
+      '共 ' + items.length + ' 个服务:归档内有包 ' + (res.archived || 0) +
+      ' · 服务器上按镜像 ID 命中 ' + (res.remoteById || 0) +
+      (res.missing ? ' · 回不去 ' + res.missing : '') +
+      (res.unknown ? ' · 无法核对 ' + res.unknown : ''));
+    box.appendChild(head);
+    // 先列阻断项(用户最需要看这个),再列可用项
+    var sorted = items.slice().sort(function (a, b) {
+      return (b.blocking ? 1 : 0) - (a.blocking ? 1 : 0);
+    });
+    sorted.forEach(function (it) {
+      var row = el('div', 'rb-precheck-row' + (it.blocking ? ' is-blocking' : ''));
+      row.appendChild(window.fillBadge(el('span'),
+        it.blocking ? 'fail' : 'ok',
+        it.blocking ? '回不去' : '可用'));
+      row.appendChild(el('span', 'rb-precheck-svc', String(it.service || '')));
+      row.appendChild(el('span', 'rb-precheck-detail', String(it.detail || '')));
+      box.appendChild(row);
+    });
+    if (exec) {
+      exec.disabled = false;
+      if (res.hasBlocking) {
+        exec.textContent = '仍要回滚(部分)';
+        exec.title = '上述「回不去」的服务将沿用服务器当前镜像,版本可能与归档不一致';
+      } else {
+        exec.textContent = '确认执行';
+        exec.title = '';
+      }
+    }
   }
 
   /** 单镜像执行前二次确认(确认后才真正发起 rollback_execute_single) */
