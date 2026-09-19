@@ -2758,6 +2758,102 @@ services:
     }
 
     #[test]
+    fn test_rollback_precheck_query_failure_says_retry_not_missing() {
+        // **审查发现**:远端镜像列表查询失败时,首版把「查不到」写成
+        // 「镜像已不在服务器上(可能被清理)」—— 定性错误会诱导用户做出错误的
+        // 恢复决策(重试即可 vs 必须重新部署)。两者都阻断(fail-closed),
+        // 但文案必须区分。
+        let images = vec![mimg("db", "postgres:16", None, Some("sha256:bbb"))];
+        let plan = plan_rollback_full(&images, &[], &[], false);
+        assert_eq!(plan[0].source, RollbackImageSource::Unknown, "查询失败归 Unknown");
+        assert!(plan[0].blocking, "fail-closed:仍阻断");
+        assert!(
+            plan[0].detail.contains("无法查询") && plan[0].detail.contains("重试"),
+            "应说「查不到,请重试」而非「镜像丢了」: {}",
+            plan[0].detail
+        );
+        assert!(
+            !plan[0].detail.contains("已不在服务器上"),
+            "不得误报为镜像丢失: {}",
+            plan[0].detail
+        );
+        // 对照:远端列表可得且确实没有该镜像 → 才是「不在服务器上」
+        let plan2 = plan_rollback_full(&images, &[], &[], true);
+        assert_eq!(plan2[0].source, RollbackImageSource::Missing);
+        assert!(plan2[0].detail.contains("不在服务器上"), "{}", plan2[0].detail);
+    }
+
+    #[test]
+    fn test_rollback_precheck_archived_package_missing_from_dir() {
+        // **补丁审查发现的第二处漏洞**:首版只看 manifest 的 `file` 字段是否为
+        // Some,就判「归档内有包 → 可用」。但 manifest 是**部署当时**写的记录,
+        // 归档目录里的文件可能已被手工删除 / 部分清理(清理分析逐目录删除、
+        // 或用户手工 rm)—— 此时 manifest 仍写着有包,而实际没有。
+        //
+        // 后果与第一处漏洞同类:预检说可用、`docker load` 阶段找不到文件
+        // (装载循环按实际文件清单走)**静默跳过**,`up -d` 用当前镜像启动,
+        // 界面报「回滚完成」。
+        //
+        // 正确判定:归档有包 **且** 该包真在目录的文件清单里。
+        let images = vec![
+            mimg("web", "myapp:1", Some("web.tar.gz"), Some("aaa")),      // 包在
+            mimg("db", "postgres:16", Some("db.tar.gz"), Some("bbb")),    // 包**不在**目录里
+        ];
+        // 目录实际只有 web.tar.gz(db.tar.gz 被清理了)
+        let actual_files = vec!["web.tar.gz".to_string(), "manifest.json".to_string()];
+        let plan = plan_rollback_with_files(&images, &[], &actual_files);
+        assert_eq!(plan[0].source, RollbackImageSource::Archived);
+        assert!(!plan[0].blocking, "包确实在 → 可用");
+        assert_eq!(
+            plan[1].source,
+            RollbackImageSource::Missing,
+            "manifest 说在但目录里没有 → 不能算可用"
+        );
+        assert!(plan[1].blocking, "应阻断(否则 load 阶段静默跳过)");
+        assert!(
+            plan[1].detail.contains("归档") && plan[1].detail.contains("不在"),
+            "文案应说明包不在归档里: {}",
+            plan[1].detail
+        );
+    }
+
+    #[test]
+    fn test_rollback_precheck_id_present_but_tag_moved_away() {
+        // **补丁审查发现的漏洞(第二十九批 R1 首版)** —— 跳过服务的镜像 ID 仍在
+        // 服务器上,但 **compose 期望的 tag 已被别的 ID 占用**时,首版预检只看
+        // 「ID 在不在」→ 判「可用」。这是错的:
+        //
+        // 整栈回滚路径**没有 `docker tag` 步骤**(只有单镜像回滚有,见
+        // `docker_tag_cmd` 的唯一调用点),它依赖 `docker load` 从包内恢复标签;
+        // 而跳过的服务**没有包**,于是 `compose up -d` 按 compose 里的
+        // `repo:tag` 去找 —— 那个 tag 现在指向别的 ID(新版本)。
+        // 结果:预检说可用、界面报「回滚完成」,服务实际没回退 —— 正是本批要
+        // 根除的那类静默失效,只是换了个触发路径。
+        //
+        // 正确判定:ID 存在 **且** 该 ID 被 compose 期望的 tag 引用(或该 tag
+        // 缺失但 ID 存在 —— 那种情况 docker 侧仍可按 ID 用,由调用方决定)。
+        let images = vec![mimg("db", "postgres:16", None, Some("sha256:bbb"))];
+        // 远端:ID bbb 仍存在,但挂在别的 tag 下;postgres:16 已被 ccc 占
+        let remote = vec![
+            ("postgres:16".to_string(), "sha256:ccc".to_string()),
+            ("postgres:16-prev".to_string(), "sha256:bbb".to_string()),
+        ];
+        let plan = plan_rollback(&images, &remote);
+        assert_eq!(
+            plan[0].source,
+            RollbackImageSource::Missing,
+            "ID 在但期望 tag 已指向别的镜像 → 不能算可用(up -d 会拉起新版)"
+        );
+        assert!(plan[0].blocking, "应阻断:否则又是静默失效");
+        // 文案要点出「标签已指向别的镜像」(用户据此判断为何回不去)
+        assert!(
+            plan[0].detail.contains("指向") && plan[0].detail.contains("不是本次归档的版本"),
+            "文案应说明标签被占用且后果: {}",
+            plan[0].detail
+        );
+    }
+
+    #[test]
     fn test_rollback_precheck_skipped_but_id_gone() {
         // 跳过且远端已无该 ID(被人手动删/清理过):阻断项,须让用户知道
         // 「这个服务回不去」—— 静默沿用当前镜像正是本批要根除的失效路径
