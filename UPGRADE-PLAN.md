@@ -3314,3 +3314,49 @@ migrate_project.rs:兜底命中入列带标记与识别说明 / 显式声明无�
 - **截图自检 PASS**:judge 子代理因 provider 故障不可用,按协议回退自行逐张检查
   (三张:预检结果 / 开机自启 / 常驻按钮;均无红色、无青色前景字、圆角 0、无裁切)
 - 桩文件已删、8798 服务已停、预览页已关
+
+# 补丁 v6.11.1:回滚中心(06 页)补上回滚预检(2026-09-19)
+
+> **来源**:用户实测反馈「回滚中心怎么没有回滚预检按钮」。
+
+## 为什么遗漏(根因)
+
+第二十九批 R1 我按「04 页一键回滚」的心智模型实现:`rollback_precheck` 与
+`rollback_execute_stack` 一样是 **projectId 驱动**,而 **06 回滚中心是目录驱动**
+(`dir` + `releaseTs`,不需要 projectId,该项目甚至不必在软件内配置)—— 所以 06 页
+**连调用都调不通**,自然没有按钮。
+
+**讽刺的是 06 页比 04 页更需要预检**:它是配置漂移(项目改名/被删/换目录)后的
+**唯一兜底入口**,而那正是「归档 manifest 里的项目名与当前配置不一致」的高发场景。
+
+## 修复
+
+- **命令双入口**:`rollback_precheck` 与 `rollback_execute_stack_at` 都扩为
+  「`projectId`(04 页路径,目录由配置推导)/ `dir`(06 页路径,绝对路径校验)」;
+  二者共用 `plan_rollback` 纯函数与同一个 `allowPartial` 语义(单一事实来源)。
+- **执行链注入**:`rollback_execute_stack_at_inner` 补上与 04 页同款的预检段
+  (manifest 读取之后、任何 `docker load` 之前);阻断 → `RollbackPrecheck` 错误码。
+- **前端**:06 页 `renderConfirm` 增「回滚预检」按钮 + 结果区(与 04 页同口径:
+  阻断项置顶、徽章区分、按钮变「仍要回滚(部分)」);`planStackRollback` 的 `run`
+  接受 `allowPartial`。**单镜像回滚不显示预检按钮**(无 manifest 可查)。
+
+## 桩验证抓到的第二个 bug
+
+首版 06 页预检结果区**不可见**(`boxVisible: false`):我复制了 04 页的交互,
+但漏了 `classList.remove('hidden')` —— 结果区带着初始 `hidden` 类。
+**DOM 断言说按钮都在、文案都对,只有截图暴露了它不可见** —— 这正是「桩验证要看图」
+而非只看 DOM 的价值。已修。
+
+## 守护
+
+`verify/user-facing-copy.js` 第 5 节扩为**断言两个入口都有预检**(19 项):
+06 页调 `rollback_precheck` / 出现「回滚预检」文案 / 执行时传 `allowPartial`。
+这条守护的存在意味着:**未来若有人只改一处入口,脚本会红**。
+
+## 验证
+
+- `cargo test` **474 passed / 13 ignored**(命令数 114 不变 —— 只改参数,无新命令)
+- `cargo clippy --all-targets` 与基线 **20 条一致,零新增**
+- `node --check` rollback.js;verify **六**脚本 PASS(user-facing-copy 19 项)
+- **桩验证**:06 页预检端到端(项目行 → 明细 → 回滚到此归档 → 回滚预检 →
+  结果区可见 + 阻断项置顶 + 按钮变「仍要回滚(部分)」);截图自检 PASS

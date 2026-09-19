@@ -1,6 +1,6 @@
 {
   "name": "docker-deploy-ssh",
-  "version": "6.11.0",
+  "version": "6.11.1",
   "description": "",
   "main": "index.js",
   "directories": {

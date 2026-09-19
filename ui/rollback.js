@@ -889,7 +889,9 @@
       kind: 'stack',
       dir: dir,
       ts: ts,
-      run: function () {
+      // 预检上下文(供 renderConfirm 的「回滚预检」按钮调用)
+      precheck: { dir: dir, ts: ts },
+      run: function (allowPartial) {
         var server = currentServer();
         if (!server) return Promise.resolve();
         // 跨页互斥:04 页部署/批量进行中时不发起(共享锁,与 deploy.js 双向)
@@ -908,7 +910,9 @@
         return window.AppBus.invoke('rollback_execute_stack_at', {
           serverId: server.id,
           dir: dir,
-          releaseTs: ts
+          releaseTs: ts,
+          // 预检已把阻断项展示给用户 → 允许部分回滚(R1;与 04 页同口径)
+          allowPartial: allowPartial === true
         }).catch(function (err) {
           window.ddRemoteOp = null;
           setBusy(false);
@@ -949,6 +953,7 @@
       var defaultTarget = repository + ':latest';
       pending = {
         kind: 'single',
+        // 第二参数忽略(单镜像回滚无 manifest 可预检;签名与整栈对齐便于统一调用)
         run: function (targetRef) {
           var server = currentServer();
           if (!server) return Promise.resolve();
@@ -1022,9 +1027,32 @@
     ok.type = 'button';
     var cancel = el('button', 'btn', '取消');
     cancel.type = 'button';
+
+    // 回滚预检(R1;第二十九批;06 回滚中心路径):
+    // 与 04 页同款交互(先预检 → 看结果 → 再确认),但这里**不强制**先预检 ——
+    // 本页允许直接执行(单镜像回滚无 manifest 可查,不适用预检)。
+    // 整栈回滚点「回滚预检」时,结果就地展示在本面板内,阻断项执行按钮改文案。
+    var preWrap = null;
+    var precheckBtn = null;
+    if (pending && pending.precheck) {
+      precheckBtn = el('button', 'btn', '回滚预检');
+      precheckBtn.type = 'button';
+      precheckBtn.title = '核对每个服务在该归档里的镜像来源(归档内有包 / 服务器上按镜像 ID 命中 / 回不去)';
+      preWrap = el('div', 'rb-precheck hidden');
+      preWrap.id = 'rb-precheck-box';
+      box.appendChild(preWrap);
+    }
+
     actions.appendChild(cancel);
+    if (precheckBtn) actions.appendChild(precheckBtn);
     actions.appendChild(ok);
     box.appendChild(actions);
+
+    if (precheckBtn) {
+      precheckBtn.addEventListener('click', function () {
+        runPagePrecheck(precheckBtn, ok, preWrap);
+      });
+    }
 
     cancel.addEventListener('click', function () {
       pending = null;
@@ -1039,9 +1067,81 @@
         showError('目标标签不能为空');
         return;
       }
+      var allowPartial = !!(plan.precheckResult && plan.precheckResult.hasBlocking);
       pending = null;
-      plan.run(target).catch(function () { /* 错误已记入日志 */ });
+      plan.run(target, allowPartial).catch(function () { /* 错误已记入日志 */ });
     });
+  }
+
+  /**
+   * 06 页回滚预检(R1;第二十九批):按目录查(本页无 projectId),
+   * 结果就地展示 —— 与 04 页同一后端命令、同一展示口径。
+   */
+  function runPagePrecheck(btn, okBtn, box) {
+    var plan = pending;
+    if (!plan || !plan.precheck) return;
+    var server = currentServer();
+    if (!server) { showError('请先选择服务器'); return; }
+    window.setBtnBusy(btn, true, '预检中…');
+    box.classList.remove('hidden'); // 结果区初始 hidden(与 04 页同款);此处揭示
+    box.textContent = '';
+    box.appendChild(el('div', 'rb-precheck-title', '回滚可用性预检中…'));
+    if (okBtn) okBtn.disabled = true;
+    window.AppBus.invoke('rollback_precheck', {
+      serverId: server.id,
+      dir: plan.precheck.dir,
+      releaseTs: plan.precheck.ts
+    })
+      .then(function (res) {
+        window.setBtnBusy(btn, false, '回滚预检');
+        plan.precheckResult = res || null;
+        renderPagePrecheckResult(res || {}, box, okBtn);
+      })
+      .catch(function (err) {
+        window.setBtnBusy(btn, false, '回滚预检');
+        box.textContent = '';
+        box.appendChild(el('div', 'rb-precheck-title', '预检失败'));
+        box.appendChild(el('div', 'rb-precheck-detail', errText(err) || '未知错误'));
+        if (okBtn) okBtn.disabled = false; // 预检失败不阻断执行(用户自行判断)
+      });
+  }
+
+  /** 渲染 06 页预检结果(与 04 页同口径:阻断项置顶 + 逐行说明) */
+  function renderPagePrecheckResult(res, box, okBtn) {
+    box.textContent = '';
+    if (res.noManifest) {
+      box.appendChild(el('div', 'rb-precheck-title',
+        '该归档无发布清单(旧版本或未完成的部署),无法逐服务核对;将按目录内的镜像包恢复'));
+      if (okBtn) okBtn.disabled = false;
+      return;
+    }
+    var items = Array.isArray(res.items) ? res.items : [];
+    box.appendChild(el('div', 'rb-precheck-title',
+      '共 ' + items.length + ' 个服务:归档内有包 ' + (res.archived || 0) +
+      ' · 服务器上按镜像 ID 命中 ' + (res.remoteById || 0) +
+      (res.missing ? ' · 回不去 ' + res.missing : '') +
+      (res.unknown ? ' · 无法核对 ' + res.unknown : '')));
+    var sorted = items.slice().sort(function (a, b) {
+      return (b.blocking ? 1 : 0) - (a.blocking ? 1 : 0);
+    });
+    sorted.forEach(function (it) {
+      var row = el('div', 'rb-precheck-row' + (it.blocking ? ' is-blocking' : ''));
+      row.appendChild(window.fillBadge(el('span'),
+        it.blocking ? 'fail' : 'ok', it.blocking ? '回不去' : '可用'));
+      row.appendChild(el('span', 'rb-precheck-svc', String(it.service || '')));
+      row.appendChild(el('span', 'rb-precheck-detail', String(it.detail || '')));
+      box.appendChild(row);
+    });
+    if (okBtn) {
+      okBtn.disabled = false;
+      if (res.hasBlocking) {
+        okBtn.textContent = '仍要回滚(部分)';
+        okBtn.title = '上述「回不去」的服务将沿用服务器当前镜像,版本可能与归档不一致';
+      } else {
+        okBtn.textContent = '确认执行回滚';
+        okBtn.title = '';
+      }
+    }
   }
 
   // ===== 初始化与页面进出 =====

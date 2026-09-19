@@ -117,8 +117,20 @@ console.log('\n=== 4. 06 页回滚可取消的接线 ===');
 }
 
 // ===== 5. 回滚预检的 UI 契约 =====
-console.log('\n=== 5. 回滚预检 UI 契约(前后端字段名对齐) ===');
+console.log('\n=== 5. 回滚预检 UI 契约(前后端字段名对齐;两个入口) ===');
 {
+  // 第二十九批补:预检必须**两个入口都有** —— 04 页(项目 id 驱动)与
+  // 06 回滚中心(目录驱动)。首版只做了 04 页,用户实测发现 06 页没有按钮;
+  // 而 06 页恰是配置漂移(项目改名/被删)后的兜底入口,比 04 页更需要预检。
+  const rbPage = read(ROLLBACK_UI) || '';
+  ok(/rollback_precheck/.test(rbPage),
+    'rollback.js(06 回滚中心)也调 rollback_precheck',
+    '两个入口都必须能预检;06 页传 dir(无 projectId)');
+  ok(/回滚预检/.test(rbPage),
+    '06 页界面出现「回滚预检」按钮文案');
+  ok(/allowPartial/.test(rbPage),
+    '06 页执行时传 allowPartial(确认后允许部分回滚)');
+
   const drb = read(DEPLOY_ROLLBACK_UI) || '';
   // 前端读的 camelCase 字段必须与后端契约一致(读错 = 静默 undefined)
   ok(/rollback_precheck/.test(drb),
