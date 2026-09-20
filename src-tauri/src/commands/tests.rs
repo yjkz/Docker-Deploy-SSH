@@ -1,5 +1,6 @@
     use super::*;
     use crate::config::{save_config, AuthConfig, TransferMode};
+    use crate::stack::{detect_image_env_drift, image_refs_with_env};
 
     // ===== 清理分析纯函数(第三批)=====
 
@@ -2819,19 +2820,17 @@ services:
 
     #[test]
     fn test_rollback_precheck_id_present_but_tag_moved_away() {
-        // **补丁审查发现的漏洞(第二十九批 R1 首版)** —— 跳过服务的镜像 ID 仍在
-        // 服务器上,但 **compose 期望的 tag 已被别的 ID 占用**时,首版预检只看
-        // 「ID 在不在」→ 判「可用」。这是错的:
+        // **第二十九批补丁**发现:跳过服务的镜像 ID 仍在服务器上,但 compose
+        // 期望的 tag 已被别的 ID 占用时,首版预检只看「ID 在不在」→ 判「可用」。
+        // 这是错的:整栈回滚当时**没有 `docker tag` 步骤**,跳过服务没有包,
+        // `up -d` 按 tag 找不到归档版本 → 静默沿用了新版本。
         //
-        // 整栈回滚路径**没有 `docker tag` 步骤**(只有单镜像回滚有,见
-        // `docker_tag_cmd` 的唯一调用点),它依赖 `docker load` 从包内恢复标签;
-        // 而跳过的服务**没有包**,于是 `compose up -d` 按 compose 里的
-        // `repo:tag` 去找 —— 那个 tag 现在指向别的 ID(新版本)。
-        // 结果:预检说可用、界面报「回滚完成」,服务实际没回退 —— 正是本批要
-        // 根除的那类静默失效,只是换了个触发路径。
-        //
-        // 正确判定:ID 存在 **且** 该 ID 被 compose 期望的 tag 引用(或该 tag
-        // 缺失但 ID 存在 —— 那种情况 docker 侧仍可按 ID 用,由调用方决定)。
+        // **v6.12.0 修正**:执行链 up 前新增「按 ID 收敛」步骤(ID 还在就把
+        // 标签指回,零拷贝),所以这种状态不再是「回不去」,而是可恢复的
+        // 中间态 —— 归 `RemoteByIdTagMoved`(契约 source 串 `tagRestore`),
+        // **不再阻断**,但 UI 必须显式展示「将自动指回」而非静默。
+        // (真机案例:goodlaser-backend:latest 指向 265b2e14d9a6,归档 ID
+        //  c313095267ee 仍挂在其它标签下 —— 旧行为报「回不去」,用户无出路。)
         let images = vec![mimg("db", "postgres:16", None, Some("sha256:bbb"))];
         // 远端:ID bbb 仍存在,但挂在别的 tag 下;postgres:16 已被 ccc 占
         let remote = vec![
@@ -2841,14 +2840,14 @@ services:
         let plan = plan_rollback(&images, &remote);
         assert_eq!(
             plan[0].source,
-            RollbackImageSource::Missing,
-            "ID 在但期望 tag 已指向别的镜像 → 不能算可用(up -d 会拉起新版)"
+            RollbackImageSource::RemoteByIdTagMoved,
+            "ID 在、tag 被占 → 可自动指回的中间态(v6.12.0 起不再判 Missing)"
         );
-        assert!(plan[0].blocking, "应阻断:否则又是静默失效");
-        // 文案要点出「标签已指向别的镜像」(用户据此判断为何回不去)
+        assert!(!plan[0].blocking, "可指回 → 不阻断(否则用户真机场景无出路)");
+        // 文案要点出「标签已指向别的镜像」+「将自动指回」
         assert!(
-            plan[0].detail.contains("指向") && plan[0].detail.contains("不是本次归档的版本"),
-            "文案应说明标签被占用且后果: {}",
+            plan[0].detail.contains("指回") && plan[0].detail.contains("其它的标签"),
+            "文案应说明标签被占用且将自动指回: {}",
             plan[0].detail
         );
     }
@@ -2976,6 +2975,334 @@ services:
             Some(crate::errors::ErrCode::RollbackPrecheck)
         );
         assert_eq!(crate::errors::ErrCode::RollbackPrecheck.as_str(), "rollback_precheck");
+    }
+
+    #[test]
+    fn test_rollback_precheck_tag_moved_counts_and_no_block() {
+        // 四态计数:tagRestore(可自动指回)单独一列,且**不计入阻断**
+        let images = vec![
+            mimg("web", "myapp:20260919", Some("web.tar.gz"), Some("aaa")),
+            mimg("db", "postgres:16", None, Some("sha256:bbb")),
+            mimg("cache", "redis:7", None, Some("sha256:ccc")),
+        ];
+        let remote = vec![
+            ("postgres:16".to_string(), "sha256:bbb".to_string()),
+            ("redis:7".to_string(), "sha256:zzz".to_string()),
+            ("redis:7-old".to_string(), "sha256:ccc".to_string()),
+        ];
+        let plan = plan_rollback(&images, &remote);
+        let s = rollback_precheck_summary(&plan);
+        assert_eq!(s.archived, 1);
+        assert_eq!(s.remote_by_id, 1);
+        assert_eq!(s.tag_restore, 1, "tag 被占但 ID 在 → 计 tag_restore");
+        assert_eq!(s.missing, 0);
+        assert!(!s.has_blocking(), "可自动指回的服务不构成阻断");
+        // 契约 source 串:前端按串渲染中间态
+        assert_eq!(rollback_source_str(RollbackImageSource::RemoteByIdTagMoved), "tagRestore");
+    }
+
+    // ===== v6.12.0:按镜像 ID 收敛(plan_tag_convergence)=====
+
+    #[test]
+    fn test_tag_convergence_retags_when_tag_moved() {
+        // 真机案例的治愈路径:ID 还在、tag 被占 → 出「指回」动作(零拷贝)
+        let images = vec![mimg("backend", "goodlaser-backend:latest", None, Some("sha256:c313"))];
+        let remote = vec![
+            ("goodlaser-backend:latest".to_string(), "sha256:265b".to_string()),
+            ("goodlaser-backend:20260901".to_string(), "sha256:c313".to_string()),
+        ];
+        let c = plan_tag_convergence(&images, &remote);
+        assert_eq!(c.retag.len(), 1);
+        assert_eq!(c.retag[0].0, "backend", "服务名(日志/历史按它归因)");
+        assert_eq!(c.retag[0].1, "sha256:c313", "源 = 归档记录的镜像 ID");
+        assert_eq!(c.retag[0].2, "goodlaser-backend:latest", "目标 = compose 期望的 tag");
+        assert!(c.missing.is_empty());
+        // 生成的命令用 ID 指回标签
+        let cmd = docker_tag_cmd(&c.retag[0].1, &c.retag[0].2);
+        assert!(cmd.starts_with("docker tag "), "{}", cmd);
+        assert!(cmd.contains("c313") && cmd.contains("goodlaser-backend:latest"), "{}", cmd);
+    }
+
+    #[test]
+    fn test_tag_convergence_noop_when_aligned() {
+        // 已经对齐(tag 正指向归档 ID)→ 无动作,不该白白 retag
+        let images = vec![mimg("db", "postgres:16", None, Some("sha256:bbb"))];
+        let remote = vec![("postgres:16".to_string(), "sha256:bbb".to_string())];
+        let c = plan_tag_convergence(&images, &remote);
+        assert!(c.retag.is_empty(), "已对齐不产生动作");
+        assert!(c.missing.is_empty());
+    }
+
+    #[test]
+    fn test_tag_convergence_tag_absent_still_retags() {
+        // tag 整个不存在(被删)但 ID 还在 → 直接建标签(同样零拷贝可救)
+        let images = vec![mimg("db", "postgres:16", None, Some("sha256:bbb"))];
+        let remote = vec![("other:1".to_string(), "sha256:bbb".to_string())];
+        let c = plan_tag_convergence(&images, &remote);
+        assert_eq!(c.retag.len(), 1, "ID 在就能建回标签");
+        assert_eq!(c.retag[0].2, "postgres:16");
+    }
+
+    #[test]
+    fn test_tag_convergence_missing_id_is_blocking_case() {
+        // ID 真丢了 → 收敛不了,交给调用方阻断(这是唯一真正的「回不去」)
+        let images = vec![mimg("db", "postgres:16", None, Some("sha256:bbb"))];
+        let remote = vec![("postgres:16".to_string(), "sha256:ccc".to_string())];
+        let c = plan_tag_convergence(&images, &remote);
+        assert!(c.retag.is_empty());
+        assert_eq!(c.missing.len(), 1);
+        assert_eq!(c.missing[0].0, "db");
+        assert_eq!(c.missing[0].1, "postgres:16");
+    }
+
+    #[test]
+    fn test_tag_convergence_skips_archived_and_idless() {
+        // 有包的服务(Archived)不参与 ID 收敛:包内标签以 load 为准,
+        // 且 list 里可能查不到(尚未 load);无 ID 的旧归档同样跳过。
+        let images = vec![
+            mimg("web", "myapp:1", Some("web.tar.gz"), Some("aaa")),
+            mimg("old", "legacy:1", None, None),
+        ];
+        let remote: Vec<(String, String)> = vec![];
+        let c = plan_tag_convergence(&images, &remote);
+        assert!(c.retag.is_empty(), "有包/无 ID 的服务不由 ID 收敛处理");
+        assert!(c.missing.is_empty(), "不应误报缺失(有包走装载,无 ID 走原降级)");
+    }
+
+    #[test]
+    fn test_tag_convergence_prefix_tolerant() {
+        // 与既有 same_image_id 同口径:一方带 sha256: 前缀一方不带仍算同
+        let images = vec![mimg("db", "postgres:16", None, Some("bbb"))];
+        let remote = vec![("postgres:16".to_string(), "sha256:bbb".to_string())];
+        let c = plan_tag_convergence(&images, &remote);
+        assert!(c.retag.is_empty(), "前缀差异不应触发多余的 retag");
+        assert!(c.missing.is_empty());
+    }
+
+    #[test]
+    fn test_tag_convergence_query_failed_all_missing() {
+        // 远端列表不可得(查询失败)时不能当成「ID 都在」—— 调用方用
+        // remote_available=false 表达,收敛计划应把全部项交回由调用方判定
+        // (保守:missing 列出,文案与预检同口径「重试」而非「丢了」)。
+        let images = vec![mimg("db", "postgres:16", None, Some("sha256:bbb"))];
+        let c = plan_tag_convergence(&images, &[]);
+        assert_eq!(c.missing.len(), 1, "查不到列表 → 不能静默放行");
+        assert!(c.retag.is_empty());
+    }
+
+    // ===== v6.12.0:清单驱动装载(select_packages)=====
+
+    #[test]
+    fn test_select_packages_only_manifest_recorded() {
+        // 目录里有 manifest 未记录的 tar → 必须跳过(第二十九批遗留的
+        // 反向校验缺口:此前按 ls 全量装载,多余包会覆盖标签且无提示)
+        let images = vec![
+            mimg("web", "myapp:1", Some("web.tar.gz"), Some("aaa")),
+            mimg("db", "postgres:16", None, Some("bbb")),
+        ];
+        let actual = vec![
+            "web.tar.gz".to_string(),
+            "stray-old.tar.gz".to_string(), // 目录里的多余包(人工放入/残留)
+            "manifest.json".to_string(),
+        ];
+        let sel = select_packages(&images, &actual);
+        assert_eq!(sel.to_load, vec!["web.tar.gz".to_string()], "只装载清单记录的包");
+        assert_eq!(sel.unrecorded, vec!["stray-old.tar.gz".to_string()], "多余包单列并告警");
+        assert!(sel.recorded_missing.is_empty());
+    }
+
+    #[test]
+    fn test_select_packages_reports_recorded_missing() {
+        // manifest 记录的包不在目录里 → 单列(预检已阻断;执行侧防御性再报一次)
+        let images = vec![mimg("web", "myapp:1", Some("web.tar.gz"), Some("aaa"))];
+        let actual = vec!["manifest.json".to_string()];
+        let sel = select_packages(&images, &actual);
+        assert!(sel.to_load.is_empty());
+        assert_eq!(sel.recorded_missing, vec!["web.tar.gz".to_string()]);
+    }
+
+    #[test]
+    fn test_select_packages_no_manifest_loads_nothing() {
+        // 无清单(旧归档)时不能盲装全部:调用方按「无清单降级」处理。
+        // 空 images(无 manifest) → to_load 空、unrecorded 列出全部目录包,
+        // 由调用方决定是否降级为「按包恢复」(现状行为)。
+        let actual = vec!["a.tar.gz".to_string(), "b.tar.gz".to_string()];
+        let sel = select_packages(&[], &actual);
+        assert!(sel.to_load.is_empty());
+        assert_eq!(sel.unrecorded.len(), 2, "无清单时所有包都属未记录,交由调用方决策");
+    }
+
+    #[test]
+    fn test_select_packages_skips_non_tar_directory_entries() {
+        // 目录清单里的非包文件(compose 副本 / override .ddbak)不参与
+        let images = vec![mimg("web", "myapp:1", Some("web.tar.gz"), Some("aaa"))];
+        let actual = vec![
+            "web.tar.gz".to_string(),
+            "docker-compose.yml".to_string(),
+            "compose.override.yml.ddbak".to_string(),
+        ];
+        let sel = select_packages(&images, &actual);
+        assert_eq!(sel.to_load, vec!["web.tar.gz".to_string()]);
+        assert!(sel.unrecorded.is_empty(), "非包文件不该进告警清单");
+    }
+
+    // ===== v6.12.0:插值漂移检测(manifest 的 tag 即部署时插值结果)=====
+
+    #[test]
+    fn test_image_env_drift_detected_and_attributed() {
+        use std::collections::HashMap;
+        // 归档 compose 里 image 用 ${TAG} 引用;manifest 记录的是部署当时插值出的 tag
+        let compose = "services:\n  web:\n    image: ${REG}/app:${TAG}\n  db:\n    image: postgres:16\n";
+        let mut env = HashMap::new();
+        env.insert("REG".to_string(), "registry.example.com".to_string());
+        env.insert("TAG".to_string(), "v2".to_string()); // 部署后被改过(v1 → v2)
+        let refs = image_refs_with_env(compose, &[], &env).expect("compose 应可解析");
+        // manifest 记录部署当时的引用:.../app:v1
+        let manifest = vec![
+            ("web".to_string(), "registry.example.com/app:v1".to_string()),
+            ("db".to_string(), "postgres:16".to_string()),
+        ];
+        let drift = detect_image_env_drift(&refs, &manifest);
+        assert_eq!(drift.len(), 1, "只有引用变量的服务会被判定漂移: {:?}", drift);
+        assert_eq!(drift[0].service, "web");
+        assert_eq!(drift[0].expected, "registry.example.com/app:v1");
+        assert_eq!(drift[0].resolved, "registry.example.com/app:v2");
+    }
+
+    #[test]
+    fn test_image_env_no_drift_when_unchanged() {
+        use std::collections::HashMap;
+        let compose = "services:\n  web:\n    image: ${REG}/app:${TAG}\n";
+        let mut env = HashMap::new();
+        env.insert("REG".to_string(), "registry.example.com".to_string());
+        env.insert("TAG".to_string(), "v1".to_string());
+        let refs = image_refs_with_env(compose, &[], &env).unwrap();
+        let manifest = vec![("web".to_string(), "registry.example.com/app:v1".to_string())];
+        assert!(detect_image_env_drift(&refs, &manifest).is_empty(), "值未变不该报漂移");
+    }
+
+    #[test]
+    fn test_image_env_drift_ignores_services_without_vars() {
+        use std::collections::HashMap;
+        // 不引用变量的 image 与 .env 无关 → 永不漂移(避免噪音)
+        let compose = "services:\n  db:\n    image: postgres:16\n";
+        let refs = image_refs_with_env(compose, &[], &HashMap::new()).unwrap();
+        let manifest = vec![("db".to_string(), "postgres:16".to_string())];
+        assert!(detect_image_env_drift(&refs, &manifest).is_empty());
+        // 即便 manifest 记的 tag 与 compose 解析结果不同,也不算漂移(非变量所致,
+        // 属 compose/manifest 不一致,由执行链其它检查覆盖)
+        let manifest2 = vec![("db".to_string(), "postgres:17".to_string())];
+        assert!(detect_image_env_drift(&refs, &manifest2).is_empty(), "无变量不参与漂移判定");
+    }
+
+    #[test]
+    fn test_image_env_drift_sees_override_image_override() {
+        use std::collections::HashMap;
+        // override 改写 image 时,漂移检测必须看到 override 后的版本(与解析同源)
+        let compose = "services:\n  web:\n    image: ${REG}/app:${TAG}\n";
+        let ov_text = "services:\n  web:\n    image: ${REG}/app:edge\n";
+        let mut env = HashMap::new();
+        env.insert("REG".to_string(), "r.io".to_string());
+        env.insert("TAG".to_string(), "v1".to_string());
+        let refs = image_refs_with_env(compose, &[ov_text.to_string()], &env).unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].resolved, "r.io/app:edge", "override 优先(与部署解析一致)");
+        let manifest = vec![("web".to_string(), "r.io/app:v1".to_string())];
+        let drift = detect_image_env_drift(&refs, &manifest);
+        assert_eq!(drift.len(), 1, "override 后的引用与 manifest 不符 → 漂移");
+    }
+
+    #[test]
+    fn test_image_env_drift_unset_var_changes_resolution() {
+        use std::collections::HashMap;
+        // 「变量在部署时定义了、后来被删」同样改变插值结果 → 必须报漂移
+        let compose = "services:\n  web:\n    image: myapp:${TAG}\n";
+        let refs = image_refs_with_env(compose, &[], &HashMap::new()).unwrap();
+        let manifest = vec![("web".to_string(), "myapp:v1".to_string())];
+        let drift = detect_image_env_drift(&refs, &manifest);
+        assert_eq!(drift.len(), 1, "变量消失同样让引用漂移: {:?}", drift);
+        assert_eq!(drift[0].resolved, "myapp:", "未定义 → 插值为空(与 run 时同口径)");
+    }
+
+    #[test]
+    fn test_image_refs_with_env_reports_has_vars() {
+        use std::collections::HashMap;
+        let compose = "services:\n  a:\n    image: plain:1\n  b:\n    image: ${X}:1\n";
+        let mut env = HashMap::new();
+        env.insert("X".to_string(), "reg".to_string());
+        let refs = image_refs_with_env(compose, &[], &env).unwrap();
+        assert_eq!(refs.len(), 2);
+        assert!(!refs[0].has_vars, "纯字面量 → 无变量");
+        assert!(refs[1].has_vars);
+        assert_eq!(refs[0].raw, "plain:1");
+    }
+
+    // ===== v6.12.0:up 后运行镜像校验(容器实际 ID)=====
+
+    #[test]
+    fn test_container_mismatch_detection() {
+        // up 后按容器实际镜像 ID 核对(兜 .env 漂移 / compose 未重建等残余路径)
+        let expected = vec![
+            ("web".to_string(), "sha256:aaa".to_string()),
+            ("db".to_string(), "sha256:bbb".to_string()),
+        ];
+        // web 跑对了;db 实际跑的是 ccc(≠ 期望 bbb)
+        let actual = vec![
+            ("web".to_string(), "sha256:aaa".to_string()),
+            ("db".to_string(), "sha256:ccc".to_string()),
+        ];
+        let m = select_container_image_mismatches(&expected, &actual);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].0, "db");
+        assert_eq!(m[0].1, "sha256:bbb", "期望值");
+        assert_eq!(m[0].2, "sha256:ccc", "实际值");
+    }
+
+    #[test]
+    fn test_container_mismatch_missing_container_counts_too() {
+        // 服务没有对应容器(up 失败/被 scale 0)→ 同样算不一致(不能静默)
+        let expected = vec![
+            ("web".to_string(), "sha256:aaa".to_string()),
+            ("worker".to_string(), "sha256:bbb".to_string()),
+        ];
+        let actual = vec![("web".to_string(), "sha256:aaa".to_string())];
+        let m = select_container_image_mismatches(&expected, &actual);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].0, "worker");
+        assert!(m[0].2.is_empty(), "无容器 → 实际值空串");
+    }
+
+    #[test]
+    fn test_container_mismatch_prefix_tolerant() {
+        // 与全仓 ID 比较同口径:sha256: 前缀差异不算不一致
+        let expected = vec![("web".to_string(), "aaa".to_string())];
+        let actual = vec![("web".to_string(), "sha256:aaa".to_string())];
+        assert!(select_container_image_mismatches(&expected, &actual).is_empty());
+    }
+
+    #[test]
+    fn test_parse_compose_service_images_single_roundtrip() {
+        // up 后校验的批量解析:一次 docker inspect 拿全部容器的 (服务, 镜像 ID)
+        // (逐服务 ps+inspect 会 2×N 次往返;批量只 2 次)
+        let out = "web|sha256:aaa\n db |sha256:bbb\n\nignored-no-pipe\n|sha256:ccc\n";
+        let v = parse_compose_service_images(out);
+        assert_eq!(v.len(), 2, "无管道行 / 服务名空的行跳过: {:?}", v);
+        assert_eq!(v[0], ("web".to_string(), "sha256:aaa".to_string()));
+        assert_eq!(v[1], ("db".to_string(), "sha256:bbb".to_string()));
+    }
+
+    #[test]
+    fn test_verify_expected_table_skips_idless() {
+        // up 后校验的期望表:只取有 ID 的服务(旧归档/采集失败无从比对)
+        let images = vec![
+            mimg("web", "myapp:1", Some("web.tar.gz"), Some("aaa")),
+            mimg("old", "legacy:1", None, None),
+            mimg("db", "postgres:16", None, Some("sha256:bbb")),
+        ];
+        let expected = expected_images_from_manifest(&images);
+        assert_eq!(expected.len(), 2, "无 ID 的服务不入期望表: {:?}", expected);
+        assert_eq!(expected[0], ("web".to_string(), "aaa".to_string()));
+        assert_eq!(expected[1], ("db".to_string(), "sha256:bbb".to_string()));
     }
 
     #[test]

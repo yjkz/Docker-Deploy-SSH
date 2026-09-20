@@ -25,13 +25,37 @@ pub enum RollbackImageSource {
     /// 归档内有镜像包 → `docker load` 使用(本次部署变化过的服务)
     Archived,
     /// 归档内无包(**智能传输跳过**),但远端仍持有 manifest 记录的镜像 ID
-    /// → 直接可用,无需重新上传(这是 R1 要支持的核心场景)
+    /// **且该标签正指向它** → 直接可用,无需重新上传(这是 R1 要支持的核心场景)
     RemoteById,
+    /// 归档内无包、远端**仍持有该镜像 ID**,但 compose 期望的标签已指向别的
+    /// ID(v6.12.0 新增):执行链 up 前会以「按 ID 收敛」步骤把标签**零拷贝
+    /// 指回**该 ID,故不是「回不去」,但必须显式展示(真机案例:
+    /// goodlaser-backend:latest 指向 265b2e14d9a6,归档 ID c313095267ee 仍在
+    /// 服务器上挂于其它标签 —— 旧行为报「回不去」,用户毫无出路)。
+    RemoteByIdTagMoved,
     /// 跳过且远端已无该 ID:旧镜像已被覆盖或清理 —— **回滚不了这个服务**,
     /// 必须让用户知道(此前是静默沿用当前镜像,界面还报「回滚完成」)
     Missing,
     /// 旧归档(manifest 无 id 记录):无从核对,保守标阻断并给指引
     Unknown,
+}
+
+impl RollbackImageSource {
+    /// 契约串(camelCase 返回体里的 `source` 字段;前端据此渲染四态)。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RollbackImageSource::Archived => "archived",
+            RollbackImageSource::RemoteById => "remoteById",
+            RollbackImageSource::RemoteByIdTagMoved => "tagRestore",
+            RollbackImageSource::Missing => "missing",
+            RollbackImageSource::Unknown => "unknown",
+        }
+    }
+}
+
+/// [`RollbackImageSource`] → 契约串(测试与调用方便捷入口;同 [`RollbackImageSource::as_str`])。
+pub fn rollback_source_str(source: RollbackImageSource) -> &'static str {
+    source.as_str()
 }
 
 /// 单个服务的回滚可用性结论。
@@ -51,6 +75,8 @@ pub struct RollbackImagePlan {
 pub struct RollbackPrecheckSummary {
     pub archived: usize,
     pub remote_by_id: usize,
+    /// tag 被占、但 ID 仍在 → 执行时可自动指回(v6.12.0;不计入阻断)
+    pub tag_restore: usize,
     pub missing: usize,
     pub unknown: usize,
 }
@@ -198,21 +224,23 @@ pub fn plan_rollback_full(
                             ),
                         }
                     } else if id_present {
-                        // ID 还在,但期望的 tag 已指向别的镜像 → up -d 会拉起新版
+                        // ID 还在,但期望的 tag 已指向别的镜像 → v6.12.0 起不再是
+                        // 死路:执行链 up 前按 ID 收敛(零拷贝 docker tag 指回)。
+                        // 仍显式展示,让用户知道执行时会动标签。
                         RollbackImagePlan {
                             service: img.service.clone(),
                             tag: img.tag.clone(),
-                            source: RollbackImageSource::Missing,
-                            blocking: true,
+                            source: RollbackImageSource::RemoteByIdTagMoved,
+                            blocking: false,
                             detail: match tag_now {
                                 Some(cur) => format!(
-                                    "{}:镜像 {} 仍存在于服务器(挂在其它的标签下),但该标签现在指向 {} —— 回滚后 compose 会按标签拉到那个版本,不是本次归档的版本",
+                                    "{}:镜像 {} 仍存在于服务器(挂在其它的标签下),该标签现指向 {} —— 执行时会自动把标签指回归档版本(零拷贝)",
                                     img.tag,
                                     short_id(id),
                                     short_id(&cur)
                                 ),
                                 None => format!(
-                                    "{}:镜像 {} 仍存在于服务器,但该标签已不存在 —— 回滚后 compose 无法按标签找到它",
+                                    "{}:镜像 {} 仍存在于服务器,但该标签已不存在 —— 执行时会自动按该 ID 重建标签",
                                     img.tag,
                                     short_id(id)
                                 ),
@@ -264,6 +292,7 @@ pub fn rollback_precheck_summary(plan: &[RollbackImagePlan]) -> RollbackPrecheck
         match p.source {
             RollbackImageSource::Archived => s.archived += 1,
             RollbackImageSource::RemoteById => s.remote_by_id += 1,
+            RollbackImageSource::RemoteByIdTagMoved => s.tag_restore += 1,
             RollbackImageSource::Missing => s.missing += 1,
             RollbackImageSource::Unknown => s.unknown += 1,
         }
@@ -279,10 +308,11 @@ pub fn rollback_precheck_block_message(
     sum: &RollbackPrecheckSummary,
 ) -> String {
     let mut lines = vec![format!(
-        "回滚可用性预检未通过:{} 个服务无法回退到该归档(归档内有包 {} 个、服务器上按镜像 ID 命中 {} 个)",
+        "回滚可用性预检未通过:{} 个服务无法回退到该归档(归档内有包 {} 个、服务器上按镜像 ID 命中 {} 个、标签待指回 {} 个)",
         sum.missing + sum.unknown,
         sum.archived,
-        sum.remote_by_id
+        sum.remote_by_id,
+        sum.tag_restore
     )];
     for p in plan.iter().filter(|p| p.blocking) {
         lines.push(format!("· {}", p.detail));
@@ -292,6 +322,294 @@ pub fn rollback_precheck_block_message(
     );
     lines.join("
 ")
+}
+
+/// 插值漂移的确认文案(纯函数,便于单测;v6.12.0)。
+///
+/// 与「回不去」同款:**必须逐条列出**哪个服务、归档记的什么、当前 `.env` 会
+/// 解析成什么 —— 只说「有 N 项漂移」对用户毫无行动价值(用户要去改 `.env`
+/// 或接受结果)。前端据错误码 `rollback_precheck` 弹「仍要回滚」确认。
+pub fn rollback_env_drift_message(drifted: &[ImageEnvDrift]) -> String {
+    let mut lines = vec![format!(
+        ".env 插值漂移预检未通过:{} 个服务的镜像引用会被服务器当前 .env 解析成与归档不同的值(.env 不入归档,回滚不恢复它)",
+        drifted.len()
+    )];
+    for d in drifted {
+        lines.push(format!(
+            "· {}:归档记录 {};按当前 .env 会解析成 {}",
+            d.service, d.expected, d.resolved
+        ));
+    }
+    lines.push(
+        "继续回滚将按当前 .env 解析出的引用启动这些服务(可能与归档版本不符)。如要精确回到归档版本,请先把服务器上的 .env 改回部署时的值;或选择「仍要回滚」接受现状。".to_string(),
+    );
+    lines.join("
+")
+}
+
+// ===== v6.12.0:按镜像 ID 收敛(up 前把标签指回归档 ID)=====
+
+/// 收敛计划:`(源 ref, 目标 tag)` 列表 —— 用 `docker tag <源> <目标>` 零拷贝
+/// 把 compose 期望的标签指回记录镜像 ID 的计划(统一形态,回滚/部署两侧共用)。
+pub struct TagConvergencePlan {
+    /// 需要执行的 `docker tag`(`(服务名, 镜像 ID 源, 目标标签)`)
+    pub retag: Vec<(String, String, String)>,
+    /// 收敛不了的服务名 + 展示引用(ID 已不在服务器)—— 由调用方决定是否阻断
+    pub missing: Vec<(String, String)>,
+}
+
+/// 「按 ID 收敛」的**唯一实现**(纯函数,便于单测;v6.12.0)。
+///
+/// 输入:`expectations` = 逐服务的 `(服务名, compose 期望的完整引用, 期望的镜像 ID)`;
+/// `remote` = 服务器当前镜像列表 `(repo:tag, id)`(`query_remote_images_full` 取得)。
+///
+/// **为什么需要**:预检/判定都只是**查询那一刻**的快照,而 `up -d` 一律按
+/// compose 里的 `repo:tag` 解析镜像 —— 二者之间隔着逐包 `docker load`(秒级
+/// 到分钟级)或整个上传过程,期间任何外部主体(另一台机器的本应用 / CI /
+/// watchtower)移动标签都会让结论失效(第二十九批记录的 TOCTOU 假设)。
+/// 治本 = up 前复核并**就地收敛**:记录过 ID 的服务,若标签没指向它,就用
+/// `docker tag <ID> <tag>` 指回(零拷贝,不需要重新传输)—— 真机案例
+/// `goodlaser-backend:latest` 指向 265b2e14d9a6、归档 ID c313095267ee 仍挂
+/// 在其它的标签下,旧行为直接报「回不去」,用户毫无出路。
+///
+/// **判定三态**:ID 不在 → 记入 `missing`(唯一真正的「收敛不了」);
+/// ID 在且标签已指向它 → 无动作;ID 在但标签指向别处/不存在 → 出 `retag`。
+///
+/// `remote` 不可得时调用方**不要**调用本函数(空列表会让所有项落入 `missing`)
+/// —— 那是「查询失败」而非「镜像丢失」,两者用户处置完全不同。
+pub fn plan_tag_convergence_pairs(
+    expectations: &[(String, String, String)],
+    remote: &[(String, String)],
+) -> TagConvergencePlan {
+    let mut retag: Vec<(String, String, String)> = Vec::new();
+    let mut missing: Vec<(String, String)> = Vec::new();
+    for (service, tag, id) in expectations {
+        let id = id.trim();
+        if id.is_empty() {
+            continue; // 未采集到 ID 的服务无从收敛(调用方另行降级)
+        }
+        if !remote_has_image_id(remote, id) {
+            missing.push((service.clone(), tag.clone()));
+            continue;
+        }
+        // ID 在:标签是否已指向它?(对齐则不产生多余动作)
+        let want = id.strip_prefix("sha256:").unwrap_or(id);
+        let tag_now = remote_id_of_tag(remote, tag);
+        if tag_now.as_deref() == Some(want) {
+            continue;
+        }
+        // 源用记录到的 ID(避开标签歧义),目标 = compose 期望的完整引用
+        retag.push((service.clone(), id.to_string(), tag.clone()));
+    }
+    TagConvergencePlan { retag, missing }
+}
+
+/// 回滚侧的收敛计划:`ManifestImage` → [`plan_tag_convergence_pairs`](唯一实现)。
+///
+/// 范围(与预检同口径):只处理「**无归档包**且记了 ID」的服务 ——
+/// - 有包的服务:标签由包内元数据恢复(`docker load`),不在此收敛
+///   (装载后标签必然正确;装载前查列表可能还看不到);
+/// - 无 ID 的旧归档:无从收敛,保持既有降级(预检已按另一口径阻断/放行)。
+pub fn plan_tag_convergence(
+    images: &[ManifestImage],
+    remote: &[(String, String)],
+) -> TagConvergencePlan {
+    let expectations: Vec<(String, String, String)> = images
+        .iter()
+        .filter(|img| {
+            // 有包 → 走装载通道,不参与 ID 收敛
+            !img.file
+                .as_deref()
+                .map(|f| !f.trim().is_empty())
+                .unwrap_or(false)
+        })
+        .filter_map(|img| {
+            img.id.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|id| (img.service.clone(), img.tag.clone(), id.to_string()))
+        })
+        .collect();
+    plan_tag_convergence_pairs(&expectations, remote)
+}
+
+// ===== v6.12.0:清单驱动装载(目录里多余的包不再静默装载)=====
+
+/// 装载选择结果(纯函数产物;见 [`select_packages`])。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageSelection {
+    /// 应装载的包(manifest 记录 ∩ 目录实际存在;**按 manifest 顺序**)
+    pub to_load: Vec<String>,
+    /// manifest 记录的包不在目录里(预检已阻断;执行侧防御性再报)
+    pub recorded_missing: Vec<String>,
+    /// 目录里存在但 manifest 未记录的 `.tar.gz`(不再静默装载)
+    pub unrecorded: Vec<String>,
+}
+
+/// 按 manifest 选择要装载的包(纯函数,便于单测;v6.12.0)。
+///
+/// **为什么需要**(第二十九批遗留的「无反向校验」):装载循环此前按目录
+/// `ls` 结果**全量**装载 —— 目录里若有 manifest 未记录的 tar(人工放入、
+/// 半成品残留),会被照常 `docker load`,其包内标签静默覆盖服务器现状,
+/// 而预检/界面毫无提示。修正后:只装载 manifest 记录的包,未记录的跳过并
+/// 警告,记录的包缺失则单列(预检已阻断,这里再报是防御性冗余)。
+///
+/// `images` 为空(无 manifest 的旧归档)时 `to_load` 为空、目录里的包全部
+/// 归入 `unrecorded` —— 由调用方决定是否降级为「按包恢复」并给出提示
+/// (现状行为,不静默)。
+pub fn select_packages(images: &[ManifestImage], actual_files: &[String]) -> PackageSelection {
+    let is_tar = |f: &str| f.ends_with(".tar.gz");
+    let recorded: Vec<&str> = images
+        .iter()
+        .filter_map(|i| i.file.as_deref())
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .collect();
+    let mut to_load: Vec<String> = Vec::new();
+    let mut recorded_missing: Vec<String> = Vec::new();
+    for name in &recorded {
+        if actual_files.iter().any(|f| f == name) {
+            to_load.push((*name).to_string());
+        } else {
+            recorded_missing.push((*name).to_string());
+        }
+    }
+    let unrecorded: Vec<String> = actual_files
+        .iter()
+        .filter(|f| is_tar(f) && !recorded.contains(&f.as_str()))
+        .cloned()
+        .collect();
+    PackageSelection {
+        to_load,
+        recorded_missing,
+        unrecorded,
+    }
+}
+
+/// 解析批量 `docker inspect` 输出为 `(服务, 镜像 ID)`(纯函数,便于单测)。
+///
+/// 输入形态:`docker inspect --format '{{.Config.Labels."com.docker.compose.service"}}|{{.Image}}' <cid...>`
+/// 的逐行结果(`服务名|sha256:...`);空行 / 无 `|` 的行 / 任一字段为空的行跳过。
+/// 用批量形态而非逐服务两次往返:up 后校验只花 2 次 SSH(`ps -q` 一次拿全部
+/// 容器 ID,`inspect` 一次拿全部服务名 + 镜像)。
+pub fn parse_compose_service_images(out: &str) -> Vec<(String, String)> {
+    out.lines()
+        .filter_map(|line| {
+            let (svc, img) = line.split_once('|')?;
+            let svc = svc.trim();
+            let img = img.trim();
+            if svc.is_empty() || img.is_empty() {
+                return None;
+            }
+            Some((svc.to_string(), img.to_string()))
+        })
+        .collect()
+}
+
+/// 采集 compose 项目内容器的 `(compose 服务名, 镜像 ID)`(v6.12.0;up 后校验共用)。
+///
+/// 2 次 SSH:`ps -q --all`(全部容器 ID;**含已退出的** —— 只查 running 会把
+/// 「容器仍在跑旧镜像」和「一次性任务已退出」都漏掉/误判)+ 一次 `docker
+/// inspect`(服务名 + 镜像)。容器无 compose 服务标签(非 compose 起的)时服务名
+/// 解析为空 → 整行跳过(校验只关心本次部署/回滚的服务)。
+pub(crate) async fn collect_running_images(
+    client: &mut SshClient,
+    compose_prefix: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let (code, ps_out) = exec_collect(client, &format!("{} ps -q --all", compose_prefix)).await?;
+    if code != 0 {
+        return Err(format!("compose ps 查询失败(退出码 {})", code));
+    }
+    let cids: Vec<String> = parse_ls_lines(&ps_out);
+    if cids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let quoted: Vec<String> = cids
+        .iter()
+        .map(|c| crate::commands::shell_single_quote(c))
+        .collect();
+    let inspect = format!(
+        "docker inspect --format {} {}",
+        crate::commands::shell_single_quote("{{.Config.Labels.\"com.docker.compose.service\"}}|{{.Image}}"),
+        quoted.join(" ")
+    );
+    let (code, ins_out) = exec_collect(client, &inspect).await?;
+    if code != 0 {
+        return Err(format!("docker inspect 查询失败(退出码 {})", code));
+    }
+    Ok(parse_compose_service_images(&ins_out))
+}
+
+/// 从 manifest 生成 up 后校验的期望表(纯函数,便于单测):只取有 ID 的服务。
+pub fn expected_images_from_manifest(images: &[ManifestImage]) -> Vec<(String, String)> {
+    images
+        .iter()
+        .filter_map(|i| {
+            i.id.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|id| (i.service.clone(), id.to_string()))
+        })
+        .collect()
+}
+
+/// 单镜像部署的 up 后校验(纯函数,便于单测):期望镜像 ID 是否被**任一**运行
+/// 容器使用。
+///
+/// 单镜像管线拿不到「服务名 ↔ 镜像」映射(该映射在用户 compose 里),故不能按
+/// 服务核对;可判定的是:**本次部署的镜像有没有真的跑起来**。若没有任何容器
+/// 在跑它,说明 compose 的 `image:` 解析到了别的引用(如 `.env` 插值漂移)或
+/// 容器未重建 —— 都必须显式告警,不能只看「up 退出码 0」。
+pub fn expected_image_running_anywhere(expected_id: &str, actual: &[(String, String)]) -> bool {
+    let want = expected_id
+        .trim()
+        .strip_prefix("sha256:")
+        .unwrap_or(expected_id.trim());
+    if want.is_empty() {
+        return true; // 无从比对(未采集到 ID):不误报
+    }
+    actual.iter().any(|(_, id)| {
+        let got = id.trim().strip_prefix("sha256:").unwrap_or(id.trim());
+        !got.is_empty() && got == want
+    })
+}
+
+// ===== v6.12.0:up 后运行镜像校验(容器实际镜像 ≠ 期望 → 显式报告)=====
+
+/// 逐服务核对容器实际运行的镜像 ID(纯函数,便于单测)。
+///
+/// **为什么需要**:up 前的一切判定(预检、收敛、清单装载)都是「准备动作」
+/// 的正确性,而 `up -d` 的实际结果还受 `.env` 插值漂移、compose 副本恢复
+/// 失败、compose 认为无变化不重建容器等残余路径影响。这里在 up **之后**
+/// 用容器实况兜底:调用方从 `compose ps -q`(容器 ID)+ `docker inspect`
+/// 取 `(服务, 实际镜像 ID)`,与本函数的期望表比对。
+///
+/// 期望表的来源:`manifest` 记录的 ID(回滚)/ 本次采集的本地 ID(部署)。
+/// `actual` 中缺服务(没起容器/被 scale 到 0)同样算不一致(实际值记空串),
+/// 不能静默。
+///
+/// 返回:`(服务, 期望 ID, 实际 ID)` 列表(空 = 全部一致)。
+pub fn select_container_image_mismatches(
+    expected: &[(String, String)],
+    actual: &[(String, String)],
+) -> Vec<(String, String, String)> {
+    let same = |a: &str, b: &str| -> bool {
+        let a = a.trim().strip_prefix("sha256:").unwrap_or(a.trim());
+        let b = b.trim().strip_prefix("sha256:").unwrap_or(b.trim());
+        !a.is_empty() && !b.is_empty() && a == b
+    };
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    for (svc, want) in expected {
+        let got = actual
+            .iter()
+            .find(|(s, _)| s == svc)
+            .map(|(_, id)| id.clone())
+            .unwrap_or_default();
+        if !same(want, &got) {
+            out.push((svc.clone(), want.clone(), got));
+        }
+    }
+    out
 }
 
 /// 归档内的 override 副本名 → 原始文件名(纯函数,便于单测)。
@@ -316,8 +634,8 @@ pub fn archived_override_original(archived_name: &str) -> Option<&str> {
     }
 }
 
-/// 镜像 ID 短哈希(展示用;纯函数)。
-fn short_id(id: &str) -> String {
+/// 镜像 ID 短哈希(展示用;纯函数;v6.12.0 起跨模块共用)。
+pub(crate) fn short_id(id: &str) -> String {
     let bare = id.trim().strip_prefix("sha256:").unwrap_or(id.trim());
     bare.chars().take(12).collect()
 }
@@ -625,6 +943,17 @@ pub struct RollbackPrecheckItem {
     pub detail: String,
 }
 
+/// 回滚预检的单项插值漂移(camelCase 契约)。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RollbackEnvDriftItem {
+    pub service: String,
+    /// 归档记录的引用(部署时插值结果 = manifest 的 tag)
+    pub expected: String,
+    /// 按服务器当前 `.env` 会解析成的引用(up -d 实际会用的)
+    pub resolved: String,
+}
+
 /// 回滚预检结果(camelCase)。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -632,10 +961,14 @@ pub struct RollbackPrecheck {
     pub items: Vec<RollbackPrecheckItem>,
     pub archived: usize,
     pub remote_by_id: usize,
+    /// 标签未指向归档 ID、但执行时会自动指回(v6.12.0;不计入阻断)
+    pub tag_restore: usize,
     pub missing: usize,
     pub unknown: usize,
     /// 存在阻断项(前端据此把「开始回滚」变为「仍要回滚(部分)」)
     pub has_blocking: bool,
+    /// `.env` 插值漂移(v6.12.0;须确认,与阻断同款处置)
+    pub env_drift: Vec<RollbackEnvDriftItem>,
     /// 归档无 manifest(极旧/半成品):无法逐服务核对
     pub no_manifest: bool,
 }
@@ -715,9 +1048,11 @@ pub async fn rollback_precheck(
             items: Vec::new(),
             archived: 0,
             remote_by_id: 0,
+            tag_restore: 0,
             missing: 0,
             unknown: 0,
             has_blocking: false,
+            env_drift: Vec::new(),
             no_manifest: true,
         });
     }
@@ -754,24 +1089,68 @@ pub async fn rollback_precheck(
         .map(|p| RollbackPrecheckItem {
             service: p.service.clone(),
             tag: p.tag.clone(),
-            source: match p.source {
-                RollbackImageSource::Archived => "archived",
-                RollbackImageSource::RemoteById => "remoteById",
-                RollbackImageSource::Missing => "missing",
-                RollbackImageSource::Unknown => "unknown",
-            }
-            .to_string(),
+            source: p.source.as_str().to_string(),
             blocking: p.blocking,
             detail: p.detail.clone(),
         })
         .collect();
+
+    // ---- 插值漂移预检(v6.12.0;与执行链同口径)----
+    // 归档 compose 是部署当时的副本,但 `image: ${VAR}` 由服务器**当前** `.env`
+    // 重新插值(.env 不入归档)。这里重算并与 manifest 的 tag 比对,凡漂移者在
+    // 预检结果里列出(前端与「回不去」同款:未确认不得执行)。
+    let mut env_drift: Vec<RollbackEnvDriftItem> = Vec::new();
+    if actual_files.iter().any(|f| f == "docker-compose.yml") {
+        let archived_compose = remote_join(&release_dir, "docker-compose.yml");
+        if let Ok((0, compose_text)) =
+            exec_collect(&mut client, &cat_file_cmd(&archived_compose)).await
+        {
+            // 归档内 override(目录枚举,与恢复顺序同源)
+            let mut ov_texts: Vec<String> = Vec::new();
+            for name in &actual_files {
+                if archived_override_original(name).is_some() {
+                    if let Ok((0, t)) =
+                        exec_collect(&mut client, &cat_file_cmd(&remote_join(&release_dir, name))).await
+                    {
+                        ov_texts.push(t);
+                    }
+                }
+            }
+            // 部署目录当前 `.env`
+            let env_table = match exec_collect(&mut client, &cat_file_cmd(&remote_join(&target_dir, ".env"))).await {
+                Ok((0, t)) if !t.trim().is_empty() => parse_env_text(&t),
+                _ => Default::default(),
+            };
+            match image_refs_with_env(&compose_text, &ov_texts, &env_table) {
+                Ok(refs) => {
+                    let pairs: Vec<(String, String)> = m
+                        .images
+                        .iter()
+                        .map(|i| (i.service.clone(), i.tag.clone()))
+                        .collect();
+                    env_drift = detect_image_env_drift(&refs, &pairs)
+                        .into_iter()
+                        .map(|d| RollbackEnvDriftItem {
+                            service: d.service,
+                            expected: d.expected,
+                            resolved: d.resolved,
+                        })
+                        .collect();
+                }
+                Err(e) => log::warn!("预检:插值漂移检查跳过({})", e),
+            }
+        }
+    }
+
     Ok(RollbackPrecheck {
         items,
         archived: sum.archived,
         remote_by_id: sum.remote_by_id,
+        tag_restore: sum.tag_restore,
         missing: sum.missing,
         unknown: sum.unknown,
         has_blocking: sum.has_blocking(),
+        env_drift,
         no_manifest: false,
     })
 }
@@ -964,8 +1343,8 @@ pub(crate) async fn rollback_execute_stack_inner(
         emit_log(
             app,
             &format!(
-                "回滚可用性预检:归档内有包 {} 个 / 服务器上按 ID 命中 {} 个 / 回不去 {} 个 / 无法核对 {} 个",
-                sum.archived, sum.remote_by_id, sum.missing, sum.unknown
+                "回滚可用性预检:归档内有包 {} 个 / 服务器上按 ID 命中 {} 个 / 标签待指回 {} 个 / 回不去 {} 个 / 无法核对 {} 个",
+                sum.archived, sum.remote_by_id, sum.tag_restore, sum.missing, sum.unknown
             ),
         );
         for p in plan.iter().filter(|p| p.blocking) {
@@ -999,10 +1378,129 @@ pub(crate) async fn rollback_execute_stack_inner(
         }
     }
 
-    // ---- 逐包 docker load(load 自动恢复镜像原标签)----
+    // ---- 插值漂移预检(v6.12.0;在可用性预检之后、装载之前)----
+    // `.env` 刻意不入归档(用户裁决,见 wiki/07),而 compose 的 `image: ${VAR}`
+    // 由 **up -d 当时的** `.env` 插值:部署后若有人改过 `.env`,`up` 解析出的
+    // 镜像引用会与 manifest 记录(部署当时的插值结果 —— 它就是插值产物)不同,
+    // 「归档 compose + 新 .env」得到一个两边都不对的结果。这里用归档 compose
+    // (含归档 override)+ 服务器当前 `.env` 重算,与 manifest 的 tag 逐服务比对。
+    // 漂移 → **须确认**(与「回不去」同款:error 码相同,前端弹「仍要回滚」),
+    // 确认后按实际解析结果执行并在历史里留痕。
+    let mut env_drift: Vec<ImageEnvDrift> = Vec::new();
+    if let Some(m) = &manifest {
+        if has_compose_copy {
+            let compose_path = remote_join(&release_dir, "docker-compose.yml");
+            let (code, compose_text) = with_timeout(
+                SSH_EXEC_TIMEOUT_SECS,
+                "读取归档 compose 超时",
+                "请检查服务器网络后重试",
+                exec_collect(&mut client, &cat_file_cmd(&compose_path)),
+            )
+            .await?;
+            if code == 0 {
+                // 归档 override 也参与合并(与恢复顺序同源)
+                let mut ov_texts: Vec<String> = Vec::new();
+                for ov_name in compose_override_names(&project.compose_file) {
+                    let archived = remote_join(&release_dir, &format!("{}.ddbak", ov_name));
+                    if let Ok((0, t)) = exec_collect(&mut client, &cat_file_cmd(&archived)).await {
+                        ov_texts.push(t);
+                    }
+                }
+                // 服务器当前 `.env`(缺失 → 空表:与 compose 实际行为一致)
+                let env_path = remote_join(&effective_remote_dir(&server, &project), ".env");
+                let env_table = match exec_collect(&mut client, &cat_file_cmd(&env_path)).await {
+                    Ok((0, t)) if !t.trim().is_empty() => parse_env_text(&t),
+                    _ => Default::default(),
+                };
+                match image_refs_with_env(&compose_text, &ov_texts, &env_table) {
+                    Ok(refs) => {
+                        let pairs: Vec<(String, String)> = m
+                            .images
+                            .iter()
+                            .map(|i| (i.service.clone(), i.tag.clone()))
+                            .collect();
+                        env_drift = detect_image_env_drift(&refs, &pairs);
+                    }
+                    Err(e) => emit_log(app, &format!("警告:插值漂移检查跳过({})", e)),
+                }
+            } else {
+                emit_log(app, "警告:读取归档 compose 失败,插值漂移检查跳过");
+            }
+            for d in &env_drift {
+                emit_log(
+                    app,
+                    &format!(
+                        "  [插值漂移] {}:归档记录 {} ,但服务器当前 .env 会解析成 {}",
+                        d.service, d.expected, d.resolved
+                    ),
+                );
+            }
+            if !env_drift.is_empty() && !allow_partial {
+                return Err(crate::errors::tagged(
+                    crate::errors::ErrCode::RollbackPrecheck,
+                    rollback_env_drift_message(&env_drift),
+                ));
+            }
+            if !env_drift.is_empty() {
+                let names: Vec<String> =
+                    env_drift.iter().map(|d| d.service.clone()).collect();
+                emit_log(
+                    app,
+                    &format!(
+                        "用户已确认插值漂移:{} 将按服务器当前 .env 解析出的引用启动(与归档记录可能不同)",
+                        names.join("、")
+                    ),
+                );
+                let note = format!("{} 存在 .env 插值漂移", names.join("、"));
+                partial_note = Some(match partial_note.take() {
+                    Some(prev) => format!("{};{}", prev, note),
+                    None => note,
+                });
+            }
+        }
+    }
+
+    // ---- 清单驱动选择装载包(v6.12.0:目录里多余的 tar 不再静默装载)----
+    // 装载此前按目录 `ls` 全量走;目录里若有 manifest 未记录的包(人工放入 /
+    // 半成品残留),其包内标签会静默覆盖服务器现状且界面无提示。修正为
+    // 只装载清单记录的包,未记录的逐条告警。
+    let selection = match &manifest {
+        Some(m) => select_packages(&m.images, &files),
+        None => {
+            // 无清单(旧归档/半成品):保持现状行为(按目录内全部包恢复),
+            // 但必须提示 —— 无法反向核对
+            emit_log(
+                app,
+                "该归档无发布清单,无法核对目录内容:将按目录内全部镜像包恢复",
+            );
+            PackageSelection {
+                to_load: packages.clone(),
+                recorded_missing: Vec::new(),
+                unrecorded: Vec::new(),
+            }
+        }
+    };
+    for name in &selection.unrecorded {
+        emit_log(
+            app,
+            &format!(
+                "警告:归档目录内 {} 未被发布清单记录,已跳过装载(防止其覆盖清单记录的标签)",
+                name
+            ),
+        );
+    }
+    for name in &selection.recorded_missing {
+        emit_log(
+            app,
+            &format!("警告:发布清单记录的镜像包 {} 不在归档目录里(预检应已阻断)", name),
+        );
+    }
+
+    // ---- 逐包 docker load(load 自动恢复镜像原标签;按清单顺序)----
+    let packages = selection.to_load;
     let n = packages.len();
     if n == 0 {
-        emit_log(app, "发布目录内无镜像包,跳过 docker load");
+        emit_log(app, "发布目录内无可装载的镜像包,跳过 docker load");
     }
     for (i, name) in packages.iter().enumerate() {
         ensure_not_cancelled(app)?;
@@ -1097,17 +1595,96 @@ pub(crate) async fn rollback_execute_stack_inner(
         );
     }
 
+    // ---- 按 ID 收敛(v6.12.0;up 前最后一道复核)----
+    // 预检是**查询那一刻**的快照,到 up 之间隔着逐包 load;期间外部主体
+    // (另一台机器的本应用 / CI / watchtower)移动标签会让结论失效(TOCTOU)。
+    // 这里按 manifest 记录的 ID 复核一次:ID 还在但标签没指向它 → `docker tag`
+    // 零拷贝指回(真机案例 goodlaser-backend:latest);ID 不在 → 重算预检并
+    // 按同一口径处置(未确认过就阻断)。
+    if let Some(m) = &manifest {
+        let remote = match query_remote_images_full(&mut client).await {
+            Ok(list) => list
+                .into_iter()
+                .map(|i| (format!("{}:{}", i.repository, i.tag), i.id))
+                .collect::<Vec<_>>(),
+            Err(e) => {
+                emit_log(
+                    app,
+                    &format!("警告:up 前复核查询镜像列表失败({});按预检结论继续", e),
+                );
+                Vec::new()
+            }
+        };
+        let convergence = plan_tag_convergence(&m.images, &remote);
+        for (svc, id, tag) in &convergence.retag {
+            emit_log(
+                app,
+                &format!(
+                    "{}:标签未指向归档版本,自动指回(docker tag {} {} )",
+                    svc,
+                    short_id(id),
+                    tag
+                ),
+            );
+            let cmd = docker_tag_cmd(id, tag);
+            if let Err(e) = exec_forwarded(app, &mut client, &cmd, SSH_EXEC_TIMEOUT_SECS).await {
+                return Err(format!("自动指回标签失败({}):{}", tag, e));
+            }
+        }
+        if !convergence.missing.is_empty() {
+            // up 前的复核发现预检后 ID 被删:预检结论已失效,必须重走确认
+            let details = convergence
+                .missing
+                .iter()
+                .map(|(svc, tag)| format!("· {}:期望镜像已不在服务器上({})", svc, tag))
+                .collect::<Vec<_>>()
+                .join("
+");
+            if !allow_partial {
+                return Err(crate::errors::tagged(
+                    crate::errors::ErrCode::RollbackPrecheck,
+                    format!(
+                        "up 前复核发现预检结论已失效(可能有其它主体在操作服务器):\n{}\n如仍要回滚,这些服务将沿用服务器当前镜像。选择「仍要回滚」继续。",
+                        details
+                    ),
+                ));
+            }
+            emit_log(
+                app,
+                &format!("up 前复核:以下服务镜像已不在服务器,将沿用当前镜像:{}", details),
+            );
+        }
+    }
+
     // ---- compose up -d(镜像标签已恢复,up 按引用重建容器)----
     ensure_not_cancelled(app)?;
     let up_cmd = compose_up_cmd(&effective_remote_dir(&server, &project), &remote_compose, &override_names);
     emit_log(app, &format!("启动服务: {}", up_cmd));
     exec_forwarded(app, &mut client, &up_cmd, STACK_COMPOSE_TIMEOUT_SECS).await?;
 
+    // ---- up 后运行镜像校验(v6.12.0;兜住所有残余路径)----
+    // up 前的一切都是「准备动作」的正确性;实际结果还受 .env 漂移、compose 副本
+    // 恢复失败、compose 认为无变化未重建容器等影响。这里按容器实况兜底:
+    // 期望 = manifest 记录的 ID,实际 = 容器 Image。
+    if let Some(m) = &manifest {
+        // 与 up 命令逐字同源的 prefix(04 页路径 up 用 -f 链)
+        let prefix = format!(
+            "cd {} && docker compose {}",
+            shell_single_quote(&effective_remote_dir(&server, &project)),
+            compose_file_flags(&remote_compose, &override_names)
+        );
+        let expected = expected_images_from_manifest(&m.images);
+        let report = verify_running_images(app, &mut client, &prefix, &expected).await;
+        if let Err(e) = report {
+            emit_log(app, &format!("警告:up 后运行镜像校验未能完成({})", e));
+        }
+    }
+
     emit_log(app, "整栈回滚完成");
     record.success = true;
     record.message = match partial_note {
-        // 部分回滚要在历史/通知里写明,不能只说「回滚到 X」
-        Some(ref names) => format!("回滚到 {}(部分:{} 未回退,沿用服务器当前镜像)", release_ts, names),
+        // 部分回滚/插值漂移要在历史/通知里写明,不能只说「回滚到 X」
+        Some(ref names) => format!("回滚到 {}({})", release_ts, names),
         None => format!("回滚到 {}", release_ts),
     };
     record.duration_secs = started.elapsed().as_secs();
@@ -2016,12 +2593,15 @@ async fn rollback_execute_stack_at_inner(
         emit_log(
             app,
             &format!(
-                "回滚可用性预检:归档内有包 {} 个 / 服务器上按 ID 命中 {} 个 / 回不去 {} 个 / 无法核对 {} 个",
-                sum.archived, sum.remote_by_id, sum.missing, sum.unknown
+                "回滚可用性预检:归档内有包 {} 个 / 服务器上按 ID 命中 {} 个 / 标签待指回 {} 个 / 回不去 {} 个 / 无法核对 {} 个",
+                sum.archived, sum.remote_by_id, sum.tag_restore, sum.missing, sum.unknown
             ),
         );
         for p in plan.iter().filter(|p| p.blocking) {
             emit_log(app, &format!("  [回不去] {}", p.detail));
+        }
+        for p in plan.iter().filter(|p| !p.blocking) {
+            emit_log(app, &format!("  [可用] {}:{} — {}", p.service, p.tag, p.detail));
         }
         if sum.has_blocking() && !allow_partial {
             return Err(crate::errors::tagged(
@@ -2048,9 +2628,117 @@ async fn rollback_execute_stack_at_inner(
         }
     }
 
+    // ---- 插值漂移预检(v6.12.0;06 页路径)----
+    // 与 04 页同口径:归档 compose(含远端枚举到的 override)+ 该项目目录当前
+    // `.env` 重算,与 manifest 的 tag 比对。漂移 → 须确认(同一错误码)。
+    let mut env_drift: Vec<ImageEnvDrift> = Vec::new();
+    if let Some(m) = &manifest {
+        if has_compose_copy {
+            let archived_compose = remote_join(&release_dir, "docker-compose.yml");
+            if let Ok((0, compose_text)) =
+                exec_collect(&mut client, &cat_file_cmd(&archived_compose)).await
+            {
+                // override 在远端枚举(本路径无 ProjectConfig)
+                let mut ov_texts: Vec<String> = Vec::new();
+                if let Ok((0, ls_out)) = exec_collect(&mut client, &ls_dir_cmd(&release_dir)).await {
+                    for name in parse_ls_lines(&ls_out) {
+                        if archived_override_original(&name).is_some() {
+                            if let Ok((0, t)) =
+                                exec_collect(&mut client, &cat_file_cmd(&remote_join(&release_dir, &name)))
+                                    .await
+                            {
+                                ov_texts.push(t);
+                            }
+                        }
+                    }
+                }
+                // 部署目录当前 `.env`
+                let env_table = match exec_collect(&mut client, &cat_file_cmd(&remote_join(&dir, ".env"))).await {
+                    Ok((0, t)) if !t.trim().is_empty() => parse_env_text(&t),
+                    _ => Default::default(),
+                };
+                match image_refs_with_env(&compose_text, &ov_texts, &env_table) {
+                    Ok(refs) => {
+                        let pairs: Vec<(String, String)> = m
+                            .images
+                            .iter()
+                            .map(|i| (i.service.clone(), i.tag.clone()))
+                            .collect();
+                        env_drift = detect_image_env_drift(&refs, &pairs);
+                    }
+                    Err(e) => emit_log(app, &format!("警告:插值漂移检查跳过({})", e)),
+                }
+            } else {
+                emit_log(app, "警告:读取归档 compose 失败,插值漂移检查跳过");
+            }
+            for d in &env_drift {
+                emit_log(
+                    app,
+                    &format!(
+                        "  [插值漂移] {}:归档记录 {} ,但当前 .env 会解析成 {}",
+                        d.service, d.expected, d.resolved
+                    ),
+                );
+            }
+            if !env_drift.is_empty() && !allow_partial {
+                return Err(crate::errors::tagged(
+                    crate::errors::ErrCode::RollbackPrecheck,
+                    rollback_env_drift_message(&env_drift),
+                ));
+            }
+            if !env_drift.is_empty() {
+                let names: Vec<String> = env_drift.iter().map(|d| d.service.clone()).collect();
+                emit_log(
+                    app,
+                    &format!(
+                        "用户已确认插值漂移:{} 将按当前 .env 解析出的引用启动(与归档记录可能不同)",
+                        names.join("、")
+                    ),
+                );
+                let note = format!("{} 存在 .env 插值漂移", names.join("、"));
+                partial_note = Some(match partial_note.take() {
+                    Some(prev) => format!("{};{}", prev, note),
+                    None => note,
+                });
+            }
+        }
+    }
+
+    // ---- 清单驱动选择装载包(v6.12.0;06 页路径)----
+    let selection = match &manifest {
+        Some(m) => select_packages(&m.images, &files),
+        None => {
+            emit_log(
+                app,
+                "该归档无发布清单,无法核对目录内容:将按目录内全部镜像包恢复",
+            );
+            PackageSelection {
+                to_load: packages.clone(),
+                recorded_missing: Vec::new(),
+                unrecorded: Vec::new(),
+            }
+        }
+    };
+    for name in &selection.unrecorded {
+        emit_log(
+            app,
+            &format!(
+                "警告:归档目录内 {} 未被发布清单记录,已跳过装载(防止其覆盖清单记录的标签)",
+                name
+            ),
+        );
+    }
+    for name in &selection.recorded_missing {
+        emit_log(
+            app,
+            &format!("警告:发布清单记录的镜像包 {} 不在归档目录里(预检应已阻断)", name),
+        );
+    }
+
+    let packages = selection.to_load;
     let n = packages.len();
     if n == 0 {
-        emit_log(app, "发布目录内无镜像包,跳过 docker load");
+        emit_log(app, "发布目录内无可装载的镜像包,跳过 docker load");
     }
     for (i, name) in packages.iter().enumerate() {
         ensure_not_cancelled(app)?;
@@ -2123,6 +2811,66 @@ async fn rollback_execute_stack_at_inner(
     // compose up -d:cd 到项目目录,按目录内 compose 文件启动
     // (override 文件按远端同名约定自动生效,无需显式 -f 链)
     ensure_not_cancelled(app)?;
+    // ---- 按 ID 收敛(v6.12.0;up 前最后一道复核;06 页路径)----
+    // 与 04 页同口径:预检快照到 up 之间隔着逐包 load,期间外部改标签会让结论
+    // 失效(TOCTOU)。这里按 manifest 记录的 ID 复核一次并零拷贝指回。
+    if let Some(m) = &manifest {
+        match query_remote_images_full(&mut client).await {
+            Ok(list) => {
+                let remote: Vec<(String, String)> = list
+                    .into_iter()
+                    .map(|i| (format!("{}:{}", i.repository, i.tag), i.id))
+                    .collect();
+                let convergence = plan_tag_convergence(&m.images, &remote);
+                for (svc, id, tag) in &convergence.retag {
+                    emit_log(
+                        app,
+                        &format!(
+                            "{}:标签未指向归档版本,自动指回(docker tag {} {} )",
+                            svc,
+                            short_id(id),
+                            tag
+                        ),
+                    );
+                    let cmd = docker_tag_cmd(id, tag);
+                    if let Err(e) =
+                        exec_forwarded(app, &mut client, &cmd, SSH_EXEC_TIMEOUT_SECS).await
+                    {
+                        return Err(format!("自动指回标签失败({}):{}", tag, e));
+                    }
+                }
+                if !convergence.missing.is_empty() {
+                    let details = convergence
+                        .missing
+                        .iter()
+                        .map(|(svc, tag)| format!("· {}:期望镜像已不在服务器上({})", svc, tag))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !allow_partial {
+                        return Err(crate::errors::tagged(
+                            crate::errors::ErrCode::RollbackPrecheck,
+                            format!(
+                                "up 前复核发现预检结论已失效(可能有其它主体在操作服务器):\n{}\n如仍要回滚,这些服务将沿用服务器当前镜像。选择「仍要回滚」继续。",
+                                details
+                            ),
+                        ));
+                    }
+                    emit_log(
+                        app,
+                        &format!("up 前复核:以下服务镜像已不在服务器,将沿用当前镜像:{}", details),
+                    );
+                }
+            }
+            Err(e) => emit_log(
+                app,
+                &format!("警告:up 前复核查询镜像列表失败({});按预检结论继续", e),
+            ),
+        }
+    }
+
+    // ---- compose up -d:cd 到项目目录,按目录内 compose 文件启动 ----
+    // (override 文件按远端同名约定自动生效,无需显式 -f 链)
+    ensure_not_cancelled(app)?;
     let up_cmd = format!(
         "cd {} && docker compose up -d",
         shell_single_quote(&dir)
@@ -2130,11 +2878,22 @@ async fn rollback_execute_stack_at_inner(
     emit_log(app, &format!("启动服务: {}", up_cmd));
     exec_forwarded(app, &mut client, &up_cmd, STACK_COMPOSE_TIMEOUT_SECS).await?;
 
+    // ---- up 后运行镜像校验(v6.12.0;06 页路径)----
+    if let Some(m) = &manifest {
+        // 与 06 页 up 命令逐字同源(该路径无 -f 链,靠 cd 后的默认文件)
+        let prefix = format!("cd {} && docker compose", shell_single_quote(&dir));
+        let expected = expected_images_from_manifest(&m.images);
+        let report = verify_running_images(app, &mut client, &prefix, &expected).await;
+        if let Err(e) = report {
+            emit_log(app, &format!("警告:up 后运行镜像校验未能完成({})", e));
+        }
+    }
+
     emit_log(app, "整栈回滚完成");
     record.success = true;
     record.message = match partial_note {
-        // 部分回滚要在历史/通知里写明,不能只说「回滚到 X」
-        Some(ref names) => format!("回滚到 {}(部分:{} 未回退,沿用服务器当前镜像)", release_ts, names),
+        // 部分回滚/插值漂移要在历史/通知里写明,不能只说「回滚到 X」
+        Some(ref names) => format!("回滚到 {}({})", release_ts, names),
         None => format!("回滚到 {}", release_ts),
     };
     record.release_dir = Some(release_dir);
@@ -2178,6 +2937,70 @@ pub(crate) fn rollback_notify_text(
 /// 仅告警,不影响回滚结果);emit 之后调 [`crate::notify::fire`] 分发通知
 /// 中心通知(成功/失败/取消,事件订阅复用部署的 AppConfig.notify.events,
 /// 失败仅告警,不影响回滚结果)。
+/// up 后运行镜像校验(v6.12.0;回滚/部署两侧共用)。
+///
+/// `compose_prefix` = 调用方 up 时用的完整命令前缀(`cd '<dir>' && docker
+/// compose [-f ...]`;各链的 `-f` 链不同,必须与 up **逐字一致**,否则
+/// compose 的项目名/文件集不同,`ps -q` 可能查不到容器)。
+///
+/// 只说 2 次 SSH:`ps -q`(全部容器 ID)+ 一次 `docker inspect`(服务名 + 镜像)。
+/// 期望表 = manifest/本地采集的 ID;**只校验有 ID 的服务**(旧归档无从比对)。
+/// 服务无容器 → 实际值空串 → 判不一致(**不能静默**:up 后没起容器本身就是
+/// 用户必须知道的状态)。
+///
+/// 一致 → 一行日志;不一致 → 逐条告警。**不改判定结果**:成败由 up 的退出码
+/// 决定,这里只负责让「实际跑的版本 ≠ 期望版本」在日志与历史里可见
+/// (兜住 .env 漂移、compose 副本恢复失败、compose 未重建容器等残余路径)。
+pub(crate) async fn verify_running_images(
+    app: &AppHandle,
+    client: &mut SshClient,
+    compose_prefix: &str,
+    expected: &[(String, String)],
+) -> Result<(), String> {
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let actual = collect_running_images(client, compose_prefix).await?;
+    if actual.is_empty() {
+        // 无任何容器:全部服务按「无容器」判不一致(不静默)
+        for (svc, want) in expected {
+            emit_log(
+                app,
+                &format!(
+                    "警告:{} 容器实际运行的镜像与期望不一致(期望 {},实际 无容器)—— 请检查 .env 插值 / compose 文件 / 容器是否重建",
+                    svc,
+                    short_id(want)
+                ),
+            );
+        }
+        return Ok(());
+    }
+    let mismatches = select_container_image_mismatches(expected, &actual);
+    if mismatches.is_empty() {
+        emit_log(
+            app,
+            &format!("up 后运行镜像校验:{} 个服务的实际镜像与期望一致", expected.len()),
+        );
+        return Ok(());
+    }
+    for (svc, want, got) in &mismatches {
+        emit_log(
+            app,
+            &format!(
+                "警告:{} 容器实际运行的镜像与期望不一致(期望 {},实际 {})—— 请检查 .env 插值 / compose 文件 / 容器是否重建",
+                svc,
+                short_id(want),
+                if got.is_empty() {
+                    "无容器".to_string()
+                } else {
+                    short_id(got)
+                }
+            ),
+        );
+    }
+    Ok(())
+}
+
 /// 组装回滚失败的留痕骨架(R4;第二十九批;纯查配置,失败给 `None`)。
 ///
 /// 为什么在命令层组装:管线失败时没有 record 返回,而失败留痕需要

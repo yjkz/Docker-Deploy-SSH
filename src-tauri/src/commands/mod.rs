@@ -92,7 +92,8 @@ use crate::ssh::{
     check_server_env, exec_collect, mkdir_p_cmd, ServerCheckReport, SshClient, INSTALL_DOCKER_CMD,
 };
 use crate::stack::{
-    apply_overrides, find_override_files, parse_compose_file, split_image_ref, ComposeStack,
+    apply_overrides, detect_image_env_drift, find_override_files, image_refs_with_env,
+    parse_compose_file, parse_env_text, split_image_ref, ComposeStack, ImageEnvDrift,
 };
 
 /// 取消提示文案(取消导致的失败统一用它,便于前端识别)。

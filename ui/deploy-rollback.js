@@ -555,8 +555,9 @@
         serverId: st.rbIds.serverId,
         projectId: st.rbIds.projectId,
         releaseTs: String(rel.ts || ''),
-        // 预检已确认(阻断项已展示给用户)→ 允许部分回滚
-        allowPartial: !!(st.rbPrecheck && st.rbPrecheck.hasBlocking)
+        // 预检已确认(阻断项或 .env 插值漂移已展示给用户)→ 允许继续
+        allowPartial: !!(st.rbPrecheck &&
+          (st.rbPrecheck.hasBlocking || (Array.isArray(st.rbPrecheck.envDrift) && st.rbPrecheck.envDrift.length)))
       });
     });
     actions.appendChild(cancel);
@@ -609,7 +610,7 @@
       });
   }
 
-  /** 渲染预检结果(每服务一行:可用 / 回不去) */
+  /** 渲染预检结果(每服务一行:可用 / 标签待指回 / 回不去;v6.12.0 加漂移) */
   function renderRbPrecheckResult(res, exec) {
     var box = document.getElementById('rb-precheck-box');
     if (!box) return;
@@ -629,27 +630,47 @@
     var head = el('div', 'rb-precheck-title',
       '共 ' + items.length + ' 个服务:归档内有包 ' + (res.archived || 0) +
       ' · 服务器上按镜像 ID 命中 ' + (res.remoteById || 0) +
+      (res.tagRestore ? ' · 标签待指回 ' + res.tagRestore : '') +
       (res.missing ? ' · 回不去 ' + res.missing : '') +
       (res.unknown ? ' · 无法核对 ' + res.unknown : ''));
     box.appendChild(head);
-    // 先列阻断项(用户最需要看这个),再列可用项
-    var sorted = items.slice().sort(function (a, b) {
-      return (b.blocking ? 1 : 0) - (a.blocking ? 1 : 0);
-    });
+    // 先列阻断项(用户最需要看这个),再列标签待指回,最后可用项
+    var rank = function (it) {
+      if (it.blocking) return 0;
+      return it.source === 'tagRestore' ? 1 : 2;
+    };
+    var sorted = items.slice().sort(function (a, b) { return rank(a) - rank(b); });
     sorted.forEach(function (it) {
       var row = el('div', 'rb-precheck-row' + (it.blocking ? ' is-blocking' : ''));
-      row.appendChild(window.fillBadge(el('span'),
-        it.blocking ? 'fail' : 'ok',
-        it.blocking ? '回不去' : '可用'));
+      var kind = it.blocking ? 'fail' : (it.source === 'tagRestore' ? 'warn' : 'ok');
+      var label = it.blocking ? '回不去' : (it.source === 'tagRestore' ? '标签待指回' : '可用');
+      row.appendChild(window.fillBadge(el('span'), kind, label));
       row.appendChild(el('span', 'rb-precheck-svc', String(it.service || '')));
       row.appendChild(el('span', 'rb-precheck-detail', String(it.detail || '')));
       box.appendChild(row);
     });
+    // 插值漂移(v6.12.0):.env 不入归档,归档 compose 的 ${VAR} 会按服务器当前
+    // .env 重新解析 —— 与归档记录不同者必须让用户看到(须确认后才执行)
+    var drift = Array.isArray(res.envDrift) ? res.envDrift : [];
+    if (drift.length) {
+      box.appendChild(el('div', 'rb-precheck-title',
+        '.env 插值漂移 ' + drift.length + ' 项:归档 compose 的镜像引用会按服务器当前 .env 解析'));
+      drift.forEach(function (d) {
+        var row = el('div', 'rb-precheck-row is-blocking');
+        row.appendChild(window.fillBadge(el('span'), 'warn', '插值漂移'));
+        row.appendChild(el('span', 'rb-precheck-svc', String(d.service || '')));
+        row.appendChild(el('span', 'rb-precheck-detail',
+          '归档记录 ' + String(d.expected || '') + ';按当前 .env 会解析成 ' + String(d.resolved || '')));
+        box.appendChild(row);
+      });
+    }
     if (exec) {
       exec.disabled = false;
-      if (res.hasBlocking) {
+      if (res.hasBlocking || drift.length) {
         exec.textContent = '仍要回滚(部分)';
-        exec.title = '上述「回不去」的服务将沿用服务器当前镜像,版本可能与归档不一致';
+        exec.title = res.hasBlocking
+          ? '上述「回不去」的服务将沿用服务器当前镜像,版本可能与归档不一致'
+          : '存在 .env 插值漂移:这些服务将按当前 .env 解析出的引用启动';
       } else {
         exec.textContent = '确认执行';
         exec.title = '';

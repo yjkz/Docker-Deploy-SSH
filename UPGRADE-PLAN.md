@@ -3419,3 +3419,96 @@ fail-closed 方向不变(仍阻断),但定性正确。
 - **06 页预检端到端桩验证**:三态渲染正确(归档有包 / 按 ID 命中 / 回不去)、阻断项置顶、
   按钮变「仍要回滚(部分)」、`unknownCmds` 为空(未发错参数名)
 - 文档核对:三处曾描述「不存在的实现」的表述现在**逐条 grep 验证为真**
+
+---
+
+# v6.12.0 回滚/部署「按镜像 ID 收敛」批(2026-09-20)
+
+> 来源:用户真机问题 + 读取第二十九批「未修但已记录」三项后要求修复。
+> 真机案例:`goodlaser-backend:latest` 实际指向 `265b2e14d9a6`,而归档记录的
+> 镜像 `c313095267ee` 仍在服务器上(挂在其它标签下)→ 旧预检判「回不去」阻断,
+> 用户看到「该标签现在指向 …,不是本次归档的版本」后**没有任何出路**(只能手工
+> `docker tag`)。根因:该服务 `file=null`(智能传输跳过未打包,归档里没有它的包),
+> 而整栈回滚**没有 `docker tag` 步骤**(rollback.rs 注释自己承认),标签由 `docker load`
+> 从包内恢复 —— 没包就恢复不了。
+
+## 设计核心:单一不变式 + 两个共用纯函数
+
+**不变式:记录过镜像 ID 的服务,`up -d` 前其标签必须指向该 ID。**
+判定与收敛只实现一份(`plan_tag_convergence_pairs`),回滚/部署两侧各自组装输入 ——
+避免「预检一套、执行一套」的判定漂移(第二十九批的核心教训)。
+
+### A. up 前「按 ID 收敛」(治真机案例 + TOCTOU 残余)
+
+- 新纯函数 `plan_tag_convergence_pairs(expectations, remote)`:ID 在且标签已指向它
+  → 无动作;ID 在但标签指向别处/不存在 → 出 `docker tag <ID> <tag>`(零拷贝);
+  ID 不在 → `missing`(唯一真正的「收敛不了」)。
+- `plan_tag_convergence(images, remote)` = 回滚侧的适配层(只处理「无归档包 + 有 ID」
+  的服务;有包的服务标签由 `docker load` 恢复,不重复处理)。
+- 接入三条链:回滚 `_inner`、回滚 `_at_inner`、部署单镜像 + 整栈(部署侧期望值 =
+  本次本地 `image_id_by_ref`;拉取类服务不参与 —— 其 tag 语义就是要随 pull 移动)。
+  预算:+2 次往返(收敛查询 + up 后校验),报告最多 +3。
+
+### B. 预检四态化(把「标签被占」从死路改为可恢复中间态)
+
+- 新来源 `RollbackImageSource::RemoteByIdTagMoved`(契约串 `tagRestore`):
+  **不阻断**,文案明说「执行时会自动把标签指回归档版本(零拷贝)」。
+- `RollbackPrecheckSummary` 增 `tag_restore` 计数;阻断文案计数同步。
+
+### C. 清单驱动装载(治 packages 与 manifest 无反向校验)
+
+- 新纯函数 `select_packages(images, actual_files)`:只装载 manifest 记录的包;
+  目录里未记录的 `.tar.gz` **跳过并逐条告警**(此前按 `ls` 全量装载,多余包会静默
+  覆盖标签);记录的包缺失单列(预检已阻断,此处防御性再报)。
+- 无 manifest 的旧归档:保持「按目录内全部包恢复」但**显式提示**无法反向核对。
+
+### D. 插值漂移检测(治 .env 不归档的插值漂移)
+
+- **不新增 manifest 字段**:manifest 的 `tag` 本身就是部署当时的插值结果,
+  用它当比对基准即可(旧归档同样可检,零 schema 变更)。
+- 新纯函数 `image_refs_with_env(compose_text, override_texts, env)` +
+  `detect_image_env_drift(refs, manifest)` + `parse_env_text`(从 `load_env_path` 抽出)。
+  预检与执行链都用**归档 compose(含归档 override)+ 服务器当前 `.env`** 重算比对。
+- 漂移 → **须确认**(同一错误码 `rollback_precheck`,与「回不去」同款);确认后按
+  实际解析结果执行并在历史里留痕(进 `partial_note`)。
+
+### E. up 后运行镜像校验(兜住所有残余路径)
+
+- 新纯函数 `select_container_image_mismatches(expected, actual)` +
+  `parse_compose_service_images`;`:2 次 SSH`(`ps -q --all` + 一次 `docker inspect
+  --format '<服务标签>|<镜像>'`)。
+- 回滚两条链与部署整栈链接入(`verify_running_images` / `collect_running_images`);
+  单镜像部署用 `expected_image_running_anywhere`(管线无「服务↔镜像」映射,只能判
+  「本次镜像有没有在跑」)。
+- 一致性 → 一行日志;**不一致 → 逐条告警**;不改判定结果(成败仍由 up 退出码定),
+  职责是让「实际跑的版本 ≠ 期望版本」可见。
+
+## 文件改动
+
+| 文件 | 改动 |
+|---|---|
+| `src-tauri/src/commands/rollback.rs` | 四态枚举/计数、`plan_tag_convergence(_pairs)`、`select_packages`、漂移预检、收敛执行步、`verify_running_images`/`collect_running_images`、预检返回扩 `tagRestore`/`envDrift` |
+| `src-tauri/src/commands/deploy.rs` | 单镜像 up 前收敛 + up 后校验;整栈步骤 6.0 收敛 + 6.1 校验 |
+| `src-tauri/src/stack.rs` | `referenced_env_vars` / `parse_env_text` / `image_refs_with_env` / `detect_image_env_drift` / `ComposeImageRef` / `ImageEnvDrift` |
+| `src-tauri/src/commands/tests.rs` | 新增 23 个单测(含改写旧用例:标签被占从 Missing 改为 tagRestore) |
+| `ui/deploy-rollback.js` / `ui/rollback.js` | 四态渲染(tagRestore 中间态 + envDrift 区块)、`allowPartial` 纳入漂移 |
+| `ui/help.js` | 04/06 帮助补自动指回 / 漂移 / 后校验(收尾清单显式检查:help 是历次盲区) |
+| `verify/user-facing-copy.js` | 新增 3 条断言(tagRestore/envDrift 消费 + 漂移入确认门) |
+
+## 验证
+
+- `cargo test` **500 passed / 13 ignored**(477→500,新增 23)
+- `cargo clippy` 与基线 **逐条一致,零新增**(仅行号位移)
+- **变异自证**:三处关键判定改坏 → 对应测试全红(select_packages 反向校验 /
+  收敛的标签对齐检查 / 漂移检测的取值入哈希)后还原
+- verify 六脚本 PASS(含 user-facing-copy 新增断言,且对其做了反向变异验证)
+- `scope-integrity` 捕获一处真实缺陷:help.js 里 `${变量}` 在模板字面量中会被当作
+  JS 插值(顶层执行抛 ReferenceError)—— 已转义为 `$\{变量\}`
+
+## 明确留档不做(维持已裁决)
+
+- 无 manifest 旧归档不做目录反向校验(降级 = 现状 + 警告);归档不新增 `.env` 存储
+  (维持 R2 用户裁决;漂移改走「检测 + 用户确认」)。
+- 部署侧「拉取类」服务无法收敛校验(tag 语义即随 pull 移动)。
+- TOCTOU 的**剩余窗口**(收敛查询到 up 之间)由 up 后校验兜底发现;不追求零窗口
+  (那需要 `docker tag` 后立即 up 的事务语义,Docker 不提供)。

@@ -448,6 +448,13 @@ async fn run_deploy_steps(
     } else {
         None
     };
+    // v6.12.0:记录本次部署的本地镜像 ID(up 前复核 / up 后校验的期望值)。
+    // 本机 inspect 失败 → None(复核跳过,不误报)。
+    let expected_id = image_id_by_ref(&image_ref).await.ok().flatten();
+    // 期望标签:compose 引用的是原引用(勾选日期标签时 retag 会把它指到新镜像)
+    let expected_ref: &str = if req.use_date_tag { &req.image } else { &image_ref };
+    let deploy_expected_id: Option<(&str, &str)> =
+        expected_id.as_deref().map(|id| (id, expected_ref));
     server_deploy(
         app,
         &mut client,
@@ -460,6 +467,9 @@ async fn run_deploy_steps(
         retag,
         // 断点续传:装载前先 inspect 远端镜像,已存在(上次装载已成功)则跳过
         resume.as_ref().map(|_| image_ref.as_str()),
+        // v6.12.0 up 前复核 / up 后校验的期望值:本次本地镜像的 ID + compose
+        // 引用的那个标签(日期标签模式下 compose 引用的是原引用,retag 已对齐)
+        deploy_expected_id,
     )
     .await?;
 
@@ -795,6 +805,9 @@ async fn server_deploy(
     tar_name: Option<&str>,
     retag: Option<(String, String)>,
     idempotent_load_ref: Option<&str>,
+    // v6.12.0 up 前收敛复核 / up 后校验的期望值:`(本地采集的镜像 ID, 部署引用)`。
+    // `None` = 未采集到(如本地 inspect 失败)→ 复核与校验跳过(不误报)。
+    deploy_expected_id: Option<(&str, &str)>,
 ) -> Result<(), String> {
     // 5.1 加载镜像(镜像未变化时跳过:ID 已在远端,无需 load)
     match tar_name {
@@ -830,6 +843,48 @@ async fn server_deploy(
         exec_forwarded(app, client, &tag_cmd, 60).await?;
     }
 
+    // 5.2b 按 ID 收敛(v6.12.0;up 前最后一道复核)----
+    // 智能传输判定 / 断点幂等检查都只是**查询那一刻**的快照,到 up 之间隔着
+    // 导出上传或 docker load(秒级到分钟级),期间外部主体移动标签会让结论
+    // 失效(TOCTOU)—— up 一律按 compose 的 `repo:tag` 解析,会拉起非预期版本。
+    // 这里按**本地构建的镜像 ID**(部署的期望值)复核一次:标签没指向它就
+    // 零拷贝指回;ID 不在服务器上(该装载却没装成)则明确报错,不静默继续。
+    if let Some((expected_id, expected_ref)) = deploy_expected_id {
+        match query_remote_images_full(client).await {
+            Ok(list) => {
+                let remote: Vec<(String, String)> = list
+                    .into_iter()
+                    .map(|i| (format!("{}:{}", i.repository, i.tag), i.id))
+                    .collect();
+                let (repo, tag) = split_image_ref(expected_ref);
+                let expect = vec![(
+                    String::new(),
+                    format!("{}:{}", repo, tag),
+                    expected_id.to_string(),
+                )];
+                let conv = plan_tag_convergence_pairs(&expect, &remote);
+                for (_, id, t) in &conv.retag {
+                    let tag_cmd = docker_tag_cmd(id, t);
+                    emit_log(
+                        app,
+                        &format!("部署前复核:标签未指向本次镜像,自动指回({})", tag_cmd),
+                    );
+                    exec_forwarded(app, client, &tag_cmd, 60).await?;
+                }
+                if !conv.missing.is_empty() {
+                    return Err(format!(
+                        "部署前复核失败:镜像 {} 不在服务器上,无法保证 compose 起的是本次构建的版本(请重试部署或检查服务器 Docker)",
+                        short_id(expected_id)
+                    ));
+                }
+            }
+            Err(e) => emit_log(
+                app,
+                &format!("警告:部署前复核查询镜像列表失败({});按既有流程继续", e),
+            ),
+        }
+    }
+
     // 5.3 启动服务:这里只使用已解析的远端 compose 路径
     let up_cmd = format!(
         "cd {} && docker compose -f {} up -d",
@@ -844,6 +899,30 @@ async fn server_deploy(
         ),
     );
     exec_forwarded(app, client, &up_cmd, 600).await?;
+
+    // 5.3b up 后校验(v6.12.0):本次镜像是否真的在跑
+    // (兜住 .env 插值漂移 / compose 未重建容器等残余路径;不改判定结果)
+    if let Some((expected_id, _)) = deploy_expected_id {
+        let prefix = format!(
+            "cd {} && docker compose -f {}",
+            shell_single_quote(&effective_remote_dir(server, project)),
+            shell_single_quote(remote_compose)
+        );
+        match collect_running_images(client, &prefix).await {
+            Ok(actual) => {
+                if !expected_image_running_anywhere(expected_id, &actual) {
+                    emit_log(
+                        app,
+                        &format!(
+                            "警告:未发现容器在运行本次部署的镜像({})—— compose 的 image 引用可能解析到了别的版本(检查 .env 插值与容器是否重建)",
+                            short_id(expected_id)
+                        ),
+                    );
+                }
+            }
+            Err(e) => emit_log(app, &format!("警告:up 后校验未能完成({})", e)),
+        }
+    }
 
     // 5.4 健康检查(up 后按预算轮询服务状态;health_wait_secs=0 时跳过)
     health_check(
@@ -1898,9 +1977,94 @@ async fn run_deploy_stack_steps(
     emit_progress(app, 6, 6, "启动");
     ensure_not_cancelled(app)?;
     let remote_compose = remote_compose_path(&effective_remote_dir(&server, &project));
-    let up_cmd = compose_up_cmd(&effective_remote_dir(&server, &project), &remote_compose, &override_names);
+    let remote_dir = effective_remote_dir(&server, &project);
+
+    // 6.0 按 ID 收敛(v6.12.0;up 前最后一道复核)----
+    // 智能传输判定只是查询那一刻的快照,到 up 之间隔着打包/上传/装载(分钟级),
+    // 期间外部主体移动标签会让跳过判定失效(TOCTOU)——「未变化」的服务不 load,
+    // up 按标签解析,会拉起非预期版本。这里按**本次本地采集的 ID**复核:
+    // 标签没指向它就零拷贝指回;ID 不在服务器上则明确报错(该提示重试)。
+    // **拉取类服务不参与**:它们的 tag 语义就是要随 pull 移动。
+    let expected_pairs: Vec<(String, String, String)> = local_choices
+        .iter()
+        .zip(local_ids.iter())
+        .filter_map(|(svc, id)| {
+            let id = id.as_deref()?;
+            // compose 引用的引用形态(与 manifest 同口径:补 latest)
+            let (repo, tag) = split_image_ref(&svc.image);
+            Some((svc.service.clone(), format!("{}:{}", repo, tag), id.to_string()))
+        })
+        .collect();
+    if !expected_pairs.is_empty() {
+        match query_remote_images_full(&mut client).await {
+            Ok(list) => {
+                let remote: Vec<(String, String)> = list
+                    .into_iter()
+                    .map(|i| (format!("{}:{}", i.repository, i.tag), i.id))
+                    .collect();
+                let conv = plan_tag_convergence_pairs(&expected_pairs, &remote);
+                for (svc, id, t) in &conv.retag {
+                    let tag_cmd = docker_tag_cmd(id, t);
+                    emit_log(
+                        app,
+                        &format!("部署前复核:{} 标签未指向本次镜像,自动指回({})", svc, tag_cmd),
+                    );
+                    exec_forwarded(app, &mut client, &tag_cmd, 60).await?;
+                }
+                if !conv.missing.is_empty() {
+                    return Err(format!(
+                        "部署前复核失败:{} 个服务的本次镜像不在服务器上,无法保证 compose 起的是本次构建的版本(请重试部署或检查服务器 Docker)",
+                        conv.missing.len()
+                    ));
+                }
+            }
+            Err(e) => emit_log(
+                app,
+                &format!("警告:部署前复核查询镜像列表失败({});按既有流程继续", e),
+            ),
+        }
+    }
+
+    let up_cmd = compose_up_cmd(&remote_dir, &remote_compose, &override_names);
     emit_log(app, &format!("启动服务: {}", up_cmd));
     exec_forwarded(app, &mut client, &up_cmd, STACK_COMPOSE_TIMEOUT_SECS).await?;
+
+    // 6.1 up 后校验(v6.12.0):逐服务核对容器实际镜像(兜住残余路径)
+    if !expected_pairs.is_empty() {
+        let expected: Vec<(String, String)> = expected_pairs
+            .iter()
+            .map(|(svc, _, id)| (svc.clone(), id.clone()))
+            .collect();
+        let prefix = format!(
+            "cd {} && docker compose {}",
+            shell_single_quote(&remote_dir),
+            compose_file_flags(&remote_compose, &override_names)
+        );
+        match collect_running_images(&mut client, &prefix).await {
+            Ok(actual) => {
+                let mismatches = select_container_image_mismatches(&expected, &actual);
+                if mismatches.is_empty() {
+                    emit_log(
+                        app,
+                        &format!("up 后运行镜像校验:{} 个服务的实际镜像与本次构建一致", expected.len()),
+                    );
+                } else {
+                    for (svc, want, got) in &mismatches {
+                        emit_log(
+                            app,
+                            &format!(
+                                "警告:{} 容器实际运行的镜像与本次构建不一致(期望 {},实际 {})—— 请检查 .env 插值 / compose 文件 / 容器是否重建",
+                                svc,
+                                short_id(want),
+                                if got.is_empty() { "无容器".to_string() } else { short_id(got) }
+                            ),
+                        );
+                    }
+                }
+            }
+            Err(e) => emit_log(app, &format!("警告:up 后校验未能完成({})", e)),
+        }
+    }
 
     // 健康检查(up 后按预算轮询服务状态;health_wait_secs=0 时跳过)
     // overrides 与 pull/up 同源,override-only 服务同样进入健康判定

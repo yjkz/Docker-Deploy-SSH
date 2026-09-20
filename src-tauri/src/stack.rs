@@ -1003,6 +1003,54 @@ pub fn interpolate_env(raw: &str, env: &HashMap<String, String>) -> String {
     interpolate_env_inner(raw, env, &mut warnings)
 }
 
+/// 提取字符串里引用的变量名(纯函数;`${VAR}` / `${VAR:-default}` / `$VAR` 三种形态,
+/// `$$` 不记)。供插值漂移指纹只对被引用的变量取值 —— 不引用就不算漂移。
+pub fn referenced_env_vars(raw: &str) -> Vec<String> {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut names: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '$' {
+            i += 1;
+            continue;
+        }
+        if i + 1 < chars.len() && chars[i + 1] == '$' {
+            i += 2; // $$ → 字面 $,不是变量
+            continue;
+        }
+        if i + 1 < chars.len() && chars[i + 1] == '{' {
+            match chars[i + 2..].iter().position(|&ch| ch == '}') {
+                Some(close) => {
+                    let end = i + 2 + close;
+                    let content: String = chars[i + 2..end].iter().collect();
+                    let name = content.split_once(":-").map(|(n, _)| n).unwrap_or(&content);
+                    let name = name.trim();
+                    if !name.is_empty() {
+                        names.push(name.to_string());
+                    }
+                    i = end + 1;
+                    continue;
+                }
+                None => {
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        let mut j = i + 1;
+        while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+            j += 1;
+        }
+        if j > i + 1 {
+            names.push(chars[i + 1..j].iter().collect());
+        }
+        i = j.max(i + 1);
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// [`interpolate_env`] 的完整实现:未定义变量替换为空串并收集警告。
 fn interpolate_env_inner(
     raw: &str,
@@ -1110,15 +1158,24 @@ fn load_env_file(dir: &Path) -> HashMap<String, String> {
 /// 读取单个 env 文件(`.env` / 服务级 `env_file` 项)为 KEY→VALUE 表;
 /// 文件不存在返回空表,读取失败记日志并返回空表(与 [`load_env_file`] 同容错口径)。
 fn load_env_path(path: &Path) -> HashMap<String, String> {
-    let mut map = HashMap::new();
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return map,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
         Err(e) => {
             log::warn!("读取 env 文件失败 ({}): {}", path.display(), e);
-            return map;
+            return HashMap::new();
         }
     };
+    parse_env_text(&text)
+}
+
+/// 解析 env 文本为 KEY→VALUE 表(纯函数;`.env` / `env_file` / **服务器上的
+/// `.env` 文本**共用同一解析口径,v6.12.0 起从 [`load_env_path`] 抽出)。
+///
+/// 逐行 `KEY=VALUE`;忽略 `#` 注释行、空行与无 `=` 的行;
+/// 键值两端空白剔除,成对包裹的单/双引号剥除。
+pub fn parse_env_text(text: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -1173,6 +1230,126 @@ fn collect_service_env(base: &HashMap<String, String>, compose_dir: &Path, entry
         }
     }
     merged
+}
+
+/// compose 中一个服务的 image 引用(原文 + 插值结果;v6.12.0 插值漂移检测用)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposeImageRef {
+    pub service: String,
+    /// image 字段原文(含 `${VAR}` 等引用)
+    pub raw: String,
+    /// 用给定 env 表插值后的结果(compose 实际生效的引用)
+    pub resolved: String,
+    /// 原文是否引用了环境变量(不含变量 → 与 env 无关,不可能漂移)
+    pub has_vars: bool,
+}
+
+/// 依序合并 override 文本进 base 文档(与 [`load_compose_document`] 同语义)。
+fn merge_override_texts(value: &mut serde_yaml::Value, overrides: &[String]) -> Result<(), String> {
+    for ov_text in overrides {
+        let mut ov_value: serde_yaml::Value = serde_yaml::from_str(ov_text)
+            .map_err(|e| format!("解析 override 文件失败,不是有效的 YAML: {}", e))?;
+        ov_value
+            .apply_merge()
+            .map_err(|e| format!("解析 override 文件失败,处理 YAML 合并键(<<)失败: {}", e))?;
+        if let Some(ov_services) = ov_value.get("services") {
+            merge_override_services(value, ov_services);
+        }
+    }
+    Ok(())
+}
+
+/// 从 compose 文本(含 optional override 文本,依序浅合并)提取各服务的 image 引用,
+/// 并按给定 env 表插值(纯函数;v6.12.0)。
+///
+/// **用途**:回滚预检的「插值漂移」检测 —— 归档 compose 是**部署当时**的副本,
+/// 其中 `image: ${VAR}` 在执行 `up -d` 时会用服务器**当前** `.env` 重新插值;
+/// `.env` 刻意不入归档(用户裁决,见 wiki/07),若部署后有人改过 `.env`,
+/// up 解析出的镜像引用会与 manifest 记录的 tag 不同 —— 而预检无从发现。
+///
+/// 做法:解析归档 compose(与部署解析同源语义:apply_merge + override 浅合并)
+/// → 每个服务的 `image` 原文 + 用 env 插值的结果一并返回,调用方与 manifest
+/// 记录的 tag 比对即可(manifest 的 tag 就是部署当时的插值结果 —— 不需要新
+/// 的指纹字段,旧归档同样可检)。
+///
+/// **env 只应传 `.env`(项目级)**:真实 Docker Compose 的插值来源是 shell 环境
+/// 与项目 `.env`;服务级 `env_file` **不参与 compose 文件自身的插值**(它只注入
+/// 容器内部环境)—— 这里要与 up 的实际行为一致,故不含 env_file。
+pub fn image_refs_with_env(
+    compose_text: &str,
+    override_texts: &[String],
+    env: &HashMap<String, String>,
+) -> Result<Vec<ComposeImageRef>, String> {
+    let text = compose_text;
+    let mut value: serde_yaml::Value = serde_yaml::from_str(text)
+        .map_err(|e| format!("解析 compose 文件失败,不是有效的 YAML: {}", e))?;
+    value
+        .apply_merge()
+        .map_err(|e| format!("解析 compose 文件失败,处理 YAML 合并键(<<)失败: {}", e))?;
+    if !value.is_mapping() {
+        return Err("compose 文件顶层结构不正确,应为键值映射".to_string());
+    }
+    merge_override_texts(&mut value, override_texts)?;
+
+    let Some(services) = value.get("services").and_then(|v| v.as_mapping()) else {
+        return Ok(Vec::new());
+    };
+    let mut out: Vec<ComposeImageRef> = Vec::new();
+    for (key, entry) in services {
+        let Some(service) = key.as_str() else { continue };
+        let Some(image_raw) = entry.get("image").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let mut warnings = Vec::new();
+        let resolved = interpolate_env_inner(image_raw, env, &mut warnings);
+        out.push(ComposeImageRef {
+            service: service.to_string(),
+            raw: image_raw.to_string(),
+            resolved: resolved.trim().to_string(),
+            has_vars: !referenced_env_vars(image_raw).is_empty(),
+        });
+    }
+    out.sort_by(|a, b| a.service.cmp(&b.service));
+    Ok(out)
+}
+
+/// 插值漂移条目(纯函数产物;见 [`detect_image_env_drift`])。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageEnvDrift {
+    pub service: String,
+    /// manifest 记录的引用(部署时插值结果)
+    pub expected: String,
+    /// 用服务器当前 `.env` 重新插值的结果(up -d 实际会用的引用)
+    pub resolved: String,
+}
+
+/// 检测插值漂移(纯函数,便于单测;v6.12.0)。
+///
+/// 比对基准是 **manifest 记录的 tag**(它本身就是部署当时的插值结果),
+/// 因此不需要在 manifest 里新增指纹字段 —— 旧归档同样可检。
+///
+/// 只对「image 原文引用了变量」的服务判定:不含变量的引用与 `.env` 无关,
+/// 解析结果不可能漂移(避免噪音)。`manifest` 传 `(service, tag)` 对;
+/// 归档 compose 里找不到对应服务名时跳过(compose 与 manifest 不一致属另一
+/// 类问题,由执行链的其它检查覆盖)。
+pub fn detect_image_env_drift(
+    refs: &[ComposeImageRef],
+    manifest: &[(String, String)],
+) -> Vec<ImageEnvDrift> {
+    let mut out: Vec<ImageEnvDrift> = Vec::new();
+    for r in refs.iter().filter(|r| r.has_vars) {
+        let Some((_, expected)) = manifest.iter().find(|(s, _)| s == &r.service) else {
+            continue;
+        };
+        if &r.resolved != expected {
+            out.push(ImageEnvDrift {
+                service: r.service.clone(),
+                expected: expected.clone(),
+                resolved: r.resolved.clone(),
+            });
+        }
+    }
+    out
 }
 
 /// 剥除成对包裹的单/双引号(compose 对 .env 值的处理方式)。

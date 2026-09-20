@@ -141,6 +141,17 @@ console.log('\n=== 5. 回滚预检 UI 契约(前后端字段名对齐;两个入�
   ok(/allowPartial/.test(drb),
     '前端传 allowPartial(用户确认后允许部分回滚)',
     'R1:阻断项存在时后端拒绝执行,须显式确认后才带 allowPartial=true 重发');
+  // v6.12.0:预检新增 tagRestore(标签待指回)与 envDrift(插值漂移)两个字段 ——
+  // 两个入口都必须消费(读错/漏读 = 新状态静默不可见,用户无从确认)
+  ok(/tagRestore/.test(drb) && /envDrift/.test(drb),
+    'deploy-rollback.js 消费 tagRestore / envDrift(v6.12.0 新状态)',
+    '四态渲染与漂移展示是「不静默」的落点;字段读错会静默退化成旧行为');
+  ok(/tagRestore/.test(rbPage) && /envDrift/.test(rbPage),
+    'rollback.js(06 页)同样消费 tagRestore / envDrift',
+    '两入口同口径(单一事实来源纪律):只改一处会让 06 页缺新状态展示');
+  ok(/envDrift[\s\S]{0,120}allowPartial|allowPartial[\s\S]{0,120}envDrift/.test(drb),
+    '04 页把 envDrift 纳入 allowPartial 判定(漂移也须确认)',
+    '漂移不确认 = 又一处「报告与实际不符」的静默失效');
 }
 
 console.log('\n---------------------------------------');
