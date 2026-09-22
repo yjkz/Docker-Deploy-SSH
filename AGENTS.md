@@ -7,7 +7,7 @@
 Windows 桌面客户端（Tauri 2）：把本地构建的 Docker 镜像一键部署到自己的服务器 —— `docker save → gzip → SFTP → docker load → compose up`，不依赖镜像仓库与 CI/CD。
 
 - 后端：纯 Rust（`src-tauri/src/`，全部业务逻辑）；前端：原生 HTML/CSS/JS（`ui/`，**无框架、无打包器、无 npm 运行时依赖**）。
-- 主分支 `main`；当前版本 v6.11.1，`cargo test` 基线 **474 passed / 13 ignored**，命令 **114** 个（实测口径 = 数 `lib.rs` 的 `generate_handler![]`）。
+- 主分支 `main`；当前版本 v6.15.0，`cargo test` 基线 **519 passed / 14 ignored**，命令 **122** 个（实测口径 = 数 `lib.rs` 的 `generate_handler![]`）。**版本与计数真值以 `ROADMAP.md`「当前状态速览」为准**（本行曾长期漂移）。
 
 ## 目录导览
 
@@ -31,6 +31,7 @@ cd src-tauri && cargo test   # 单测；真机测试: cargo test docker:: -- --i
 cd src-tauri && cargo clippy # 与基线逐条比对：新代码零新增告警（CI 不加 -D warnings）
 node --check ui/xxx.js       # 改 JS 后逐个语法检查
 node verify/form-validation.js && node verify/bridge-integrity.js && node verify/scope-integrity.js
+node verify/static-integrity.js   # 静态完整性：未声明自由标识符(含嵌套回调) + DOM id 唯一性/引用有效性
 node verify/contract-smoke.js    # 前后端命令/事件集合双向核对（新增动态调用点需同步其补充表）
 node verify/doc-consistency.js   # 版本号/命令数/测试数/七篇页首版本戳；发版后 --write --tests=N 更新缓存
 ```
@@ -67,7 +68,7 @@ node verify/doc-consistency.js   # 版本号/命令数/测试数/七篇页首版
 
 ## 验证与发布流程
 
-- 逻辑类改动先跑 `verify/` 四脚本（比开浏览器快）；UI 视觉验证用**浏览器 + Tauri 桩**（`ui/_tauri-stub.js` + `ui/_judge-preview.html` + 本机无缓存静态服务，browser-use 截图交 judge）——**不用 computer-use**（用户常在全屏游戏）。**用完删桩、停服务、关页面**。
+- 逻辑类改动先跑 `verify/` 脚本（比开浏览器快；清单见「常用命令」）；UI 视觉验证用**浏览器 + Tauri 桩**（`ui/_tauri-stub.js` + `ui/_judge-preview.html` + 本机无缓存静态服务，browser-use 截图交 judge）——**不用 computer-use**（用户常在全屏游戏）。**用完删桩、停服务、关页面**。
   - **IAB 按 URL 缓存资源**：桩验证前给预览页所有脚本加 `?v=N`（或起 no-cache 服务），否则改完 JS 看到的还是旧代码；`AppBus.on` 的 unlisten 是异步返回——任何「只判 unlisten 的幂等守卫」都无效（终端双注册事故，见 UPGRADE-PLAN 第二十二批二）。
 - **push 前**：`cargo test` 必须**亲眼确认 `test result: ok`**；绝不把验证与提交串进同一条 `&&` 管道（grep/head 会吞失败输出，曾把编译失败的提交推上 main）。
 - **GitHub 走本地代理**：`git -c http.proxy=http://127.0.0.1:12450 -c https.proxy=http://127.0.0.1:12450 push origin main`；SSH 连服务器直连、不走代理。
@@ -95,7 +96,7 @@ git worktree add -b dev/s2-<topic>  D:/Github-repositories/docker-deploy-ssh-s2 
 1. **文件主权**：每批开工前先在 ROADMAP 候选池节确认本会话的「文件主权矩阵」（哪些文件归你改）；**除此之外的文件开发期冻结**——尤其 `lib.rs`、三处版本号（`tauri.conf.json`/`Cargo.toml`/`package.json`）、`wiki/README.md`、七篇页首戳、`verify/VERSION.txt`、`index.html`、`app.js`、`ROADMAP.md`/`UPGRADE-PLAN.md` 公共行。
 2. **合入串行**：同一时刻只有一方合入 main。先完成方：验证链全绿 → 合入 main（代码 + 测试 + 自己的 UPGRADE-PLAN 节/ROADMAP 条目）→ push → 停下汇报。
 3. **后完成方**：`git rebase main` → 合入 → 补自己文档 + **批次收尾一次**（三处版本号 bump + wiki/README + 七篇页首戳 + `doc-consistency --write --tests=N`）→ push → 停下汇报。
-4. **验证链各自跑**：`cargo test` 亲眼确认 `test result: ok` → clippy 与基线逐条比对 → 改 JS 跑 `node --check` → verify 四脚本 → UI 改动走「浏览器 + Tauri 桩」截图交 judge。worktree 无需 `node_modules`。
+4. **验证链各自跑**：`cargo test` 亲眼确认 `test result: ok` → clippy 与基线逐条比对 → 改 JS 跑 `node --check` → verify 脚本（清单见「常用命令」）→ UI 改动走「浏览器 + Tauri 桩」截图交 judge。worktree 无需 `node_modules`。
 5. **资源冲突避免**：两会话的本地静态服务用**不同端口**（S1:8799 / S2:8798）；**不要同时跑两个 `npm run tauri dev`**（WebView2 dev 实例会互相抢端口/配置）；cargo target 各自 worktree 独立，首次全量编译慢属正常。
 
 ### 并行对状态（2026-09-17 第三批已完结）

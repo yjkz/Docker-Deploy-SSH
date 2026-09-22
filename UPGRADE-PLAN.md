@@ -3772,3 +3772,86 @@ wiki/07 决策 79 补边界:①换 `remote_dir` / 目录改名 → 旧目录容�
 - 宿主机**任意路径**文件管理(仅开放部署目录且只读;通用宿主文件管理风险高,另行评估)。
 - 容器内多选批量传输(先单条;批量已有「同栈分发」)。
 - 二进制/超大文件的就地编辑(引导下载改后上传)。
+
+---
+
+# 第三十四批(一):静态守护(自由标识符 + DOM id)+ 文档清尾(2026-09-22)
+
+> **来源**:第三十四批开工总方案(池内 7 项 + 池外 4 项,四问确认后分批);本批 = **S4** +
+> 池外「全站多页同 id 系统性扫描/守护」+ **S5**,并把新扫描首跑抓到的两处真 bug 一并修复。
+> **版本**:v6.15.0(本批为批次收尾,后续批共享同一版本号)。
+
+## 交付
+
+**新守护 `verify/static-integrity.js`**(零依赖,已入本地链与 CI),两段 ——
+
+- **A 未声明自由标识符(词法级)**:补 `scope-integrity.js` 的运行时盲区(元素级 addEventListener /
+  setTimeout 等嵌套回调不执行,getElementById 恒 null 还会短路「以元素存在为前置」的分支)。
+  自建 ES5 词法器(注释/字符串/模板/正则/数字)+ 作用域链收集(var/function 提升到最近函数作用域、
+  形参、catch 形参、window/globalThis 全局赋值集合 46 个、内建与 DOM 接口白名单),引用判定在整文件
+  收集后统一进行;`typeof x` 操作数跳过(特征探测合法)。**负向夹具 10 条**随脚本常跑(含 v5.14.0 的
+  `$` 事故形态、跨文件局部名外泄、字符串/注释/正则免疫、三元中段引用、用户属性键不误报)。
+- **B DOM id 完整性**:B1 index.html 静态 id 唯一性(229 个);B2 `getElementById('x')` /
+  `querySelector('#x')` / `$('x')` 字面量必须可解析 —— 合法来源 = 静态 id ∪ 动态赋值(`.id = 'x'` /
+  `setAttribute('id',…)`)∪ innerHTML 静态骨架字符串 ∪ **字段构造助手参数位**(`buildField`/
+  `appendField`/`checkboxRow` 这类「形参赋给 `.id`」的助手,含链式转交,按形参索引取实参);B3 动态 id
+  重名默认失败,评审通过者登记白名单(附理由;本仓 4 条均为「同一容器清空后顺序重建,任一时刻至多一个
+  实例」)。
+
+**首跑抓出的两处真 bug(本批修复)**:
+
+1. `ui/deploy.js`(原 2571 行)`serverId: sid` —— **第二十八批 B1 复合键重构漏删声明的回归**:原实现
+   `var sid = String(item.serverId)` 被删、`serverId: sid` 留在失败/取消台的续传登记里 → 登记时抛
+   `ReferenceError`(发生在 deploy-done 回调里,后续 `st.batch.idx++` / `renderBatchPanel` /
+   `runBatchNext` 全部不执行 → **该台之后队列停摆、续传入口不登记**)。修复 = `String(item.serverId)`,
+   与上方复合键 `batchItemKey(item.serverId, item.project.id)` 同源。
+2. `ui/app.js`(1321 行)`getElementById('settings-btn')` —— 实际 id 为 `settings-entry-btn`
+   (`index.html:57`),`if (gear)` 守卫吞掉 → **dock 版本徽点「点击打开设置中心」静默失效**。
+   修复 = 改对 id(桩验证见下)。
+
+**顺带清理**:`ui/manage-stacks.js` 的 .env 保存确认按钮 `confirm-ok-btn`/`confirm-cancel-btn` 与
+`manage.js` 的通用确认体跨文件重名 → 按同文件既有约定改名 **`env-confirm-*`**(4 行,零行为变化;
+复现 `compose-confirm-*` 已命名空间化的惯例)。`verify/scope-integrity.js` 头注释漂移修正(CHAIN 实为
+theme-init + 17,并补 static-integrity 的分工说明)。
+
+**S5**:`wiki/06:136`、`wiki/07:273` TOCTOU 例子的 watchtower(2025 已归档)改为「另一台机器的本应用 /
+CI / 运维脚本」。
+
+**文档清尾**:AGENTS.md 基线行与 verify 清单(四/六脚本 → 指向「常用命令」清单,增 static-integrity)、
+ROADMAP(候选池状态、S4/S5 行、速览、命令 114→122 漂移、JS 16→18 漂移)、wiki/README 命令/事件/
+章节计数与版本段、三处版本号、七篇页首戳。
+
+## 验证
+
+- `cargo test` **519 passed / 14 ignored**(亲自读 `test result: ok` 行;纯前端/脚本改动,Rust 侧不变)
+- `cargo clippy`:本批零 Rust 源码改动(仅 Cargo.toml 版本串),告警集合与基线不可变
+- `node --check`:deploy.js / app.js / manage-stacks.js / static-integrity.js 全过
+- verify **七脚本**全 rc=0(新脚本:10 夹具全 PASS + A 段 18 文件零发现 + B 段 229 静态 id /
+  221 动态 id / 536 引用全部可解析)
+- **桩验证 + judge**:桩页(take_update_pending→host_check→app_settings_get→update_check 全链,
+  零未捕获异常/未处理 rejection)中点击版本徽点 → 设置模态打开(visible=true,标题「设置SETTINGS」,
+  内容完整);judge **pass**。注:IAB 的 Playwright 指针点击通道本会话未生效(locator click 超时、
+  坐标点击无效,DPR=1 且命中测试证明元素本身可点)→ 验收改用页内 click 事件驱动处理链
+- CI:`.github/workflows/ci.yml` 增 static-integrity 一步
+
+## 裁决记录(2026-09-22 四问确认;后续批次按其执行)
+
+| 项 | 裁决 | 落地 |
+|---|---|---|
+| P4 更新包签名校验 | **跳过留档**(待密钥管理拍板后另行开工) | 本版本不实现 |
+| 宿主机文件管理 | 白名单目录可读写(全局设置项,默认空;白名单外维持现状只读) | 第三十四批(五) |
+| 容器内文件传输 | 做多选批量(下载 + 上传) | 第三十四批(四) |
+| 「up 后镜像不一致」 | 统一口径 + 可见(部署链与回滚链同文案进 `record.message`,不升级失败) | 第三十四批(二) |
+
+## 文件改动
+
+| 文件 | 改动 |
+|---|---|
+| `verify/static-integrity.js` | **新增**(词法器 + 作用域收集 + id 三查 + 10 条夹具) |
+| `ui/deploy.js` | 批量续传登记 `sid` 回归修复(1 行) |
+| `ui/app.js` | 设置入口 id 修复(1 行) |
+| `ui/manage-stacks.js` | .env 确认按钮 id 命名空间化(4 行) |
+| `verify/scope-integrity.js` | 头注释漂移修正(16→17 + 分工说明) |
+| `wiki/06` / `wiki/07` | watchtower 措辞(watchtower → 运维脚本) |
+| `.github/workflows/ci.yml` | 增 static-integrity 步骤 |
+| `AGENTS.md` / `ROADMAP.md` / `wiki/README.md` / 七篇页首戳 / 三处版本号 | 基线与计数对齐 v6.15.0 |

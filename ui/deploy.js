@@ -2568,7 +2568,7 @@
       }
       if (!exists) {
         st.batch.resumable.push({
-          serverId: sid,
+          serverId: String(item.serverId),
           projectId: String(item.project.id),
           serverName: item.server ? (item.server.name || item.server.id) : '',
           mode: st.batch.resume ? (item.resumeMode || st.batch.mode) : st.batch.mode

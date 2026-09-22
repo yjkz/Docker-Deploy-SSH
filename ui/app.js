@@ -1318,7 +1318,7 @@
         verNode.appendChild(dot);
         verNode.addEventListener('click', function () {
           window.showPage('check'); // 设置中心入口在 dock 齿轮;点徽点打开设置模态
-          var gear = document.getElementById('settings-btn');
+          var gear = document.getElementById('settings-entry-btn');
           if (gear) gear.click();
         });
       };

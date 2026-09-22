@@ -725,10 +725,10 @@
     }));
     div.innerHTML +=
       '<div class="modal-actions">' +
-      '<button id="confirm-cancel-btn" class="btn" type="button">取消</button>' +
-      '<button id="confirm-ok-btn" class="btn btn-danger" type="button">保存</button>' +
+      '<button id="env-confirm-cancel-btn" class="btn" type="button">取消</button>' +
+      '<button id="env-confirm-ok-btn" class="btn btn-danger" type="button">保存</button>' +
       '</div>';
-    var cancelBtn = div.querySelector('#confirm-cancel-btn');
+    var cancelBtn = div.querySelector('#env-confirm-cancel-btn');
     if (cancelBtn) {
       cancelBtn.addEventListener('click', function () {
         // 草稿含 U+FFFD 时提示区一并保留风险说明
@@ -737,7 +737,7 @@
         reopenStackEnvEdit(st, draft, session, hint);
       });
     }
-    var okBtn = div.querySelector('#confirm-ok-btn');
+    var okBtn = div.querySelector('#env-confirm-ok-btn');
     if (okBtn) okBtn.addEventListener('click', function () { doStackEnvSave(st, session, draft); });
     return div;
   }

@@ -73,6 +73,12 @@ jobs:
         run: node verify/contract-smoke.js
         shell: bash
 
+      # 静态完整性(第三十四批):词法级未声明自由标识符(含嵌套回调,补
+      # scope-integrity 的运行时盲区)+ DOM id 唯一性与引用有效性
+      - name: Static integrity (verify/)
+        run: node verify/static-integrity.js
+        shell: bash
+
       # 文档一致性(第二十二批):版本号/命令数/测试数/页首版本戳跨文档核对
       # (测试数比对依赖 verify/VERSION.txt 缓存;缓存被 .gitignore 时该项跳过)
       - name: Doc consistency (verify/)

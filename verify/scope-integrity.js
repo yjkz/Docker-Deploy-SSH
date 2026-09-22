@@ -7,7 +7,9 @@
 // `$` 只在 DOMContentLoaded 回调里第一次被求值。此脚本把该缺陷固化为可回归检查。
 //
 // 桥接完整性(bridge-integrity.js)查的是 K.* 显式桥;本脚本查的是**隐式自由
-// 标识符**——两道互补的网。
+// 标识符**——两道互补的网。嵌套回调(元素 addEventListener / setTimeout 等)里的
+// 同类引用**执行不到**,由 static-integrity.js 的词法级检查覆盖(本脚本的运行时
+// 观测面止于顶层与 DOMContentLoaded)。
 const fs = require('fs');
 const path = require('path');
 const ROOT = path.join(__dirname, '..');
@@ -48,7 +50,7 @@ global.__TAURI__ = {
 // window 上的 addEventListener(domListeners.window 已由 global.addEventListener 覆盖,
 // 因为 global.window === global)
 
-// ===== index.html 的真实加载顺序(theme-init.js 在前,自 app.js 起的 16 个随后) =====
+// ===== index.html 的真实加载顺序(theme-init.js 在前,其余 17 个随后;共 18) =====
 const CHAIN = [
   'theme-init.js',
   'app.js', 'check.js', 'images.js', 'servers.js', 'servers-cleanup.js',
