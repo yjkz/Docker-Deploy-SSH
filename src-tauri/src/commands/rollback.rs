@@ -575,6 +575,23 @@ pub fn expected_images_from_manifest(images: &[ManifestImage]) -> Vec<(String, S
         .collect()
 }
 
+/// manifest → `(service, repo:tag)` 列表(第三十四批 P3)。与
+/// [`expected_images_from_manifest`] 的区别:后者是**镜像 ID** 口径,供 up 后
+/// 运行校验;本函数是**引用**口径,供 up 前 `compose config` 解析结果逐服务比对。
+pub fn manifest_image_refs(images: &[ManifestImage]) -> Vec<(String, String)> {
+    images
+        .iter()
+        .filter_map(|i| {
+            let tag = i.tag.trim();
+            if tag.is_empty() {
+                None
+            } else {
+                Some((i.service.clone(), tag.to_string()))
+            }
+        })
+        .collect()
+}
+
 /// 单镜像部署的 up 后校验(纯函数,便于单测):期望镜像 ID 是否被**任一**运行
 /// 容器使用。
 ///
@@ -1806,6 +1823,49 @@ pub(crate) async fn rollback_execute_stack_inner(
                 app,
                 &format!("up 前复核:以下服务镜像已不在服务器,将沿用当前镜像:{}", details),
             );
+        }
+    }
+
+    // up 前服务端权威解析校验(第三十四批 P3;回滚侧**只读告警**)----
+    // 插值漂移预检按「确认制」处理 .env 漂移(用户可确认按当前 .env 执行),
+    // 故此处**不再阻断**;补的是预检看不见的服务器 shell 环境变量维度 ——
+    // 不一致逐条告警,实际结果由 up 后校验兜底并写入结果文案。
+    if let Some(m) = &manifest {
+        let expected_resolved = manifest_image_refs(&m.images);
+        match compose_config_probe(
+            app,
+            &mut client,
+            &effective_remote_dir(&server, &project),
+            Some(remote_compose.as_str()),
+            &override_names,
+        )
+        .await
+        {
+            Ok(ComposeConfigProbe::Resolved(resolved)) => {
+                let report = crate::stack::diff_resolved_images(&expected_resolved, &resolved);
+                for (svc, want, got) in &report.mismatched {
+                    emit_log(
+                        app,
+                        &format!(
+                            "警告:up 前解析校验 {} 解析为 {},与归档记录不符(期望 {})—— 服务器 shell 环境变量或 .env 可能改写了标签",
+                            svc,
+                            if got.is_empty() { "(compose 中无此服务)" } else { got.as_str() },
+                            want
+                        ),
+                    );
+                }
+                if report.mismatched.is_empty() {
+                    emit_log(
+                        app,
+                        &format!(
+                            "up 前服务端解析校验:{} 个服务的镜像与归档记录一致",
+                            expected_resolved.len()
+                        ),
+                    );
+                }
+            }
+            Ok(ComposeConfigProbe::Unsupported) => {}
+            Err(e) => emit_log(app, &format!("警告:up 前解析校验未能完成({})", e)),
         }
     }
 
@@ -3065,6 +3125,53 @@ async fn rollback_execute_stack_at_inner(
                     ),
                 );
             }
+        }
+    }
+    // up 前服务端权威解析校验(第三十四批 P3;回滚侧只读告警,与 04 链同口径)----
+    // 归档有 compose 副本 → 显式 `-f` 链(与上方 up 命令逐字同源);无副本的
+    // 降级路径按目录默认解析(与 up 同形态)。
+    if let Some(m) = &manifest {
+        let expected_resolved = manifest_image_refs(&m.images);
+        let probe_compose = if has_compose_copy {
+            Some(remote_join(&dir, "docker-compose.yml"))
+        } else {
+            None
+        };
+        let probe_overrides: &[String] = if has_compose_copy { &override_chain } else { &[] };
+        match compose_config_probe(
+            app,
+            &mut client,
+            &dir,
+            probe_compose.as_deref(),
+            probe_overrides,
+        )
+        .await
+        {
+            Ok(ComposeConfigProbe::Resolved(resolved)) => {
+                let report = crate::stack::diff_resolved_images(&expected_resolved, &resolved);
+                for (svc, want, got) in &report.mismatched {
+                    emit_log(
+                        app,
+                        &format!(
+                            "警告:up 前解析校验 {} 解析为 {},与归档记录不符(期望 {})—— 服务器 shell 环境变量或 .env 可能改写了标签",
+                            svc,
+                            if got.is_empty() { "(compose 中无此服务)" } else { got.as_str() },
+                            want
+                        ),
+                    );
+                }
+                if report.mismatched.is_empty() {
+                    emit_log(
+                        app,
+                        &format!(
+                            "up 前服务端解析校验:{} 个服务的镜像与归档记录一致",
+                            expected_resolved.len()
+                        ),
+                    );
+                }
+            }
+            Ok(ComposeConfigProbe::Unsupported) => {}
+            Err(e) => emit_log(app, &format!("警告:up 前解析校验未能完成({})", e)),
         }
     }
     emit_log(app, &format!("启动服务: {}", up_cmd));

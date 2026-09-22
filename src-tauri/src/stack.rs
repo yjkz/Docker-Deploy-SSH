@@ -1417,6 +1417,127 @@ pub fn declared_env_keys_of_service(
     Ok(keys)
 }
 
+// ===== up 前服务端权威解析校验(第三十四批 P3)=====
+// 背景:本地 `image_refs_with_env` 重算属**近似**;compose 插值还吃服务器 shell
+// 环境变量,只有服务端 `docker compose config` 才是权威结果。以下纯函数供各条
+// 链在 up 前比对「记录期望 vs 服务端解析」,把本地看不见的漂移显式化
+// (与 v6.12.0「按 ID 收敛」互补:收敛治标签指向,本校验治 compose 解析结果)。
+
+/// `docker compose config --format json` 输出中的单个服务(仅关心 image)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedService {
+    pub service: String,
+    /// `None` = 输出里没有 image 字段。实测(compose v5.4.0,第三十四批):
+    /// 缺省 `image:` 的 build 服务**不会**被补默认镜像名,JSON 里直接无该字段。
+    pub image: Option<String>,
+}
+
+/// 解析 `docker compose config --format json` 输出(纯函数)。
+///
+/// 注意:经 SSH 拿到的可能是 **stdout+stderr 合并**文本(undefined 变量的
+/// warning 在前),故取首个 `{` 到最后一个 `}` 的区间再解析。
+pub fn parse_compose_config_json(text: &str) -> Result<Vec<ResolvedService>, String> {
+    let start = text
+        .find('{')
+        .ok_or_else(|| "输出中未找到 JSON(compose config 无输出)".to_string())?;
+    let end = text
+        .rfind('}')
+        .ok_or_else(|| "输出中未找到 JSON(compose config 无输出)".to_string())?;
+    if end <= start {
+        return Err("输出中未找到完整 JSON".to_string());
+    }
+    let value: serde_json::Value = serde_json::from_str(&text[start..=end])
+        .map_err(|e| format!("不是有效的 config JSON: {}", e))?;
+    let services = value
+        .get("services")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| "config JSON 缺少 services 段".to_string())?;
+    let mut out: Vec<ResolvedService> = services
+        .iter()
+        .map(|(name, entry)| ResolvedService {
+            service: name.clone(),
+            image: entry
+                .get("image")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+        })
+        .collect();
+    out.sort_by(|a, b| a.service.cmp(&b.service));
+    Ok(out)
+}
+
+/// 镜像引用规范化(比对口径):去空白与包裹引号;补缺省 `:latest`;
+/// 剥离 `docker.io/` / `index.docker.io/` 前缀;digest 形式(`repo@sha256:…`)
+/// 原样保留。**两侧同口径调用**,只求可比,不做语义改写(如不动 `library/`)。
+pub fn normalize_image_ref(raw: &str) -> String {
+    let s = raw.trim().trim_matches(|c| c == '"' || c == '\'');
+    if s.is_empty() {
+        return String::new();
+    }
+    if let Some((repo, digest)) = s.split_once('@') {
+        return format!("{}@{}", strip_registry_prefix(repo.trim()), digest.trim());
+    }
+    // 末段冒号视为 tag;`registry:5000/path` 这类端口冒号后含 `/`,不算 tag
+    let (repo, tag) = match s.rfind(':') {
+        Some(i) if !s[i + 1..].contains('/') => (&s[..i], s[i + 1..].trim()),
+        _ => (s, ""),
+    };
+    let tag = if tag.is_empty() { "latest" } else { tag };
+    format!("{}:{}", strip_registry_prefix(repo.trim()), tag)
+}
+
+fn strip_registry_prefix(repo: &str) -> String {
+    let r = repo.strip_prefix("index.docker.io/").unwrap_or(repo);
+    r.strip_prefix("docker.io/").unwrap_or(r).to_string()
+}
+
+/// 逐服务比对结果(纯函数产物)。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ResolvedImageReport {
+    /// 期望与服务端解析不一致:(service, 期望, 实际)。实际为空串 = 服务在
+    /// 解析结果中**完全缺失**(up 不会启动它 —— 比标签不符更严重)。
+    pub mismatched: Vec<(String, String, String)>,
+    /// 期望里有、解析结果无 image 的服务(构建类;不判定,仅提示)。
+    pub no_image: Vec<String>,
+    /// 服务端解析结果里的服务数(日志用)。
+    pub resolved_total: usize,
+}
+
+/// 期望 vs 服务端权威解析逐服务比对(纯函数)。空期望 → 空报告(不判定)。
+pub fn diff_resolved_images(
+    expected: &[(String, String)],
+    resolved: &[ResolvedService],
+) -> ResolvedImageReport {
+    use std::collections::HashMap;
+    let map: HashMap<&str, Option<&str>> = resolved
+        .iter()
+        .map(|r| (r.service.as_str(), r.image.as_deref()))
+        .collect();
+    let mut report = ResolvedImageReport {
+        resolved_total: resolved.len(),
+        ..Default::default()
+    };
+    for (svc, want) in expected {
+        match map.get(svc.as_str()) {
+            None => report.mismatched.push((
+                svc.clone(),
+                normalize_image_ref(want),
+                String::new(),
+            )),
+            Some(None) => report.no_image.push(svc.clone()),
+            Some(Some(got)) => {
+                let want_n = normalize_image_ref(want);
+                let got_n = normalize_image_ref(got);
+                if want_n != got_n {
+                    report.mismatched.push((svc.clone(), want_n, got_n));
+                }
+            }
+        }
+    }
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2880,5 +3001,127 @@ services:
         assert_eq!(mounts[0].source, "./data");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ===== up 前服务端权威解析校验(第三十四批 P3)=====
+
+    /// golden:compose v5.4.0 本机实测抓样(临时项目 dd-p3-lab;覆盖 .env 插值 /
+    /// 注册表路径 / 无 tag / build 且无 image 四形态)。
+    const CONFIG_JSON_GOLDEN: &str = r#"{
+  "name": "dd-p3-lab",
+  "networks": { "default": { "name": "dd-p3-lab_default", "ipam": {} } },
+  "services": {
+    "api": { "command": null, "entrypoint": null, "image": "registry.example.com/team/api:1.0", "networks": { "default": null } },
+    "plain": { "command": null, "entrypoint": null, "image": "redis", "networks": { "default": null } },
+    "web": { "command": null, "entrypoint": null, "image": "nginx:1.27", "networks": { "default": null } },
+    "worker": { "build": { "context": "/x", "dockerfile": "Dockerfile" }, "command": null, "entrypoint": null, "networks": { "default": null } }
+  }
+}"#;
+
+    #[test]
+    fn test_parse_compose_config_json_golden() {
+        let out = parse_compose_config_json(CONFIG_JSON_GOLDEN).unwrap();
+        let names: Vec<&str> = out.iter().map(|s| s.service.as_str()).collect();
+        assert_eq!(names, vec!["api", "plain", "web", "worker"]);
+        assert_eq!(
+            out[0].image.as_deref(),
+            Some("registry.example.com/team/api:1.0")
+        );
+        assert_eq!(out[1].image.as_deref(), Some("redis"), "无 tag 原样保留");
+        assert_eq!(out[2].image.as_deref(), Some("nginx:1.27"), "插值已由服务端完成");
+        assert_eq!(out[3].image, None, "build 且无 image 的服务不补默认镜像名");
+    }
+
+    #[test]
+    fn test_parse_compose_config_json_tolerates_leading_warning() {
+        // 合并流形态(undefined 变量 warning 在 JSON 之前;本机实测)
+        let text = "time=\"2026-09-22T21:15:49+08:00\" level=warning msg=\"The MISSING variable is not set. Defaulting to a blank string.\"\n{\n  \"services\": { \"broken\": { \"image\": \"nginx:\" } }\n}";
+        let out = parse_compose_config_json(text).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].image.as_deref(), Some("nginx:"), "空 tag 原样保留,规范化时补 latest");
+    }
+
+    #[test]
+    fn test_parse_compose_config_json_rejects_garbage() {
+        assert!(parse_compose_config_json("go-yaml load error in parser").is_err());
+        assert!(
+            parse_compose_config_json("{}").is_err(),
+            "缺 services 段应报错(交给调用方按解析失败处置)"
+        );
+    }
+
+    #[test]
+    fn test_normalize_image_ref_cases() {
+        assert_eq!(normalize_image_ref("nginx"), "nginx:latest");
+        assert_eq!(normalize_image_ref("nginx:"), "nginx:latest");
+        assert_eq!(normalize_image_ref(" nginx:1.27 "), "nginx:1.27");
+        assert_eq!(
+            normalize_image_ref("docker.io/library/nginx:1.27"),
+            "library/nginx:1.27",
+            "只剥 docker.io 前缀,不动 library/"
+        );
+        assert_eq!(
+            normalize_image_ref("index.docker.io/team/api:1.0"),
+            "team/api:1.0"
+        );
+        assert_eq!(
+            normalize_image_ref("registry:5000/team/api"),
+            "registry:5000/team/api:latest",
+            "注册表端口冒号不算 tag"
+        );
+        assert_eq!(normalize_image_ref("repo@sha256:abc"), "repo@sha256:abc");
+        assert_eq!(normalize_image_ref("\"quoted:1\""), "quoted:1");
+    }
+
+    #[test]
+    fn test_diff_resolved_images_ok_with_latest_normalization() {
+        let expected = vec![
+            ("web".to_string(), "nginx:1.27".to_string()),
+            ("plain".to_string(), "redis".to_string()),
+            ("worker".to_string(), "dd-p3-lab-worker:latest".to_string()),
+        ];
+        let resolved = parse_compose_config_json(CONFIG_JSON_GOLDEN).unwrap();
+        let report = diff_resolved_images(&expected, &resolved);
+        assert!(report.mismatched.is_empty(), "{:?}", report.mismatched);
+        assert_eq!(
+            report.no_image,
+            vec!["worker".to_string()],
+            "构建类服务单独归类(仅提示,不判差异)"
+        );
+        assert_eq!(report.resolved_total, 4);
+    }
+
+    #[test]
+    fn test_diff_resolved_images_mismatch_and_missing() {
+        let expected = vec![
+            ("web".to_string(), "nginx:1.26".to_string()),
+            ("ghost".to_string(), "ghost:1".to_string()),
+        ];
+        let resolved = parse_compose_config_json(CONFIG_JSON_GOLDEN).unwrap();
+        let report = diff_resolved_images(&expected, &resolved);
+        assert_eq!(report.mismatched.len(), 2);
+        assert_eq!(
+            report.mismatched[0],
+            (
+                "web".to_string(),
+                "nginx:1.26".to_string(),
+                "nginx:1.27".to_string()
+            ),
+            "标签不符:两侧都规范化后逐字给出"
+        );
+        assert_eq!(
+            report.mismatched[1],
+            ("ghost".to_string(), "ghost:1".to_string(), String::new()),
+            "解析结果完全缺失:实际为空串(比标签不符更严重)"
+        );
+        assert!(report.no_image.is_empty());
+    }
+
+    #[test]
+    fn test_diff_resolved_images_empty_expected_is_noop() {
+        let resolved = parse_compose_config_json(CONFIG_JSON_GOLDEN).unwrap();
+        let report = diff_resolved_images(&[], &resolved);
+        assert!(report.mismatched.is_empty() && report.no_image.is_empty());
+        assert_eq!(report.resolved_total, 4);
     }
 }

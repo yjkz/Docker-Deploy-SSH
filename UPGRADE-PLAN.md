@@ -3855,3 +3855,44 @@ ROADMAP(候选池状态、S4/S5 行、速览、命令 114→122 漂移、JS 16�
 | `wiki/06` / `wiki/07` | watchtower 措辞(watchtower → 运维脚本) |
 | `.github/workflows/ci.yml` | 增 static-integrity 步骤 |
 | `AGENTS.md` / `ROADMAP.md` / `wiki/README.md` / 七篇页首戳 / 三处版本号 | 基线与计数对齐 v6.15.0 |
+
+---
+
+# 第三十四批(二):up 前服务端权威解析校验 + 「up 后不一致」口径统一(2026-09-22)
+
+> **来源**:第三十四批方案(P3 + 池外 D 裁决);**版本**:v6.16.0(v6.15.0 已发版,本批为收尾 bump)。
+
+## 交付
+
+**P3 —— up 前服务端权威解析校验**(`docker compose config --format json`;+1 次 SSH)
+
+- **纯函数三件套**(`stack.rs`):`parse_compose_config_json`(容忍 stdout+stderr 合并流:取首 `{`…末 `}`;缺 `image` 的构建类服务保留为 `None`)/ `normalize_image_ref`(补缺省 `:latest`、剥 `docker.io`/`index.docker.io` 前缀;注册表端口冒号不误当 tag)/ `diff_resolved_images`(不符 / 解析缺失 / 构建类三态;只判前两态)。
+- **探测与降级**(`deploy.rs`):`compose_config_json_cmd(_in_dir)`(`-f` 链与 up 同源)+ `compose_config_probe`(退出码 0 且可解析为 JSON 才判定;`unknown flag` → 告警跳过;其余非零 → Err 附输出尾部)。
+- **接入三条链**:**整栈部署(阻断)** —— 在 6.0「按 ID 收敛」之后、up 之前与服务清单逐服务比对,不一致返回错误并逐条列明细;**04/06 回滚(只告警)** —— 插值漂移预检已是「确认制」,再阻断会与用户刚做出的确认冲突;紧急回滚优先,实际结果由 up 后校验兜底。
+- **边界**:单镜像部署/回滚无逐服务 manifest,不接入(既有「按 ID 收敛 + up 后校验」覆盖);拉取类服务无声明 image 时自然跳过。
+- **本机 Docker 实测抓样**(compose v5.4.0):`${VAR}` 插值、注册表路径、无 tag 原样保留、build 且无 image **不补默认镜像名**、undefined 变量 warning 与 JSON 同流、语法错误 exit=1 + go-yaml 报错 —— 全部固化为 golden 单测。
+
+**D —— 「up 后镜像不一致」口径统一(部署侧接入)**
+
+- 整栈:6.1 校验的不一致数写入 `record.message`(「部署完成;up 后校验:N 个服务的实际镜像与本次构建不一致(详见日志)」);单镜像:未发现容器运行本次镜像时同款并入(「…未发现容器在运行本次部署的镜像(详见日志)」);两处收尾改为「管线预设的 message 非空则沿用,否则回落『部署完成』」。**判定结果不变**(成败仍由 up 退出码/健康检查决定)。
+
+## 验证
+
+- `cargo test` **528 passed / 14 ignored**(519→528,+9:stack 7 + commands 2)
+- **变异自证两轮均被抓**:①去掉 `:latest` 补全与前缀剥离 → `test_normalize_image_ref_cases` 红;②把「构建类无 image」改判为不一致 → `test_diff_resolved_images_ok_with_latest_normalization` 红;还原后全绿
+- `cargo clippy`:11 条(与基线一致,零新增)
+- 本机 Docker 实测:上表四类形态抓样 + 语法错误 exit 码(命令拼装与解析口径均实测)
+- verify 七脚本 rc=0;`node --check`(JS 仅 help.js 文案改动)
+- 真机验证:按既有约定由用户统一执行
+
+## 文件改动
+
+| 文件 | 改动 |
+|---|---|
+| `src-tauri/src/stack.rs` | 纯函数三件套 + 7 单测(golden 来自本机实测) |
+| `src-tauri/src/commands/deploy.rs` | `compose_config_json_cmd(_in_dir)` / `ComposeConfigProbe` / `compose_config_probe` / 整栈链阻断接入 / 单镜像 `post_note` / 两处收尾文案口径 |
+| `src-tauri/src/commands/rollback.rs` | `manifest_image_refs` 纯函数 + 04/06 两链只读告警接入 |
+| `src-tauri/src/commands/tests.rs` | +2 单测(命令拼装 / manifest 引用口径) |
+| `ui/help.js` | FAQ 新增「up 前/后校验不一致」条目 |
+| `wiki/02` / `wiki/06` / `wiki/07` | 校验口径、决策 87、限制 55、行数/测试数漂移修正 |
+| 版本/文档 | 三处版本号 + wiki/README + ROADMAP + 七篇页首戳 → v6.16.0 / 528 |

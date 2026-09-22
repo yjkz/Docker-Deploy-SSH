@@ -1380,6 +1380,63 @@ services:
         assert_eq!(tail(&with_flags), tail(&compose_up_cmd_in_dir("/opt/app")));
     }
 
+    // ===== 第三十四批 P3:up 前服务端解析校验(命令拼装 + manifest 引用口径) =====
+
+    #[test]
+    fn test_compose_config_json_cmd() {
+        assert_eq!(
+            compose_config_json_cmd("/opt/app", "/opt/app/docker-compose.yml", &[]),
+            "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' config --format json"
+        );
+        assert_eq!(
+            compose_config_json_cmd(
+                "/opt/app",
+                "/opt/app/docker-compose.yml",
+                &["compose.override.yaml".to_string()]
+            ),
+            "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' -f 'compose.override.yaml' config --format json"
+        );
+        assert_eq!(
+            compose_config_json_cmd_in_dir("/opt/app"),
+            "cd '/opt/app' && docker compose config --format json"
+        );
+        // `-f` 链与 up 同源(同一 compose_file_flags):解析的就是要启动的模型
+        let up = compose_up_cmd("/opt/app", "/opt/app/docker-compose.yml", &[]);
+        let cfg = compose_config_json_cmd("/opt/app", "/opt/app/docker-compose.yml", &[]);
+        let first_flag = |cmd: &str| {
+            cmd.split("docker compose ")
+                .nth(1)
+                .unwrap()
+                .split(' ')
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(first_flag(&up), first_flag(&cfg));
+    }
+
+    #[test]
+    fn test_manifest_image_refs() {
+        let mk = |service: &str, tag: &str, id: Option<&str>| ManifestImage {
+            service: service.to_string(),
+            tag: tag.to_string(),
+            file: None,
+            id: id.map(|s| s.to_string()),
+        };
+        let images = vec![
+            mk("web", "nginx:1.27", Some("sha256:aaa")),
+            mk("api", "   ", Some("sha256:bbb")), // 空 tag 跳过
+            mk("plain", "redis:latest", None),    // 无 ID 也保留(引用口径不看 ID)
+        ];
+        assert_eq!(
+            manifest_image_refs(&images),
+            vec![
+                ("web".to_string(), "nginx:1.27".to_string()),
+                ("plain".to_string(), "redis:latest".to_string()),
+            ]
+        );
+    }
+
     // ===== 第三十二批:回滚 compose/override 与结果文案(纯函数) =====
 
     #[test]

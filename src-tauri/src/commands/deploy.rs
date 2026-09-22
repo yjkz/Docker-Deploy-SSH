@@ -134,8 +134,16 @@ async fn run_deploy(
     );
     let result = run_deploy_steps(app, req, &mut record, resume, checkpoint).await;
     record.success = result.is_ok();
+    // 成功文案:管线可预先用 record.message 携带补充说明(第三十四批 D:up 后
+    // 校验不一致并入结果文案);未设置时回落默认「部署完成」。失败恒以错误为准。
     record.message = match &result {
-        Ok(()) => "部署完成".to_string(),
+        Ok(()) => {
+            if record.message.is_empty() {
+                "部署完成".to_string()
+            } else {
+                record.message.clone()
+            }
+        }
         Err(e) => e.clone(),
     };
     record.duration_secs = started.elapsed().as_secs();
@@ -455,7 +463,7 @@ async fn run_deploy_steps(
     let expected_ref: &str = if req.use_date_tag { &req.image } else { &image_ref };
     let deploy_expected_id: Option<(&str, &str)> =
         expected_id.as_deref().map(|id| (id, expected_ref));
-    server_deploy(
+    let post_note = server_deploy(
         app,
         &mut client,
         &server,
@@ -472,6 +480,12 @@ async fn run_deploy_steps(
         deploy_expected_id,
     )
     .await?;
+
+    // up 后校验的告警并入结果文案(第三十四批 D:与回滚链同口径,历史/通知不撒谎;
+    // 判定结果不变 —— 上一行 `?` 已保证只有管线成功才会走到这里)
+    if let Some(note) = post_note {
+        record.message = format!("部署完成;{}", note);
+    }
 
     // ---- 成功收尾:清除断点 + 删除断点期保留的本地临时 tar ----
     // (失败/取消不走这里:断点与临时 tar 都保留,供续传复用)
@@ -808,7 +822,11 @@ async fn server_deploy(
     // v6.12.0 up 前收敛复核 / up 后校验的期望值:`(本地采集的镜像 ID, 部署引用)`。
     // `None` = 未采集到(如本地 inspect 失败)→ 复核与校验跳过(不误报)。
     deploy_expected_id: Option<(&str, &str)>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
+    // v6.12.0 up 后校验的告警并入结果文案(第三十四批 D):None = 一致/未采集;
+    // Some(note) = 有告警,调用方拼进 record.message(判定结果不变 —— 成败仍由
+    // up 退出码与健康检查决定)。
+    let mut post_note: Option<String> = None;
     // 5.1 加载镜像(镜像未变化时跳过:ID 已在远端,无需 load)
     match tar_name {
         Some(tar_name) => {
@@ -909,6 +927,8 @@ async fn server_deploy(
                             short_id(expected_id)
                         ),
                     );
+                    post_note =
+                        Some("up 后校验:未发现容器在运行本次部署的镜像(详见日志)".to_string());
                 }
             }
             Err(e) => emit_log(app, &format!("警告:up 后校验未能完成({})", e)),
@@ -937,7 +957,7 @@ async fn server_deploy(
             emit_log(app, &format!("警告:清理远端临时文件失败: {}", e));
         }
     }
-    Ok(())
+    Ok(post_note)
 }
 
 /// 断点续传的装载幂等检查:远端是否已存在该镜像引用
@@ -1359,8 +1379,17 @@ async fn run_deploy_stack(
     // (deploy-done 恰好一次的不变量由外层 finish_deploy_run 保持)。
     let result = maybe_auto_rollback(app, &record, result, is_resume).await;
     record.success = result.is_ok();
+    // 成功文案:管线可预先用 record.message 携带补充说明(第三十四批 D:up 后
+    // 校验不一致并入结果文案);未设置时回落默认「部署完成」。失败恒以错误为准
+    // (自动回滚的结果说明已并入 Err 文案,不经 record.message)。
     record.message = match &result {
-        Ok(()) => "部署完成".to_string(),
+        Ok(()) => {
+            if record.message.is_empty() {
+                "部署完成".to_string()
+            } else {
+                record.message.clone()
+            }
+        }
         Err(e) => e.clone(),
     };
     record.duration_secs = started.elapsed().as_secs();
@@ -2016,11 +2045,71 @@ async fn run_deploy_stack_steps(
         }
     }
 
+    // 6.0b up 前服务端权威解析校验(第三十四批 P3)----
+    // 本地 `image_refs_with_env` 重算属近似(compose 插值还吃服务器 shell 环境
+    // 变量);up 将按服务端解析结果重建容器,静默起错版本比失败更糟 —— 故
+    // 「标签不一致」与「服务在 compose 中缺失」都**阻断**;语法错误也在此提前
+    // 暴露(报错更聚焦)。拉取类服务无声明 image 时自然跳过(image 为空)。
+    let expected_resolved: Vec<(String, String)> = services
+        .iter()
+        .filter(|s| !s.image.trim().is_empty())
+        .map(|s| (s.service.clone(), s.image.clone()))
+        .collect();
+    if !expected_resolved.is_empty() {
+        match compose_config_probe(
+            app,
+            &mut client,
+            &remote_dir,
+            Some(remote_compose.as_str()),
+            &override_names,
+        )
+        .await?
+        {
+            ComposeConfigProbe::Resolved(resolved) => {
+                let report = crate::stack::diff_resolved_images(&expected_resolved, &resolved);
+                for svc in &report.no_image {
+                    emit_log(
+                        app,
+                        &format!("up 前解析校验:服务 {} 无 image 字段(构建类),跳过比对", svc),
+                    );
+                }
+                if report.mismatched.is_empty() {
+                    emit_log(
+                        app,
+                        &format!(
+                            "up 前服务端解析校验:{} 个服务的镜像与本次部署记录一致(解析结果共 {} 个服务)",
+                            expected_resolved.len(),
+                            report.resolved_total
+                        ),
+                    );
+                } else {
+                    for (svc, want, got) in &report.mismatched {
+                        emit_log(
+                            app,
+                            &format!(
+                                "up 前解析校验不一致:{} 解析为 {},与本次部署记录不符(期望 {})",
+                                svc,
+                                if got.is_empty() { "(compose 中无此服务)" } else { got.as_str() },
+                                want
+                            ),
+                        );
+                    }
+                    return Err(format!(
+                        "up 前解析校验未通过:{} 个服务的镜像在服务器上解析结果与本次部署记录不一致(逐条见日志)。常见原因:服务器 shell 环境变量改写了标签 / .env 与预览时不同 / compose 副本不一致 —— 请检查后重试",
+                        report.mismatched.len()
+                    ));
+                }
+            }
+            ComposeConfigProbe::Unsupported => {}
+        }
+    }
+
     let up_cmd = compose_up_cmd(&remote_dir, &remote_compose, &override_names);
     emit_log(app, &format!("启动服务: {}", up_cmd));
     exec_forwarded(app, &mut client, &up_cmd, STACK_COMPOSE_TIMEOUT_SECS).await?;
 
-    // 6.1 up 后校验(v6.12.0):逐服务核对容器实际镜像(兜住残余路径)
+    // 6.1 up 后校验(v6.12.0;第三十四批 D:不一致数并入结果文案,与回滚链同口径)
+    let mut post_mismatch = 0usize;
     if !expected_pairs.is_empty() {
         let expected: Vec<(String, String)> = expected_pairs
             .iter()
@@ -2034,6 +2123,7 @@ async fn run_deploy_stack_steps(
         match collect_running_images(&mut client, &prefix).await {
             Ok(actual) => {
                 let mismatches = select_container_image_mismatches(&expected, &actual);
+                post_mismatch = mismatches.len();
                 if mismatches.is_empty() {
                     emit_log(
                         app,
@@ -2055,6 +2145,13 @@ async fn run_deploy_stack_steps(
             }
             Err(e) => emit_log(app, &format!("警告:up 后校验未能完成({})", e)),
         }
+    }
+
+    if post_mismatch > 0 {
+        record.message = format!(
+            "部署完成;up 后校验:{} 个服务的实际镜像与本次构建不一致(详见日志)",
+            post_mismatch
+        );
     }
 
     // 健康检查(up 后按预算轮询服务状态;health_wait_secs=0 时跳过)
@@ -2564,6 +2661,78 @@ pub fn compose_up_cmd_in_dir(remote_dir: &str) -> String {
         COMPOSE_FLAG_PULL_NEVER,
         COMPOSE_FLAG_NO_BUILD
     )
+}
+
+/// 拼装「服务端权威解析」命令(第三十四批 P3):`docker compose config --format json`。
+/// `-f` 链与 [`compose_up_cmd`] 同源(同一 `compose_file_flags`),保证解析的就是要启动的模型。
+pub fn compose_config_json_cmd(remote_dir: &str, compose_file: &str, overrides: &[String]) -> String {
+    format!(
+        "cd {} && docker compose {} config --format json",
+        shell_single_quote(remote_dir),
+        compose_file_flags(compose_file, overrides)
+    )
+}
+
+/// 目录默认解析形态的 `config`(仅 06 页回滚降级路径;与 [`compose_up_cmd_in_dir`] 同口径)。
+pub fn compose_config_json_cmd_in_dir(remote_dir: &str) -> String {
+    format!(
+        "cd {} && docker compose config --format json",
+        shell_single_quote(remote_dir)
+    )
+}
+
+/// up 前服务端解析校验的探测结果(第三十四批 P3)。
+pub(crate) enum ComposeConfigProbe {
+    /// 解析成功(服务端权威结果:service → image)
+    Resolved(Vec<crate::stack::ResolvedService>),
+    /// 服务器 compose 不支持 `--format json`(unknown flag):已告警,调用方跳过本步
+    Unsupported,
+}
+
+/// up 前跑一次 `docker compose config --format json`(+1 次 SSH;第三十四批 P3)。
+///
+/// 背景:本地 `image_refs_with_env` 重算属近似 —— compose 插值还吃服务器 shell
+/// 环境变量,只有服务端解析才是权威。返回:
+/// - `Ok(Resolved)`:解析成功;
+/// - `Ok(Unsupported)`:老版 compose 不支持该旗标(可部署环境经 `--pull never`
+///   已要求 compose ≥ v2.15,实际不会出现;仍优雅降级为告警跳过);
+/// - `Err`:compose 语法 / 模型 / 插值错误(附输出尾部)—— 由调用方决定阻断还是告警
+///   (部署链阻断、回滚链告警,理由见各调用点)。
+pub(crate) async fn compose_config_probe(
+    app: &AppHandle,
+    client: &mut SshClient,
+    remote_dir: &str,
+    compose_file: Option<&str>,
+    overrides: &[String],
+) -> Result<ComposeConfigProbe, String> {
+    let cmd = match compose_file {
+        Some(f) => compose_config_json_cmd(remote_dir, f, overrides),
+        None => compose_config_json_cmd_in_dir(remote_dir),
+    };
+    let (code, out) = exec_collect(client, &cmd).await?;
+    if code == 0 {
+        return crate::stack::parse_compose_config_json(&out)
+            .map(ComposeConfigProbe::Resolved)
+            .map_err(|e| format!("compose config 输出无法按 JSON 解析: {}", e));
+    }
+    let tail = tail_lines(&out, 4);
+    if out.contains("unknown flag")
+        || out.contains("unknown shorthand flag")
+        || out.contains("unknown command")
+    {
+        emit_log(
+            app,
+            &format!(
+                "警告:服务器 docker compose 不支持 config --format json,跳过 up 前服务端解析校验({})",
+                tail.trim()
+            ),
+        );
+        return Ok(ComposeConfigProbe::Unsupported);
+    }
+    Err(format!(
+        "up 前 compose 服务端解析未通过(compose 文件或插值有问题):{}",
+        tail.trim()
+    ))
 }
 
 /// 拼装 `-f <base> -f <override>...` 片段(compose 按顺序合并,后者覆盖前者);
