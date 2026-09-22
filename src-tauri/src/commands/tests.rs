@@ -921,7 +921,7 @@ services:
         assert!(!cmd.contains(local));
         assert_eq!(
             cmd,
-            "cd '/home/henghao' && docker compose -f '/home/henghao/docker-compose.yml' up -d"
+            "cd '/home/henghao' && docker compose -f '/home/henghao/docker-compose.yml' up -d --remove-orphans --pull never"
         );
     }
 
@@ -1349,7 +1349,7 @@ services:
     fn test_compose_up_cmd() {
         assert_eq!(
             compose_up_cmd("/opt/app", "/opt/app/docker-compose.yml", &[]),
-            "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' up -d"
+            "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' up -d --remove-orphans --pull never"
         );
         assert_eq!(
             compose_up_cmd(
@@ -1357,8 +1357,26 @@ services:
                 "/opt/app/docker-compose.yml",
                 &["compose.override.yaml".to_string()]
             ),
-            "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' -f 'compose.override.yaml' up -d"
+            "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' -f 'compose.override.yaml' up -d --remove-orphans --pull never"
         );
+    }
+
+    /// 第三十一批 P1/P2:up 命令族的加固旗标只有单一来源 —— 带 `-f` 链的
+    /// [`compose_up_cmd`] 与 06 页默认文件名形态的 [`compose_up_cmd_in_dir`]
+    /// 都必须同时带 `--remove-orphans`(孤儿容器)与 `--pull never`(禁止隐式拉取)。
+    /// 变异自证:任一旗标从拼装器里去掉,本测试必红。
+    #[test]
+    fn test_up_flag_hardening_both_forms() {
+        let with_flags = compose_up_cmd("/opt/app", "/opt/app/docker-compose.yml", &[]);
+        assert!(with_flags.contains(COMPOSE_FLAG_REMOVE_ORPHANS));
+        assert!(with_flags.contains(COMPOSE_FLAG_PULL_NEVER));
+        assert_eq!(
+            compose_up_cmd_in_dir("/opt/app"),
+            "cd '/opt/app' && docker compose up -d --remove-orphans --pull never"
+        );
+        // 两侧形态的旗标部分逐字一致(防「只改一处」的漂移)
+        let tail = |cmd: &str| cmd.split("up -d ").nth(1).unwrap().to_string();
+        assert_eq!(tail(&with_flags), tail(&compose_up_cmd_in_dir("/opt/app")));
     }
 
     // ===== Task 5:augment_pull_error 私有仓库认证提示 =====
@@ -1646,7 +1664,10 @@ services:
             ps_line("db", "running", Some(""), None),
             ps_line("cache", "running", Some("healthy"), Some(0)),
         ];
-        assert_eq!(health_verdict(&as_lines(&raw)), HealthVerdict::Pass);
+        assert_eq!(
+            health_verdict(&as_lines(&raw)),
+            HealthVerdict::Pass { completed: vec![] }
+        );
     }
 
     #[test]
@@ -1682,19 +1703,44 @@ services:
     }
 
     #[test]
-    fn test_health_verdict_exited_zero_exit_code_pending() {
-        // exited 且 ExitCode==0(一次性服务正常退出)→ 不算失败,继续轮询,
-        // pending 展示"已退出(退出码 0)"并置 exited_zero(预算耗尽时报错
-        // 据此提示关闭健康检查)
+    fn test_health_verdict_exited_zero_completes_not_pending() {
+        // 第三十一批 S2:exited 且 ExitCode==0(一次性初始化服务正常退出)
+        // → 按「完成」处理,不再计入 pending、不再在预算耗尽后误报失败;
+        // 服务名进 Pass.completed,由调用方逐条日志明示
         let raw = vec![
             ps_line("web", "running", None, None),
             ps_line("job", "exited", None, Some(0)),
         ];
         assert_eq!(
             health_verdict(&as_lines(&raw)),
-            HealthVerdict::Indeterminate {
-                pending: Some(("job".to_string(), "已退出(退出码 0)".to_string())),
-                exited_zero: true
+            HealthVerdict::Pass {
+                completed: vec!["job".to_string()]
+            }
+        );
+        // 仅一次性服务(全部 exited-0)→ 同样通过
+        let raw = vec![ps_line("job", "exited", None, Some(0))];
+        assert_eq!(
+            health_verdict(&as_lines(&raw)),
+            HealthVerdict::Pass {
+                completed: vec!["job".to_string()]
+            }
+        );
+        // 常驻服务全部 running → completed 为空(不产生多余日志)
+        let raw = vec![ps_line("web", "running", None, None)];
+        assert_eq!(
+            health_verdict(&as_lines(&raw)),
+            HealthVerdict::Pass { completed: vec![] }
+        );
+        // 失败终态优先于「完成」:同轮里 restarting 仍立即失败,不被 exited-0 掩盖
+        let raw = vec![
+            ps_line("job", "exited", None, Some(0)),
+            ps_line("db", "restarting", None, None),
+        ];
+        assert_eq!(
+            health_verdict(&as_lines(&raw)),
+            HealthVerdict::Unhealthy {
+                service: "db".to_string(),
+                state: "restarting".to_string()
             }
         );
     }
@@ -1731,15 +1777,15 @@ services:
         // 空行 / 全空白 / 非 JSON 输出(旧版 compose、警告行等)→ 无法判定,继续轮询
         assert_eq!(
             health_verdict(&[""]),
-            HealthVerdict::Indeterminate { pending: None, exited_zero: false }
+            HealthVerdict::Indeterminate { pending: None }
         );
         assert_eq!(
             health_verdict(&["   "]),
-            HealthVerdict::Indeterminate { pending: None, exited_zero: false }
+            HealthVerdict::Indeterminate { pending: None }
         );
         assert_eq!(
             health_verdict(&[r#"time="2026-08-30" level=warning msg="x""#]),
-            HealthVerdict::Indeterminate { pending: None, exited_zero: false }
+            HealthVerdict::Indeterminate { pending: None }
         );
     }
 
@@ -1747,17 +1793,22 @@ services:
     fn test_health_verdict_health_three_states() {
         // 无 Health 字段(无 healthcheck)→ Pass
         let raw = vec![ps_line("web", "running", None, None)];
-        assert_eq!(health_verdict(&as_lines(&raw)), HealthVerdict::Pass);
+        assert_eq!(
+            health_verdict(&as_lines(&raw)),
+            HealthVerdict::Pass { completed: vec![] }
+        );
         // Health="healthy" → Pass
         let raw = vec![ps_line("web", "running", Some("healthy"), None)];
-        assert_eq!(health_verdict(&as_lines(&raw)), HealthVerdict::Pass);
+        assert_eq!(
+            health_verdict(&as_lines(&raw)),
+            HealthVerdict::Pass { completed: vec![] }
+        );
         // Health="starting" → 尚未就绪,继续轮询(pending 展示 Health)
         let raw = vec![ps_line("web", "running", Some("starting"), None)];
         assert_eq!(
             health_verdict(&as_lines(&raw)),
             HealthVerdict::Indeterminate {
-                pending: Some(("web".to_string(), "starting".to_string())),
-                exited_zero: false
+                pending: Some(("web".to_string(), "starting".to_string()))
             }
         );
         // Health="unhealthy" → 未通过,继续轮询(预算耗尽时报错展示该状态)
@@ -1765,8 +1816,7 @@ services:
         assert_eq!(
             health_verdict(&as_lines(&raw)),
             HealthVerdict::Indeterminate {
-                pending: Some(("web".to_string(), "unhealthy".to_string())),
-                exited_zero: false
+                pending: Some(("web".to_string(), "unhealthy".to_string()))
             }
         );
     }
@@ -1778,8 +1828,7 @@ services:
         assert_eq!(
             health_verdict(&as_lines(&raw)),
             HealthVerdict::Indeterminate {
-                pending: Some(("web".to_string(), "created".to_string())),
-                exited_zero: false
+                pending: Some(("web".to_string(), "created".to_string()))
             }
         );
     }
@@ -1790,7 +1839,10 @@ services:
         let lines = vec![
             r#"[{"Service":"web","State":"running"},{"Service":"db","State":"running","Health":"healthy"}]"#,
         ];
-        assert_eq!(health_verdict(&lines), HealthVerdict::Pass);
+        assert_eq!(
+            health_verdict(&lines),
+            HealthVerdict::Pass { completed: vec![] }
+        );
     }
 
     #[test]
@@ -1810,7 +1862,10 @@ services:
     fn test_health_verdict_health_object_status() {
         // Health 为嵌套对象时取其 Status 字段
         let lines = vec![r#"{"Service":"web","State":"running","Health":{"Status":"healthy"}}"#];
-        assert_eq!(health_verdict(&lines), HealthVerdict::Pass);
+        assert_eq!(
+            health_verdict(&lines),
+            HealthVerdict::Pass { completed: vec![] }
+        );
     }
 
     // ===== Task 6:classify_change 部署变更分类(六例)=====

@@ -155,5 +155,31 @@ console.log('\n=== 5. 回滚预检 UI 契约(前后端字段名对齐;两个入�
 }
 
 console.log('\n---------------------------------------');
+// ===== 6. 第三十一批 P1/P2:启动阶段加固的用户可见口径 =====
+// 两条都是**行为变更**:P1 会删除同项目内的孤儿容器(用户必须知情,否则是
+// 「静默删容器」);P2 把「隐式拉取」改成「显式报错」(不写清会被当成新故障)。
+// 文案口径若再改,须同步本守护与 wiki/06、wiki/07。
+console.log('\n=== 6. 启动阶段加固口径(P1 孤儿容器 / P2 禁止隐式拉取) ===');
+{
+  const help = read(HELP) || '';
+  ok(/不在当前 compose 里的旧服务容器会被一并移除/.test(help),
+    'help.js 写明「同项目内不在当前 compose 的旧服务容器会被一并移除」(P1)',
+    '第三十一批 P1:up 带 --remove-orphans —— 会删容器,属行为变更,必须可见');
+  ok(/不会隐式拉取镜像/.test(help),
+    'help.js 写明「启动不会隐式拉取镜像,镜像缺失立即报错」(P2)',
+    '第三十一批 P2:up 带 --pull never,把静默拉取变成显式报错');
+  ok(/服务器拉取[\s\S]{0,40}不受影响/.test(help),
+    'help.js 说明「服务器拉取」分类不受 --pull never 影响',
+    'P2 的边界:拉取类服务在部署步骤 5 已显式 pull,不受影响');
+  // 精确到 05 页两行的 code 片段(06 页行也含 up -d --remove-orphans,
+  // 宽松写法会被它误命中 —— 首次变异测试即漏网,故收紧)
+  ok(/docker compose up -d --remove-orphans<\/code>/.test(help),
+    'help.js 的栈「启动」命令写明 --remove-orphans(05 页)',
+    '第三十一批 P1:栈启动同口径;up 侧刻意不加 --pull never');
+  ok(/docker compose down --remove-orphans<\/code>/.test(help),
+    'help.js 的栈「停止」命令写明 --remove-orphans(05 页)',
+    '第三十一批 P1:停止时孤儿容器与网络一并回收');
+}
+
 console.log('PASS ' + pass + ' / FAIL ' + fail);
 process.exit(fail === 0 ? 0 : 1);

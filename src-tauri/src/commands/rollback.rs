@@ -2891,12 +2891,10 @@ async fn rollback_execute_stack_at_inner(
     }
 
     // ---- compose up -d:cd 到项目目录,按目录内 compose 文件启动 ----
-    // (override 文件按远端同名约定自动生效,无需显式 -f 链)
+    // (override 文件按远端同名约定自动生效,无需显式 -f 链;
+    //  拼装走 compose_up_cmd_in_dir:P1/P2 加固旗标随之内联)
     ensure_not_cancelled(app)?;
-    let up_cmd = format!(
-        "cd {} && docker compose up -d",
-        shell_single_quote(&dir)
-    );
+    let up_cmd = compose_up_cmd_in_dir(&dir);
     emit_log(app, &format!("启动服务: {}", up_cmd));
     exec_forwarded(app, &mut client, &up_cmd, STACK_COMPOSE_TIMEOUT_SECS).await?;
 

@@ -886,18 +886,9 @@ async fn server_deploy(
     }
 
     // 5.3 启动服务:这里只使用已解析的远端 compose 路径
-    let up_cmd = format!(
-        "cd {} && docker compose -f {} up -d",
-        shell_single_quote(&effective_remote_dir(server, project)),
-        shell_single_quote(remote_compose),
-    );
-    emit_log(
-        app,
-        &format!(
-            "启动服务: cd {} && docker compose -f {} up -d",
-            effective_remote_dir(server, project), remote_compose
-        ),
-    );
+    // (拼装走 compose_up_cmd 唯一来源:P1/P2 加固旗标随之内联在命令里)
+    let up_cmd = compose_up_cmd(&effective_remote_dir(server, project), remote_compose, &[]);
+    emit_log(app, &format!("启动服务: {}", up_cmd));
     exec_forwarded(app, client, &up_cmd, 600).await?;
 
     // 5.3b up 后校验(v6.12.0):本次镜像是否真的在跑
@@ -1058,10 +1049,10 @@ async fn run_hook(
 /// → [`upload_compose_files`] 上传的同一批文件):逐个追加 `-f`,保证 override-only
 /// 的服务同样出现在 ps 输出中、不逃逸健康判定。
 ///
-/// - 全部服务 running 且(无 healthcheck 或 healthy)→ 通过;
+/// - 全部服务满足〔running 且(无 healthcheck 或 healthy)〕或〔已成功退出
+///   (退出码 0)〕→ 通过;后者按「完成」处理并逐条记日志
+///   (第三十一批 S2:一次性初始化服务不再误报失败);
 /// - 任一服务 Restarting/Dead(或 Exited 且退出码非零/字段缺失)→ 立即失败;
-///   Exited 且退出码 0(一次性服务正常退出)→ 不算失败,继续轮询,预算耗尽
-///   报错并注明"若为一次性初始化服务请关闭健康检查";
 /// - 解析不出状态(旧版 compose 输出、查询暂时失败等)→ 继续轮询至预算耗尽;
 /// - 失败时先经 [`dump_compose_logs`] 拉取各服务最近日志进部署日志,再以中文
 ///   错误中止(`健康检查未通过:<服务> <状态>`)。
@@ -1088,10 +1079,8 @@ async fn health_check(
             HEALTH_POLL_INTERVAL_SECS, project.health_wait_secs
         ),
     );
-    // 最近一轮"尚未就绪"的服务与状态(预算耗尽时报错展示);
-    // last_exited_zero:该服务是否"已退出(退出码 0)"(一次性服务提示)
+    // 最近一轮"尚未就绪"的服务与状态(预算耗尽时报错展示)
     let mut last_pending: Option<(String, String)> = None;
-    let mut last_exited_zero = false;
     loop {
         ensure_not_cancelled(app)?;
         // 单轮查询:60 秒超时;查询超时或 SSH 传输失败都按"无法判定"
@@ -1112,7 +1101,15 @@ async fn health_check(
         };
         let lines: Vec<&str> = out.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
         match health_verdict(&lines) {
-            HealthVerdict::Pass => {
+            HealthVerdict::Pass { completed } => {
+                // 已成功退出(退出码 0)的服务:一次性初始化服务的正常终态,
+                // 按完成处理 —— 逐条明示,不静默(第三十一批 S2)
+                for svc in &completed {
+                    emit_log(
+                        app,
+                        &format!("健康检查:{} 已成功退出(退出码 0),按完成处理", svc),
+                    );
+                }
                 emit_log(
                     app,
                     &format!("健康检查通过(耗时 {} 秒)", started.elapsed().as_secs()),
@@ -1123,29 +1120,23 @@ async fn health_check(
                 dump_compose_logs(app, client, remote_dir, compose_file, overrides).await;
                 return Err(format!("健康检查未通过:{} {}", service, state));
             }
-            HealthVerdict::Indeterminate { pending, exited_zero } => {
+            HealthVerdict::Indeterminate { pending } => {
                 if let Some(p) = pending {
                     if last_pending.as_ref() != Some(&p) {
                         emit_log(app, &format!("健康检查:{} 尚未就绪({})", p.0, p.1));
                     }
                     last_pending = Some(p);
-                    last_exited_zero = exited_zero;
                 }
             }
         }
         if started.elapsed() >= budget {
             dump_compose_logs(app, client, remote_dir, compose_file, overrides).await;
-            return Err(match (&last_pending, last_exited_zero) {
-                // 一次性服务已正常退出:报错注明,提示关闭健康检查
-                (Some((service, state)), true) => format!(
-                    "健康检查未通过:{} {},若为一次性初始化服务请关闭健康检查(等待 {} 秒超时)",
-                    service, state, project.health_wait_secs
-                ),
-                (Some((service, state)), false) => format!(
+            return Err(match &last_pending {
+                Some((service, state)) => format!(
                     "健康检查未通过:{} {}(等待 {} 秒超时)",
                     service, state, project.health_wait_secs
                 ),
-                (None, _) => format!(
+                None => format!(
                     "健康检查未通过:无法获取服务状态(等待 {} 秒超时)",
                     project.health_wait_secs
                 ),
@@ -2519,12 +2510,46 @@ pub fn compose_pull_cmd(
     )
 }
 
-/// 拼装 compose up 命令(后台启动全部服务;override 文件按序 `-f` 追加)。
+/// compose `up` 的孤儿容器清理旗标(第三十一批 P1):同项目内不在当前 compose 的
+/// 容器一并移除 —— 否则「删掉某服务后重新部署」或「回滚到旧归档」时,新版才有的
+/// 服务容器会作为孤儿继续运行,界面却报「完成」(与第三十批「按 ID 收敛」同族的
+/// 「回滚没回干净」)。栈停止(down)同样使用本旗标。
+pub const COMPOSE_FLAG_REMOVE_ORPHANS: &str = "--remove-orphans";
+
+/// compose `up` 的禁止隐式拉取旗标(第三十一批 P2):`up` 默认 `pull=missing`,
+/// 引用在本地不存在时会**静默从 registry 拉一个非归档版本**(`.env` 漂移 / 标签被
+/// 外部移走可触发)。本应用的拉取类服务已在部署步骤 5 显式 `compose pull`、本地
+/// 传输类由 `docker load` 保证,故该旗标只把「意外缺失」从静默拉取变成显式报错。
+///
+/// 刻意**不**用于 05 页栈启停(`manage_stack_action`):该入口的用户可见语义包含
+/// 「拉取缺失镜像」(见 ui/help.js),加 `--pull never` 会改变其既定行为。
+pub const COMPOSE_FLAG_PULL_NEVER: &str = "--pull never";
+
+/// 拼装 compose up 命令(后台启动全部服务;override 文件按序 `-f` 追加;
+/// 尾部固定带 P1/P2 两道加固旗标,见 [`COMPOSE_FLAG_REMOVE_ORPHANS`] /
+/// [`COMPOSE_FLAG_PULL_NEVER`])。
+///
+/// 部署(整栈/单镜像)、回滚(04 页两条链/06 页)全链共用本拼装器 —— 命令形态
+/// 只有这一个来源,新增加固参数不必逐站点改。
 pub fn compose_up_cmd(remote_dir: &str, compose_file: &str, overrides: &[String]) -> String {
     format!(
-        "cd {} && docker compose {} up -d",
+        "cd {} && docker compose {} up -d {} {}",
         shell_single_quote(remote_dir),
-        compose_file_flags(compose_file, overrides)
+        compose_file_flags(compose_file, overrides),
+        COMPOSE_FLAG_REMOVE_ORPHANS,
+        COMPOSE_FLAG_PULL_NEVER
+    )
+}
+
+/// 拼装「按目录内默认 compose 文件启动」的 up 命令(06 页回滚中心路径:
+/// compose 副本已按原名恢复到回滚目录,靠 `cd` 后的默认解析,无 `-f` 链)。
+/// 加固旗标与 [`compose_up_cmd`] 同源。
+pub fn compose_up_cmd_in_dir(remote_dir: &str) -> String {
+    format!(
+        "cd {} && docker compose up -d {} {}",
+        shell_single_quote(remote_dir),
+        COMPOSE_FLAG_REMOVE_ORPHANS,
+        COMPOSE_FLAG_PULL_NEVER
     )
 }
 

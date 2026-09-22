@@ -262,13 +262,16 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 > **来源**:用户要求「盘点未修项 + 针对实现流程上网调研」(2026-09-22);全部条目已做落点侦察,
 > P1/P2 另有**本机 Docker 实测**证据。**选取方式**:按需挑选;建议先做 P1+P2 小批
 > (up 命令参数级,直击「回滚回干净 / 不静默」,与第三十批「按 ID 收敛」同主题)。
+>
+> **状态(2026-09-22)**:P1 / P2 / S1 / S2 已随**第三十一批(v6.13.0)**完成(S1 复核后
+> 为文档更正:代码早已修复);P3 / P4 / S3 / S4 / S5 / L1 / L2 仍待挑选。
 
 #### P 组|部署/回滚流程加固(有新证据)
 
 | # | 项 | 落点与要点 | 规模 | 侦察依据(2026-09-22) |
 |---|---|---|---|---|
-| P1 | 孤儿容器:**`--remove-orphans`** | 部署/回滚/栈停止全链未用该参数 → 回滚到旧归档(或部署时删掉某服务)后,**新版才有的服务容器作为孤儿继续运行**,界面报「完成」——与第三十批「按 ID 收敛」同族的「回滚没回干净」。建议回滚两条链 `up` 必加;部署链一并加(行为变更写 wiki/help:会清掉同项目内不在当前 compose 的容器) | 小 | **本机 Docker 实测**:v1(a+b)→ v2(只 a)再 up,不加参数 → 仅一行 orphan warning、b 容器仍在;加参数 → b 被移除。出处:distr.sh 生产清单「Pass `--remove-orphans` on every `compose up`/`down`」 |
-| P2 | **`--pull never`**(防意外静默拉取) | `up -d` 默认 pull=missing:引用在本地不存在时会**静默从 registry 拉一个非归档版本**(.env 漂移/外部移标签可触发)。本应用拉取类服务已在步骤 5 显式 pull、本地传输服务由 load 保证 → 加 `--pull never` 只把「意外缺失」从静默拉取变成显式报错 | 小 | compose v2 全支持该参数;需回归「拉取类服务」路径。与本项目「不静默」哲学一致 |
+| ~~P1~~ ✅ 已完成(第三十一批 v6.13.0) | 孤儿容器:**`--remove-orphans`** | 部署/回滚/栈停止全链未用该参数 → 回滚到旧归档(或部署时删掉某服务)后,**新版才有的服务容器作为孤儿继续运行**,界面报「完成」——与第三十批「按 ID 收敛」同族的「回滚没回干净」。建议回滚两条链 `up` 必加;部署链一并加(行为变更写 wiki/help:会清掉同项目内不在当前 compose 的容器) | 小 | **本机 Docker 实测**:v1(a+b)→ v2(只 a)再 up,不加参数 → 仅一行 orphan warning、b 容器仍在;加参数 → b 被移除。出处:distr.sh 生产清单「Pass `--remove-orphans` on every `compose up`/`down`」 |
+| ~~P2~~ ✅ 已完成(第三十一批 v6.13.0) | **`--pull never`**(防意外静默拉取) | `up -d` 默认 pull=missing:引用在本地不存在时会**静默从 registry 拉一个非归档版本**(.env 漂移/外部移标签可触发)。本应用拉取类服务已在步骤 5 显式 pull、本地传输服务由 load 保证 → 加 `--pull never` 只把「意外缺失」从静默拉取变成显式报错 | 小 | ~~compose v2 全支持该参数~~ **修正(第三十一批实测)**:`--pull` 旗标自 compose **v2.15** 起提供,更老版本会报 unknown flag;需回归「拉取类服务」路径。与本项目「不静默」哲学一致 |
 | P3 | up 前**服务端权威解析校验**(`docker compose config`) | 现有插值漂移检测只读 `.env`;compose 插值还吃**服务器 shell 环境变量**(本地重算看不到)。恢复 compose 副本后、up 前跑 `docker compose ... config`(YAML 输出本地解析 `services.*.image`),与 manifest tag 逐服务比对;顺带 compose 语法预检。+1 次 SSH | 小-中 | simplified.guide 回滚指南(「`config --images` 在 recreate 前抓住错误 tag」);本地 `image_refs_with_env` 重算属近似,服务端 config 为权威 |
 | P4 | **更新包签名校验**(安全) | `update_download` → `update_install` 现仅路径白名单、**无签名验证**:Release 资产被替换即静默装篡改版。①轻量:release.yml 出 `.sig`(`tauri signer`)+ 内嵌公钥本地验签后再安装;②完整:切官方 `tauri-plugin-updater`(签名强制) | 中 | 需用户参与密钥管理(私钥进 CI secret、公钥内嵌);Tauri 官方文档:签名 cannot be disabled |
 
@@ -276,8 +279,8 @@ UI 验证用**浏览器 + Tauri 桩**(computer-use 已弃用):`ui/_tauri-stub.js
 
 | # | 项 | 落点与要点 | 规模 | 侦察依据 |
 |---|---|---|---|---|
-| S1 | `import_compose` 失败残留 `config/stacks/<uuid>/` 目录 | 写配置失败路径补目录清理 | 极小 | wiki/07 限制 7 |
-| S2 | 健康检查对 **exit-0 一次性初始化服务**误报未就绪 | 按 `State/ExitCode` 精确区分「已成功退出」(或提供忽略开关) | 小 | wiki/07 限制 11 |
+| ~~S1~~ ✅ 已完成(第三十一批 v6.13.0) | `import_compose` 失败残留 `config/stacks/<uuid>/` 目录 | **复核结论:代码早在第二十三批已修**(闭包式失败清理 + 单测);本批只更正 wiki/07 的过期记载 | 极小 | wiki/07 限制 7 |
+| ~~S2~~ ✅ 已完成(第三十一批 v6.13.0) | 健康检查对 **exit-0 一次性初始化服务**误报未就绪 | 用户拍板**自动通过**:`exited && ExitCode==0` → `Pass{completed}` 并逐条记日志(不选逐服务忽略清单,代价见 wiki/07 决策 16) | 小 | wiki/07 限制 11 |
 | S3 | `run_migrate_project` 零管线级测试 | 加 `#[ignore]` 真机样板(先例:volume roundtrip `ssh.rs:1219`) | 小-中 | 质量发现(2026-09-18) |
 | S4 | `scope-integrity.js` 对「回调内新增裸露引用」不覆盖 | 词法级「未声明自由标识符」静态检查 | 小 | 质量发现(2026-09-18) |
 | S5 | wiki/06、07 的 TOCTOU 例子提到 **watchtower(2025 已归档)** | 措辞换成 CI / 运维脚本 / 另一台机器的本应用 | 微小 | 2026-09-22 调研 |
@@ -616,9 +619,10 @@ verify **六**脚本 PASS(新增 user-facing-copy)/ 桩验证 3 视图 + 截图�
 
 ## 当前状态速览
 
-- 版本 **v6.12.1**;main = origin/main;基线 `cargo test` **501 passed** / 13 ignored
+- 版本 **v6.13.0**;main = origin/main;基线 `cargo test` **505 passed** / 13 ignored
 - 命令 **114** 个(generate_handler 实测;第二十二批 +3 调度 +2 配置历史;第二十五批 +5 导入/清理/compose)
-- **候选池(2026-09-22 入库,第三十一批预备)**:部署/回滚流程加固 —— P1 孤儿容器(`--remove-orphans`,本机 Docker 实测确认缺口)/ P2 `--pull never`(防意外静默拉取)/ P3 up 前服务端 `docker compose config` 权威校验 / P4 更新包签名校验(安全);另 S 组小修 5 项 + L 组评估 2 项。详见「待完成 → 候选池(2026-09-22 入库)」
+- **第三十一批 / v6.13.0(2026-09-22)已完成**:部署/回滚流程加固 —— ①**P1 孤儿容器**:部署/回滚/迁移/栈启停的 `up`(与栈 `down`)统一带 `--remove-orphans`(`compose_up_cmd` / `compose_up_cmd_in_dir` 唯二拼装来源;`manage_stack_action` 走纯函数 `compose_action_sub`),同项目内不在当前 compose 的容器一并移除 —— 治「回滚到旧归档 / 删掉服务后孤儿继续跑、界面报完成」;②**P2 禁止隐式拉取**:部署/回滚/迁移的 `up` 带 `--pull never`,镜像缺失显式报错(05 页栈启动刻意不加);③**S2 健康检查 exited-0 口径**(用户拍板自动通过):`Pass{completed}` + 逐条日志,不再让一次性初始化服务误报失败(此前叠加自动回滚会回滚好部署);④**S1 复核**:代码早已修复,wiki/07 过期记载更正;⑤**本机 Docker 实测**:孤儿 up/down 移除、`--pull never` 显式报错、拉取类回归、真实 `ps --all` exited-0 形态;测试 501→505,命令 114 不变
+- **候选池(2026-09-22 入库,第三十一批预备)**:~~P1 孤儿容器~~ / ~~P2 `--pull never`~~ / ~~S1~~ / ~~S2~~ **已随 v6.13.0 完成**;余 P3(up 前服务端 `docker compose config` 权威校验)/ P4(更新包签名校验)/ S3(`run_migrate_project` 真机样板)/ S4(词法级自由标识符守护)/ S5(watchtower 措辞)/ L1(层级增量)/ L2(服务器体检增强)。详见「待完成 → 候选池(2026-09-22 入库)」
 - **补丁 v6.11.1(2026-09-19)**:回滚中心(06 页)补上回滚预检 —— 第二十九批遗漏了该入口(用户实测发现);两个命令扩为双入口(项目 id / 项目目录)
 - **补丁 v6.12.1(2026-09-22)**:修复 up 后校验的 `docker inspect` 模板解析错误(真机反馈)—— 带点标签键误用字段链(`.Config.Labels."k"` 非法 Go 模板)致退出码 64,校验每次部署皆失败(只告警不误判);改 `index` 读取 + 失败信息附输出尾部 + 回归守护测试(形态 + 真机 CLI 解析);测试 500→501,命令 114 不变
 - **第三十批 / v6.12.0(2026-09-20)已完成**:回滚/部署「按镜像 ID 收敛」——用户真机问题(标签被外部移走、归档 ID 仍在服务器 → 旧预检「回不去」且无出路)驱动;up 前按 ID 收敛(零拷贝指回,治 TOCTOU + 真机案例)/ 预检四态(tagRestore)/ up 后运行镜像校验 / 清单驱动装载(.tar 反向校验)/ .env 插值漂移预检(须确认);测试 477→500,命令 114 不变

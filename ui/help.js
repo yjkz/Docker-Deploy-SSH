@@ -219,6 +219,7 @@
           <li><strong>回滚预检</strong>:在回滚确认页点「回滚预检」会核对每个服务在该归档里的镜像来源 —— 归档内有包(直接装载)/ 服务器上仍持有该镜像 ID(智能传输跳过的服务,直接可用)/ <strong>标签待指回</strong>(镜像 ID 仍在服务器上但标签被别的版本占用,执行时自动零拷贝指回,不算「回不去」)/ <strong>回不去</strong>(镜像已被覆盖或清理)。有「回不去」的服务时会逐条列出并让您确认,不会静默跳过;确认后其余服务照常回退,这些服务沿用服务器当前镜像。<strong>部署/回滚前自动复核</strong>(v6.12.0):准备完成后、启动前按记录的镜像 ID 再核对并自动指回被移动的标签;启动后还会核对容器实际运行的镜像,与记录不一致会在日志里显式告警。</li>
           <li><strong>镜像引用漂移</strong>(v6.12.0):compose 里 <code>image: $\{变量\}</code> 由服务器上当前的 <code>.env</code> 解析 —— 若部署后改过 .env,回滚/部署后的实际引用会与归档记录不同。预检会把「归档记录 X;按当前 .env 会解析成 Y」逐条列出并要求确认(部署时按 .env 解析;.env 不随归档保存,属刻意取舍)。</li>
           <li>点「停止批量」后<strong>当前这台会在步骤边界立即中止</strong>(发取消请求,不必等整台跑完),余下标记「已跳过」;被中止的台<strong>会留下断点</strong>,批量结束后可从面板「续传此台」或「续传未完成服务器(N 台)」继续。停止<strong>不自动续传</strong>当前台(停止是明确的意图)。</li>
+          <li><strong>启动阶段的两条加固</strong>:①部署 / 回滚启动服务时,<strong>同项目内不在当前 compose 里的旧服务容器会被一并移除</strong>(compose 的 <code>--remove-orphans</code> 语义)—— 删掉某个服务后重新部署、或回滚到旧归档时,不会再留下「界面报完成、旧服务却还在跑」的孤儿容器;②启动<strong>不会隐式拉取镜像</strong>(<code>--pull never</code>)—— 镜像缺失会立即明确报错,而不是悄悄从镜像仓库拉一个与归档不一致的版本。分类为「服务器拉取」的服务不受影响(部署步骤 5 已显式拉取)。</li>
         </ul>
         <h4>定时部署与允许执行时段</h4>
         <ul>
@@ -360,8 +361,8 @@
           <thead><tr><th>按钮</th><th>点击后发生什么</th></tr></thead>
           <tbody>
             <tr><td>刷新栈</td><td>重新扫描远程目录,重建栈列表</td></tr>
-            <tr><td>启动</td><td>二次确认后执行 <code>docker compose up -d</code>:后台创建并启动该栈的全部服务(含拉取缺失镜像),<strong>最多等待 2 分钟</strong>;成功后刷新栈列表与概览</td></tr>
-            <tr><td>停止</td><td>二次确认后执行 <code>docker compose down</code>:停止并移除该栈的容器;<strong>数据卷默认保留</strong>,但容器本身会被移除</td></tr>
+            <tr><td>启动</td><td>二次确认后执行 <code>docker compose up -d --remove-orphans</code>:后台创建并启动该栈的全部服务(含拉取缺失镜像;同项目内不在该 compose 里的旧容器会被一并移除),<strong>最多等待 2 分钟</strong>;成功后刷新栈列表与概览</td></tr>
+            <tr><td>停止</td><td>二次确认后执行 <code>docker compose down --remove-orphans</code>:停止并移除该栈的容器(含不在该 compose 里的孤儿容器,网络一并回收);<strong>数据卷默认保留</strong>,但容器本身会被移除</td></tr>
             <tr><td>服务状态</td><td>弹窗表格显示 compose ps 的结果:服务名 + 运行状态(运行中 / 已退出 / …)</td></tr>
             <tr><td>日志</td><td>弹窗显示 compose logs 输出,行数可选 100 / 500 / 1000 / 全部;顶栏可勾选<strong>「实时跟随」</strong>:开启后持续接收新日志(关闭开关或关闭弹窗即停),容器退出时跟随自动结束</td></tr>
             <tr><td>.env</td><td>查看 / 编辑栈目录的 .env 文件(默认只读,「编辑」后可保存,需二次确认);文件不存在时保存将自动创建,<strong>下次 compose up 生效</strong></td></tr>
@@ -432,7 +433,7 @@
         <table>
           <thead><tr><th>类型</th><th>说明</th></tr></thead>
           <tbody>
-            <tr><td>回滚到此归档</td><td>整栈回滚:重载归档内的镜像包 → 恢复该归档的 compose 副本到项目目录 → <code>docker compose up -d</code>。任何扫描到的项目都能用(不要求软件内配置)</td></tr>
+            <tr><td>回滚到此归档</td><td>整栈回滚:重载归档内的镜像包 → 恢复该归档的 compose 副本到项目目录 → <code>docker compose up -d --remove-orphans --pull never</code>。任何扫描到的项目都能用(不要求软件内配置)</td></tr>
             <tr><td>切回此版本</td><td>单镜像回滚:把 <code>仓库名:日期标签</code> 重新指到 compose 使用的标签后重建容器。<strong>需要该项目在软件内已配置</strong>(未配置的会提示去「服务器管理」新增)</td></tr>
           </tbody>
         </table>
@@ -440,6 +441,7 @@
           <li>回滚前有确认面板列出将执行的动作,单镜像回滚可修改目标标签(默认 <code>latest</code>);</li>
           <li>执行日志显示在页面底部面板,过程与部署共用同一事件流;</li>
           <li>归档空间占用可在「服务器管理 → 清理优化」中按项目清理(默认保留最新 5 个);</li>
+          <li><strong>启动阶段加固</strong>:回滚的 <code>up</code> 带 <code>--remove-orphans</code>(同项目内不在归档 compose 里的容器会被移除,不留孤儿)与 <code>--pull never</code>(镜像缺失立即报错,不悄悄拉取)。</li>
           <li><strong>回滚会改变服务器上运行的服务版本</strong>,请确认目标归档 / 标签正确。</li>
         </ul>`
     },

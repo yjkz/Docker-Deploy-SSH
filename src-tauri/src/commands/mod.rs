@@ -1025,19 +1025,17 @@ pub fn compose_logs_cmd(remote_dir: &str, compose_file: &str, overrides: &[Strin
 /// 单轮健康检查判定结果(见 [`health_verdict`])。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HealthVerdict {
-    /// 全部服务 running 且健康检查通过(或无 healthcheck)
-    Pass,
+    /// 全部服务满足〔running 且健康检查通过(或无 healthcheck)〕或〔已成功退出
+    /// (退出码 0)〕;`completed` 为已成功退出的服务名(典型为一次性初始化服务,
+    /// 按「完成」处理 —— 由调用方逐条明示,不静默)。
+    Pass { completed: Vec<String> },
     /// 任一服务进入失败终态(Restarting/Dead,或 Exited 且退出码非零/缺失),
     /// 立即中止
     Unhealthy { service: String, state: String },
-    /// 尚无法判定(解析失败、服务仍在启动/健康检查进行中、一次性服务已正常
-    /// 退出等),继续轮询;`pending` 携带最近观察到的未就绪服务与展示状态,
-    /// 供预算耗尽时报错展示;`exited_zero` 表示该服务"已退出(退出码 0)"
-    /// (典型为一次性初始化服务,预算耗尽的报错需据此提示关闭健康检查)。
-    Indeterminate {
-        pending: Option<(String, String)>,
-        exited_zero: bool,
-    },
+    /// 尚无法判定(解析失败、服务仍在启动/健康检查进行中、created/paused 等),
+    /// 继续轮询;`pending` 携带最近观察到的未就绪服务与展示状态,供预算耗尽时
+    /// 报错展示。
+    Indeterminate { pending: Option<(String, String)> },
 }
 
 /// 对 `docker compose ps --all --format json` 的输出行做单轮健康判定(纯函数)。
@@ -1046,11 +1044,12 @@ pub enum HealthVerdict {
 ///   解析不出任何服务记录 → `Indeterminate`;
 /// - restarting/dead → 立即 `Unhealthy{ service, state }`;
 /// - exited:按 `ExitCode` 区分(存在版本差异)——非零 → 立即 `Unhealthy`
-///   (state 展示 "exited(非零退出)");`0` → 一次性服务正常退出,不算失败,
-///   归入 `Indeterminate`(`pending` 展示 "已退出(退出码 0)" 且 `exited_zero`
-///   为 true,预算耗尽时由调用方附加一次性服务提示);`ExitCode` 字段缺失 →
+///   (state 展示 "exited(非零退出)");`0` → **一次性服务正常退出 = 完成**
+///   (第三十一批 S2:不再计入 pending 等预算耗尽后误报失败,而是按满足处理、
+///   服务名进 `Pass.completed`,由调用方逐条明示);`ExitCode` 字段缺失 →
 ///   保守按 `Unhealthy`(宁误报不漏报);
-/// - 全部服务 state=="running" 且(无 Health 字段/为空 或 "healthy")→ `Pass`;
+/// - 全部服务满足〔state=="running" 且(无 Health 字段/为空 或 "healthy")〕或
+///   〔已成功退出(退出码 0)〕→ `Pass{ completed }`;
 /// - 其余(服务仍在启动、health 为 starting/unhealthy 等)→ `Indeterminate`,
 ///   `pending` 取第一个未就绪服务(有 Health 且非 healthy 时展示 Health,
 ///   否则展示容器 state)。
@@ -1081,10 +1080,7 @@ pub fn health_verdict(lines: &[&str]) -> HealthVerdict {
         }
     }
     if entries.is_empty() {
-        return HealthVerdict::Indeterminate {
-            pending: None,
-            exited_zero: false,
-        };
+        return HealthVerdict::Indeterminate { pending: None };
     }
     // 失败终态:立即失败(取先出现者);exited 需结合 ExitCode 区分一次性服务
     for e in &entries {
@@ -1096,7 +1092,7 @@ pub fn health_verdict(lines: &[&str]) -> HealthVerdict {
                 };
             }
             "exited" => match e.exit_code {
-                // 一次性服务正常退出:不算失败,进入下方 pending 逻辑
+                // 一次性服务正常退出:不算失败(下方按"完成"处理)
                 Some(0) => {}
                 Some(_) => {
                     return HealthVerdict::Unhealthy {
@@ -1115,9 +1111,11 @@ pub fn health_verdict(lines: &[&str]) -> HealthVerdict {
             _ => {}
         }
     }
-    // 逐服务判定 running + 健康
+    // 逐服务判定:running + 健康,或**已成功退出(退出码 0)**(第三十一批 S2:
+    // 一次性初始化服务的正常终态 = 完成 —— 此前按"未就绪"计入 pending,预算
+    // 耗尽后误报失败,与「部署失败自动回滚」叠加时会把好部署回滚掉)
     let mut pending: Option<(String, String)> = None;
-    let mut exited_zero = false;
+    let mut completed: Vec<String> = Vec::new();
     for e in &entries {
         let state_ok = e.state.eq_ignore_ascii_case("running");
         let health_ok = match e.health.as_deref() {
@@ -1127,28 +1125,22 @@ pub fn health_verdict(lines: &[&str]) -> HealthVerdict {
         if state_ok && health_ok {
             continue;
         }
+        if e.state.eq_ignore_ascii_case("exited") && e.exit_code == Some(0) {
+            completed.push(e.service.clone());
+            continue;
+        }
         if pending.is_none() {
-            // 已退出(退出码 0)的服务永不满足"全部 running",展示专用状态,
-            // 预算耗尽时调用方据此附加一次性服务提示
-            let is_exited_zero =
-                e.state.eq_ignore_ascii_case("exited") && e.exit_code == Some(0);
-            let shown = if is_exited_zero {
-                "已退出(退出码 0)".to_string()
-            } else {
-                // 展示口径:健康检查未通过时优先展示 Health(如 starting/unhealthy),
-                // 否则展示容器状态(如 created/paused)
-                e.health.clone().unwrap_or_else(|| e.state.clone())
-            };
-            pending = Some((e.service.clone(), shown));
-            exited_zero = is_exited_zero;
+            // 展示口径:健康检查未通过时优先展示 Health(如 starting/unhealthy),
+            // 否则展示容器状态(如 created/paused)
+            pending = Some((
+                e.service.clone(),
+                e.health.clone().unwrap_or_else(|| e.state.clone()),
+            ));
         }
     }
     match pending {
-        None => HealthVerdict::Pass,
-        Some(p) => HealthVerdict::Indeterminate {
-            pending: Some(p),
-            exited_zero,
-        },
+        None => HealthVerdict::Pass { completed },
+        Some(p) => HealthVerdict::Indeterminate { pending: Some(p) },
     }
 }
 

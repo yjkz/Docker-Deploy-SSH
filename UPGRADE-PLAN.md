@@ -3535,3 +3535,101 @@ fail-closed 方向不变(仍阻断),但定性正确。
   测试同口径)。**变异自证**:改回点号写法 → 测试红(形态断言先命中)。
 
 测试 500→501;clippy 与基线零新增;verify 六脚本 PASS。
+
+---
+
+# 第三十一批:v6.13.0 部署/回滚流程加固(P1/P2 + S1/S2,2026-09-22)
+
+> **来源**:候选池(2026-09-22 入库)用户批复「首批 P1 孤儿容器 + P2 `--pull never`」,
+> 开工前追问补齐两处边界(05 页栈启停 / 迁移目标启动)+ 搭车 S 组。S2 的口径由用户
+> 拍板「自动通过」(三选一),S1 复核后确认**代码早已修复**、只剩文档过期。
+
+## P1 孤儿容器:`--remove-orphans` 全链
+
+**问题**:回滚到旧归档(或部署时删掉某服务)后,新版才有的服务容器会作为**孤儿继续
+运行**,界面却报「完成」—— 与第三十批「按 ID 收敛」同族的「回滚没回干净」。
+
+**改动**:`up` 命令拼装收敛为**唯二来源** —— `compose_up_cmd`(带 `-f` 链:整栈部署 /
+单镜像部署 / 04 页两条回滚链 / 迁移目标)与 `compose_up_cmd_in_dir`(06 页按目录默认
+文件名),尾部固定 `--remove-orphans --pull never`(常量 `COMPOSE_FLAG_*`);05 页栈
+启停(`manage_stack_action`)经纯函数 `compose_action_sub`,`up -d` / `down` **两侧**
+都带 `--remove-orphans`。
+
+**本机 Docker 实测**(compose v5.4.0,跑完已清理归零):
+
+| 场景 | 旧形态 | 新形态 |
+|---|---|---|
+| v1(a+b)→ v2(只 a)再 up | 一行 orphan warning,**b 容器仍 Up** | `b Stopped → Removing → Removed` |
+| `down` | a 被删、b 残留,并报 `Network ... Resource is still in use` | `b` 与网络一并回收 |
+| 应用原样命令串(带/不带 `-f` 链两种形态) | — | 孤儿均被移除 |
+
+## P2 禁止隐式拉取:`--pull never`
+
+**问题**:`up -d` 默认 `pull=missing`,引用在本地不存在时会**静默从 registry 拉一个
+非归档版本**(`.env` 漂移 / 标签被外部移走可触发)。
+
+**实测**:本地无 `alpine:3.21` 时,旧形态 up 静默拉取并启动;新形态
+`up -d --remove-orphans --pull never` → `Error response from daemon: No such image: ...`
+(退出码 1,**不产生容器、不拉取**)。**回归**:拉取类服务「步骤 5 显式 pull → 步骤 6
+新形态 up」实测通过(不受影响)。
+
+**边界**:①05 页栈「启动」刻意**不带**该旗标(该入口既有用户可见语义含「拉取缺失
+镜像」,见 ui/help.js);②需服务器 compose ≥ v2.15(`--pull` 旗标自该版提供),
+更老版本会报 unknown flag —— 已写入 wiki/06、wiki/07 与 ROADMAP 池条目修正。
+
+## S2 健康检查 exited-0 口径(用户拍板:自动通过)
+
+`health_verdict` 把 `exited && ExitCode==0` 归入「已完成」:`Pass{completed}` 携带
+服务名,`health_check` 逐条明示「服务 X 已成功退出(退出码 0),按完成处理」;
+`Indeterminate` 的 `exited_zero` 字段删除,预算耗尽文案不再提示「关闭健康检查」。
+
+**为什么**:一次性初始化服务的正常终态此前被当作「未就绪」轮询到预算耗尽 → 这类栈
+**每次部署都误报失败**;若开了「部署失败自动回滚」会把**好部署回滚掉**(真故障级)。
+
+**代价(已知并接受)**:「起错命令、秒退 0」的常驻服务不再被健康检查拦住 —— 实测
+`collect_running_images` 用 `ps -q --all`,该形态容器存在、镜像 ID 正确,up 后运行
+镜像校验同样看不到。留档:若将来出现「必须拦截秒退 0」的真实诉求,再启用项目级
+逐服务忽略清单(本批口径三选一中的第二项)。
+
+**本机实测**:真实 `compose ps --all --format json` 输出中,一次性服务为
+`"State":"exited","ExitCode":0`(与判定依据一致)。
+
+## S1 复核(候选条目基于过期文档)
+
+S1 声称 `import_compose` 失败残留 `config/stacks/<uuid>/`。实测**代码早在第二十三批
+已修**:`compose_sources.rs` 把「复制副本 → 记 origin.json → 写配置」包进闭包,任一
+失败即清理目录,并有单测 `test_import_compose_failure_cleans_stray_stack_dir`(用损坏
+`projects.json` 复现「副本已拷完、写配置失败」)。本批仅更正 wiki/07 限制 7 的记载。
+
+## 文件改动
+
+| 文件 | 改动 |
+|---|---|
+| `src-tauri/src/commands/deploy.rs` | 新增 `COMPOSE_FLAG_REMOVE_ORPHANS` / `COMPOSE_FLAG_PULL_NEVER`;`compose_up_cmd` 带两旗标;新增 `compose_up_cmd_in_dir`;单镜像 up 改走同一拼装器(消除重复字符串);`health_check` 消费 `Pass{completed}` 并逐条记日志 |
+| `src-tauri/src/commands/rollback.rs` | 06 页 up 改走 `compose_up_cmd_in_dir` |
+| `src-tauri/src/manage_stacks.rs` | 新增纯函数 `compose_action_sub`(up/down 均带 `--remove-orphans`;不带 `--pull never`) |
+| `src-tauri/src/migrate_project.rs` | 新增纯函数 `compose_simple_action_cmd`(目标 up 走 `compose_up_cmd`;源侧 stop/start 不变) |
+| `src-tauri/src/commands/mod.rs` | `HealthVerdict::Pass{completed}` / `Indeterminate{pending}`;exited-0 按完成处理 |
+| `src-tauri/src/commands/tests.rs` + 两模块测试 | 更新既有断言(compose 命令 2 处 + health_verdict 6 处)+ 新增 4 条口径测试 |
+| `wiki/02` / `wiki/04` / `wiki/06` / `wiki/07` | 命令形态、健康检查语义、P1/P2 决策与代价(决策 79/80)、S1 更正、S2 修复 |
+| `ui/help.js` | 04 页「启动阶段的两条加固」;05 页栈启停命令;06 页回滚命令与说明 |
+| `verify/user-facing-copy.js` | 第 6 节 5 条断言(首次变异测试**漏网一次**:宽松正则被 06 页行误命中 → 收紧为 05 页 code 片段后重测通过) |
+
+## 验证
+
+- `cargo test` **505 passed / 13 ignored**(501→505,新增 4)
+- `cargo clippy --all-targets` 18 条告警**全部落在未改动行**(逐条比对位置,零新增)
+- 本机 Docker 实测:P1(up/down + 两种命令形态)/ P2(静默拉取对照、显式报错、拉取类
+  回归)/ S2 真实 ps 输出形态;测试产物清理,容器/镜像归零
+- verify 六脚本 PASS(user-facing-copy 27 项;新增第 6 节经反向变异:去掉 05 页旗标 /
+  去掉 P1 口径句 → 均红,还原后绿)
+- 文档:本节 + ROADMAP(池状态/速览/池条目修正)+ 三处版本号 + 七篇页首戳 +
+  `doc-consistency --write --tests=505`
+
+## 明确留档不做
+
+- 05 页栈「启动」不加 `--pull never`(既有语义含拉取缺失镜像,改它会破坏文档化的行为)。
+- 不做「逐服务健康检查忽略清单」(用户选了自动通过;触发条件见上 S2 节)。
+- 候选池其余条目不在本批:P3(服务端 `compose config` 权威校验)/ P4(更新包签名)/
+  L1(层级增量)/ L2(体检增强)/ S3(迁移管线真机样板)/ S4(词法级自由标识符守护)/
+  S5(wiki 的 watchtower 例子,本批未动,仍在池中)。

@@ -1676,6 +1676,25 @@ async fn copy_remote_dir(
     Ok(count)
 }
 
+/// 拼装源/目标的一条 compose 动作命令(纯函数,便于单测)。
+///
+/// `up`(目标侧启服,阶段⑧)走 [`commands::compose_up_cmd`] —— 与部署/回滚链同
+/// 口径带上 P1/P2 加固旗标:目标镜像全部来自 `docker load`(源服务器搬运),
+/// 任何隐式拉取都意味着「起的不是源上的版本」;`--remove-orphans` 则清掉目标
+/// 目录里上次迁移残留的孤儿容器。`stop` / `start`(源侧停机窗口的开合)不带旗标。
+fn compose_simple_action_cmd(dir: &str, action: &str) -> String {
+    let compose_file = commands::remote_join(dir, "docker-compose.yml");
+    match action {
+        "up" => commands::compose_up_cmd(dir, &compose_file, &[]),
+        other => format!(
+            "cd {} && docker compose -f {} {}",
+            shell_single_quote(dir),
+            shell_single_quote(&compose_file),
+            other
+        ),
+    }
+}
+
 /// 在源/目标执行一条 compose 动作(`stop` / `start` / `up`)。
 async fn compose_simple_action(
     client: &mut SshClient,
@@ -1683,19 +1702,7 @@ async fn compose_simple_action(
     action: &str,
     emit_line: &Arc<dyn Fn(&str) + Send + Sync>,
 ) -> Result<(), String> {
-    let cmd = match action {
-        "up" => format!(
-            "cd {} && docker compose -f {} up -d",
-            shell_single_quote(dir),
-            shell_single_quote(&commands::remote_join(dir, "docker-compose.yml"))
-        ),
-        other => format!(
-            "cd {} && docker compose -f {} {}",
-            shell_single_quote(dir),
-            shell_single_quote(&commands::remote_join(dir, "docker-compose.yml")),
-            other
-        ),
-    };
+    let cmd = compose_simple_action_cmd(dir, action);
     // 输出逐行 emit(便于用户看到 stop/start 的实际结果)
     let mut buf = String::new();
     let mut on_line = |line: &str| {
@@ -1762,6 +1769,27 @@ mod tests {
         assert_eq!(dir_basename("/home/user/zetok/"), "zetok");
         assert_eq!(dir_basename("/opt/app"), "app");
         assert_eq!(dir_basename("/"), "");
+    }
+
+    /// 第三十一批 P1/P2:目标侧启服(阶段⑧)与部署/回滚同口径带加固旗标;
+    /// 源侧停机窗口的 stop / start 不带(不开新容器、不拉镜像)。
+    #[test]
+    fn test_compose_simple_action_cmd_flags() {
+        assert_eq!(
+            compose_simple_action_cmd("/opt/app", "up"),
+            "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' up -d --remove-orphans --pull never"
+        );
+        assert_eq!(
+            compose_simple_action_cmd("/opt/app", "stop"),
+            "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' stop"
+        );
+        assert_eq!(
+            compose_simple_action_cmd("/opt/app", "start"),
+            "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' start"
+        );
+        // 路径含单引号经 shell 转义,不破坏命令结构
+        assert!(compose_simple_action_cmd("/opt/a'pp", "stop")
+            .contains("'\\''pp/docker-compose.yml'"));
     }
 
     #[test]

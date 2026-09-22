@@ -80,6 +80,21 @@ fn compose_prefix(compose_file: &str) -> String {
     )
 }
 
+/// 栈 up / down 的 compose 子命令(纯函数,便于单测)。
+///
+/// 第三十一批 P1:up 与 down 两侧都带 `--remove-orphans`(与部署/回滚链同口径)
+/// —— 启动/停止后不留「同项目内已不在当前 compose」的孤儿容器。
+/// 刻意**不**带 `--pull never`:本入口(05 页栈「启动」)的既有用户可见语义含
+/// 「拉取缺失镜像」(见 ui/help.js),P2 的禁止隐式拉取只适用于部署/回滚/迁移链。
+fn compose_action_sub(action: &str) -> Result<String, String> {
+    let remove_orphans = crate::commands::COMPOSE_FLAG_REMOVE_ORPHANS;
+    match action {
+        "up" => Ok(format!("up -d {}", remove_orphans)),
+        "down" => Ok(format!("down {}", remove_orphans)),
+        other => Err(format!("不支持的栈操作: {}(仅支持 up / down)", other)),
+    }
+}
+
 // ===== Tauri 命令 =====
 
 /// 扫描 remote_dir 下(深度 ≤4,与回滚中心/清理分析的项目扫描口径一致)的
@@ -154,11 +169,7 @@ pub async fn manage_stack_action(
     compose_file: String,
     action: String,
 ) -> Result<ActionResult, String> {
-    let sub = match action.as_str() {
-        "up" => "up -d",
-        "down" => "down",
-        other => return Err(format!("不支持的栈操作: {}(仅支持 up / down)", other)),
-    };
+    let sub = compose_action_sub(&action)?;
     let cmd = format!("{} {}", compose_prefix(&compose_file), sub);
     let (_server, mut client) = connect_server(&server_id, password_plain.as_deref()).await?;
     with_timeout(
@@ -677,6 +688,34 @@ mod tests {
         assert_eq!(parent_dir_of("/opt/app/docker-compose.yml"), "/opt/app");
         assert_eq!(parent_dir_of("/docker-compose.yml"), "/"); // Some(0) → 根目录
         assert_eq!(parent_dir_of("docker-compose.yml"), "."); // 无 '/' → 当前目录
+    }
+
+    #[test]
+    fn test_compose_action_sub_flags() {
+        // 第三十一批 P1:栈启停两侧都带 --remove-orphans(与部署/回滚同口径)
+        assert_eq!(compose_action_sub("up").unwrap(), "up -d --remove-orphans");
+        assert_eq!(compose_action_sub("down").unwrap(), "down --remove-orphans");
+        // 刻意不带 --pull never:05 页栈「启动」的既有用户可见语义含
+        // 「拉取缺失镜像」(ui/help.js),P2 只适用于部署/回滚/迁移链
+        assert!(!compose_action_sub("up").unwrap().contains("--pull"));
+        // 未知动作照旧报错(不静默放过)
+        let err = compose_action_sub("restart").unwrap_err();
+        assert!(err.contains("不支持的栈操作"), "实际: {}", err);
+        assert!(err.contains("restart"), "实际: {}", err);
+    }
+
+    #[test]
+    fn test_stack_action_cmd_prefix_and_sub() {
+        // 命令 = compose_prefix(-f + --project-directory) + 子命令,口径不变
+        let cmd = format!(
+            "{} {}",
+            compose_prefix("/opt/app/docker-compose.yml"),
+            compose_action_sub("down").unwrap()
+        );
+        assert_eq!(
+            cmd,
+            "docker compose -f '/opt/app/docker-compose.yml' --project-directory '/opt/app' down --remove-orphans"
+        );
     }
 
     #[test]
