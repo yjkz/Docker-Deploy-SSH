@@ -3633,3 +3633,91 @@ S1 声称 `import_compose` 失败残留 `config/stacks/<uuid>/`。实测**代码
 - 候选池其余条目不在本批:P3(服务端 `compose config` 权威校验)/ P4(更新包签名)/
   L1(层级增量)/ L2(体检增强)/ S3(迁移管线真机样板)/ S4(词法级自由标识符守护)/
   S5(wiki 的 watchtower 例子,本批未动,仍在池中)。
+
+---
+
+# 第三十二批:回滚链审查修复(P1/P2 后续;随 v6.13.0 合并交付,2026-09-22)
+
+> **来源**:用户要求「详细讲 P1 并审查回滚是否还有隐藏漏洞」→ 逐段审两条回滚链
+> (04 页 / 06 页)与预检,列 **F1–F7** 七条 finding(每条附实测或代码证据),
+> 用户批复「全部进行修复」。**版本**:v6.13.0 尚未发版,本批与第三十一批**共享同一
+> 版本号**(先例:第二十七/二十八批合并为 v6.9.0),不单独 bump。
+
+## F1/F2 回滚的 compose/override 一律「归档为准」,06 页改显式 `-f` 链
+
+**实测依据**(本机 compose v5.4.0):
+- 默认文件解析优先级 `compose.yaml` > `compose.yml` > `docker-compose.yml` > `docker-compose.yaml`;
+  同目录并存时 compose 自身打印 `Found multiple config files … Using compose.yaml` →
+  **归档恢复出的 `docker-compose.yml` 根本不参与启动**(旧形态实测:起的是 shadow 项目的容器)。
+- 无 `-f` 时**最多只吃一个** override(`compose.override.yaml` 优先):三文件场景实测自动解析出
+  `A B`(缺 `docker-compose.override.yml` 的 `C`),而部署用的是全部 `-f` 链(`A B C`)。
+
+**修复**:06 页 up 由纯函数 `rollback_at_up_plan` 给出「显式 `-f` 链(归档基础文件 + 归档内
+四个标准 override)+ 与 up **逐字同源**的校验前缀」;归档无副本的旧归档保持降级(按目录现有
+compose 启动),并由预检 `noComposeCopy` 提示;目录内存在遮蔽文件时执行期告警(不静默)。
+04 页的 override 集合同步改为归档为准(`rollback_override_chain`,与 `stack::OVERRIDE_FILE_NAMES`
+同源);本地新增/删除 override 不再影响回滚合并结果(本地独有项给日志提示)。
+
+**实测**:新形态 up 起 `ddroll-arch` 项目 4 个服务(arch/keep/ov/ov2),`shadow` 未启动;
+再删掉基础 compose 里的 `keep` 后 up → `keep` 被孤儿清理移除(项目内收敛仍有效)。
+
+## F3 `--no-build`:堵住「构建」这条非归档通道
+
+`--pull never` 只挡拉取。实测:服务写了 `build:` 且镜像缺失时 `up` **现场构建**并起容器;
+加 `--no-build` → `No such image: <ref>`,不构建、无容器。已加入 `compose_up_cmd` 的固定尾旗
+(部署/回滚/迁移;05 页栈启停不带)。三个旗标合起来是「**不拉、不建、不留孤儿**」。
+
+## F4 孤儿清理的「项目作用域」边界(文档)
+
+wiki/07 决策 79 补边界:①换 `remote_dir` / 目录改名 → 旧目录容器不在此列(两套并存);
+②两个项目共用同一部署目录(限制 38)→ 部署/回滚其一会移除另一个的容器;
+③compose 顶层 `name:` 被改动同理。help.js 同步。
+
+## F5 两条回滚链的 override 集合统一为「归档为准」
+
+见 F1/F2;**预检的插值漂移取值也改用同一函数** —— 否则「漂移结论」与实际 up 的合并结果
+可能不一致(只查一个来源、执行用另一个)。
+
+## F6 预检新增 `noComposeCopy` + 桩验证**顺带抓到真 bug**
+
+`RollbackPrecheck` 增 `no_compose_copy`(camelCase `noComposeCopy`),两个入口的预检结果块
+各加一行提示;桩验证两页截图交 judge,均 **pass**。
+**顺带抓到的真 bug**:04 页模态与 06 页面板都创建 `id="rb-precheck-box"`,而 06 页元素在 DOM
+中**更靠前** → 04 页 `getElementById` 取到 06 页容器,**预检结果写进另一页、模态里空白**
+(用户看不到「回不去」清单)。已将 06 页容器改名 `rb-page-precheck-box`,并在
+`verify/user-facing-copy.js` 加两条断言(两 id 必须不同 + 04 页仍按 `#rb-precheck-box` 取目标)。
+**该 bug 与本次改动无关**,触发时序为「先访问 06 页跑过预检 → 再开 04 页回滚模态」。
+
+## F7 up 后校验的不一致数写进历史/通知
+
+`verify_running_images` 改为返回不一致明细;`rollback_result_message` 统一组装结果文案:
+部分回滚/漂移的服务名 + 「N 个服务的实际镜像与归档不一致(详见日志)」都进 `record.message`
+(该 message 同时进通知正文)。**判定结果不变**(成败仍由 up 退出码决定,不一致不升级为失败)。
+
+## 文件改动
+
+| 文件 | 改动 |
+|---|---|
+| `src-tauri/src/commands/deploy.rs` | `COMPOSE_FLAG_NO_BUILD` + 尾旗;`compose_up_cmd_in_dir` 标注为降级专用 |
+| `src-tauri/src/commands/rollback.rs` | 新增 `has_compose_copy` / `rollback_override_chain` / `shadowing_compose_files` / `compose_shadow_probe_cmd` / `rollback_at_up_plan` / `rollback_result_message`;04 页 override 链改归档为准 + 差异日志;06 页 up 改显式链 + 遮蔽告警;预检 `no_compose_copy` + 漂移 override 集合同源;`verify_running_images` 返回明细 |
+| `src-tauri/src/stack.rs` | `OVERRIDE_FILE_NAMES` 常量(与 `find_override_files` 同源) |
+| `src-tauri/src/commands/tests.rs` | 旗标断言补 `--no-build` + 新增 5 条纯函数测试 |
+| `ui/deploy-rollback.js` / `ui/rollback.js` | 预检提示行(noComposeCopy);06 页容器 id 改名(修 id 冲突) |
+| `ui/help.js` | 三条加固(含 build)、「compose 与 override 以归档为准」、降级说明 |
+| `verify/user-facing-copy.js` | +5 条断言(F3 文案 / 归档为准 / noComposeCopy 双入口 / 两 id 不同 + 04 页取目标) |
+
+## 验证
+
+- `cargo test` **510 passed / 13 ignored**(505→510,新增 5)
+- `cargo clippy` 逐条比对:零新增(告警位置与本批改动行无交集)
+- **本机 Docker 实测**:遮蔽文件对照(旧形态起 shadow / 新形态起归档项目)、多 override
+  (`-f` 链 3 vs 自动 1)、`--no-build` 对照(构建成功 vs 显式报错)、孤儿移除仍生效;跑完清理归零
+- **桩验证 + judge**:两个入口提示行各截一图,judge 两页均 **pass**;顺带发现并修复 id 冲突
+  (含 DOM 证据:两个 `[id=rb-precheck-box]`,靠前者属 06 页)
+- verify 六脚本 PASS(user-facing-copy 32 项)
+
+## 明确留档不做
+
+- 全站「多页同 id」系统性扫描(本批修了实测发现的一处,扫描留作候选)。
+- 「up 后镜像不一致」不升级为失败(维持既有口径,仅进结果文案)。
+- 非标准 override 名(手工放进归档)不进入 `-f` 链(收窄,见 wiki/07 决策 81)。

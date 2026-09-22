@@ -618,21 +618,29 @@ pub fn dedupe_volume_specs(mounts: &[VolumeMount]) -> Vec<VolumeSpec> {
     specs
 }
 
-/// 按 compose 默认加载顺序检测 `compose_dir` 下的 override 文件:
+/// compose override 的**标准文件名**(按合并顺序,后者覆盖前者):
 /// `compose.override.yaml` → `compose.override.yml` →
-/// `docker-compose.override.yaml` → `docker-compose.override.yml`,
-/// 存在的全部按此序返回(合并时后者覆盖前者;无则返回空)。
+/// `docker-compose.override.yaml` → `docker-compose.override.yml`。
+///
+/// 单一来源:部署时 [`find_override_files`] 检测/上传、`-f` 文件链拼装,
+/// 以及回滚时「归档里哪些 override 参与」(第三十二批 F5)都引用本清单 ——
+/// 保证「部署上传了什么,回滚就应用什么」。
+pub const OVERRIDE_FILE_NAMES: [&str; 4] = [
+    "compose.override.yaml",
+    "compose.override.yml",
+    "docker-compose.override.yaml",
+    "docker-compose.override.yml",
+];
+
+/// 按 compose 默认加载顺序检测 `compose_dir` 下的 override 文件
+/// ([`OVERRIDE_FILE_NAMES`] 同序),存在的全部按此序返回(合并时后者覆盖前者;
+/// 无则返回空)。
 pub fn find_override_files(compose_dir: &Path) -> Vec<PathBuf> {
-    [
-        "compose.override.yaml",
-        "compose.override.yml",
-        "docker-compose.override.yaml",
-        "docker-compose.override.yml",
-    ]
-    .iter()
-    .map(|name| compose_dir.join(name))
-    .filter(|path| path.is_file())
-    .collect()
+    OVERRIDE_FILE_NAMES
+        .iter()
+        .map(|name| compose_dir.join(name))
+        .filter(|path| path.is_file())
+        .collect()
 }
 
 /// 推导 compose v2 的项目名候选(纯函数,读 `compose_path` 同目录文件)。

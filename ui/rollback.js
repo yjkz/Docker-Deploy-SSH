@@ -1039,7 +1039,10 @@
       precheckBtn.type = 'button';
       precheckBtn.title = '核对每个服务在该归档里的镜像来源(归档内有包 / 服务器上按镜像 ID 命中 / 回不去)';
       preWrap = el('div', 'rb-precheck hidden');
-      preWrap.id = 'rb-precheck-box';
+      // 第三十二批:容器 id 必须与 04 页模态的 #rb-precheck-box **不同**
+      // (04 页用 getElementById 取渲染目标;若两页同 id,DOM 更靠前的本页元素
+      //  会抢走 04 页的写入目标 → 04 页模态里预检结果静默不可见,实测发现)
+      preWrap.id = 'rb-page-precheck-box';
       box.appendChild(preWrap);
     }
 
@@ -1125,6 +1128,11 @@
       (res.tagRestore ? ' · 标签待指回 ' + res.tagRestore : '') +
       (res.missing ? ' · 回不去 ' + res.missing : '') +
       (res.unknown ? ' · 无法核对 ' + res.unknown : '')));
+    // 归档无 compose 副本(第三十二批 F6):与 04 页同口径提示
+    if (res.noComposeCopy) {
+      box.appendChild(el('div', 'rb-precheck-title',
+        '注意:该归档没有 compose 副本,本次回滚将沿用服务器现有 compose 文件,服务构成可能与归档不一致'));
+    }
     var rank = function (it) {
       if (it.blocking) return 0;
       return it.source === 'tagRestore' ? 1 : 2;

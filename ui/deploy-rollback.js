@@ -634,6 +634,12 @@
       (res.missing ? ' · 回不去 ' + res.missing : '') +
       (res.unknown ? ' · 无法核对 ' + res.unknown : ''));
     box.appendChild(head);
+    // 归档无 compose 副本(第三十二批 F6):本次沿用服务器现有 compose,
+    // 服务构成可能与归档不一致 —— 必须在确认前让用户看到
+    if (res.noComposeCopy) {
+      box.appendChild(el('div', 'rb-precheck-title',
+        '注意:该归档没有 compose 副本,本次回滚将沿用服务器现有 compose 文件,服务构成可能与归档不一致'));
+    }
     // 先列阻断项(用户最需要看这个),再列标签待指回,最后可用项
     var rank = function (it) {
       if (it.blocking) return 0;

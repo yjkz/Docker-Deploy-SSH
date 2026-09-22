@@ -219,7 +219,7 @@
           <li><strong>回滚预检</strong>:在回滚确认页点「回滚预检」会核对每个服务在该归档里的镜像来源 —— 归档内有包(直接装载)/ 服务器上仍持有该镜像 ID(智能传输跳过的服务,直接可用)/ <strong>标签待指回</strong>(镜像 ID 仍在服务器上但标签被别的版本占用,执行时自动零拷贝指回,不算「回不去」)/ <strong>回不去</strong>(镜像已被覆盖或清理)。有「回不去」的服务时会逐条列出并让您确认,不会静默跳过;确认后其余服务照常回退,这些服务沿用服务器当前镜像。<strong>部署/回滚前自动复核</strong>(v6.12.0):准备完成后、启动前按记录的镜像 ID 再核对并自动指回被移动的标签;启动后还会核对容器实际运行的镜像,与记录不一致会在日志里显式告警。</li>
           <li><strong>镜像引用漂移</strong>(v6.12.0):compose 里 <code>image: $\{变量\}</code> 由服务器上当前的 <code>.env</code> 解析 —— 若部署后改过 .env,回滚/部署后的实际引用会与归档记录不同。预检会把「归档记录 X;按当前 .env 会解析成 Y」逐条列出并要求确认(部署时按 .env 解析;.env 不随归档保存,属刻意取舍)。</li>
           <li>点「停止批量」后<strong>当前这台会在步骤边界立即中止</strong>(发取消请求,不必等整台跑完),余下标记「已跳过」;被中止的台<strong>会留下断点</strong>,批量结束后可从面板「续传此台」或「续传未完成服务器(N 台)」继续。停止<strong>不自动续传</strong>当前台(停止是明确的意图)。</li>
-          <li><strong>启动阶段的两条加固</strong>:①部署 / 回滚启动服务时,<strong>同项目内不在当前 compose 里的旧服务容器会被一并移除</strong>(compose 的 <code>--remove-orphans</code> 语义)—— 删掉某个服务后重新部署、或回滚到旧归档时,不会再留下「界面报完成、旧服务却还在跑」的孤儿容器;②启动<strong>不会隐式拉取镜像</strong>(<code>--pull never</code>)—— 镜像缺失会立即明确报错,而不是悄悄从镜像仓库拉一个与归档不一致的版本。分类为「服务器拉取」的服务不受影响(部署步骤 5 已显式拉取)。</li>
+          <li><strong>启动阶段的三条加固</strong>(部署 / 回滚 / 迁移共用):①<strong>同项目内不在当前 compose 里的旧服务容器会被一并移除</strong>(compose 的 <code>--remove-orphans</code> 语义)—— 删掉某个服务后重新部署、或回滚到旧归档时,不会再留下「界面报完成、旧服务却还在跑」的孤儿容器。<em>注意归属范围</em>:清理按 compose <strong>项目</strong>判定,更换部署目录或改动 compose 顶层 <code>name:</code> 后,旧目录 / 旧项目名下的容器不在此列(需自行清理);两个项目共用同一部署目录时,部署其一会移除另一个的容器;②启动<strong>不会隐式拉取镜像</strong>(<code>--pull never</code>)—— 镜像缺失会立即明确报错,而不是悄悄从镜像仓库拉一个与归档不一致的版本;③启动<strong>也不会现场构建镜像</strong>(<code>--no-build</code>)—— 服务写了 <code>build:</code> 段而镜像缺失时同样立即报错,而不是构建出一个非归档版本。分类为「服务器拉取」的服务不受影响(部署步骤 5 已显式拉取)。</li>
         </ul>
         <h4>定时部署与允许执行时段</h4>
         <ul>
@@ -441,7 +441,8 @@
           <li>回滚前有确认面板列出将执行的动作,单镜像回滚可修改目标标签(默认 <code>latest</code>);</li>
           <li>执行日志显示在页面底部面板,过程与部署共用同一事件流;</li>
           <li>归档空间占用可在「服务器管理 → 清理优化」中按项目清理(默认保留最新 5 个);</li>
-          <li><strong>启动阶段加固</strong>:回滚的 <code>up</code> 带 <code>--remove-orphans</code>(同项目内不在归档 compose 里的容器会被移除,不留孤儿)与 <code>--pull never</code>(镜像缺失立即报错,不悄悄拉取)。</li>
+          <li><strong>启动阶段加固</strong>:回滚的 <code>up</code> 带 <code>--remove-orphans</code>(同项目内不在归档 compose 里的容器会被移除,不留孤儿)、<code>--pull never</code>(镜像缺失立即报错,不悄悄拉取)与 <code>--no-build</code>(不现场构建非归档版本)。</li>
+          <li><strong>compose 与 override 以归档为准</strong>:回滚会恢复归档内的 compose 副本,并<strong>显式指定</strong>它 + 归档内的 override(不再依赖目录里的默认文件解析 —— 目录若另有 <code>compose.yaml</code>/<code>compose.yml</code>,它们的解析优先级更高,会遮蔽 <code>docker-compose.yml</code>;归档里没有的 override 也不会被凭空应用)。归档本身没有 compose 副本时,预检会提示「沿用服务器现有 compose,服务构成可能与归档不一致」;目录内存在遮蔽文件时,执行日志会给出告警。</li>
           <li><strong>回滚会改变服务器上运行的服务版本</strong>,请确认目标归档 / 标签正确。</li>
         </ul>`
     },

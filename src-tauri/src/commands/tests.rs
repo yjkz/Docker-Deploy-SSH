@@ -921,7 +921,7 @@ services:
         assert!(!cmd.contains(local));
         assert_eq!(
             cmd,
-            "cd '/home/henghao' && docker compose -f '/home/henghao/docker-compose.yml' up -d --remove-orphans --pull never"
+            "cd '/home/henghao' && docker compose -f '/home/henghao/docker-compose.yml' up -d --remove-orphans --pull never --no-build"
         );
     }
 
@@ -1349,7 +1349,7 @@ services:
     fn test_compose_up_cmd() {
         assert_eq!(
             compose_up_cmd("/opt/app", "/opt/app/docker-compose.yml", &[]),
-            "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' up -d --remove-orphans --pull never"
+            "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' up -d --remove-orphans --pull never --no-build"
         );
         assert_eq!(
             compose_up_cmd(
@@ -1357,26 +1357,126 @@ services:
                 "/opt/app/docker-compose.yml",
                 &["compose.override.yaml".to_string()]
             ),
-            "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' -f 'compose.override.yaml' up -d --remove-orphans --pull never"
+            "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' -f 'compose.override.yaml' up -d --remove-orphans --pull never --no-build"
         );
     }
 
-    /// 第三十一批 P1/P2:up 命令族的加固旗标只有单一来源 —— 带 `-f` 链的
-    /// [`compose_up_cmd`] 与 06 页默认文件名形态的 [`compose_up_cmd_in_dir`]
-    /// 都必须同时带 `--remove-orphans`(孤儿容器)与 `--pull never`(禁止隐式拉取)。
-    /// 变异自证:任一旗标从拼装器里去掉,本测试必红。
+    /// 第三十一批 P1/P2 + 第三十二批 F3:up 命令族的加固旗标只有单一来源 ——
+    /// 带 `-f` 链的 [`compose_up_cmd`] 与降级形态的 [`compose_up_cmd_in_dir`]
+    /// 都必须同时带 `--remove-orphans`(孤儿容器)/ `--pull never`(禁止隐式拉取)/
+    /// `--no-build`(禁止回退构建)。变异自证:任一旗标从拼装器里去掉,本测试必红。
     #[test]
     fn test_up_flag_hardening_both_forms() {
         let with_flags = compose_up_cmd("/opt/app", "/opt/app/docker-compose.yml", &[]);
         assert!(with_flags.contains(COMPOSE_FLAG_REMOVE_ORPHANS));
         assert!(with_flags.contains(COMPOSE_FLAG_PULL_NEVER));
+        assert!(with_flags.contains(COMPOSE_FLAG_NO_BUILD));
         assert_eq!(
             compose_up_cmd_in_dir("/opt/app"),
-            "cd '/opt/app' && docker compose up -d --remove-orphans --pull never"
+            "cd '/opt/app' && docker compose up -d --remove-orphans --pull never --no-build"
         );
         // 两侧形态的旗标部分逐字一致(防「只改一处」的漂移)
         let tail = |cmd: &str| cmd.split("up -d ").nth(1).unwrap().to_string();
         assert_eq!(tail(&with_flags), tail(&compose_up_cmd_in_dir("/opt/app")));
+    }
+
+    // ===== 第三十二批:回滚 compose/override 与结果文案(纯函数) =====
+
+    #[test]
+    fn test_has_compose_copy() {
+        let files = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(has_compose_copy(&files(&["docker-compose.yml", "manifest.json"])));
+        // 只有 override / 其它名字 → 不算有副本(固定名口径)
+        assert!(!has_compose_copy(&files(&[
+            "compose.yaml",
+            "docker-compose.yml.ddbak",
+            "manifest.json"
+        ])));
+        assert!(!has_compose_copy(&files(&[])));
+    }
+
+    /// F5:override 应用链**归档为准** + 只认四个标准名 + 按合并顺序。
+    #[test]
+    fn test_rollback_override_chain() {
+        let files = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // 归档里有的标准名按合并顺序返回(输入顺序无关)
+        assert_eq!(
+            rollback_override_chain(&files(&[
+                "docker-compose.override.yml.ddbak",
+                "compose.override.yaml.ddbak",
+                "docker-compose.yml",
+            ])),
+            vec![
+                "compose.override.yaml".to_string(),
+                "docker-compose.override.yml".to_string()
+            ]
+        );
+        // 非标准名(手工放进归档的形态)不进入 -f 链;ddbak 之外的同名文件也不算
+        assert!(rollback_override_chain(&files(&[
+            "compose.prod.yml.ddbak",
+            "compose.override.yaml",
+        ]))
+        .is_empty());
+        assert!(rollback_override_chain(&files(&[])).is_empty());
+    }
+
+    /// F1:遮蔽检测只认优先级高于 docker-compose.yml 的两个名字。
+    #[test]
+    fn test_shadowing_compose_files() {
+        let files = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            shadowing_compose_files(&files(&[
+                "compose.yaml",
+                "docker-compose.yml",
+                "docker-compose.yaml",
+            ])),
+            vec!["compose.yaml".to_string()]
+        );
+        assert_eq!(
+            shadowing_compose_files(&files(&["compose.yml", "compose.yaml"])),
+            vec!["compose.yaml".to_string(), "compose.yml".to_string()]
+        );
+        // docker-compose.yaml 优先级低于 docker-compose.yml,不算遮蔽
+        assert!(shadowing_compose_files(&files(&["docker-compose.yaml"])).is_empty());
+    }
+
+    /// F1/F2:06 页 up 形态 —— 有副本走显式 `-f` 链且校验前缀与之逐字同源;
+    /// 无副本走降级默认解析形态。
+    #[test]
+    fn test_rollback_at_up_plan() {
+        let chain = vec!["compose.override.yaml".to_string()];
+        let (prefix, cmd) = rollback_at_up_plan("/opt/app", true, &chain);
+        assert_eq!(
+            cmd,
+            "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' -f 'compose.override.yaml' up -d --remove-orphans --pull never --no-build"
+        );
+        // 校验前缀 = up 命令去掉 " up -d ..." 部分(文件集逐字一致)
+        assert_eq!(prefix, cmd.split(" up -d ").next().unwrap());
+        // 无副本(降级)→ 目录默认解析,不带 -f
+        let (prefix, cmd) = rollback_at_up_plan("/opt/app", false, &[]);
+        assert_eq!(
+            cmd,
+            "cd '/opt/app' && docker compose up -d --remove-orphans --pull never --no-build"
+        );
+        assert_eq!(prefix, "cd '/opt/app' && docker compose");
+    }
+
+    /// F7:回滚结果文案 —— 部分回滚与 up 后不一致都要进历史/通知。
+    #[test]
+    fn test_rollback_result_message() {
+        assert_eq!(rollback_result_message("20260901-120000", None, 0), "回滚到 20260901-120000");
+        assert_eq!(
+            rollback_result_message("20260901-120000", Some("web 未回退,沿用服务器当前镜像"), 0),
+            "回滚到 20260901-120000(web 未回退,沿用服务器当前镜像)"
+        );
+        assert_eq!(
+            rollback_result_message("20260901-120000", None, 2),
+            "回滚到 20260901-120000;up 后校验:2 个服务的实际镜像与归档不一致(详见日志)"
+        );
+        // 两者同时存在:都要写明
+        let msg = rollback_result_message("20260901-120000", Some("web 未回退"), 1);
+        assert!(msg.contains("(web 未回退)"), "{}", msg);
+        assert!(msg.contains("1 个服务的实际镜像与归档不一致"), "{}", msg);
     }
 
     // ===== Task 5:augment_pull_error 私有仓库认证提示 =====

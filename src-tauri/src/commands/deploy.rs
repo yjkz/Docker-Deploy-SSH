@@ -2525,31 +2525,44 @@ pub const COMPOSE_FLAG_REMOVE_ORPHANS: &str = "--remove-orphans";
 /// 「拉取缺失镜像」(见 ui/help.js),加 `--pull never` 会改变其既定行为。
 pub const COMPOSE_FLAG_PULL_NEVER: &str = "--pull never";
 
-/// 拼装 compose up 命令(后台启动全部服务;override 文件按序 `-f` 追加;
-/// 尾部固定带 P1/P2 两道加固旗标,见 [`COMPOSE_FLAG_REMOVE_ORPHANS`] /
-/// [`COMPOSE_FLAG_PULL_NEVER`])。
+/// compose `up` 的禁止回退构建旗标(第三十二批 F3):服务写了 `build:` 且镜像在
+/// 本地不存在时,`up` 会**现场构建**出一个非归档版本(`--pull never` 拦不住
+/// 构建 —— 本机实测:缺镜像 + build 段时 up 构建成功并起容器,界面报完成)。
+/// 本应用从不把构建上下文传到服务器(镜像一律 `docker load` / `compose pull`),
+/// 故该旗标把「静默构建」也变成显式报错(`No such image: <ref>`)。
 ///
-/// 部署(整栈/单镜像)、回滚(04 页两条链/06 页)全链共用本拼装器 —— 命令形态
-/// 只有这一个来源,新增加固参数不必逐站点改。
+/// 同 [`COMPOSE_FLAG_PULL_NEVER`],05 页栈启停不使用(该页允许用户自己的
+/// compose 工作流按原语义拉取)。
+pub const COMPOSE_FLAG_NO_BUILD: &str = "--no-build";
+
+/// 拼装 compose up 命令(后台启动全部服务;override 文件按序 `-f` 追加;
+/// 尾部固定带三道加固旗标,见 [`COMPOSE_FLAG_REMOVE_ORPHANS`] /
+/// [`COMPOSE_FLAG_PULL_NEVER`] / [`COMPOSE_FLAG_NO_BUILD`]:不拉、不建、
+/// 不留孤儿 —— 「实际跑什么」只能来自归档/本次 load)。
+///
+/// 部署(整栈/单镜像)、回滚(04 页两条链/06 页显式链)、迁移目标全链共用本
+/// 拼装器 —— 命令形态只有这一个来源,新增加固参数不必逐站点改。
 pub fn compose_up_cmd(remote_dir: &str, compose_file: &str, overrides: &[String]) -> String {
     format!(
-        "cd {} && docker compose {} up -d {} {}",
+        "cd {} && docker compose {} up -d {} {} {}",
         shell_single_quote(remote_dir),
         compose_file_flags(compose_file, overrides),
         COMPOSE_FLAG_REMOVE_ORPHANS,
-        COMPOSE_FLAG_PULL_NEVER
+        COMPOSE_FLAG_PULL_NEVER,
+        COMPOSE_FLAG_NO_BUILD
     )
 }
 
-/// 拼装「按目录内默认 compose 文件启动」的 up 命令(06 页回滚中心路径:
-/// compose 副本已按原名恢复到回滚目录,靠 `cd` 后的默认解析,无 `-f` 链)。
+/// 拼装「按目录内默认 compose 文件启动」的 up 命令(**仅 06 页回滚的降级路径**:
+/// 归档无 compose 副本时沿用目录现有 compose,靠 `cd` 后的默认解析,无 `-f` 链)。
 /// 加固旗标与 [`compose_up_cmd`] 同源。
 pub fn compose_up_cmd_in_dir(remote_dir: &str) -> String {
     format!(
-        "cd {} && docker compose up -d {} {}",
+        "cd {} && docker compose up -d {} {} {}",
         shell_single_quote(remote_dir),
         COMPOSE_FLAG_REMOVE_ORPHANS,
-        COMPOSE_FLAG_PULL_NEVER
+        COMPOSE_FLAG_PULL_NEVER,
+        COMPOSE_FLAG_NO_BUILD
     )
 }
 

@@ -1777,7 +1777,7 @@ mod tests {
     fn test_compose_simple_action_cmd_flags() {
         assert_eq!(
             compose_simple_action_cmd("/opt/app", "up"),
-            "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' up -d --remove-orphans --pull never"
+            "cd '/opt/app' && docker compose -f '/opt/app/docker-compose.yml' up -d --remove-orphans --pull never --no-build"
         );
         assert_eq!(
             compose_simple_action_cmd("/opt/app", "stop"),

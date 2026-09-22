@@ -179,6 +179,31 @@ console.log('\n=== 6. 启动阶段加固口径(P1 孤儿容器 / P2 禁止隐式
   ok(/docker compose down --remove-orphans<\/code>/.test(help),
     'help.js 的栈「停止」命令写明 --remove-orphans(05 页)',
     '第三十一批 P1:停止时孤儿容器与网络一并回收');
+  // 第三十二批 F3:build 兜底(镜像缺失时 up 现场构建非归档版本)必须写明
+  ok(/不会现场构建镜像|--no-build/.test(help),
+    'help.js 写明「启动不会现场构建镜像」(F3,--no-build)',
+    '第三十二批 F3:服务写了 build: 而镜像缺失时 up 会构建非归档版本;该旗标把它变成显式报错');
+  // 第三十二批 F1/F2/F5:compose 与 override 的口径(显式 -f 链 = 归档为准)
+  ok(/compose 与 override 以归档为准/.test(help),
+    'help.js 说明「compose 与 override 以归档为准」(F1/F2/F5)',
+    '显式 -f 链取代默认解析:遮蔽文件(compose.yaml 优先)与「最多一个 override」都不再影响回滚');
+  // 第三十二批 F6:预检「归档无 compose 副本」提示必须两个入口都消费
+  {
+    const rbPage = read(ROLLBACK_UI) || '';
+    const drbPage = read(DEPLOY_ROLLBACK_UI) || '';
+    ok(/noComposeCopy/.test(rbPage) && /noComposeCopy/.test(drbPage),
+      '两个回滚入口都消费 noComposeCopy(F6)',
+      'RollbackPrecheck.no_compose_copy(camelCase);漏读 = 用户不知道本次 compose 是沿用的');
+    // 第三十二批实测发现的真 bug:两个入口的预检容器若用同一 id,04 页模态
+    // 的 getElementById 会取到 DOM 更靠前的 06 页元素 → 04 页预检结果静默不可见
+    const rbId = (rbPage.match(/preWrap\.id = '([^']+)'/) || [])[1];
+    const drbId = (drbPage.match(/pre\.id = '([^']+)'/) || [])[1];
+    ok(!!rbId && !!drbId && rbId !== drbId,
+      '两个入口的预检容器 id 不同(' + rbId + ' vs ' + drbId + ')',
+      '同 id 时 DOM 靠前的 06 页元素会抢走 04 页模态的渲染目标(实测:模态内空白)');
+    ok(/getElementById\('rb-precheck-box'\)/.test(drbPage),
+      '04 页仍按 #rb-precheck-box 取渲染目标(与上一条配对,改名需同步两处)');
+  }
 }
 
 console.log('PASS ' + pass + ' / FAIL ' + fail);

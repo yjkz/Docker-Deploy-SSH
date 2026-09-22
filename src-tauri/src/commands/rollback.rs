@@ -662,6 +662,108 @@ pub(crate) fn short_id(id: &str) -> String {
     bare.chars().take(12).collect()
 }
 
+/// 归档目录清单是否含 compose 副本(固定名 `docker-compose.yml`)。
+/// 纯函数,四处口径共用(发布简报 / 预检 / 两条执行链)。
+pub(crate) fn has_compose_copy(files: &[String]) -> bool {
+    files.iter().any(|f| f == "docker-compose.yml")
+}
+
+/// 归档里**应当参与回滚**的 override 原名列表(纯函数,便于单测)。
+///
+/// 第三十二批 F5:两条回滚链的 override 集合据此统一为「**归档为准**」——
+/// 04 页不再按本地配置检测(本地新增的文件会让 `-f` 指向服务器上不存在的路径,
+/// 本地删除的文件会让归档那一层静默丢失);06 页不再依赖 compose 的默认解析。
+/// 只认应用部署时会上传的四个标准名([`crate::stack::OVERRIDE_FILE_NAMES`],
+/// 与 `find_override_files` 同源):手工放进归档的其它 `<名>.ddbak` 形态不进入
+/// `-f` 链,避免回滚凭空多应用一层 override。
+pub fn rollback_override_chain(archived_files: &[String]) -> Vec<String> {
+    crate::stack::OVERRIDE_FILE_NAMES
+        .iter()
+        .filter(|name| {
+            let archived = format!("{}.ddbak", name);
+            archived_files.iter().any(|f| f == &archived)
+        })
+        .map(|name| name.to_string())
+        .collect()
+}
+
+/// 目录内会**遮蔽** `docker-compose.yml` 的默认 compose 文件名(纯函数)。
+///
+/// `docker compose`(无 `-f`)的文件解析实测优先级(compose v5.4.0;与上游
+/// 文档口径一致):`compose.yaml` > `compose.yml` > `docker-compose.yml` >
+/// `docker-compose.yaml`。06 页回滚已改为显式 `-f`(不受遮蔽影响),但用户
+/// 手工在该目录执行 compose 命令时会命中遮蔽文件(可能是另一套服务/项目名),
+/// 故检测到即告警(不静默)。
+pub fn shadowing_compose_files(present: &[String]) -> Vec<String> {
+    ["compose.yaml", "compose.yml"]
+        .iter()
+        .filter(|n| present.iter().any(|p| p == *n))
+        .map(|n| n.to_string())
+        .collect()
+}
+
+/// 探测项目目录内是否存在遮蔽 compose 文件(单次 SSH 执行的命令;
+/// 无匹配时仍以退出码 0 收尾,避免被当作执行失败)。
+fn compose_shadow_probe_cmd(dir: &str) -> String {
+    format!(
+        "cd {} && for f in compose.yaml compose.yml; do [ -f \"$f\" ] && echo \"$f\"; done; true",
+        shell_single_quote(dir)
+    )
+}
+
+/// 06 页回滚的 up 形态(纯函数,便于单测;第三十二批 F1/F2)。
+///
+/// 归档有 compose 副本 → **显式 `-f` 链**(基础文件 = 归档恢复出的
+/// `docker-compose.yml`,override = 归档内标准名),返回
+/// `(up 后校验前缀, up 命令)` 且两者文件集逐字同源;
+/// 无副本(降级:沿用现有 compose)→ 目录默认解析形态,保持既有语义。
+pub fn rollback_at_up_plan(
+    dir: &str,
+    has_compose_copy: bool,
+    override_chain: &[String],
+) -> (String, String) {
+    if has_compose_copy {
+        let base = remote_join(dir, "docker-compose.yml");
+        (
+            format!(
+                "cd {} && docker compose {}",
+                shell_single_quote(dir),
+                compose_file_flags(&base, override_chain)
+            ),
+            compose_up_cmd(dir, &base, override_chain),
+        )
+    } else {
+        (
+            format!("cd {} && docker compose", shell_single_quote(dir)),
+            compose_up_cmd_in_dir(dir),
+        )
+    }
+}
+
+/// 回滚成功记录的结果文案(纯函数,便于单测;第三十二批 F7)。
+///
+/// 让「部分回滚」与「up 后镜像不一致」都写进历史与通知,而不是只在日志里
+/// —— 此前 up 后校验只告警,历史仍写「回滚到 X」,通知亦无从反映。
+/// `partial_note` = 部分回滚/插值漂移的服务名(顿号分隔);
+/// `mismatch_count` = up 后运行镜像校验发现的不一致服务数(0 = 全部一致)。
+pub fn rollback_result_message(
+    release_ts: &str,
+    partial_note: Option<&str>,
+    mismatch_count: usize,
+) -> String {
+    let mut msg = format!("回滚到 {}", release_ts);
+    if let Some(note) = partial_note {
+        msg.push_str(&format!("({})", note));
+    }
+    if mismatch_count > 0 {
+        msg.push_str(&format!(
+            ";up 后校验:{} 个服务的实际镜像与归档不一致(详见日志)",
+            mismatch_count
+        ));
+    }
+    msg
+}
+
 /// 整栈部署成功时写入发布目录的 `manifest.json` 结构(回滚列表页据此展示
 /// 各 release 包含的服务;`docker-compose.yml` 副本随清单一并归档)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -895,7 +997,7 @@ pub async fn rollback_list_releases(
         }
         let files = entry.files.clone();
         let has_manifest = files.iter().any(|f| f == "manifest.json");
-        let has_compose_copy = files.iter().any(|f| f == "docker-compose.yml");
+        let has_compose_copy = has_compose_copy(&files);
         let services = parse_release_manifest(&entry.manifest)
             .map(|m| m.images.into_iter().map(|img| img.service).collect())
             .unwrap_or_default();
@@ -993,6 +1095,10 @@ pub struct RollbackPrecheck {
     pub env_drift: Vec<RollbackEnvDriftItem>,
     /// 归档无 manifest(极旧/半成品):无法逐服务核对
     pub no_manifest: bool,
+    /// 归档**无 compose 副本**(第三十二批 F6):该次回滚只能沿用服务器现有
+    /// compose 文件,服务构成可能与归档不一致 —— 前端据此显示提示行。
+    /// `no_manifest` 分支不额外探测(该分支前端不再逐项渲染),恒 false。
+    pub no_compose_copy: bool,
 }
 
 /// 回滚预检(只读;第二十九批 R1):列出该归档每个服务的镜像来源,
@@ -1076,6 +1182,7 @@ pub async fn rollback_precheck(
             has_blocking: false,
             env_drift: Vec::new(),
             no_manifest: true,
+            no_compose_copy: false,
         });
     }
     let m = parse_release_manifest(&out)
@@ -1121,21 +1228,22 @@ pub async fn rollback_precheck(
     // 归档 compose 是部署当时的副本,但 `image: ${VAR}` 由服务器**当前** `.env`
     // 重新插值(.env 不入归档)。这里重算并与 manifest 的 tag 比对,凡漂移者在
     // 预检结果里列出(前端与「回不去」同款:未确认不得执行)。
+    // override 集合用 [`rollback_override_chain`](第三十二批 F5:必须是执行链
+    // 实际会应用的那一组,否则漂移结论与实际 up 不一致)。
+    let no_compose_copy = !has_compose_copy(&actual_files);
     let mut env_drift: Vec<RollbackEnvDriftItem> = Vec::new();
-    if actual_files.iter().any(|f| f == "docker-compose.yml") {
+    if !no_compose_copy {
         let archived_compose = remote_join(&release_dir, "docker-compose.yml");
         if let Ok((0, compose_text)) =
             exec_collect(&mut client, &cat_file_cmd(&archived_compose)).await
         {
-            // 归档内 override(目录枚举,与恢复顺序同源)
+            // 归档内 override(归档为准 + 四个标准名,与执行链同一函数)
             let mut ov_texts: Vec<String> = Vec::new();
-            for name in &actual_files {
-                if archived_override_original(name).is_some() {
-                    if let Ok((0, t)) =
-                        exec_collect(&mut client, &cat_file_cmd(&remote_join(&release_dir, name))).await
-                    {
-                        ov_texts.push(t);
-                    }
+            for name in rollback_override_chain(&actual_files) {
+                if let Ok((0, t)) =
+                    exec_collect(&mut client, &cat_file_cmd(&remote_join(&release_dir, &format!("{}.ddbak", name)))).await
+                {
+                    ov_texts.push(t);
                 }
             }
             // 部署目录当前 `.env`
@@ -1174,6 +1282,7 @@ pub async fn rollback_precheck(
         has_blocking: sum.has_blocking(),
         env_drift,
         no_manifest: false,
+        no_compose_copy,
     })
 }
 
@@ -1302,7 +1411,7 @@ pub(crate) async fn rollback_execute_stack_inner(
         .filter(|f| f.ends_with(".tar.gz"))
         .cloned()
         .collect();
-    let has_compose_copy = files.iter().any(|f| f == "docker-compose.yml");
+    let has_compose_copy = has_compose_copy(&files);
 
     // ---- 读 manifest(存在才解析):校验留档归属并登记镜像引用,供回滚历史展示 ----
     let mut manifest: Option<ReleaseManifest> = None;
@@ -1576,10 +1685,32 @@ pub(crate) async fn rollback_execute_stack_inner(
         emit_log(app, "发布目录无 compose 副本,沿用服务器现有 compose 文件");
     }
 
-    // override 文件名与单镜像回滚同口径:部署时 upload_compose_files 已把
-    // override 上传到远端根目录,回滚按文件名直接引用,保证 -f 文件链与
-    // 部署时 pull/up 一致(override-only 服务不逃逸)
-    let override_names = compose_override_names(&project.compose_file);
+    // override 文件链(第三十二批 F5):**归档为准** —— 只取归档里存在、且属于
+    // 应用部署时会上传的四个标准名的 override(与 06 页统一口径)。此前按本地
+    // 配置检测:本地新增的 override 在服务器上不存在(`-f` 指向不存在路径,
+    // compose 硬失败),本地删除的 override 会让归档那一层**静默丢失**。
+    // 归档无 compose 副本(旧归档降级:沿用现有 compose)时退回本地检测,
+    // 保持既有降级行为。
+    let override_names: Vec<String> = if has_compose_copy {
+        rollback_override_chain(&files)
+    } else {
+        compose_override_names(&project.compose_file)
+    };
+    if has_compose_copy {
+        let local_only: Vec<String> = compose_override_names(&project.compose_file)
+            .into_iter()
+            .filter(|n| !override_names.iter().any(|a| a == n))
+            .collect();
+        if !local_only.is_empty() {
+            emit_log(
+                app,
+                &format!(
+                    "提示:本地 override {} 不在该归档内,本次回滚不应用(归档为准;部署该版本时它尚未存在或未随包上传)",
+                    local_only.join("、")
+                ),
+            );
+        }
+    }
 
     // ---- 恢复 override 副本(R2;第二十九批)----
     // 归档内的 override 以 `<原名>.ddbak` 存放(与根目录同名文件区分),
@@ -1687,7 +1818,9 @@ pub(crate) async fn rollback_execute_stack_inner(
     // ---- up 后运行镜像校验(v6.12.0;兜住所有残余路径)----
     // up 前的一切都是「准备动作」的正确性;实际结果还受 .env 漂移、compose 副本
     // 恢复失败、compose 认为无变化未重建容器等影响。这里按容器实况兜底:
-    // 期望 = manifest 记录的 ID,实际 = 容器 Image。
+    // 期望 = manifest 记录的 ID,实际 = 容器 Image。不一致数写进结果文案
+    // (第三十二批 F7:历史与通知不撒谎)。
+    let mut post_mismatch = 0usize;
     if let Some(m) = &manifest {
         // 与 up 命令逐字同源的 prefix(04 页路径 up 用 -f 链)
         let prefix = format!(
@@ -1696,19 +1829,15 @@ pub(crate) async fn rollback_execute_stack_inner(
             compose_file_flags(&remote_compose, &override_names)
         );
         let expected = expected_images_from_manifest(&m.images);
-        let report = verify_running_images(app, &mut client, &prefix, &expected).await;
-        if let Err(e) = report {
-            emit_log(app, &format!("警告:up 后运行镜像校验未能完成({})", e));
+        match verify_running_images(app, &mut client, &prefix, &expected).await {
+            Ok(mismatches) => post_mismatch = mismatches.len(),
+            Err(e) => emit_log(app, &format!("警告:up 后运行镜像校验未能完成({})", e)),
         }
     }
 
     emit_log(app, "整栈回滚完成");
     record.success = true;
-    record.message = match partial_note {
-        // 部分回滚/插值漂移要在历史/通知里写明,不能只说「回滚到 X」
-        Some(ref names) => format!("回滚到 {}({})", release_ts, names),
-        None => format!("回滚到 {}", release_ts),
-    };
+    record.message = rollback_result_message(release_ts, partial_note.as_deref(), post_mismatch);
     record.duration_secs = started.elapsed().as_secs();
     Ok(record)
 }
@@ -2090,7 +2219,7 @@ pub async fn rollback_project_detail(
             .cloned()
             .collect();
         let has_manifest = entry.files.iter().any(|f| f == "manifest.json");
-        let has_compose_copy = entry.files.iter().any(|f| f == "docker-compose.yml");
+        let has_compose_copy = has_compose_copy(&entry.files);
         let (services, manifest_images) = match parse_release_manifest(&entry.manifest) {
             Some(m) => (
                 m.images.iter().map(|img| img.service.clone()).collect(),
@@ -2569,7 +2698,7 @@ async fn rollback_execute_stack_at_inner(
     }
     let files = parse_ls_lines(&out);
     let packages: Vec<String> = files.iter().filter(|f| f.ends_with(".tar.gz")).cloned().collect();
-    let has_compose_copy = files.iter().any(|f| f == "docker-compose.yml");
+    let has_compose_copy = has_compose_copy(&files);
 
     // manifest:历史展示(归属由目录前缀保证,不以项目名卡)
     let mut manifest: Option<ReleaseManifest> = None;
@@ -2653,6 +2782,8 @@ async fn rollback_execute_stack_at_inner(
     // ---- 插值漂移预检(v6.12.0;06 页路径)----
     // 与 04 页同口径:归档 compose(含远端枚举到的 override)+ 该项目目录当前
     // `.env` 重算,与 manifest 的 tag 比对。漂移 → 须确认(同一错误码)。
+    // override 集合 = [`rollback_override_chain`](第三十二批 F5:与执行链的
+    // `-f` 链同一函数,否则漂移结论与实际 up 的合并结果可能不一致)。
     let mut env_drift: Vec<ImageEnvDrift> = Vec::new();
     if let Some(m) = &manifest {
         if has_compose_copy {
@@ -2660,18 +2791,16 @@ async fn rollback_execute_stack_at_inner(
             if let Ok((0, compose_text)) =
                 exec_collect(&mut client, &cat_file_cmd(&archived_compose)).await
             {
-                // override 在远端枚举(本路径无 ProjectConfig)
+                // override 在远端枚举(本路径无 ProjectConfig;归档为准 + 标准名)
                 let mut ov_texts: Vec<String> = Vec::new();
-                if let Ok((0, ls_out)) = exec_collect(&mut client, &ls_dir_cmd(&release_dir)).await {
-                    for name in parse_ls_lines(&ls_out) {
-                        if archived_override_original(&name).is_some() {
-                            if let Ok((0, t)) =
-                                exec_collect(&mut client, &cat_file_cmd(&remote_join(&release_dir, &name)))
-                                    .await
-                            {
-                                ov_texts.push(t);
-                            }
-                        }
+                for name in rollback_override_chain(&files) {
+                    if let Ok((0, t)) = exec_collect(
+                        &mut client,
+                        &cat_file_cmd(&remote_join(&release_dir, &format!("{}.ddbak", name))),
+                    )
+                    .await
+                    {
+                        ov_texts.push(t);
                     }
                 }
                 // 部署目录当前 `.env`
@@ -2798,6 +2927,26 @@ async fn rollback_execute_stack_at_inner(
         emit_log(app, "发布目录无 compose 副本,沿用现有 compose 文件");
     }
 
+    // override **应用链**(第三十二批 F5/F1-F2):归档里存在、且属于四个标准名的
+    // override —— 与 04 页同口径(归档为准)。up 改显式 `-f` 链后,这一组就是本次
+    // 回滚实际合并的文件集合(不再依赖 compose 默认解析:那会因 `compose.yaml` /
+    // `compose.yml` 优先级更高而整体绕过归档副本,且最多只吃一个 override)。
+    // 归档无副本(降级路径)→ 空链,up 走目录默认解析(与降级语义一致)。
+    let override_chain = if has_compose_copy {
+        rollback_override_chain(&files)
+    } else {
+        Vec::new()
+    };
+    if !override_chain.is_empty() {
+        emit_log(
+            app,
+            &format!(
+                "本次回滚应用 override 文件(归档为准):{}",
+                override_chain.join("、")
+            ),
+        );
+    }
+
     // ---- 恢复 override 副本(R2;第二十九批;06 页路径)----
     // 本路径由目录驱动、无 ProjectConfig,故在**远端**枚举归档内的
     // `<名>.ddbak` 再按原名恢复 —— 比本地文件名枚举更稳(不依赖本地副本),
@@ -2890,32 +3039,51 @@ async fn rollback_execute_stack_at_inner(
         }
     }
 
-    // ---- compose up -d:cd 到项目目录,按目录内 compose 文件启动 ----
-    // (override 文件按远端同名约定自动生效,无需显式 -f 链;
-    //  拼装走 compose_up_cmd_in_dir:P1/P2 加固旗标随之内联)
+    // ---- compose up -d(第三十二批 F1/F2:归档有副本时走**显式 `-f` 链**)----
+    // 基础文件固定为归档恢复出的 `docker-compose.yml` + 归档内的标准 override。
+    // 此前该路径靠目录默认解析,实测有两个静默偏差点:①目录里存在
+    // `compose.yaml`/`compose.yml` 时优先级更高,归档恢复的 docker-compose.yml
+    // **根本不参与启动**;②自动解析最多只吃**一个** override,而部署时用的是
+    // 全部 `-f` 链 —— 回滚的服务构成于是与归档不一致,界面却报完成。
+    // 归档无副本时保持既有降级(按目录现有 compose 启动;预检的 noComposeCopy
+    // 已提示)。
     ensure_not_cancelled(app)?;
-    let up_cmd = compose_up_cmd_in_dir(&dir);
+    let (verify_prefix, up_cmd) = rollback_at_up_plan(&dir, has_compose_copy, &override_chain);
+    if has_compose_copy {
+        // 遮蔽探测(第三十二批 F1):目录内若有更高优先级的默认 compose 文件,
+        // 用户手工在该目录执行 compose 命令时会命中它(可能是另一套服务/项目)
+        // —— 本次回滚已显式指定归档 compose,不受影响,但要让用户知道
+        if let Ok((0, probe_out)) = exec_collect(&mut client, &compose_shadow_probe_cmd(&dir)).await
+        {
+            let shadow = shadowing_compose_files(&parse_ls_lines(&probe_out));
+            if !shadow.is_empty() {
+                emit_log(
+                    app,
+                    &format!(
+                        "警告:目录内另有 {},默认解析优先级高于 docker-compose.yml —— 本次回滚已显式指定归档 compose 不受影响,但你手工在该目录执行 docker compose 命令时会用到它(可能是另一套服务/项目),请留意",
+                        shadow.join("、")
+                    ),
+                );
+            }
+        }
+    }
     emit_log(app, &format!("启动服务: {}", up_cmd));
     exec_forwarded(app, &mut client, &up_cmd, STACK_COMPOSE_TIMEOUT_SECS).await?;
 
-    // ---- up 后运行镜像校验(v6.12.0;06 页路径)----
+    // ---- up 后运行镜像校验(v6.12.0;06 页路径;不一致数写进结果文案 F7)----
+    let mut post_mismatch = 0usize;
     if let Some(m) = &manifest {
-        // 与 06 页 up 命令逐字同源(该路径无 -f 链,靠 cd 后的默认文件)
-        let prefix = format!("cd {} && docker compose", shell_single_quote(&dir));
+        // 与 up 命令逐字同源的 prefix(显式 `-f` 链 / 降级默认解析二选一)
         let expected = expected_images_from_manifest(&m.images);
-        let report = verify_running_images(app, &mut client, &prefix, &expected).await;
-        if let Err(e) = report {
-            emit_log(app, &format!("警告:up 后运行镜像校验未能完成({})", e));
+        match verify_running_images(app, &mut client, &verify_prefix, &expected).await {
+            Ok(mismatches) => post_mismatch = mismatches.len(),
+            Err(e) => emit_log(app, &format!("警告:up 后运行镜像校验未能完成({})", e)),
         }
     }
 
     emit_log(app, "整栈回滚完成");
     record.success = true;
-    record.message = match partial_note {
-        // 部分回滚/插值漂移要在历史/通知里写明,不能只说「回滚到 X」
-        Some(ref names) => format!("回滚到 {}({})", release_ts, names),
-        None => format!("回滚到 {}", release_ts),
-    };
+    record.message = rollback_result_message(release_ts, partial_note.as_deref(), post_mismatch);
     record.release_dir = Some(release_dir);
     record.duration_secs = started.elapsed().as_secs();
     Ok(record)
@@ -2968,21 +3136,25 @@ pub(crate) fn rollback_notify_text(
 /// 服务无容器 → 实际值空串 → 判不一致(**不能静默**:up 后没起容器本身就是
 /// 用户必须知道的状态)。
 ///
-/// 一致 → 一行日志;不一致 → 逐条告警。**不改判定结果**:成败由 up 的退出码
-/// 决定,这里只负责让「实际跑的版本 ≠ 期望版本」在日志与历史里可见
-/// (兜住 .env 漂移、compose 副本恢复失败、compose 未重建容器等残余路径)。
+/// 一致 → 一行日志并返回空表;不一致 → 逐条告警并**返回不一致明细**
+/// (`(服务, 期望 ID, 实际 ID)`,实际为空串 = 无容器)—— 调用方据此写进回滚
+/// 结果文案(第三十二批 F7:历史与通知不再只写「回滚到 X」)。**不改判定
+/// 结果**:成败仍由 up 的退出码决定,这里只负责让「实际跑的版本 ≠ 期望版本」
+/// 在日志与历史里可见(兜住 .env 漂移、compose 副本恢复失败、compose
+/// 未重建容器等残余路径)。
 pub(crate) async fn verify_running_images(
     app: &AppHandle,
     client: &mut SshClient,
     compose_prefix: &str,
     expected: &[(String, String)],
-) -> Result<(), String> {
+) -> Result<Vec<(String, String, String)>, String> {
     if expected.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let actual = collect_running_images(client, compose_prefix).await?;
     if actual.is_empty() {
         // 无任何容器:全部服务按「无容器」判不一致(不静默)
+        let mut mismatches: Vec<(String, String, String)> = Vec::new();
         for (svc, want) in expected {
             emit_log(
                 app,
@@ -2992,8 +3164,9 @@ pub(crate) async fn verify_running_images(
                     short_id(want)
                 ),
             );
+            mismatches.push((svc.clone(), want.clone(), String::new()));
         }
-        return Ok(());
+        return Ok(mismatches);
     }
     let mismatches = select_container_image_mismatches(expected, &actual);
     if mismatches.is_empty() {
@@ -3001,7 +3174,7 @@ pub(crate) async fn verify_running_images(
             app,
             &format!("up 后运行镜像校验:{} 个服务的实际镜像与期望一致", expected.len()),
         );
-        return Ok(());
+        return Ok(Vec::new());
     }
     for (svc, want, got) in &mismatches {
         emit_log(
@@ -3018,7 +3191,7 @@ pub(crate) async fn verify_running_images(
             ),
         );
     }
-    Ok(())
+    Ok(mismatches)
 }
 
 /// 组装回滚失败的留痕骨架(R4;第二十九批;纯查配置,失败给 `None`)。
