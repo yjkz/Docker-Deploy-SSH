@@ -1072,6 +1072,15 @@
     return fails;
   }
 
+  /** 字节 → 人类可读(1024 进制;与 config-io.js formatBytesLocal 同口径) */
+  function formatBytesLocal(n) {
+    var v = Number(n) || 0;
+    if (v < 1024) return v + ' B';
+    if (v < 1024 * 1024) return (v / 1024).toFixed(1) + ' KB';
+    if (v < 1024 * 1024 * 1024) return (v / 1024 / 1024).toFixed(1) + ' MB';
+    return (v / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+  }
+
   function renderCheck(report) {
     var box = document.getElementById('deploy-check');
     if (!box) return;
@@ -1102,6 +1111,16 @@
       isFinite(disk) && disk >= DISK_MIN_GB ? 'ok' : 'warn',
       diskText));
     box.appendChild(badges);
+
+    // 磁盘紧张时的可回收提示(第三十四批 L2;可选字段,缺省不渲染)
+    var df = r.docker_df;
+    if (isFinite(disk) && disk < DISK_MIN_GB && df && Number(df.total_reclaimable) > 0) {
+      var hint = '磁盘紧张:服务器可回收空间 ≈ ' + formatBytesLocal(df.total_reclaimable);
+      var logBytes = Number(r.container_log_bytes);
+      if (logBytes > 0) hint += ';容器日志 ≈ ' + formatBytesLocal(logBytes);
+      hint += '(可用 03 页服务器的「清理优化」定向清理)';
+      box.appendChild(el('div', 'server-check-hint', hint));
+    }
 
     var errors = Array.isArray(r.errors) ? r.errors : [];
     if (errors.length > 0) {

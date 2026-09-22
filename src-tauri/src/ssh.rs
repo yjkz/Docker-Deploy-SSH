@@ -531,6 +531,115 @@ pub struct ServerCheckReport {
     pub remote_dir_exists: bool,
     pub disk_free_gb: f64,
     pub errors: Vec<String>,
+    /// `docker system df` 汇总(第三十四批 L2;**可选**:未探测到为 None,
+    /// 前端按缺省隐藏 —— 探不到不应把环境判定染红)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docker_df: Option<DockerDfSummary>,
+    /// 容器日志文件占用字节(同上,可选;非 root 读不到时为 None)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_log_bytes: Option<u64>,
+}
+
+/// `docker system df` 的可回收空间汇总(第三十四批 L2)。单位统一为字节;
+/// 十进制单位按 1000 计(与 docker 显示口径一致)。
+#[derive(Debug, Default, Serialize, Clone, PartialEq, Eq)]
+pub struct DockerDfSummary {
+    pub images_reclaimable: u64,
+    pub containers_reclaimable: u64,
+    pub volumes_reclaimable: u64,
+    pub build_cache_reclaimable: u64,
+    pub total_size: u64,
+    pub total_reclaimable: u64,
+}
+
+/// 解析 docker 人类可读体积(如 `260.8MB`、`0B`、`1.5GiB`;容忍
+/// `260.8MB (100%)` 这类带占比后缀的形态)。二进制单位(iB 结尾)按 1024,
+/// 十进制单位按 1000 —— 与 `docker system df` 的显示口径一致。
+pub fn parse_docker_size(raw: &str) -> Option<u64> {
+    let s = raw.trim();
+    let unit_start = s
+        .char_indices()
+        .find(|(_, c)| !c.is_ascii_digit() && *c != '.')
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    let (num_part, unit_part) = s.split_at(unit_start);
+    let value: f64 = num_part.parse().ok()?;
+    // 单位取到空白/左括号为止(占比后缀 " (100%)" 等)
+    let unit: String = unit_part
+        .chars()
+        .take_while(|c| !c.is_whitespace() && *c != '(')
+        .collect();
+    let factor: f64 = match unit.to_ascii_lowercase().as_str() {
+        "b" => 1.0,
+        "kb" => 1e3,
+        "mb" => 1e6,
+        "gb" => 1e9,
+        "tb" => 1e12,
+        "pb" => 1e15,
+        "kib" => 1024.0,
+        "mib" => 1024.0 * 1024.0,
+        "gib" => 1024.0 * 1024.0 * 1024.0,
+        "tib" => 1024.0f64.powi(4),
+        "pib" => 1024.0f64.powi(5),
+        _ => return None,
+    };
+    Some((value * factor) as u64)
+}
+
+/// 解析 `docker system df --format '{{json .}}'` 的 NDJSON 输出
+/// (逐行一个 JSON 对象;第三十四批 L2)。无任何有效行返回 None。
+pub fn parse_docker_df(lines: &str) -> Option<DockerDfSummary> {
+    let mut summary = DockerDfSummary::default();
+    let mut seen = 0usize;
+    for line in lines.lines() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let ty = v.get("Type").and_then(|t| t.as_str()).unwrap_or("");
+        let size = v
+            .get("Size")
+            .and_then(|s| s.as_str())
+            .and_then(parse_docker_size)
+            .unwrap_or(0);
+        let reclaim = v
+            .get("Reclaimable")
+            .and_then(|s| s.as_str())
+            .and_then(parse_docker_size)
+            .unwrap_or(0);
+        seen += 1;
+        summary.total_size += size;
+        summary.total_reclaimable += reclaim;
+        match ty {
+            "Images" => summary.images_reclaimable = reclaim,
+            "Containers" => summary.containers_reclaimable = reclaim,
+            "Local Volumes" => summary.volumes_reclaimable = reclaim,
+            "Build Cache" => summary.build_cache_reclaimable = reclaim,
+            _ => {}
+        }
+    }
+    if seen == 0 {
+        None
+    } else {
+        Some(summary)
+    }
+}
+
+/// 取输出中首个十进制整数(容器日志 `du -bc | tail -1` 的字节数;失败/空返回 None)。
+pub fn parse_first_u64(out: &str) -> Option<u64> {
+    let digits: String = out
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
 }
 
 /// 检查远端环境:docker / docker compose / gzip 是否可用、远端目录是否存在、
@@ -607,6 +716,25 @@ pub async fn check_server_env(
             code,
             out.trim()
         ));
+    }
+
+    // 可回收空间 + 容器日志体积(第三十四批 L2)----
+    // 目的:生产头号事故是磁盘被悬空镜像 / 容器日志撑满;磁盘紧张时前端据此提示
+    // 「清理分析可回收 X」。**尽力而为**:探测失败不进 `errors`(可选增强信息,
+    // 权限不足等不应把环境判定染红),字段保持 None,由前端按缺省隐藏。
+    if report.docker {
+        let (code, out) = exec_collect(client, "docker system df --format '{{json .}}'").await?;
+        if code == 0 {
+            report.docker_df = parse_docker_df(&out);
+        }
+        // 容器日志落盘文件体积(通常 root 私有;无权读取时 du 无输出 → None)。
+        // 不依赖 GNU 专属旗标(BusyBox xargs 对空输入本就跳过):
+        // docker ps -aq → inspect 取 LogPath → du -bc 求和 → 取总字节
+        let log_cmd = "docker ps -aq | xargs docker inspect --format '{{.LogPath}}' 2>/dev/null | xargs du -bc 2>/dev/null | tail -1 | awk '{print $1}'";
+        let (code, out) = exec_collect(client, log_cmd).await?;
+        if code == 0 {
+            report.container_log_bytes = parse_first_u64(&out);
+        }
     }
 
     Ok(report)
@@ -1448,6 +1576,192 @@ W3hdnIKXGhKqXUN1AAAAFTE5OTMzQExBUFRPUC00SlVPMUwxMwECAwQF\n\
         )
         .await
         .ok();
+    }
+
+    // ===== 第三十四批 L2:环境体检解析纯函数 =====
+
+    #[test]
+    fn test_parse_docker_size_units() {
+        assert_eq!(parse_docker_size("0B"), Some(0));
+        assert_eq!(parse_docker_size("260.8MB"), Some(260_800_000));
+        assert_eq!(parse_docker_size("260.8MB (100%)"), Some(260_800_000));
+        assert_eq!(parse_docker_size("3.655MB"), Some(3_655_000));
+        assert_eq!(parse_docker_size("12kB"), Some(12_000));
+        assert_eq!(parse_docker_size("1.5GiB"), Some(1_610_612_736));
+        assert_eq!(parse_docker_size("n/a"), None);
+    }
+
+    #[test]
+    fn test_parse_docker_df_golden() {
+        // golden:本机 `docker system df --format '{{json .}}'` 实测抓样
+        // (空镜像 + 遗留卷 + 构建缓存;Reclaimable 带占比后缀)
+        let out = concat!(
+            "{\"Active\":\"0\",\"Reclaimable\":\"0B\",\"Size\":\"0B\",\"TotalCount\":\"0\",\"Type\":\"Images\"}\n",
+            "{\"Active\":\"0\",\"Reclaimable\":\"0B\",\"Size\":\"0B\",\"TotalCount\":\"0\",\"Type\":\"Containers\"}\n",
+            "{\"Active\":\"0\",\"Reclaimable\":\"260.8MB (100%)\",\"Size\":\"260.8MB\",\"TotalCount\":\"9\",\"Type\":\"Local Volumes\"}\n",
+            "{\"Active\":\"0\",\"Reclaimable\":\"3.655MB\",\"Size\":\"3.655MB\",\"TotalCount\":\"5\",\"Type\":\"Build Cache\"}\n"
+        );
+        let df = parse_docker_df(out).expect("四行都应解析");
+        assert_eq!(df.volumes_reclaimable, 260_800_000);
+        assert_eq!(df.build_cache_reclaimable, 3_655_000);
+        assert_eq!(df.images_reclaimable, 0);
+        assert_eq!(df.total_reclaimable, 264_455_000);
+        assert_eq!(df.total_size, 264_455_000);
+        assert!(parse_docker_df("no docker here").is_none());
+        assert!(parse_docker_df("").is_none());
+    }
+
+    #[test]
+    fn test_parse_first_u64() {
+        assert_eq!(parse_first_u64("21861888894\t\n"), Some(21_861_888_894));
+        assert_eq!(parse_first_u64(" 42 total"), Some(42));
+        assert_eq!(parse_first_u64(""), None);
+        assert_eq!(parse_first_u64("du: cannot access '/x'"), None);
+    }
+
+    // ===== 第三十四批 S3:项目迁移「目标链」真机样板 =====
+
+    /// 覆盖迁移链里**卷 roundtrip 未覆盖**的一段:源/目标目录的三件套经 SFTP
+    /// 搬运后,①归档字节级一致;②目标侧 compose 可被**服务端权威解析**
+    /// (`docker compose config --format json`,与第三十四批 P3 同一命令)且
+    /// `.env` 插值随行;③目标侧按该 compose 能真正 `up` 起容器(迁移的
+    /// 「目标启动」步骤)。
+    ///
+    /// 需要服务器可执行 docker 且能拉取 busybox(或已存在 busybox)。
+    /// 运行:`DD_SSH_TEST_HOST=... cargo test migrate_project_target -- --ignored`
+    #[tokio::test]
+    #[ignore = "需要真实 SSH 服务器 + docker(见函数注释的运行方式)"]
+    async fn test_migrate_project_target_chain_real() {
+        let cfg = test_cfg_from_env()
+            .expect("请设置 DD_SSH_TEST_HOST / DD_SSH_TEST_USER / (DD_SSH_TEST_PASSWORD | DD_SSH_TEST_KEY)");
+        let pw = std::env::var("DD_SSH_TEST_PASSWORD").ok();
+        let mut client = SshClient::connect(&cfg, pw.as_deref(), None, Arc::default())
+            .await
+            .expect("connect 失败");
+
+        let root = "/tmp/dd-mig-target-test";
+        let src = format!("{root}/src");
+        let dst = format!("{root}/dst");
+
+        // 本地准备:compose + .env(插值占位)+ 模拟归档(含二进制字节)
+        let local_tmp = std::env::temp_dir().join("dd-mig-target-test");
+        std::fs::create_dir_all(&local_tmp).expect("本地临时目录创建失败");
+        let compose_local = local_tmp.join("docker-compose.yml");
+        let compose_text =
+            "services:\n  app:\n    image: busybox:${BTAG}\n    command: [\"sh\", \"-c\", \"sleep 30\"]\n";
+        std::fs::write(&compose_local, compose_text).expect("写本地 compose 失败");
+        let env_local = local_tmp.join("env");
+        std::fs::write(&env_local, "BTAG=latest\n").expect("写本地 .env 失败");
+        let archive_local = local_tmp.join("2026-01-01.tar.gz");
+        let archive_bytes: Vec<u8> = b"dd-migrate-archive-bytes-\x00\x01\x02\n".to_vec();
+        std::fs::write(&archive_local, &archive_bytes).expect("写本地归档失败");
+
+        // busybox 就绪(与卷 roundtrip 同款:有则用,无则拉)
+        let (code, _) = exec_collect(&mut client, "docker image inspect busybox:latest")
+            .await
+            .expect("inspect 失败");
+        if code != 0 {
+            let (code, out) = exec_collect(&mut client, "docker pull busybox:latest")
+                .await
+                .expect("pull 失败");
+            assert_eq!(code, 0, "无法获取 busybox(需服务器出网或预置): {out}");
+        }
+
+        // 准备远端目录(源/目标)
+        let (code, _) = exec_collect(
+            &mut client,
+            &format!("rm -rf {root} && mkdir -p {src} {dst}"),
+        )
+        .await
+        .expect("准备远端目录失败");
+        assert_eq!(code, 0);
+
+        // 搬运 1:源侧三件套经 SFTP 上传(迁移「compose 三件套 + 归档」段同款通道)
+        let nop = |_: u64, _: u64| {};
+        client
+            .sftp_upload(&compose_local, &src, "docker-compose.yml", false, &nop)
+            .await
+            .expect("上传 compose 失败");
+        client
+            .sftp_upload(&env_local, &src, ".env", false, &nop)
+            .await
+            .expect("上传 .env 失败");
+        client
+            .sftp_upload(&archive_local, &src, "2026-01-01.tar.gz", false, &nop)
+            .await
+            .expect("上传归档失败");
+
+        // 解析 1(源侧):服务端权威解析应把 ${BTAG} 插值为 latest
+        let cfg_cmd = crate::commands::compose_config_json_cmd(&src, &format!("{src}/docker-compose.yml"), &[]);
+        let (code, out) = exec_collect(&mut client, &cfg_cmd).await.expect("config 执行失败");
+        assert_eq!(code, 0, "源侧 compose config 失败: {out}");
+        let resolved = crate::stack::parse_compose_config_json(&out).expect("解析 config JSON 失败");
+        let app = resolved
+            .iter()
+            .find(|s| s.service == "app")
+            .expect("解析结果缺少 app 服务");
+        assert_eq!(app.image.as_deref(), Some("busybox:latest"), "服务端插值结果应为 busybox:latest");
+
+        // 搬运 2:归档下载 → 字节比对 → 上传目标(迁移的「搬过去」语义)
+        let archive_back = local_tmp.join("2026-01-01-back.tar.gz");
+        client
+            .sftp_download(&format!("{src}/2026-01-01.tar.gz"), &archive_back, &nop)
+            .await
+            .expect("下载归档失败");
+        let back_bytes = std::fs::read(&archive_back).expect("读回下载文件失败");
+        assert_eq!(back_bytes, archive_bytes, "归档经 SFTP 往返应逐字节一致");
+        client
+            .sftp_upload(&archive_back, &dst, "2026-01-01.tar.gz", false, &nop)
+            .await
+            .expect("上传归档到目标失败");
+        client
+            .sftp_upload(&compose_local, &dst, "docker-compose.yml", false, &nop)
+            .await
+            .expect("上传 compose 到目标失败");
+        client
+            .sftp_upload(&env_local, &dst, ".env", false, &nop)
+            .await
+            .expect("上传 .env 到目标失败");
+
+        // 目标链:服务端解析 → up(与部署/迁移同款加固旗标)→ 自证运行
+        let dst_cfg_cmd = crate::commands::compose_config_json_cmd(&dst, &format!("{dst}/docker-compose.yml"), &[]);
+        let (code, out) = exec_collect(&mut client, &dst_cfg_cmd).await.expect("目标 config 失败");
+        assert_eq!(code, 0, "目标侧 compose config 失败: {out}");
+        let (code, out) = exec_collect(
+            &mut client,
+            &format!(
+                "cd {dst} && docker compose -f {dst}/docker-compose.yml up -d --remove-orphans --pull never --no-build"
+            ),
+        )
+        .await
+        .expect("目标 up 执行失败");
+        assert_eq!(code, 0, "目标侧 up 失败: {out}");
+        let (code, out) = exec_collect(
+            &mut client,
+            &format!("docker compose -f {dst}/docker-compose.yml ps -q"),
+        )
+        .await
+        .expect("目标 ps 失败");
+        assert_eq!(code, 0, "目标 ps 失败: {out}");
+        let cid = out.trim();
+        assert!(!cid.is_empty(), "目标 side up 后应有容器");
+        let (code, out) = exec_collect(
+            &mut client,
+            &format!("docker inspect --format '{{{{.State.Running}}}}' {cid}"),
+        )
+        .await
+        .expect("inspect 失败");
+        assert_eq!(code, 0, "inspect 失败: {out}");
+        assert_eq!(out.trim(), "true", "迁移目标链应有容器在运行");
+
+        // 清理:目标 down(含卷)+ 远端目录 + 本地临时文件
+        let _ = exec_collect(
+            &mut client,
+            &format!("cd {dst} && docker compose -f {dst}/docker-compose.yml down --remove-orphans -v 2>/dev/null; rm -rf {root}; true"),
+        )
+        .await
+        .ok();
+        let _ = std::fs::remove_dir_all(&local_tmp);
     }
 }
 

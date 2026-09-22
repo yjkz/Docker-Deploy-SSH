@@ -3896,3 +3896,50 @@ ROADMAP(候选池状态、S4/S5 行、速览、命令 114→122 漂移、JS 16�
 | `ui/help.js` | FAQ 新增「up 前/后校验不一致」条目 |
 | `wiki/02` / `wiki/06` / `wiki/07` | 校验口径、决策 87、限制 55、行数/测试数漂移修正 |
 | 版本/文档 | 三处版本号 + wiki/README + ROADMAP + 七篇页首戳 → v6.16.0 / 528 |
+
+---
+
+# 第三十四批(三):服务器体检增强 + 迁移「目标链」真机样板(2026-09-22)
+
+> **来源**:第三十四批方案(L2 + S3);**版本**:v6.16.0(与(二)同一未发版版本合并交付)。
+
+## 交付
+
+**L2 —— 服务器体检增强(可回收空间 / 容器日志)**
+
+- `server_env_check` 增两条**尽力而为**的探测(同一 SSH 会话,+2 次 exec):
+  - `docker system df --format '{{json .}}'` → 四类(镜像 / 容器 / 卷 / 构建缓存)可回收字节 + 总量;
+  - 容器日志体积:`docker ps -aq | xargs docker inspect --format '{{.LogPath}}' 2>/dev/null | xargs du -bc 2>/dev/null | tail -1 | awk '{print $1}'`(不依赖 GNU `xargs -r`;非 root 读不到 → 无输出 → 字段缺省)。
+- 纯函数 3 个(`ssh.rs`):`parse_docker_size`(十进制/二进制单位双口径,容忍 `260.8MB (100%)` 占比后缀)/ `parse_docker_df`(NDJSON 逐行解析)/ `parse_first_u64`;golden 来自本机 `docker system df` 实测抓样 + 3 单测。
+- 契约:`ServerCheckReport` 增 `docker_df` / `container_log_bytes` 两**可选**字段(`#[serde(skip_serializing_if = "Option::is_none")]`);**探测失败不进 `errors`、不参与环境判定**(可选增强信息不该把判定染红),字段缺省时前端隐藏。
+- 前端:`servers.js` 03 页卡片新增「可回收空间 ≈ X(镜像/容器/卷/构建缓存)」与「容器日志占用 ≈ Y」两行;`deploy.js` 部署预检在**磁盘紧张**(`disk_free_gb < DISK_MIN_GB`)且有可回收量时提示「磁盘紧张:服务器可回收空间 ≈ X(可用 03 页「清理优化」定向清理)」。两文件各带与 `config-io.js` 同口径的 `formatBytesLocal` 局部助手(沿既有先例)。
+- 文档:`wiki/04` 契约块登记可选字段;`wiki/06` 闸门表补「只作展示与提示」边界;`help.js` 03 页「测试连接 / 环境检测」行说明。
+
+**S3 —— 迁移「目标链」真机 `#[ignore]` 样板**(`ssh.rs` 测试模块,紧邻卷 roundtrip)
+
+`test_migrate_project_target_chain_real` 覆盖迁移链里**卷 roundtrip 未覆盖**的段落:
+1. 本地生成 compose(`image: busybox:${BTAG}`)/ `.env` / 含二进制字节的模拟归档;
+2. 三件套经 `sftp_upload` 上传源目录;
+3. **源侧服务端权威解析**(复用第三十四批 P2 的 `compose_config_json_cmd`)→ 断言 `${BTAG}` 被服务器插值为 `busybox:latest`;
+4. 归档 `sftp_download` 回本机 → **逐字节比对** → 再上传目标目录;
+5. 目标侧权威解析 → `up -d --remove-orphans --pull never --no-build`(与部署/迁移同款加固旗标)→ `compose ps -q` + `docker inspect State.Running` 自证容器在跑;
+6. 清理:`down -v` + `rm -rf` 远端与本地临时目录。
+运行方式:`DD_SSH_TEST_HOST=... cargo test migrate_project_target -- --ignored`(真机验证按既有约定由用户统一执行)。
+
+## 验证
+
+- `cargo test` **531 passed / 15 ignored**(528→531,+3 纯函数;真机样板 14→15)
+- `cargo clippy`:零新增(本批 Rust 改动仅 ssh.rs/无告警面)
+- `node --check` servers.js / deploy.js;`static-integrity` 全绿(新增 `formatBytesLocal` 声明与引用闭合)
+- **桩验证 + judge**:03 页卡片两行(可回收 1.85 GB 分解 / 日志 20.00 GB)与 04 页「磁盘紧张」提示均按桩数据渲染、零未捕获异常;judge 两图 **pass**(04 页首判 fail 系截图只覆盖 720px 视口、提示行在视口下方——滚动重拍后判 pass,非产品缺陷;顺带确认提示行在失败态仍可见,与错误框并存)
+- verify 七脚本 rc=0
+- 本机实测:容器日志体积命令在真实 Docker 上返回字节数(本机 21.8 GB,正印证该指标的价值);`docker system df` golden 抓样
+
+## 文件改动
+
+| 文件 | 改动 |
+|---|---|
+| `src-tauri/src/ssh.rs` | `ServerCheckReport` 可选字段 + `DockerDfSummary` + 3 纯函数 + `check_server_env` 两探测 + 3 单测 + S3 真机样板 |
+| `ui/servers.js` / `ui/deploy.js` | 可回收/日志展示 + 磁盘紧张提示(+ 局部 `formatBytesLocal`) |
+| `ui/help.js` | 03 页检测行说明 |
+| `wiki/04` / `wiki/06` / `wiki/02` / `wiki/README` / `ROADMAP.md` / 七篇页首戳 | 契约与计数同步(531 / 15) |

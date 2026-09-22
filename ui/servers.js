@@ -452,6 +452,15 @@
     return card;
   }
 
+  /** 字节 → 人类可读(1024 进制;与 config-io.js formatBytesLocal 同口径) */
+  function formatBytesLocal(n) {
+    var v = Number(n) || 0;
+    if (v < 1024) return v + ' B';
+    if (v < 1024 * 1024) return (v / 1024).toFixed(1) + ' KB';
+    if (v < 1024 * 1024 * 1024) return (v / 1024 / 1024).toFixed(1) + ' MB';
+    return (v / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+  }
+
   /** 卡片内嵌检测结果区:徽章行 + 红字错误列表 + 未通过项操作 */
   function checkSection(server) {
     var box = el('div', 'server-check');
@@ -479,6 +488,23 @@
     var diskKind = (isFinite(disk) && disk >= DISK_MIN_GB) ? 'ok' : 'warn';
     badges.appendChild(window.fillBadge(el('span'), diskKind, diskText));
     box.appendChild(badges);
+
+    // 可回收空间 / 容器日志体积(第三十四批 L2;可选字段,缺省不渲染 ——
+    // 探测失败或旧版服务器不返回时静默隐藏)
+    var df = report.docker_df;
+    if (df && Number(df.total_reclaimable) > 0) {
+      box.appendChild(el('div', 'server-check-hint',
+        '可回收空间 ≈ ' + formatBytesLocal(df.total_reclaimable) +
+        '(镜像 ' + formatBytesLocal(df.images_reclaimable) +
+        ' / 容器 ' + formatBytesLocal(df.containers_reclaimable) +
+        ' / 卷 ' + formatBytesLocal(df.volumes_reclaimable) +
+        ' / 构建缓存 ' + formatBytesLocal(df.build_cache_reclaimable) + ')'));
+    }
+    var logBytes = Number(report.container_log_bytes);
+    if (logBytes > 0) {
+      box.appendChild(el('div', 'server-check-hint',
+        '容器日志占用 ≈ ' + formatBytesLocal(logBytes)));
+    }
 
     var errors = Array.isArray(report.errors) ? report.errors : [];
     if (errors.length > 0) {
