@@ -506,19 +506,37 @@ pub fn parse_compose_service_images(out: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// up 后校验的 `docker inspect` 模板:`<compose 服务名>|<镜像 ID>`。
+///
+/// **必须用 `index` 读带点的标签键**:`.Config.Labels."com.docker.compose.service"`
+/// **不是合法 Go 模板**(字段链只接受标识符;带点的键要用 `index`)—— docker CLI
+/// 在连接 daemon **之前**解析模板,直接报 `template parsing error: bad character
+/// U+0022` 并以 **退出码 64** 退出(v6.12.0 首发真机实测:`up 后校验` 每次部署都
+/// 失败,只告警不误判成败,但校验整条形同虚设)。由
+/// `test_compose_service_image_template_parses` 守护(含真机 docker CLI 解析)。
+pub(crate) const COMPOSE_SERVICE_IMAGE_TEMPLATE: &str =
+    "{{index .Config.Labels \"com.docker.compose.service\"}}|{{.Image}}";
+
 /// 采集 compose 项目内容器的 `(compose 服务名, 镜像 ID)`(v6.12.0;up 后校验共用)。
 ///
 /// 2 次 SSH:`ps -q --all`(全部容器 ID;**含已退出的** —— 只查 running 会把
 /// 「容器仍在跑旧镜像」和「一次性任务已退出」都漏掉/误判)+ 一次 `docker
 /// inspect`(服务名 + 镜像)。容器无 compose 服务标签(非 compose 起的)时服务名
 /// 解析为空 → 整行跳过(校验只关心本次部署/回滚的服务)。
+///
+/// 失败信息附远端输出尾部(命令输出与 stderr 合并):模板/参数类错误会直接显形
+/// (v6.12.0 真机教训 —— 只报「退出码 64」时用户与维护者都要反推)。
 pub(crate) async fn collect_running_images(
     client: &mut SshClient,
     compose_prefix: &str,
 ) -> Result<Vec<(String, String)>, String> {
     let (code, ps_out) = exec_collect(client, &format!("{} ps -q --all", compose_prefix)).await?;
     if code != 0 {
-        return Err(format!("compose ps 查询失败(退出码 {})", code));
+        return Err(format!(
+            "compose ps 查询失败(退出码 {}):{}",
+            code,
+            tail_lines(&ps_out, 3)
+        ));
     }
     let cids: Vec<String> = parse_ls_lines(&ps_out);
     if cids.is_empty() {
@@ -530,12 +548,16 @@ pub(crate) async fn collect_running_images(
         .collect();
     let inspect = format!(
         "docker inspect --format {} {}",
-        crate::commands::shell_single_quote("{{.Config.Labels.\"com.docker.compose.service\"}}|{{.Image}}"),
+        crate::commands::shell_single_quote(COMPOSE_SERVICE_IMAGE_TEMPLATE),
         quoted.join(" ")
     );
     let (code, ins_out) = exec_collect(client, &inspect).await?;
     if code != 0 {
-        return Err(format!("docker inspect 查询失败(退出码 {})", code));
+        return Err(format!(
+            "docker inspect 查询失败(退出码 {}):{}",
+            code,
+            tail_lines(&ins_out, 3)
+        ));
     }
     Ok(parse_compose_service_images(&ins_out))
 }

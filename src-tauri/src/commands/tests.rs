@@ -3306,6 +3306,49 @@ services:
     }
 
     #[test]
+    fn test_compose_service_image_template_parses() {
+        // **真机回归(v6.12.0 首发缺陷)**:`{{.Config.Labels."com.docker.compose.service"}}`
+        // 不是合法 Go 模板(字段链只接受标识符;带点键要用 `index`)—— docker CLI
+        // 在连接 daemon **之前**解析模板,直接 `template parsing error: bad character
+        // U+0022` 且退出码 64,up 后校验每次部署都失败(只告警不误判成败,但校验
+        // 形同虚设;真机报错原文:"docker inspect 查询失败(退出码 64)")。
+        let template = COMPOSE_SERVICE_IMAGE_TEMPLATE;
+
+        // 形态断言(零依赖兜底:CI / 无 docker CLI 环境同样能挡住退回点号写法)
+        assert!(
+            template.contains("index .Config.Labels"),
+            "带点的标签键必须用 index 读取: {}",
+            template
+        );
+        assert!(
+            !template.contains("Labels.\""),
+            "点号直取带点键不是合法 Go 模板(真机退出码 64): {}",
+            template
+        );
+
+        // 真机验证:让本机 docker CLI 实际解析一次模板。解析先于连接 daemon,
+        // 故**无 daemon 也能验证**(连接失败 = 已通过解析;失败信息不含模板错误);
+        // docker CLI 不存在 → 跳过(与 docker:: 真机测试同口径)。
+        let out = std::process::Command::new("docker")
+            .args(["inspect", "--format", template, "dd-selftest-no-such-object"])
+            .output();
+        let Ok(out) = out else {
+            println!("本机无 docker CLI,跳过模板真机解析");
+            return;
+        };
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !text.contains("template parsing error") && !text.contains("bad character"),
+            "docker CLI 解析模板失败,up 后校验会整条失效: {}",
+            text.trim()
+        );
+    }
+
+    #[test]
     fn test_manifest_image_legacy_json_without_id() {
         // 旧归档(本字段引入前)的 manifest.json 无 id 字段 → serde default 兼容 None
         let legacy = r#"{"project":"app","ts":"20260101-000000","compose_copy":"docker-compose.yml",

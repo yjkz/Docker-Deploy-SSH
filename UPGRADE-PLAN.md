@@ -3512,3 +3512,26 @@ fail-closed 方向不变(仍阻断),但定性正确。
 - 部署侧「拉取类」服务无法收敛校验(tag 语义即随 pull 移动)。
 - TOCTOU 的**剩余窗口**(收敛查询到 up 之间)由 up 后校验兜底发现;不追求零窗口
   (那需要 `docker tag` 后立即 up 的事务语义,Docker 不提供)。
+
+## 补丁修复:up 后校验的 docker inspect 模板解析错误(真机反馈,2026-09-20)
+
+真机部署日志报:`警告:up 后校验未能完成(docker inspect 查询失败(退出码 64))`。
+
+**根因**:v6.12.0 的 up 后校验用 `{{.Config.Labels."com.docker.compose.service"}}`
+读取带点的标签键 —— **不是合法 Go 模板**(字段链只接受标识符;带点的键必须用
+`index` 函数读取)。docker CLI 在连接 daemon **之前**解析模板,直接报
+`template parsing error: bad character U+0022` 并以 **退出码 64**(usage 错误)退出
+→ 该校验在每次部署/回滚时都失败(只告警、不误判成败 —— 降级行为正确,但校验
+整条形同虚设)。**真机复现**:本机无 daemon 也能复现(解析先于连接)。
+
+**修复**:
+- 模板改 `{{index .Config.Labels "com.docker.compose.service"}}|{{.Image}}`,
+  提为常量 `COMPOSE_SERVICE_IMAGE_TEMPLATE`;
+- `collect_running_images` 两处失败信息附远端输出尾部(`tail_lines`)—— 真机
+  教训:只报「退出码 64」时用户与维护者都要反推;
+- 新增回归守护 `test_compose_service_image_template_parses`:形态断言(零依赖,
+  CI 无 docker 也能挡住退回点号写法)+ 真机 docker CLI 实际解析一次模板
+  (解析先于 daemon,无 daemon 亦可验证;CLI 不存在则跳过,与 docker:: 真机
+  测试同口径)。**变异自证**:改回点号写法 → 测试红(形态断言先命中)。
+
+测试 500→501;clippy 与基线零新增;verify 六脚本 PASS。
