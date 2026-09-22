@@ -1410,7 +1410,8 @@ pub(crate) fn tar_image_candidates(configured: &str) -> Vec<String> {
 }
 
 /// 选一个可用于 tar 的镜像:优先服务器上已有的,其次尝试拉取 busybox。
-async fn pick_tar_image(
+///(第三十三批起 `pub(crate)`:卷文件管理复用同一解析 —— 设置项 `tarImage` 优先。)
+pub(crate) async fn pick_tar_image(
     client: &mut SshClient,
     emit_line: &Arc<dyn Fn(&str) + Send + Sync>,
 ) -> Result<String, String> {

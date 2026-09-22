@@ -787,6 +787,29 @@
     } else {
       wrap.appendChild(makeActionBtn('启动', 'start', c.id));
     }
+    // 第三十三批:容器文件管理 + 容器快照(经 FilesKit 桥;与终端/日志同层)
+    var filesBtn = document.createElement('button');
+    filesBtn.type = 'button';
+    filesBtn.className = 'btn btn-sm';
+    filesBtn.textContent = '文件';
+    filesBtn.title = '浏览 / 上传 / 下载 / 编辑容器内文件(docker cp 通道,无 shell 的镜像也可传)';
+    filesBtn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      if (window.FilesKit) window.FilesKit.openFor(state.serverId, c.id, c.names || c.id);
+    });
+    wrap.appendChild(filesBtn);
+
+    var snapBtn = document.createElement('button');
+    snapBtn.type = 'button';
+    snapBtn.className = 'btn btn-sm';
+    snapBtn.textContent = '快照';
+    snapBtn.title = '环境变量 / 端口映射 / 进程 / 挂载一览(可与 compose 声明对比键名)';
+    snapBtn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      if (window.FilesKit) window.FilesKit.openSnapshot(state.serverId, c.id);
+    });
+    wrap.appendChild(snapBtn);
+
     wrap.appendChild(makeActionBtn('日志', 'logs', c.id));
     wrap.appendChild(makeActionBtn('删除', 'rm', c.id, true));
 
@@ -1830,6 +1853,17 @@
     backupBtn.title = '把整个卷打包为 tar.gz 下载到本机';
     backupBtn.addEventListener('click', function () { confirmVolumeBackup(v.name); });
     wrap.appendChild(backupBtn);
+
+    // 第三十三批:卷内文件管理(与容器同一模态,数据源切到「数据卷」)
+    var filesBtn = document.createElement('button');
+    filesBtn.type = 'button';
+    filesBtn.className = 'btn btn-sm';
+    filesBtn.textContent = '文件';
+    filesBtn.title = '浏览 / 上传 / 下载 / 编辑卷内文件(临时容器挂载,工具总是可用)';
+    filesBtn.addEventListener('click', function () {
+      if (window.FilesKit) window.FilesKit.openForVolume(state.serverId, v.name);
+    });
+    wrap.appendChild(filesBtn);
 
     var rmBtn = document.createElement('button');
     rmBtn.type = 'button';

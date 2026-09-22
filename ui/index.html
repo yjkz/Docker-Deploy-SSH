@@ -966,6 +966,17 @@
     </div>
   </div>
 
+  <!-- 文件管理模态(第三十三批:容器 / 数据卷 / 部署目录(只读)三源;内容由 files.js 构建) -->
+  <div id="files-modal" class="modal-overlay hidden">
+    <div class="modal-card files-modal-card" role="dialog" aria-modal="true" aria-labelledby="files-modal-title">
+      <div class="modal-head">
+        <div id="files-modal-title" class="modal-title">文件管理<span class="help-title-en">FILES</span></div>
+        <button id="files-modal-close" class="modal-close" type="button" title="关闭">关闭</button>
+      </div>
+      <div id="files-modal-body" class="modal-body"></div>
+    </div>
+  </div>
+
   <script src="app.js"></script>
   <script src="check.js"></script>
   <script src="images.js"></script>
@@ -977,6 +988,7 @@
   <script src="deploy-schedule.js"></script>
   <script src="manage.js"></script>
   <script src="manage-stacks.js"></script>
+  <script src="files.js"></script>
   <script src="rollback.js"></script>
   <script src="notify.js"></script>
   <script src="help.js"></script>

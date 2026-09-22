@@ -3721,3 +3721,54 @@ wiki/07 决策 79 补边界:①换 `remote_dir` / 目录改名 → 旧目录容�
 - 全站「多页同 id」系统性扫描(本批修了实测发现的一处,扫描留作候选)。
 - 「up 后镜像不一致」不升级为失败(维持既有口径,仅进结果文案)。
 - 非标准 override 名(手工放进归档)不进入 `-f` 链(收窄,见 wiki/07 决策 81)。
+
+---
+
+# 第三十三批:v6.14.0 文件管理(容器 / 数据卷 / 部署目录)+ 容器快照 + 同栈分发(2026-09-22)
+
+> **来源**:用户「容器终端里要有文件管理(上传/修改/下载)」+ 讨论后拍板三项范围:
+> ①数据源 = **容器 + 卷 + 部署目录只读**;②覆盖策略 = **本机备份保留 3 份**；
+> ③本批范围 = 文件管理 + C(容器快照)+ D(同栈分发)。
+
+## 通道选型(先实测,再定方案)
+
+| 实测(Docker 29.7.2 本机) | 结论 |
+|---|---|
+| `docker cp <cid>:<path> -` / `tar cf - \| docker cp - <cid>:/dir/` | `docker cp` 是 daemon 侧文件操作:**零二进制容器(distroLESS/scratch)双向可用** |
+| 已停止容器 cp | 双向可用(`docker exec` 报 is not running) |
+| 容器 → 容器 cp | **Docker 不支持** → 一切经宿主 `/tmp` 中转(与卷备份/迁移同构) |
+| `LC_ALL=C ls -la`(BusyBox 与 GNU) | 同形,可稳定解析(含带空格文件名、符号链接 `-> ` 形态) |
+| 数据卷 `docker run --rm -v <vol>:/v -v <stage>:/out <img> sh -c 'cp -r /v/x /out/'` | 卷源**总有工具**(镜像自带),下载/上传/改名/删除全链实测通过 |
+
+## 交付
+
+**8 条新命令**(`manage_files.rs`,命令 114→**122**):`manage_files_list` / `download` / `upload` /
+`read_text` / `write_text` / `fs_op` / `cancel` / `manage_container_snapshot`。
+纯函数 9 个(路径校验/目标校验/绝对路径/文件名/`ls` 解析/候选命令/卷命令/打包命令/fs 脚本/备份裁剪)
+全部单测;**真机 `#[ignore]` 样板** `test_real_docker_list_and_cp_roundtrip`(列举解析 + cp 出/回 + 目录打包)。
+
+**前端**:新模态 `files-modal`(`ui/files.js`,四视图:列表 / 编辑器 / 快照 / 分发)+ 05 页容器行
+「文件 / 快照」、卷行「文件」入口;`FilesKit` 单次赋值桥(宿主内联消费 —— `bridge-integrity` 已扩展为
+同时扫 `window.<Kit>.<键>` 形态)。
+
+**关键口径**:部署目录**只读**(用户裁决,写路径一律 Err);编辑 ≤512KB 且 UTF-8;覆盖前默认备份到
+`config/fm-backups/<server>/<kind>-<target>/<ts>/` 保留 3 份;快照环境变量默认掩码;分发为前端串行编排
+(零新命令,复用 upload)。
+
+## 验证
+
+- `cargo test` **519 passed / 14 ignored**(510→519;真机样板 `--ignored` 已实跑通过)
+- 本机 Docker 实测:容器列举/解析、cp 往返、目录打包、**卷源全链**(列举→下载→改后上传→mkdir/rename/delete)
+- verify 六脚本 PASS(user-facing-copy 36 项,新增 4 条:文件管理入口 / 只读口径 / fm-backups / 分发)
+- 桩验证三视图(列表 / 快照 / 分发)+ judge **三轮**:首轮快照 fail(进程行走比例字体导致
+  docker top 分栏错位)→ 改等宽轨道后**二轮仍 fail** —— 真因是 **HTML 折叠连续空格**
+  (docker top 是 tabwriter 空格补齐输出,真机抓样确认无 TAB),且桩数据也按真机形态重做;
+  改 `white-space: pre` + 技术块内横向滚动后**三轮 PASS**。顺带修掉界面文案里 markdown `**`
+  直接可见的问题(后端 note 字符串)
+- 命令计数/doc 同步:`wiki/04` 122 + 事件 13 + 七篇页首戳 + README/ROADMAP
+
+## 明确留档不做
+
+- 宿主机**任意路径**文件管理(仅开放部署目录且只读;通用宿主文件管理风险高,另行评估)。
+- 容器内多选批量传输(先单条;批量已有「同栈分发」)。
+- 二进制/超大文件的就地编辑(引导下载改后上传)。

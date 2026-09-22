@@ -20,6 +20,11 @@ const WIRING = [
   {
     host: 'ui/servers.js', kit: 'ServersKit',
     consumers: ['ui/servers-cleanup.js']
+  },
+  {
+    // 第三十三批:文件管理模态(容器/卷/部署目录三源 + 容器快照)
+    host: 'ui/files.js', kit: 'FilesKit',
+    consumers: ['ui/manage.js']
   }
 ];
 
@@ -49,6 +54,9 @@ for (const cfg of WIRING) {
   for (const f of cfg.consumers) {
     const s = fs.readFileSync(path.join(ROOT, f), 'utf8');
     for (const k of (s.match(new RegExp('K\\.[A-Za-z_$][\\w$]*', 'g')) || [])) need.add(k.slice(2));
+    // 第三十三批:宿主文件内联消费 `window.<Kit>.<键>`(未写 K.* 别名,懒取值避免加载顺序耦合)
+    const reInline = new RegExp('window[.]' + cfg.kit + '[.][A-Za-z_$][A-Za-z0-9_$]*', 'g');
+    for (const full of (s.match(reInline) || [])) need.add(full.split('.').pop());
   }
   const missing = [...need].filter(k => !provided.includes(k));
   const okAssign = assignments.length === 1;

@@ -53,7 +53,7 @@ const CHAIN = [
   'theme-init.js',
   'app.js', 'check.js', 'images.js', 'servers.js', 'servers-cleanup.js',
   'deploy.js', 'deploy-rollback.js', 'deploy-migrate.js', 'deploy-schedule.js',
-  'manage.js', 'manage-stacks.js', 'rollback.js', 'notify.js', 'help.js',
+  'manage.js', 'manage-stacks.js', 'files.js', 'rollback.js', 'notify.js', 'help.js',
   'config-io.js', 'settings.js'
 ];
 

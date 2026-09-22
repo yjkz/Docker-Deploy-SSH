@@ -1373,9 +1373,90 @@ fn unquote(s: &str) -> String {
     }
 }
 
+/// 取 compose 文本中某服务 `environment:` 声明的**键名**(纯函数,便于单测)。
+///
+/// 第三十三批「容器快照」用:与容器实际环境变量做**键名**双向对比。
+/// 只做静态提取 —— 支持 mapping(`KEY: value`)与序列(`- KEY=value` / `- KEY`)两种写法;
+/// **不做**插值、不展开 `env_file`、不含 compose 之外的注入来源(那是运行期语义,
+/// 调用方必须在文案里注明口径,避免把「静态看不到」误报成「没生效」)。
+pub fn declared_env_keys_of_service(
+    compose_text: &str,
+    service: &str,
+) -> Result<Vec<String>, String> {
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(compose_text).map_err(|e| format!("compose 解析失败: {}", e))?;
+    let Some(svc) = doc.get("services").and_then(|s| s.get(service)) else {
+        return Ok(Vec::new());
+    };
+    let Some(env) = svc.get("environment") else {
+        return Ok(Vec::new());
+    };
+    let mut keys: Vec<String> = Vec::new();
+    match env {
+        serde_yaml::Value::Mapping(m) => {
+            for (k, _) in m {
+                if let Some(k) = k.as_str() {
+                    keys.push(k.to_string());
+                }
+            }
+        }
+        serde_yaml::Value::Sequence(seq) => {
+            for item in seq {
+                if let Some(s) = item.as_str() {
+                    let key = s.split('=').next().unwrap_or(s).trim();
+                    if !key.is_empty() {
+                        keys.push(key.to_string());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_declared_env_keys_of_service() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx
+    environment:
+      APP_ENV: prod
+      PORT: 8080
+  db:
+    image: postgres
+    environment:
+      - POSTGRES_USER=app
+      - POSTGRES_PASSWORD
+      - WITH_EQUALS=a=b
+  plain:
+    image: busybox
+"#;
+        assert_eq!(
+            declared_env_keys_of_service(yaml, "web").unwrap(),
+            vec!["APP_ENV".to_string(), "PORT".to_string()]
+        );
+        assert_eq!(
+            declared_env_keys_of_service(yaml, "db").unwrap(),
+            vec![
+                "POSTGRES_PASSWORD".to_string(),
+                "POSTGRES_USER".to_string(),
+                "WITH_EQUALS".to_string()
+            ]
+        );
+        // 服务无 environment / 服务不存在 → 空(不报错)
+        assert!(declared_env_keys_of_service(yaml, "plain").unwrap().is_empty());
+        assert!(declared_env_keys_of_service(yaml, "nope").unwrap().is_empty());
+        // 非法 YAML → Err(调用方文案里体现)
+        assert!(declared_env_keys_of_service("services: [", "web").is_err());
+    }
 
     /// 建一个临时 fixture 目录(测试结束自行清理)。
     fn temp_fixture_dir() -> std::path::PathBuf {

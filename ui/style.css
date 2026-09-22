@@ -4874,3 +4874,63 @@ tr.stat-flash > td:first-child {
   color: var(--ark-paper-dim-ink);
   padding: 4px 0;
 }
+
+/* ===== 文件管理模态(第三十三批:容器 / 数据卷 / 部署目录三源 + 容器快照) =====
+   复用既有 token 与控件类(.btn/.input/.select/.data-table/.manage-env-editor);
+   圆角 0、无新色值;含中文元素一律 --font-cjk(mono 只留给 ASCII 键/读数)。 */
+.modal-card.files-modal-card { width: min(920px, 94vw); }
+
+.files-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.files-seg { display: flex; flex: none; border: 1px solid var(--ark-line); }
+.files-seg-btn { border: 0; background: transparent; color: var(--ark-paper-ink-65);
+  font-family: var(--font-cjk); font-size: 12px; padding: 6px 10px; flex: none; }
+.files-seg-btn.active { background: var(--ark-ink); color: var(--ark-paper); }
+.files-target, .files-dirinput { min-width: 0; flex: 1 1 220px; }
+
+.files-pathbar { display: flex; align-items: center; gap: 8px; margin: 4px 0 8px; }
+.files-label { flex: none; font-family: var(--font-cjk); font-size: 12px; color: var(--ark-paper-ink-65); }
+.files-crumb { min-width: 0; flex: 1; display: flex; flex-wrap: wrap; align-items: center; row-gap: 2px; }
+.files-crumb-btn { border: 0; background: transparent; color: var(--ark-ink); padding: 1px 2px;
+  font-size: 12px; cursor: pointer; }
+.files-crumb-btn:hover { background: var(--ark-line-soft); }
+.files-crumb-sep { color: var(--ark-paper-ink-65); font-size: 12px; }
+.files-filter { flex: none; width: 180px; }
+
+.files-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.files-note { font-family: var(--font-cjk); font-size: 12px; color: var(--ark-paper-ink-65);
+  margin: 2px 0 8px; word-break: break-word; }
+.files-note.is-warn { color: var(--ark-warn-text); }
+.files-err { font-family: var(--font-cjk); font-size: 12px; color: var(--ark-warn-text);
+  border-left: 3px solid var(--ark-warn); padding: 4px 8px; margin: 4px 0 8px; word-break: break-word; }
+
+.files-list { display: flex; flex-direction: column; }
+.files-empty { font-family: var(--font-cjk); font-size: 12.5px; color: var(--ark-paper-ink-65); padding: 10px 2px; }
+.files-table td { vertical-align: middle; }
+.files-name-cell { min-width: 0; }
+.files-name { word-break: break-all; }
+.files-row-actions { white-space: nowrap; }
+.files-row-actions .btn { margin-right: 4px; }
+.files-row-actions .btn:last-child { margin-right: 0; }
+
+.files-progress { margin: 6px 0 8px; }
+.files-progress-text { font-family: var(--font-cjk); font-size: 12px; color: var(--ark-paper-ink-65); margin-bottom: 4px; }
+.files-progress-track { height: 4px; background: var(--ark-line-soft); }
+.files-progress-fill { height: 100%; background: var(--ark-signal); transition: width var(--ark-dur-fast) var(--ark-ease-out); }
+
+.files-editor-area { width: 100%; min-height: 46vh; }
+.files-snapshot, .files-distribute { display: flex; flex-direction: column; }
+.files-section-title { font-family: var(--font-cjk); font-size: 12px; font-weight: 600; color: var(--ark-ink);
+  margin: 10px 0 4px; }
+.files-kv { display: flex; align-items: baseline; gap: 8px; padding: 2px 0; font-size: 12px; }
+.files-kv-key { flex: none; max-width: 42%; color: var(--ark-paper-ink-65); }
+.files-kv-val { min-width: 0; word-break: break-all; }
+.files-line { font-size: 12px; padding: 1px 0; word-break: break-all; }
+/* 技术数据行(docker top 原文表 / 端口三元组 / 挂载三元组):按字符位对齐才有意义,
+   走等宽轨道;偶发中文(如含中文的挂载路径)落在字体栈内的 Noto CJK 兜底,与终端同口径 */
+/* 技术数据块:docker top 为 tabwriter **空格补齐**输出(无 TAB),必须同时
+   ①保留连续空格(否则 HTML 折叠后分栏错位)②不折行(否则长行被打散)——
+   故整块 white-space: pre + 横向滚动(与终端/日志的横向滚动同族) */
+.files-tech { overflow-x: auto; max-width: 100%; padding-bottom: 2px; }
+.files-line.is-tech { font-family: var(--font-mono); white-space: pre; }
+.files-check-name { margin-right: 2px; }
+.files-check { display: flex; align-items: center; gap: 6px; font-size: 12.5px; padding: 2px 0; }

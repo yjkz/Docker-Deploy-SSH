@@ -13,6 +13,7 @@ pub mod errors;
 pub mod history;
 pub mod manage;
 pub mod manage_exec;
+pub mod manage_files;
 pub mod manage_logs;
 pub mod manage_stacks;
 pub mod manage_stats;
@@ -156,6 +157,14 @@ pub fn run() {
       manage_stacks::manage_stack_compose_save,
       manage::manage_volume_browse,
       manage::manage_volume_backup,
+      manage_files::manage_files_list,
+      manage_files::manage_files_download,
+      manage_files::manage_files_upload,
+      manage_files::manage_files_read_text,
+      manage_files::manage_files_write_text,
+      manage_files::manage_files_fs_op,
+      manage_files::manage_files_cancel,
+      manage_files::manage_container_snapshot,
     ])
     .setup(|app| {
       // 日志(不限 debug 构建,release 同样记录,便于现场排查):
