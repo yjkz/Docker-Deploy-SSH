@@ -3943,3 +3943,34 @@ ROADMAP(候选池状态、S4/S5 行、速览、命令 114→122 漂移、JS 16�
 | `ui/servers.js` / `ui/deploy.js` | 可回收/日志展示 + 磁盘紧张提示(+ 局部 `formatBytesLocal`) |
 | `ui/help.js` | 03 页检测行说明 |
 | `wiki/04` / `wiki/06` / `wiki/02` / `wiki/README` / `ROADMAP.md` / 七篇页首戳 | 契约与计数同步(531 / 15) |
+
+---
+
+# 第三十四批(四):容器内多选批量传输(第三十三批留档清尾,2026-09-22)
+
+> **来源**:第三十四批方案的池外项(第三十三批明确留档「容器内多选批量传输(先单条;批量已有「同栈分发」)」);
+> 用户裁决「做多选批量下载+上传」。**版本**:v6.16.0(与前两子批同一未发版版本合并)。**纯前端**(零新命令、零后端改动)。
+
+## 交付(`ui/files.js` + `ui/style.css`)
+
+- **勾选列**:列表行首常显勾选框(与 05 页容器批量同语言),表头全选框带半选态(`indeterminate`);勾选**就地更新**批量条与全选态(不整块重绘,避免列表滚动位置丢失)。
+- **批量下载**:勾选(文件 + 目录均可,目录由服务端自动打包)→ 选一次本机目录 → 逐条串行 `manage_files_download`。
+- **批量上传**:工具栏新增按钮 → `dialog.open({ multiple: true })` 一次选多个本地文件 → 逐条串行 `manage_files_upload`(复用单条的「覆盖前备份 3 份」语义,确认框写明)。
+- **进度与取消**:复用 `files-transfer-progress` 订阅(进度条不变),`st.opLabel = '批量下载 (i/N)'`;**取消即中止**并把剩余项标「已取消(未执行)」(`parseErrCode === 'canceled'`)。
+- **结果汇总**:结束后渲染逐条结果(成功/失败徽章 + 名称 + 文案,三列网格对齐),toast 汇总「N/M 成功」;切换目录/再次批量时清除;勾选集合以当前目录为键,`refreshList()` 时统一作废。
+- **CSS**:`.files-pick-cell`(窄列居中)/`.files-batchbar`/`.files-batch-results .files-kv`(三列 grid);checkbox 走全局体系(`accent-color` + `tr:hover` 反白豁免均已存在)。
+
+## 验证
+
+- `node --check` files.js;**static-integrity 全绿**(首跑抓出 `files-batch-count` 缺 id 的悬空引用 → 已修,否则计数条静默不更新);verify 七脚本 rc=0;`cargo test` 531 不变(纯前端)
+- **桩验证 + judge**:勾选 2 项(目录+文件)→ 批量条/半选态正确;批量下载 2/2(逐条结果 + toast + 选择自动清空),零未捕获异常;judge 两图 **pass**
+- **本轮桩验证的抓错与教训**:首轮 judge 打回「批量条贴表格(间距 0)/结果列参差」——DOM 实测确认 `gapBarToTable=0`,根因是**预览页只破了脚本缓存、`style.css` 未加 `?v=` → IAB 返回旧样式表**(新增 CSS 全未生效);生成器补样式表版本号后实测 `gapBarToTable=12`、结果三列 x 坐标逐行一致(199/255/463),复判 **pass**。`AGENTS.md` 的 IAB 缓存提示已同步(脚本**与 style.css**)。
+
+## 文件改动
+
+| 文件 | 改动 |
+|---|---|
+| `ui/files.js` | 勾选列 / 表头全选 / 批量条 / 批量下载 / 批量上传 / `runBatch` 串行编排(取消即中止)/ 结果区块 |
+| `ui/style.css` | `.files-pick-cell` / `.files-batchbar` / `.files-batch-results` 三列 grid |
+| `ui/help.js` | 文件管理章节新增「多选批量传输」条目 |
+| `wiki/03` / `AGENTS.md` / `ROADMAP.md` / `wiki/README.md` | 模块说明、IAB 缓存教训、状态与速览同步 |

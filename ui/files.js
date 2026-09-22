@@ -55,7 +55,10 @@
     opLabel: '',
     targets: { container: [], volume: [] },
     dirBase: '',
-    err: ''
+    err: '',
+    // 多选批量传输(第三十四批(四))
+    sel: {},               // 勾选集合(条目名 → true;仅当前目录内有效)
+    batchResults: null     // { label, results: [{ name, ok, message }] }
   };
 
   function invoke(cmd, args) { return window.AppBus.invoke(cmd, args); }
@@ -168,6 +171,9 @@
 
   function refreshList() {
     if (!st.serverId) return;
+    // 目录/目标切换即作废勾选与批量结果(条目名以当前目录为键)
+    st.sel = {};
+    st.batchResults = null;
     st.busy = true;
     st.err = '';
     render();
@@ -619,6 +625,8 @@
     };
     mk('上传文件', doUpload, st.busy || readOnly || st.unsupported,
       readOnly ? '部署目录为只读源' : (st.unsupported ? '该容器无 shell,请用完整路径下载/上传(本页暂不支持)' : ''));
+    mk('批量上传', doBatchUpload, st.busy || readOnly || st.unsupported,
+      readOnly ? '部署目录为只读源' : (st.unsupported ? '该容器无 shell,请用完整路径下载/上传(本页暂不支持)' : '一次选择多个本地文件,串行上传到当前目录'));
     mk('新建目录', doMkdir, st.busy || readOnly || st.unsupported, '');
     mk('刷新', function () { refreshList(); }, st.busy, '');
     if (st.kind === 'container') {
@@ -657,6 +665,126 @@
     box.appendChild(track);
   }
 
+  // ===== 多选批量传输(第三十四批(四);前端串行编排,复用单条命令)=====
+
+  /** 当前勾选的条目名(按列表顺序) */
+  function selectedNames() {
+    return visibleEntries()
+      .map(function (e) { return e.name; })
+      .filter(function (n) { return !!st.sel[n]; });
+  }
+
+  /** 就地刷新批量条与表头全选态(勾选不整块重绘,避免列表滚动位置丢失) */
+  function refreshPickUi() {
+    var count = selectedNames().length;
+    var bar = $('files-batchbar');
+    if (bar) {
+      if (count === 0) bar.classList.add('hidden');
+      else bar.classList.remove('hidden');
+      var txt = $('files-batch-count');
+      if (txt) txt.textContent = '已选 ' + count + ' 项';
+    }
+    var all = $('files-pick-all');
+    if (all) {
+      var total = visibleEntries().length;
+      all.checked = count > 0 && count === total;
+      all.indeterminate = count > 0 && count < total;
+    }
+  }
+
+  function doBatchDownload() {
+    var names = selectedNames();
+    if (!names.length) return;
+    window.AppBus.pickPath({ directory: true, title: '选择批量下载保存目录' }).then(function (picked) {
+      if (!picked) return;
+      var dir = String(picked);
+      runBatch('批量下载', names.map(function (n) {
+        return {
+          name: n,
+          run: function () {
+            return invoke('manage_files_download', Object.assign(baseArgs(), {
+              path: joinPath(n), localDir: dir
+            })).then(function (res) { return '已保存到 ' + res; });
+          }
+        };
+      }));
+    }).catch(function () {});
+  }
+
+  function doBatchUpload() {
+    var dialog = (window.__TAURI__ || {}).dialog;
+    if (!dialog || typeof dialog.open !== 'function') {
+      window.toast('对话框组件不可用', 'fail');
+      return;
+    }
+    dialog.open({ multiple: true, directory: false, title: '选择要批量上传的文件' }).then(function (picked) {
+      var list = Array.isArray(picked) ? picked.filter(Boolean) : (picked ? [picked] : []);
+      if (!list.length) return;
+      var dest = st.path || '根目录';
+      if (!window.confirm('批量上传 ' + list.length + ' 个文件到 ' + dest +
+        '?\n\n若目标已存在同名文件,将先备份到本机(配置目录 fm-backups,同文件保留 3 份)。\n继续?')) return;
+      runBatch('批量上传', list.map(function (p) {
+        var src = String(p);
+        var name = src.split(/[\\/]/).pop() || src;
+        return {
+          name: name,
+          run: function () {
+            return invoke('manage_files_upload', Object.assign(baseArgs(), {
+              destDir: st.path, localPath: src, backup: true
+            })).then(function (res) {
+              return res && res.backedUp ? '已上传;原文件已备份' : '已上传';
+            });
+          }
+        };
+      }));
+    }).catch(function () {});
+  }
+
+  /** 串行批量执行:接通进度订阅、逐项更新 opLabel;取消即中止并标记剩余项 */
+  function runBatch(label, items) {
+    if (st.busy || !items.length) return;
+    st.busy = true;
+    st.progress = null;
+    st.err = '';
+    st.batchResults = null;
+    render();
+    subscribeProgress().then(function (un) {
+      var results = [];
+      var aborted = false;
+      var finish = function () {
+        st.busy = false;
+        st.progress = null;
+        if (un) un();
+        var ok = results.filter(function (r) { return r.ok; }).length;
+        st.batchResults = { label: label, results: results };
+        st.sel = {};
+        render();
+        window.toast(label + '完成:' + ok + '/' + results.length + ' 成功', ok === results.length ? 'ok' : 'warn');
+      };
+      var next = function (i) {
+        if (aborted || i >= items.length) { finish(); return; }
+        st.opLabel = label + ' (' + (i + 1) + '/' + items.length + ')';
+        items[i].run().then(function (msg) {
+          results.push({ name: items[i].name, ok: true, message: msg || '完成' });
+          renderProgress();
+          next(i + 1);
+        }).catch(function (e) {
+          var canceled = typeof window.parseErrCode === 'function' && window.parseErrCode(e) === 'canceled';
+          results.push({ name: items[i].name, ok: false, message: window.errText(e) || '失败' });
+          if (canceled) {
+            aborted = true;
+            for (var k = i + 1; k < items.length; k++) {
+              results.push({ name: items[k].name, ok: false, message: '已取消(未执行)' });
+            }
+          }
+          renderProgress();
+          next(i + 1);
+        });
+      };
+      next(0);
+    });
+  }
+
   function renderList() {
     var wrap = el('div', 'files-list');
     wrap.appendChild(renderPathBar());
@@ -665,7 +793,37 @@
     var prog = el('div', 'files-progress hidden');
     prog.id = 'files-progress';
     wrap.appendChild(prog);
-    setTimeout(renderProgress, 0);
+    // 多选批量条(勾选为空时隐藏;勾选后就地更新,不整块重绘)
+    var bar = el('div', 'files-batchbar hidden');
+    bar.id = 'files-batchbar';
+    var cnt = el('span', 'files-batch-count', '已选 0 项');
+    cnt.id = 'files-batch-count';
+    bar.appendChild(cnt);
+    var dl = el('button', 'btn btn-sm', '批量下载');
+    dl.type = 'button';
+    dl.disabled = st.busy;
+    dl.addEventListener('click', function () { doBatchDownload(); });
+    bar.appendChild(dl);
+    var clr = el('button', 'btn btn-sm', '清除选择');
+    clr.type = 'button';
+    clr.disabled = st.busy;
+    clr.addEventListener('click', function () { st.sel = {}; render(); });
+    bar.appendChild(clr);
+    wrap.appendChild(bar);
+    // 批量结果(切换目录/再次批量时清除)
+    if (st.batchResults) {
+      wrap.appendChild(el('div', 'files-section-title', st.batchResults.label + '结果'));
+      var resBox = el('div', 'files-batch-results');
+      st.batchResults.results.forEach(function (r) {
+        var line = el('div', 'files-kv');
+        line.appendChild(window.fillBadge(el('span'), r.ok ? 'ok' : 'fail', r.ok ? '成功' : '失败'));
+        line.appendChild(el('span', 'files-kv-key', r.name));
+        line.appendChild(el('span', 'files-kv-val', r.message));
+        resBox.appendChild(line);
+      });
+      wrap.appendChild(resBox);
+    }
+    setTimeout(function () { renderProgress(); refreshPickUi(); }, 0);
 
     if (st.busy && !st.entries.length) {
       wrap.appendChild(el('div', 'files-empty', '读取中…'));
@@ -681,6 +839,20 @@
     var table = el('table', 'data-table files-table');
     var thead = el('thead');
     var tr = el('tr');
+    var thPick = el('th', 'files-pick-cell');
+    var cbAll = el('input', null, null);
+    cbAll.type = 'checkbox';
+    cbAll.id = 'files-pick-all';
+    cbAll.setAttribute('aria-label', '全选当前列表');
+    cbAll.disabled = st.busy;
+    cbAll.addEventListener('change', function () {
+      var all = visibleEntries();
+      if (cbAll.checked) all.forEach(function (item) { st.sel[item.name] = true; });
+      else st.sel = {};
+      render();
+    });
+    thPick.appendChild(cbAll);
+    tr.appendChild(thPick);
     ['名称', '类型', '大小', '权限', '时间', '操作'].forEach(function (h) {
       tr.appendChild(el('th', null, h));
     });
@@ -689,6 +861,19 @@
     var tbody = el('tbody');
     list.forEach(function (e) {
       var row = el('tr');
+      var pickTd = el('td', 'files-pick-cell');
+      var cb = el('input', null, null);
+      cb.type = 'checkbox';
+      cb.checked = !!st.sel[e.name];
+      cb.disabled = st.busy;
+      cb.setAttribute('aria-label', '选择 ' + e.name);
+      cb.addEventListener('change', function () {
+        if (cb.checked) st.sel[e.name] = true;
+        else delete st.sel[e.name];
+        refreshPickUi();
+      });
+      pickTd.appendChild(cb);
+      row.appendChild(pickTd);
       var nameTd = el('td', 'files-name-cell');
       nameTd.appendChild(el('span', 'files-name', e.name));
       if (e.isDir) {

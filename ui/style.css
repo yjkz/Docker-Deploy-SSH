@@ -4917,6 +4917,16 @@ tr.stat-flash > td:first-child {
 .files-progress-track { height: 4px; background: var(--ark-line-soft); }
 .files-progress-fill { height: 100%; background: var(--ark-signal); transition: width var(--ark-dur-fast) var(--ark-ease-out); }
 
+/* 第三十四批(四):多选批量传输(勾选列 + 批量条 + 结果;checkbox 走全局 checkbox 体系) */
+.files-pick-cell { width: 34px; text-align: center; }
+.files-pick-cell input { cursor: pointer; }
+.files-batchbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 12px; }
+.files-batchbar.hidden { display: none; }
+.files-batch-count { font-family: var(--font-cjk); font-size: 12px; color: var(--ark-ink); }
+.files-batch-results { display: flex; flex-direction: column; margin-bottom: 12px; }
+/* 结果三列对齐(徽章 / 名称 / 文案):名称列固定宽,文案列恒对齐 */
+.files-batch-results .files-kv { display: grid; grid-template-columns: 48px 200px minmax(0, 1fr); column-gap: 8px; }
+
 .files-editor-area { width: 100%; min-height: 46vh; }
 .files-snapshot, .files-distribute { display: flex; flex-direction: column; }
 .files-section-title { font-family: var(--font-cjk); font-size: 12px; font-weight: 600; color: var(--ark-ink);
