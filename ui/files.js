@@ -1,5 +1,5 @@
 /* ============================================================
- * files.js — 文件管理(第三十三批):容器 rootfs / 数据卷 / 部署目录(只读)三源
+ * files.js — 文件管理(第三十三批):容器 rootfs / 数据卷 / 部署目录三源
  *
  * 普通 script 加载(在 app.js 之后),不依赖任何框架;对外只暴露 window.FilesKit
  * (单次赋值,键由 manage.js 消费 —— 见 verify/bridge-integrity.js)。
@@ -8,7 +8,8 @@
  * - 容器:docker cp 通道(容器无任何二进制也能传),目录列举/改名/删除需要容器有
  *   shell;没有时列表返回 unsupported,本页降级为「按完整路径下载/上传」。
  * - 数据卷:后端经临时容器挂载(工具来自镜像,总是可用)。
- * - 部署目录:**只读**(下载/查看;上传/改名/删除按钮禁用并说明)。
+ * - 部署目录:写权限由设置中心「宿主机可写目录」白名单决定(第三十四批(五))—— 白名单内可
+ *   上传/编辑/新建/改名/删除,白名单外只读(按钮禁用并说明);真正的判定在后端(canonicalize 后)。
  *
  * 传输是同步命令(等待完成),期间本页锁定并订阅 files-transfer-progress 显示进度;
  * 「取消传输」调用 manage_files_cancel(块级生效)。
@@ -58,13 +59,37 @@
     err: '',
     // 多选批量传输(第三十四批(四))
     sel: {},               // 勾选集合(条目名 → true;仅当前目录内有效)
-    batchResults: null     // { label, results: [{ name, ok, message }] }
+    batchResults: null,    // { label, results: [{ name, ok, message }] }
+    // 宿主机可写目录白名单(第三十四批(五);openWith 时从设置读入)
+    hostWritePaths: []
   };
 
   function invoke(cmd, args) { return window.AppBus.invoke(cmd, args); }
 
   function baseArgs() {
     return { serverId: st.serverId, kind: st.kind, target: st.target };
+  }
+
+  /** 部署目录源的当前绝对路径(与后端 source_abs_path 的 DeployDir 分支同口径) */
+  function deployDirAbs() {
+    var base = String(st.target || st.dirBase || '/');
+    var rel = String(st.path || '');
+    var joined = rel ? base.replace(/\/+$/, '') + '/' + rel : base;
+    return joined.replace(/\/+$/, '') || '/';
+  }
+
+  /** 当前路径是否允许写(部署目录看白名单;容器/卷恒可写)。
+      前端只做词法门控 —— 真正的判定在后端(canonicalize 后)。 */
+  function hostWritableHere() {
+    if (st.kind !== 'deployDir') return true;
+    var prefixes = st.hostWritePaths || [];
+    if (!prefixes.length) return false;
+    var abs = deployDirAbs();
+    for (var i = 0; i < prefixes.length; i++) {
+      var p = String(prefixes[i] || '');
+      if (p === '/' || abs === p || abs.indexOf(p + '/') === 0) return true;
+    }
+    return false;
   }
 
   // ===== 模态骨架 =====
@@ -120,6 +145,12 @@
     st.progress = null;
     st.view = 'list';
     st.snapshot = null;
+    // 宿主机可写目录白名单(第三十四批(五);前端仅作 UI 门控,真正判定在后端)
+    st.hostWritePaths = [];
+    invoke('app_settings_get').then(function (s) {
+      st.hostWritePaths = (s && Array.isArray(s.hostWritePaths)) ? s.hostWritePaths : [];
+      if (st.open && st.kind === 'deployDir') render();
+    }).catch(function () {});
     var ov = overlay();
     if (!ov) return;
     ov.classList.remove('hidden');
@@ -515,7 +546,7 @@
     var wrap = el('div', 'files-head');
     // 源切换
     var seg = el('div', 'files-seg');
-    [['container', '容器'], ['volume', '数据卷'], ['deployDir', '部署目录(只读)']].forEach(function (pair) {
+    [['container', '容器'], ['volume', '数据卷'], ['deployDir', '部署目录']].forEach(function (pair) {
       var b = el('button', 'btn files-seg-btn' + (st.kind === pair[0] ? ' active' : ''), pair[1]);
       b.type = 'button';
       b.addEventListener('click', function () {
@@ -613,7 +644,7 @@
 
   function renderActions() {
     var wrap = el('div', 'files-actions');
-    var readOnly = st.kind === 'deployDir';
+    var readOnly = st.kind === 'deployDir' && !hostWritableHere();
     var mk = function (label, fn, disabled, title) {
       var b = el('button', 'btn', label);
       b.type = 'button';
@@ -790,6 +821,14 @@
     wrap.appendChild(renderPathBar());
     wrap.appendChild(renderActions());
     if (st.note) wrap.appendChild(el('div', 'files-note', st.note));
+    // 宿主机源写权限提示(第三十四批(五))
+    if (st.kind === 'deployDir') {
+      var writable = hostWritableHere();
+      wrap.appendChild(el('div', 'files-note' + (writable ? '' : ' is-warn'),
+        writable
+          ? '该目录在「宿主机可写目录」白名单内:可直接上传 / 编辑 / 新建 / 改名 / 删除'
+          : '部署目录为只读源:仅白名单目录可写(可在设置中心「通用」区添加「宿主机可写目录」)'));
+    }
     var prog = el('div', 'files-progress hidden');
     prog.id = 'files-progress';
     wrap.appendChild(prog);
@@ -895,7 +934,7 @@
         act.appendChild(rowBtn('下载', function () { doDownload(joinPath(e.name)); }));
         act.appendChild(rowBtn('编辑', function () { doEdit(joinPath(e.name)); }));
       }
-      if (st.kind !== 'deployDir' && !st.unsupported) {
+      if (hostWritableHere() && !st.unsupported) {
         act.appendChild(rowBtn('改名', function () { doRename(e.name); }));
         act.appendChild(rowBtn('删除', function () { doDelete(e.name, e.isDir); }, true));
       }

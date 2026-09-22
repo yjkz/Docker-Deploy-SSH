@@ -743,6 +743,63 @@ pub struct AppSettings {
     /// 越界值(>23)按关闭处理。
     #[serde(default)]
     pub digest_hour: Option<u32>,
+    /// 宿主机(部署目录源)可写目录白名单(第三十四批(五);**空列表 = 不可写**,
+    /// 维持第三十三批的只读口径)。
+    ///
+    /// 仅作用于文件管理「部署目录」源:写操作的目标路径在服务器上
+    /// `readlink -f` canonicalize 后必须落在某条白名单前缀内(目录边界匹配,
+    /// 见 [`path_within_any`]);容器 / 卷源不受影响。保存侧经
+    /// [`normalize_host_write_paths`] 归一化(非法项丢弃)。
+    #[serde(default)]
+    pub host_write_paths: Vec<String>,
+}
+
+/// 「宿主机可写目录」白名单上限(条)。
+pub const HOST_WRITE_PATHS_MAX: usize = 10;
+
+/// 归一化「宿主机可写目录」白名单(纯函数,第三十四批(五)):去空白与尾斜杠;
+/// 必须绝对路径、不含 `..` 段 / NUL / 换行、长度 ≤ 512;去重(保序);
+/// cap [`HOST_WRITE_PATHS_MAX`] 条。非法条目**静默丢弃**(读侧只认这里的结果)。
+pub fn normalize_host_write_paths(raw: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for item in raw {
+        let s = item.trim();
+        if s.is_empty() || !s.starts_with('/') {
+            continue;
+        }
+        if s.contains('\0') || s.contains('\n') || s.contains('\r') || s.len() > 512 {
+            continue;
+        }
+        let trimmed = s.trim_end_matches('/');
+        let normalized = if trimmed.is_empty() { "/" } else { trimmed };
+        if normalized.split('/').any(|seg| seg == "..") {
+            continue;
+        }
+        if !out.iter().any(|x| x == normalized) {
+            out.push(normalized.to_string());
+        }
+        if out.len() >= HOST_WRITE_PATHS_MAX {
+            break;
+        }
+    }
+    out
+}
+
+/// 路径是否位于白名单前缀之内(纯函数;目录边界匹配:`/a` 不匹配 `/ab`;
+/// `"/"` 前缀恒真)。两侧都应已归一化(去尾斜杠)。
+pub fn path_within_any(path: &str, prefixes: &[String]) -> bool {
+    for p in prefixes {
+        if p == "/" {
+            if path.starts_with('/') {
+                return true;
+            }
+            continue;
+        }
+        if path == p || path.starts_with(&format!("{}/", p)) {
+            return true;
+        }
+    }
+    false
 }
 
 /// `AppSettings::default` 的手写实现:`auto_update_from_source` 缺省为 **true**
@@ -766,6 +823,7 @@ impl Default for AppSettings {
             tar_image: String::new(),
             digest_hour: None,
             auto_start: false,
+            host_write_paths: Vec::new(),
         }
     }
 }
@@ -829,6 +887,9 @@ pub fn app_settings_get() -> AppSettings {
 /// 时现读文件,保存即生效)。探活间隔变更时同步(重)启/停后端探活任务。
 #[tauri::command]
 pub fn app_settings_set(app: tauri::AppHandle, settings: AppSettings) -> std::result::Result<(), String> {
+    // 白名单归一化在落盘前收口(第三十四批(五);与 termLogKeepDays 读侧夹取同精神)
+    let mut settings = settings;
+    settings.host_write_paths = normalize_host_write_paths(&settings.host_write_paths);
     save_app_settings(&settings).map_err(|e| format!("保存设置失败: {}", e))?;
     crate::probe::sync_from_settings(&app);
     // 资源阈值告警(第二十四批):保存即按新设置启停(同探活口径)
@@ -1077,6 +1138,46 @@ pub(crate) static TEST_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ===== 第三十四批(五):宿主机可写目录白名单(纯函数) =====
+
+    #[test]
+    fn test_normalize_host_write_paths() {
+        let raw = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            normalize_host_write_paths(&raw(&[
+                " /data/ ", "/srv/app/", "/data", "/etc", "relative", "/a/../b", ""
+            ])),
+            vec!["/data".to_string(), "/srv/app".to_string(), "/etc".to_string()],
+            "去空白/尾斜杠、去重,相对路径与含 .. 的条目丢弃"
+        );
+        let many: Vec<String> = (0..15).map(|i| format!("/p{}", i)).collect();
+        assert_eq!(normalize_host_write_paths(&many).len(), HOST_WRITE_PATHS_MAX);
+        assert!(normalize_host_write_paths(&raw(&["  ", "x/y"])).is_empty());
+    }
+
+    #[test]
+    fn test_path_within_any_boundary() {
+        let ps = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let allowed = ps(&["/data", "/srv/app"]);
+        assert!(path_within_any("/data", &allowed), "白名单目录本身可写");
+        assert!(path_within_any("/data/x.txt", &allowed));
+        assert!(path_within_any("/srv/app/sub/deep", &allowed));
+        assert!(!path_within_any("/database", &allowed), "目录边界:不得吞同名前缀目录");
+        assert!(!path_within_any("/etc/passwd", &allowed));
+        assert!(!path_within_any("/Data/x", &allowed), "大小写敏感(远端为 Linux)");
+        assert!(path_within_any("/anything", &ps(&["/"])));
+    }
+
+    #[test]
+    fn test_host_write_paths_serde_default() {
+        // 旧 settings.json(无该字段)反序列化 = 空列表(维持只读)
+        let s: AppSettings = serde_json::from_str(
+            r#"{"closeToTray":false,"proxy":"","autoUpdateFromSource":true}"#,
+        )
+        .unwrap();
+        assert!(s.host_write_paths.is_empty());
+    }
 
     #[test]
     fn test_roundtrip() {
@@ -1392,6 +1493,7 @@ mod tests {
             tar_image: "registry.local/tar:1".into(),
             digest_hour: None,
             auto_start: false,
+            host_write_paths: Vec::new(),
         };
         save_app_settings(&settings).unwrap();
         assert!(dir.join("config/settings.json").exists());
@@ -1449,6 +1551,7 @@ mod tests {
             tar_image: String::new(),
             digest_hour: None,
             auto_start: false,
+            host_write_paths: Vec::new(),
         };
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains("\"closeToTray\":true"));

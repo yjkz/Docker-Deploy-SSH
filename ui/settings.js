@@ -344,6 +344,21 @@
       '运行日志按日期轮转写在应用目录 logs/ 下,部署 / 连接问题可在此排查'));
     main.appendChild(logRow);
 
+    // ── 宿主机可写目录(第三十四批(五))──
+    // 文件管理「部署目录」源的写权限白名单:留空 = 全只读(维持第三十三批口径)
+    var wpRow = el('div', 'form-row');
+    wpRow.appendChild(window.formLabel('宿主机可写目录', 'HOST WRITE', false, 'settings-host-write-paths'));
+    var wpTa = el('textarea', 'form-textarea');
+    wpTa.id = 'settings-host-write-paths';
+    wpTa.rows = 3;
+    wpTa.placeholder = '/opt/app\n/srv/data';
+    wpTa.spellcheck = false;
+    wpRow.appendChild(wpTa);
+    wpRow.appendChild(el('div', 'form-hint',
+      '每行一个绝对路径;文件管理「部署目录」源只允许写入这些目录之内(留空 = 只读,不放开写)。' +
+      '写入前会在服务器上解析真实路径(软链不能逃逸),最多 10 条'));
+    main.appendChild(wpRow);
+
     // ── 更新 UPDATE ──
     main.appendChild(groupTitle('更新', 'UPDATE'));
     main.appendChild(buildField('代理地址', 'PROXY', 'settings-proxy-input', 'text', '',
@@ -678,6 +693,16 @@
     return isNaN(n) ? 0 : n;
   }
 
+  /** 宿主机可写目录白名单:每行一个绝对路径(后端再归一化:丢弃非法项、cap 10) */
+  function hostWritePathsArg() {
+    var ta = document.getElementById('settings-host-write-paths');
+    if (!ta) return [];
+    return String(ta.value || '')
+      .split(/\r?\n/)
+      .map(function (s) { return s.trim(); })
+      .filter(function (s) { return s.length > 0; });
+  }
+
   function onSave() {
     if (st.saving) return;
     var session = st.session; // 捕获模态会话,异步收尾校验是否已过期
@@ -700,7 +725,8 @@
         composeScanMaxDepth: composeDepthArg(),
         tarImage: fieldVal('settings-tar-image-input').trim(),
         digestHour: digestHourArg(),
-        autoStart: isChecked('settings-auto-start')
+        autoStart: isChecked('settings-auto-start'),
+        hostWritePaths: hostWritePathsArg()
       }
     }).then(function () {
       // 过期会话(保存期间模态被关闭甚至重开)→ 静默丢弃,防旧 promise 回写新模态
@@ -835,6 +861,11 @@
         // 代理字段预填 ''(非 '0'),保留 === '' 守卫即可满足「未改动不覆盖」
         var proxy = document.getElementById('settings-proxy-input');
         if (proxy && proxy.value === '') proxy.value = String(s.proxy || '');
+        // 宿主机可写目录白名单(第三十四批(五);无条件回填)
+        var wp = document.getElementById('settings-host-write-paths');
+        if (wp) {
+          wp.value = Array.isArray(s.hostWritePaths) ? s.hostWritePaths.join('\n') : '';
+        }
         showUpdateMessage('info', '');
       })
       .catch(function (err) {

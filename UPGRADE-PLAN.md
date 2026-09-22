@@ -3974,3 +3974,50 @@ ROADMAP(候选池状态、S4/S5 行、速览、命令 114→122 漂移、JS 16�
 | `ui/style.css` | `.files-pick-cell` / `.files-batchbar` / `.files-batch-results` 三列 grid |
 | `ui/help.js` | 文件管理章节新增「多选批量传输」条目 |
 | `wiki/03` / `AGENTS.md` / `ROADMAP.md` / `wiki/README.md` | 模块说明、IAB 缓存教训、状态与速览同步 |
+
+---
+
+# 第三十四批(五):宿主机白名单读写(第三十三批留档清尾,2026-09-22)
+
+> **来源**:第三十四批方案的池外项(第三十三批明确留档「宿主机任意路径文件管理 — 仅开放部署目录且只读,
+> 通用宿主文件管理风险高,另行评估」);用户裁决「**白名单目录可读写**」。**版本**:v6.16.0(同一未发版版本合并)。
+
+## 口径(用户裁决 + 批次内定的默认设计)
+
+- 新增设置项 **`AppSettings.hostWritePaths`**(camelCase;绝对路径前缀白名单,**默认空 = 维持第三十三批只读**;
+  归一化:去空白/尾斜杠、拒相对路径与含 `..`、拒 NUL/换行/超长、去重,cap [`HOST_WRITE_PATHS_MAX`]=10)。
+- **只放开写、不收紧读**(任意路径只读浏览不变);**仅作用于「部署目录」源** —— 容器/卷源不受限。
+- **判定在服务端**:入口闸门 `ensure_host_write_allowed` 先在远端把「目标路径 + 各白名单条目」一次性
+  `readlink -f` canonicalize(失败回落字面路径),再按**目录边界**做前缀匹配(白名单条目取「字面 ∪ canonical」
+  两种形态,允许白名单自身是软链)—— 软链不能逃逸;不通过即拒并给出可操作文案(指向设置中心)。
+- 覆盖前备份(本机 `fm-backups` 3 份)与前端二次确认沿用第三十三批;**读路径零改动**。
+
+## 交付
+
+- **后端**:`config.rs`(`host_write_paths` 字段 + `normalize_host_write_paths` / `path_within_any` 纯函数 + 保存侧归一化
+  + 3 单测)、`manage_files.rs`(`canonicalize_paths_cmd` 纯函数 + `ensure_host_write_allowed` 闸门;`upload_local_file`
+  入口接入(覆盖上传与文本写回);`manage_files_fs_op` 接入并**补上 Third-33 从未实现的 DeployDir 分支**;
+  **审计顺带修掉两个真缺口** —— `upload_local_file` 的写入分支对 DeployDir 是 `unreachable!()`(白名单放开后会 panic)、
+  备份分支对 DeployDir 恒「不存在」(会**静默跳过备份**),均已按宿主机 `cp` 语义实现;`is_read_only` 退休)。
+- **前端**:`settings.js` 「通用」区新增多行输入(`settings-host-write-paths`;每行一个绝对路径,填表/保存载荷
+  `hostWritePaths`)+ `files.js` 打开时读设置做**词法 UI 门控**(按钮禁用、行内改名/删除、提示行:「白名单内可写」/
+  「仅白名单目录可写」两态),真正判定恒在后端。
+- **文档**:wiki/02(模块说明)、wiki/03(设置与文件管理)、wiki/04(AppSettings + 文件命令行为)、wiki/07
+  (决策 88:白名单写 + canonicalize + 取舍;决策 86 标注被本批取代)、help.js(文件管理两处 + 部署目录条目)。
+
+## 验证
+
+- `cargo test` **534 passed / 15 ignored**(531→534,+3 纯函数/契约单测);`cargo clippy` 11 条零新增
+- `node --check` files.js / settings.js;static-integrity 全绿;verify 七脚本 rc=0
+- **桩验证 + judge**:设置中心新字段回填/保存载荷 ✓;文件管理「部署目录」**白名单内可写**(提示行 + 上传/新建可用 + 行内改名/删除)与**白名单外只读**(warn 提示行 + 按钮置灰 + 行内仅下载/编辑)两态均按预期、零未捕获异常;judge **三图全 pass**。`verify/user-facing-copy.js` 的旧「部署目录只读」断言随口径更新为白名单表述(+ 新增批量传输断言),PASS 37/0
+- 真机验证按既有约定由用户统一执行(闸门命令形态已随单测固化)
+
+## 文件改动
+
+| 文件 | 改动 |
+|---|---|
+| `src-tauri/src/config.rs` | `host_write_paths` 字段 + 2 纯函数 + 保存侧归一化 + 3 单测 + 2 处测试字面量补字段 |
+| `src-tauri/src/manage_files.rs` | 闸门(命令拼装 + canonicalize 校验)+ 3 个写入口接入 + 补 DeployDir 写入/备份分支 + 模块文档 |
+| `ui/settings.js` | 「宿主机可写目录」多行输入(构建/回填/保存载荷) |
+| `ui/files.js` | `hostWritePaths` 读取 + `hostWritableHere` 词法门控(按钮/行内操作/两态提示行) |
+| `wiki/02·03·04·07` / `help.js` / `ROADMAP.md` / `wiki/README.md` / `AGENTS.md` | 文档与计数(534)同步 |

@@ -1,4 +1,4 @@
-//! 文件管理(第三十三批):容器 rootfs / 数据卷 / 部署目录(只读)三源 —— 浏览、下载、
+//! 文件管理(第三十三批):容器 rootfs / 数据卷 / 部署目录三源 —— 浏览、下载、
 //! 上传(含覆盖前本机备份)、文本查看与编辑、新建目录/改名/删除。
 //!
 //! **通道选择**(本机 Docker 实测):
@@ -9,7 +9,10 @@
 //! - 数据卷经临时容器挂载(`docker run --rm -v <vol>:/v ...`;tar 镜像来自
 //!   [`crate::migrate_project::pick_tar_image`]:设置项 `tarImage` 优先),卷内操作
 //!   **总有工具可用**。
-//! - 部署目录走宿主机命令与 SFTP(不经 docker);按用户裁决**只读**。
+//! - 部署目录走宿主机命令与 SFTP(不经 docker)。**写权限**(第三十四批(五),用户裁决):
+//!   仅当目标路径落在设置项「宿主机可写目录」白名单内(空列表 = 只读,维持第三十三批
+//!   口径)且远端 `readlink -f` canonicalize 后仍在白名单内时放行 —— 见
+//!   [`ensure_host_write_allowed`];容器/卷源不受此限。
 //!
 //! 传输统一经服务器 `/tmp/dd-fm-<uuid>/` 中转(容器/卷 ↔ 宿主 cp + SFTP),结束时守卫清理;
 //! 进度经 `files-transfer-progress` 事件(完成/失败由命令返回值表达,避免双信号),
@@ -85,10 +88,86 @@ impl SourceKind {
         }
     }
 
-    /// 部署目录**只读**(用户裁决):写路径一律拒绝。
-    pub fn is_read_only(self) -> bool {
+    /// 部署目录写权限(第三十四批(五)):由设置项「宿主机可写目录」白名单决定
+    /// —— 见 [`ensure_host_write_allowed`];容器 / 卷源恒可写。
+    pub fn is_host_source(self) -> bool {
         matches!(self, Self::DeployDir)
     }
+}
+
+// ===== 宿主机写权限闸门(第三十四批(五))=====
+// 第三十三批「部署目录只读」为用户裁决;本批按用户裁决放开为**白名单可写**:
+// 设置项 `hostWritePaths`(config::AppSettings)列出允许写入的绝对路径前缀,
+// 空列表 = 维持只读。写操作的目标路径必须在服务器上 `readlink -f`
+// canonicalize 后落在某条白名单之内(目录边界匹配)—— 防符号链接逃逸;
+// 白名单条目本身也取同一次 canonicalize 结果(允许白名单自身是软链)。
+// 容器 / 卷源不经过本闸门。
+
+/// 拼装 canonicalize 命令:逐路径 `readlink -f`,失败(不存在等)回落原字面
+/// 路径;输出与输入**同序、一行一个**(纯函数,便于单测)。
+///
+/// 不用 `--`(BusyBox readlink 不支持);条目由 [`shell_quote`] 单引号包裹,
+/// 且调用方保证全部是绝对路径(不以 `-` 开头)。
+pub fn canonicalize_paths_cmd(paths: &[String]) -> String {
+    let mut quoted: Vec<String> = Vec::with_capacity(paths.len());
+    for p in paths {
+        quoted.push(shell_quote(p));
+    }
+    format!(
+        "for p in {}; do (readlink -f \"$p\" 2>/dev/null || printf '%s\\n' \"$p\"); done",
+        quoted.join(" ")
+    )
+}
+
+/// 宿主机写权限闸门:目标绝对路径经远端 canonicalize 后必须落在设置项
+/// 「宿主机可写目录」白名单内,否则拒绝并给出可操作文案。
+pub async fn ensure_host_write_allowed(
+    client: &mut SshClient,
+    abs_path: &str,
+) -> Result<(), String> {
+    let allowed = crate::config::normalize_host_write_paths(
+        &crate::config::load_app_settings().host_write_paths,
+    );
+    if allowed.is_empty() {
+        return Err(
+            "部署目录为只读源:未配置「宿主机可写目录」白名单,不支持上传/新建/改名/删除\
+             (可下载或查看;可在设置中心「通用」区添加允许写入的目录)"
+                .to_string(),
+        );
+    }
+    let mut paths: Vec<String> = vec![abs_path.to_string()];
+    paths.extend(allowed.iter().cloned());
+    let cmd = canonicalize_paths_cmd(&paths);
+    let (code, out) = exec_collect(client, &cmd).await?;
+    if code != 0 {
+        return Err(format!(
+            "校验可写目录失败(readlink 退出码 {}): {}",
+            code,
+            out.trim()
+        ));
+    }
+    let lines: Vec<String> = out.lines().map(|l| l.trim().to_string()).collect();
+    if lines.len() < paths.len() || lines[0].is_empty() {
+        return Err("校验可写目录失败(远端输出不完整)".to_string());
+    }
+    let mut prefixes: Vec<String> = Vec::new();
+    for (i, lit) in allowed.iter().enumerate() {
+        prefixes.push(lit.clone());
+        if let Some(canon) = lines.get(i + 1) {
+            if !canon.is_empty() && canon != lit {
+                prefixes.push(canon.clone());
+            }
+        }
+    }
+    let target = &lines[0];
+    if crate::config::path_within_any(target, &prefixes) {
+        return Ok(());
+    }
+    Err(format!(
+        "部署目录为只读源:目标 {} 不在「宿主机可写目录」白名单内(远端实际解析为 {};\
+         可在设置中心「通用」区把所需目录加入白名单)",
+        abs_path, target
+    ))
 }
 
 // ===== 纯函数:路径 / 校验 =====
@@ -780,9 +859,6 @@ async fn upload_local_file(
     backup: bool,
 ) -> Result<serde_json::Value, String> {
     let kind = SourceKind::parse(kind_str)?;
-    if kind.is_read_only() {
-        return Err("部署目录为只读源:不支持上传/修改(可下载或查看)".to_string());
-    }
     let target = validate_target(kind, target)?;
     let dest_rel = normalize_rel_path(dest_rel)?;
     if dest_rel.is_empty() {
@@ -793,6 +869,10 @@ async fn upload_local_file(
     reset_cancelled();
 
     let (_server, mut client) = connect_server(server_id, password_plain).await?;
+    // 宿主机源(部署目录)写闸门:白名单 + 远端 canonicalize(第三十四批(五))
+    if kind.is_host_source() {
+        ensure_host_write_allowed(&mut client, &source_abs_path(kind, &target, &dest_rel)).await?;
+    }
     let staging = staging_dir(&op_id);
     let cleanup = RemoteDirGuard(cleanup_cmd(&staging));
 
@@ -862,7 +942,21 @@ async fn upload_local_file(
                 )
                 .await?;
             }
-            SourceKind::DeployDir => unreachable!("入口已拒"),
+            SourceKind::DeployDir => {
+                // 宿主机目标(第三十四批(五)):直接 cp(白名单闸门已在入口按
+                // canonicalize 结果放行;目标目录须已存在 —— 与卷分支同口径)
+                run_cmd_ok(
+                    &mut client,
+                    &format!(
+                        "cp {} {}",
+                        shell_quote(&staged),
+                        shell_quote(&source_abs_path(kind, &target, &dest_rel))
+                    ),
+                    FM_TRANSFER_TIMEOUT_SECS,
+                    "写入目标文件失败(目标目录须已存在)",
+                )
+                .await?;
+            }
         }
 
         Ok(serde_json::json!({
@@ -917,7 +1011,14 @@ async fn try_backup_existing(
                 .await
                 .is_ok()
         }
-        SourceKind::DeployDir => false,
+        SourceKind::DeployDir => run_cmd_ok(
+            client,
+            &format!("test -f {}", shell_quote(&abs)),
+            FM_LIST_TIMEOUT_SECS,
+            "检查目标文件失败",
+        )
+        .await
+        .is_ok(),
     };
     if !exists {
         return Ok(None);
@@ -940,7 +1041,11 @@ async fn try_backup_existing(
                 Some(&staging),
             )
         }
-        SourceKind::DeployDir => unreachable!(),
+        SourceKind::DeployDir => format!(
+            "cp {} {}",
+            shell_quote(&abs),
+            shell_quote(&remote_join(&staging, &staged_name))
+        ),
     };
     if run_cmd_ok(client, &fetch_cmd, FM_TRANSFER_TIMEOUT_SECS, "备份原文件失败")
         .await
@@ -1082,9 +1187,6 @@ pub async fn manage_files_write_text(
     backup: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let kind = SourceKind::parse(&kind)?;
-    if kind.is_read_only() {
-        return Err("部署目录为只读源:不支持上传/修改(可下载或查看)".to_string());
-    }
     let target = validate_target(kind, &target)?;
     let rel = normalize_rel_path(&path)?;
     if rel.is_empty() {
@@ -1125,7 +1227,7 @@ pub async fn manage_files_write_text(
 
 // ===== 命令:新建目录 / 改名 / 删除 / 取消 =====
 
-/// 单条文件操作(`mkdir` / `rename` / `delete`;部署目录只读)。
+/// 单条文件操作(`mkdir` / `rename` / `delete`;部署目录经白名单闸门)。
 #[tauri::command]
 pub async fn manage_files_fs_op(
     server_id: String,
@@ -1137,9 +1239,6 @@ pub async fn manage_files_fs_op(
     new_name: Option<String>,
 ) -> Result<(), String> {
     let kind = SourceKind::parse(&kind)?;
-    if kind.is_read_only() {
-        return Err("部署目录为只读源:不支持新建/改名/删除(可下载或查看)".to_string());
-    }
     let target = validate_target(kind, &target)?;
     let rel = normalize_rel_path(&path)?;
     if rel.is_empty() {
@@ -1158,7 +1257,11 @@ pub async fn manage_files_fs_op(
             let cmd = volume_run_cmd(&image, &target, &script, None);
             run_cmd_ok(&mut client, &cmd, FM_LIST_TIMEOUT_SECS, "文件操作失败").await?;
         }
-        SourceKind::DeployDir => unreachable!("入口已拒"),
+        SourceKind::DeployDir => {
+            // 白名单闸门(第三十四批(五)):目标路径 canonicalize 后须在白名单内
+            ensure_host_write_allowed(&mut client, &abs).await?;
+            run_cmd_ok(&mut client, &script, FM_LIST_TIMEOUT_SECS, "文件操作失败").await?;
+        }
     }
     Ok(())
 }
