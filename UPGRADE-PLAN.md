@@ -4162,3 +4162,104 @@ registry 协议承担,不赌 `load` 容错)。
 - 一条**方法学提醒**留给后续批次:浏览器 IAB 会按 URL 缓存,改 CSS 后必须整页 `reload()` 或给样式表加
   `?v=` —— 本批第一次截「部署」区时误以为 88vh 未生效,实为旧样式表
 
+
+---
+
+# 第三十六批(0 期):L1 层级增量传输可行性 spike(2026-09-23,纯文档)
+
+> **来源**:L1 评估(第三十四批(六))结论为「值得做但建议单独立批」,用户裁决「先 spike 打掉唯一证伪点」。
+> **版本**:无 bump(零生产代码、零命令、零测试变更;v6.17.0 已发版)。
+> **授权边界**:用户指定**仅可用 kkhuawei 与 tencent2** 两台服务器,且**不得使用服务器现有镜像**
+> (自建受控镜像),并强调**注意内存限制**;实验后须归零。
+
+## 一、要回答的问题
+
+评估阶段只证过「本机 Docker Desktop(containerd store)+ 同机 load」这一格。真正的证伪点是:
+**缺 blob 的裁剪包,目标机的 `docker load` 认不认** —— 尤其 Linux 服务器上仍主流的**经典 image store**。
+
+## 二、环境矩阵(只读探查所得)
+
+| 角色 | 机器 | OS | Docker | 存储驱动 / 判据 | image store |
+|---|---|---|---|---|---|
+| 本地(开发机) | Windows + Docker Desktop | — | 29.7.2 | `overlayfs` | **containerd** |
+| 目标 A | tencent2 | OpenCloudOS 9.6 | 28.0.1 | `overlay2` @ `/var/lib/docker` | **经典** |
+| 目标 B | kkhuawei | Ubuntu 24.04 | 29.8.1 | `overlayfs` + `io.containerd.snapshotter.v1` | **containerd**(Linux 真机) |
+
+**特征检测判据(本轮直接产出)**:`docker info --format '{{json .DriverStatus}}'` 中含
+`["driver-type","io.containerd.snapshotter.v1"]` → containerd;否则为经典(辅助信号:`{{.Driver}}` 是
+`overlayfs` 还是 `overlay2`)。项目内已有查服务器版本的先例(`manage_files.rs:1626`)。
+
+## 三、受控镜像(全部自建,`FROM scratch`,零拉取)
+
+| | 基底层 | 应用层 | v1→v2 差异 |
+|---|---|---|---|
+| 小镜像 | 3 MB 随机 | 130 B | 仅应用层一行 |
+| 大镜像 | **233 MB**(高可压缩) | 小 | 仅应用层一行 |
+
+`FROM scratch` 保证无任何外部镜像依赖;两版基底层 diffID 逐字节相同(实测
+`8545326772665328…` / `1e8fb136ca91…` 两轮均一致),精确复刻「重建但层大量重叠」的真实形态。
+
+## 四、包布局(实测:两种 store 产的包结构不同)
+
+| 包来源 | 布局 | 层 blob 命名 | 层是否压缩 |
+|---|---|---|---|
+| containerd 产(Docker Desktop / kkhuawei) | OCI + 兼容 `manifest.json` | **压缩摘要**(`bc914f20…`) | 是 |
+| 经典 store 产(tencent2) | OCI + 兼容 `manifest.json` + `repositories` | **diffID**(`1e8fb136…`) | **否(未压缩)** |
+
+两种包都靠「blob→diffID」映射与目标机对账:containerd 产靠 `config.rootfs.diff_ids` 与
+`manifest.layers[]` **同序配对**;经典产 **blob 名即 diffID**,零解析成本。
+
+## 五、正向矩阵:6/6 全绿
+
+| # | 包 | 目标 store | 传输体积 | load | 内容级验证 |
+|---|---|---|---|---|---|
+| 1 | containerd 产·裁剪 | containerd | 20,480 B | ✅ rc=0 | ✅ 基底层 md5 一致 |
+| 2 | containerd 产·裁剪 | **经典** | 20,480 B | ✅ rc=0 | ✅ 基底层 md5 一致 |
+| 3 | 经典产·裁剪 | 经典 | 20,480 B | ✅ rc=0 | ✅ 基底层 md5 一致 |
+| 4 | 经典产·裁剪 | containerd | 20,480 B | ✅ rc=0 | ✅ 基底层 md5 一致 |
+| 5 | **大镜像**·裁剪(233 MB 层) | containerd | **2,243 B**(gzip) | ✅ **<1s** | ✅ **233 MB 层 md5 一致** |
+| 6 | **大镜像**·裁剪 | **经典** | **2,243 B**(gzip) | ✅ **<1s** | ✅ **233 MB 层 md5 一致** |
+
+- 全量对照:大镜像全量包 gzip 后 5,251,181 B → 增量包 **2,243 B(0.043%)**;load 耗时 1s → **<1s**。
+- **内容级验证方法**(本轮方法学):`docker create`(配 `/bin/true`)+ `docker cp <ctr>:/path - | tar -xO |
+  md5sum` —— **`docker cp` 到 stdout 输出的是 tar 流,直接 md5 会得到"两台机器互相一致但都不是原文件"的假结果**(首轮踩过)。
+- 跨格式无碍:压缩 blob 包 / 未压缩 blob 包,两种 store 都能吃下。
+- 内存:全程波动 ±10~20 MB(`docker load` 流式落盘),两台均无压力。
+
+## 六、负向矩阵:两种 store 的失败语义**完全相反**(本轮最关键发现)
+
+| 目标 store | 退出码 | 报错 | 半成品镜像 | 恢复 |
+|---|---|---|---|---|
+| **containerd** | **0** ❌ | **stdout**:`Error unpacking image dd-l1big:v2: … failed to get reader from content store: content digest sha256:461805…: not found` | **留下带标签的坏镜像**(`docker images`/`inspect` 都正常,层却缺) | 重灌全量包 ✅(共享 blob 顺带治好旧坏镜像) |
+| **经典** | **1** ✓ | **stderr**:`open /var/lib/docker/tmp/docker-import-<rand>/blobs/sha256/461805…: no such file or directory` | 无(镜像未创建) | — |
+
+**含义**:`docker load` 的退出码**不足以判定成败** —— containerd 侧是「rc=0 + 坏镜像 + stdout 一句错」,
+若照旧只看 rc,1 期会把一次失败的部署报成成功,并把一个坏镜像留在服务器上(后续 compose up 报错难溯源)。
+
+## 七、顺带发现(不属 L1,独立记账):镜像 ID 口径跨 store 不一致
+
+| store | `.Id` 语义 | 实测(同一镜像 dd-l1big:v2) |
+|---|---|---|
+| containerd | 包内 `index.json` 的 **manifest 摘要** | `db0a685bdb3e…`(= 本地 `.Id`) |
+| 经典 | 包内 legacy `manifest.json` 的 **Config 摘要** | `c926efd5d737…` |
+
+小镜像同样复现(`12196c7b` vs `140fd7e4`)。影响面**不属 L1**:本地 Docker Desktop(4.34+ 默认
+containerd store)与经典 store 服务器之间,`same_image_id` 恒不成立 → 智能传输**静默退化为全量上传**;
+「按 ID 收敛」的回滚预检也可能误判「回不去」。需另立条目复核(无 attestation 镜像、`docker images
+--no-trunc` 与 `.Id` 是否同源)。
+
+## 八、对 1 期实现的直接结论
+
+1. **不需要按 store 做能力门控**:两种 store 都接受裁剪包(6/6),特征检测**仅用于选择失败检测策略**。
+2. **判据 = diffID**(store 无关,唯一可靠);镜像 ID 因跨 store 不可用(见第七节)。
+3. **失败检测必须「rc + 文本」双判**:containerd 扫 stdout 的 `Error unpacking image`,经典侧扫
+   stderr 的 `no such file or directory`;**重试前先 `docker rmi` 清掉半成品**(否则坏标签滞留)。
+4. **兜底 = 重灌全量包**,实测有效且不需要额外清理(共享 blob 会自愈);呼应已定决策「本地同时留整包」。
+5. 压缩形态、包布局来源都不构成障碍 —— 裁剪实现只需认「blob 名 → diffID」两条路径。
+
+## 九、归零与边界
+
+- 两台服务器:测试镜像全删(`dd-l1*` 残留 **0**)、测试容器全删、`/tmp/dd-l1-spike` 删除;
+  images/containers 计数回到基线(**tencent2 19/3**、**kkhuawei 12/1**),可用内存回基线。
+- 全程未碰:现有镜像、现有容器、卷、网络、compose 项目、daemon 配置;**未执行任何 prune**。
+- 本地:测试镜像已删,包与临时脚本留在系统 temp(不入库)。
