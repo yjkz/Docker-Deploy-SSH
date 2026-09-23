@@ -4451,3 +4451,26 @@ containerd store)与经典 store 服务器之间,`same_image_id` 恒不成立 �
   不静默);③增量预查询连接在打包期间空置(ssh 未配 keepalive,长打包后可能被空闲
   超时掐断;上传失败可续传,不损坏数据)。
 
+### 追加(三):「记录在案」三项全部修正(用户裁决「全部修正」;同日,随 v6.18.0 发版)
+
+- **① 断点模式下打包/导出失败的孤儿 tar**:原 `TempFileGuard::keep` 在断点活跃时
+  构造即不删 —— 打包/导出失败(断点产物尚未写盘)时留下的 tar 既不在断点清理表里、
+  也不在成功收尾清理表里,只能手工清临时目录。**修复**:守卫语义改「**先 armed 后
+  disarm**」—— 一律 `new` 构造(失败/取消时 Drop 清半成品),**产物登记进断点之后**
+  调 `disarm()` 转保留:单镜像在写 `art` + `checkpoint_save(3)` 后 disarm,整栈
+  `pack_local_images` 在成功返回前对 keep 模式统一 disarm(含每个兜底整包的守卫)。
+  `TempFileGuard::keep` 随之删除(测试改测 disarm 语义)。
+- **② 兜底重传前的 `docker rmi -f <tag>` 可能误删上一版**:装载失败时服务器上未必
+  有本次坏镜像(经典 store 缺层失败时镜像根本未创建 / 半成品未注册),无脑 rmi 会把
+  该标签原指向的**上一版镜像**删掉,让更早的归档落 `Missing`。**修复**:新增
+  `remote_id_of_ref`(inspect 取当前 ID),**只有该引用当前指向本次期望的镜像 ID 时
+  才删**(单镜像用 `deploy_expected_id`;整栈用装载循环前构建的 `expected_ids`,与
+  pack_list 同序);否则跳过并记日志(共享 blob 由整包重传自愈,不必冒险)。
+- **③ 长打包期间复用连接被空闲超时掐断**:增量预查询建的连接空置数分钟后再用于
+  步骤 3 上传,ssh 未配 keepalive 时可能已被服务器/中间设备断开。**修复**:
+  `SshClient::connect` 的 russh `client::Config` 设 `keepalive_interval = 30s`
+  (max 3 次未响应即断开,取 russh 默认)—— 覆盖全部长连接场景,心跳开销可忽略。
+
+验证:`cargo test` 552 passed / `cargo clippy --lib` 11 条与基线一致(过程中新引入的
+一条 `field assignment outside of initializer` 已按建议改 struct update 语法,零残留)。
+

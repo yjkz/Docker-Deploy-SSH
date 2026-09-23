@@ -1310,8 +1310,9 @@ fn emit_log(app: &AppHandle, msg: &str) {
 
 /// 本地临时 tar 的 Drop 守卫:作用域结束(成功或失败)时删除文件。
 ///
-/// [`TempFileGuard::keep`](断点续传活跃时使用)不删除 —— 临时 tar 供失败后
-/// 续传复用,由成功收尾([`checkpoint_cleanup_on_success`])或
+/// 断点续传场景用「先 armed 后登记」两步(第三十九批):产物**登记进断点产物之前**
+/// 一律 armed(Drop 删 —— 失败/取消时不留孤儿);登记完成后 [`TempFileGuard::disarm`]
+/// 转保留,由成功收尾([`checkpoint_cleanup_on_success`])或
 /// `deploy_resume_discard` 显式清理。
 pub(crate) struct TempFileGuard {
     path: PathBuf,
@@ -1325,9 +1326,11 @@ impl TempFileGuard {
         Self { path, keep: false }
     }
 
-    /// 断点活跃时使用的守卫:Drop 不删除。
-    fn keep(path: PathBuf) -> Self {
-        Self { path, keep: true }
+    /// 转为「保留」模式(第三十九批):文件**已登记进断点产物**(或交付调用方管理),
+    /// Drop 不再删除。供「先 armed 后登记」的流程使用 —— 打包/导出失败(尚未登记)
+    /// 时仍由 Drop 清掉半成品,避免断点清理表里没有它们的孤儿文件。
+    fn disarm(&mut self) {
+        self.keep = true;
     }
 
     /// 公开构造(供 [`crate::migrate_project`] 使用;语义同 [`Self::new`])。

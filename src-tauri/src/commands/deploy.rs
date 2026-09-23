@@ -372,13 +372,11 @@ async fn run_deploy_steps(
                 ensure_not_cancelled(app)?;
                 let tar_name = format!("{}.tar.gz", uuid::Uuid::new_v4());
                 let out_path = std::env::temp_dir().join(&tar_name);
-                // 断点续传开启时保留本地 tar 供失败后复用(成功/放弃时显式清理);
-                // 关闭时用完即删:Drop guard 覆盖成功/失败全部路径(旧行为)
-                let guard = if checkpoint {
-                    TempFileGuard::keep(out_path.clone())
-                } else {
-                    TempFileGuard::new(out_path.clone())
-                };
+                // 先 armed 构造(第三十九批):导出失败/取消时 Drop 清掉**尚未登记进
+                // 断点**的半成品 —— 此前按 checkpoint 直接造 keep 守卫,失败路径上
+                // 这些包成了孤儿(断点清理表里没有它们,成功收尾也不会碰)。
+                // 导出成功、产物写入断点后再 disarm(交给断点/成功收尾管理)。
+                let mut guard = TempFileGuard::new(out_path.clone());
 
                 // 空间预检:导出目标盘(临时目录所在盘)剩余空间 ≥ 镜像大小 × 1.5
                 // (镜像大小暂存,供步骤 3 的远端磁盘预检复用,避免二次查询)
@@ -448,12 +446,8 @@ async fn run_deploy_steps(
                                     exp.full_bytes / 1024 / 1024
                                 ),
                             );
-                            // 兜底整包:与主 tar 同生命周期策略(断点期保留,成功即删)
-                            _fallback_guard = Some(if checkpoint {
-                                TempFileGuard::keep(full_path.clone())
-                            } else {
-                                TempFileGuard::new(full_path.clone())
-                            });
+                            // 兜底整包:与主 tar 同生命周期策略(先 armed,登记断点后 disarm)
+                            _fallback_guard = Some(TempFileGuard::new(full_path.clone()));
                             fallback_full = Some(full_path);
                             exp.trimmed_bytes
                         }
@@ -471,6 +465,11 @@ async fn run_deploy_steps(
                     .map(|p| p.to_string_lossy().to_string());
                 if checkpoint {
                     checkpoint_save(&key, MODE_SINGLE, 3, &server, &project, artifacts_value(&art));
+                    // 产物已登记进断点(第三十九批):转为保留模式,失败时留给续传复用
+                    guard.disarm();
+                    if let Some(g) = _fallback_guard.as_mut() {
+                        g.disarm();
+                    }
                 }
                 Some((tar_name, out_path, Some(guard), image_bytes))
             }
@@ -717,6 +716,28 @@ pub(crate) async fn query_remote_layer_ids(
 ) -> Result<std::collections::HashSet<String>, String> {
     let (_code, out) = exec_collect(client, REMOTE_LAYERS_CMD).await?;
     Ok(crate::incremental::parse_layer_inventory(&out))
+}
+
+/// 查远端某引用**当前指向**的镜像 ID(`docker image inspect --format '{{.Id}}'`;
+/// 引用不存在 / 查询失败 → `None`)。
+///
+/// 第三十九批(防误删):增量装载失败后的「半成品清理」只应删**本次**留下的坏镜像
+/// —— 该引用当前指向的必须是本地采集的本次镜像 ID;否则它指向的是上一版
+/// (经典 store 缺层失败时镜像根本未创建,或半成品未注册),删掉会让更早的归档
+/// 落 `Missing`(共享 blob 会由整包重传自愈,无需冒这个险)。
+async fn remote_id_of_ref(client: &mut SshClient, reference: &str) -> Option<String> {
+    let (code, out) = exec_collect(client, &docker_inspect_id_cmd(reference))
+        .await
+        .ok()?;
+    if code != 0 {
+        return None;
+    }
+    let id = out.trim();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
+    }
 }
 
 /// 层级增量导出(第三十七批):产出裁剪包(上传)+ 整包(兜底)。
@@ -1082,13 +1103,35 @@ async fn server_deploy(
                             full_local.display()
                         ));
                     }
-                    // 半成品清理:坏镜像带着标签留在服务器上会让后续 compose up 报错难溯源
+                    // 半成品清理(第三十九批加按 ID 核对):**只删本次留下的坏镜像** ——
+                    // 该引用当前指向的必须是本次期望的镜像 ID;否则它是上一版的标签
+                    // (经典 store 缺层失败时镜像根本未创建 / 半成品未注册),删掉会让
+                    // 更早的归档落 Missing(共享 blob 会由重传自愈,无需冒这个险)
                     if let Some(clean_ref) =
                         idempotent_load_ref.or(deploy_expected_id.map(|(_, r)| r))
                     {
-                        let rmi = format!("docker rmi -f {}", shell_single_quote(clean_ref));
-                        if let Err(e) = exec_forwarded(app, client, &rmi, 120).await {
-                            emit_log(app, &format!("警告:清理半成品镜像失败({}),继续重传整包", e));
+                        let is_ours = match (
+                            deploy_expected_id,
+                            remote_id_of_ref(client, clean_ref).await,
+                        ) {
+                            (Some((expected_id, _)), Some(cur)) => {
+                                same_image_id(&cur, expected_id)
+                            }
+                            _ => false,
+                        };
+                        if is_ours {
+                            let rmi = format!("docker rmi -f {}", shell_single_quote(clean_ref));
+                            if let Err(e) = exec_forwarded(app, client, &rmi, 120).await {
+                                emit_log(app, &format!("警告:清理半成品镜像失败({}),继续重传整包", e));
+                            }
+                        } else {
+                            emit_log(
+                                app,
+                                &format!(
+                                    "半成品清理跳过:{} 当前不是本次镜像(或无法核对),不动它(避免误删上一版)",
+                                    clean_ref
+                                ),
+                            );
                         }
                     }
                     upload_tar(app, client, full_local, "/tmp", full_remote, "整包重传上传进度").await?;
@@ -2220,6 +2263,19 @@ async fn run_deploy_stack_steps(
     }
 
     // ---- 步骤 4:装载 ----
+    // 本次各包的期望镜像 ID(与 tars.files 同序;第三十九批:半成品清理按 ID 核对用)。
+    // 与 pack_unchanged 同款对齐(服务名 → local_choices 下标 → local_ids;续传时
+    // local_ids 已就地重采,不会为空)。
+    let expected_ids: Vec<Option<String>> = pack_list
+        .iter()
+        .map(|s| {
+            local_choices
+                .iter()
+                .position(|c| c.service == s.service)
+                .and_then(|i| local_ids.get(i).cloned())
+                .flatten()
+        })
+        .collect();
     // 归档最终结果(第三十八批;与 tars.files 同序):`Some(名)` = 归档里有该服务的
     // 自包含包;`None` = 无(重建失败后已清理);`archive_needs[i]` 非空 = 该服务的
     // 归档依赖服务器已有层(重建失败,回滚预检据此核对)。
@@ -2311,10 +2367,30 @@ async fn run_deploy_stack_steps(
                             full_local.display()
                         ));
                     }
-                    // 半成品清理:坏镜像带着标签留在服务器上会让后续 compose up 报错难溯源
-                    let rmi = format!("docker rmi -f {}", shell_single_quote(&art.images[i]));
-                    if let Err(e) = exec_forwarded(app, &mut client, &rmi, 120).await {
-                        emit_log(app, &format!("警告:清理半成品镜像失败({}),继续重传整包", e));
+                    // 半成品清理(第三十九批加按 ID 核对):**只删本次留下的坏镜像** ——
+                    // 该引用当前指向的必须是本次期望的镜像 ID;否则它指向上一版
+                    // (经典 store 缺层失败时镜像根本未创建),删掉会让更早的归档落
+                    // Missing(共享 blob 会由重传自愈,无需冒这个险)
+                    let is_ours = match (
+                        expected_ids.get(i).cloned().flatten(),
+                        remote_id_of_ref(&mut client, &art.images[i]).await,
+                    ) {
+                        (Some(expected_id), Some(cur)) => same_image_id(&cur, &expected_id),
+                        _ => false,
+                    };
+                    if is_ours {
+                        let rmi = format!("docker rmi -f {}", shell_single_quote(&art.images[i]));
+                        if let Err(e) = exec_forwarded(app, &mut client, &rmi, 120).await {
+                            emit_log(app, &format!("警告:清理半成品镜像失败({}),继续重传整包", e));
+                        }
+                    } else {
+                        emit_log(
+                            app,
+                            &format!(
+                                "半成品清理跳过:{} 当前不是本次镜像(或无法核对),不动它(避免误删上一版)",
+                                art.images[i]
+                            ),
+                        );
                     }
                     // 兜底整包远端名必须带 `.full` 独立后缀 —— 与裁剪包同名会让
                     // SFTP 的「远端大小比对」续传把整包续在裁剪包屁股后面而损坏
@@ -2735,15 +2811,13 @@ async fn pack_local_images(
         let out_path = std::env::temp_dir().join(&tar_name);
         outputs.push((out_path, tar_name));
     }
+    // 一律 armed 构造(第三十九批):打包失败/取消时 Drop 清掉**尚未登记进断点**的
+    // 半成品 —— 此前按 keep_guards 直接造 keep 守卫,失败路径上这些 tar 是孤儿
+    // (断点产物尚未写盘,「放弃断点」与成功收尾都不会碰它们)。成功返回前对
+    // keep 模式统一 disarm(交给断点/成功收尾管理)。
     let mut guards: Vec<TempFileGuard> = outputs
         .iter()
-        .map(|(p, _)| {
-            if keep_guards {
-                TempFileGuard::keep(p.clone())
-            } else {
-                TempFileGuard::new(p.clone())
-            }
-        })
+        .map(|(p, _)| TempFileGuard::new(p.clone()))
         .collect();
     let images: Vec<String> = local.iter().map(|s| s.image.clone()).collect();
 
@@ -2812,13 +2886,9 @@ async fn pack_local_images(
                         ),
                     );
                 }
-                // 兜底整包与主包同生命周期(keep = 断点期保留,成功/放弃时显式清理)
+                // 兜底整包与主包同生命周期(一律 armed,成功返回前统一 disarm —— 见函数头)
                 if let Some(full) = &one.full {
-                    guards.push(if keep_guards {
-                        TempFileGuard::keep(full.clone())
-                    } else {
-                        TempFileGuard::new(full.clone())
-                    });
+                    guards.push(TempFileGuard::new(full.clone()));
                 }
                 if let Some(slot) = results.get_mut(idx) {
                     *slot = Some(one);
@@ -2853,6 +2923,13 @@ async fn pack_local_images(
     }
     if let Some(e) = first_error {
         return Err(e);
+    }
+    // 成功:keep 模式下把守卫转「保留」(第三十九批)—— 产物即将写入断点产物,
+    // 失败/取消时 Drop 清半成品的行为只覆盖「尚未登记」的那一段(见函数头)
+    if keep_guards {
+        for g in guards.iter_mut() {
+            g.disarm();
+        }
     }
     // 传输方式汇总(只在实际尝试过裁剪的口径下打印;未启用/查询失败不改日志)
     if remote_layers.is_some() {

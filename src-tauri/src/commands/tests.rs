@@ -2572,9 +2572,12 @@ services:
         let p2 = std::env::temp_dir().join(format!("dd-guard-{}.tmp", uuid::Uuid::new_v4()));
         std::fs::write(&p2, b"x").unwrap();
         {
-            let _g = TempFileGuard::keep(p2.clone());
+            // 第三十九批:保留语义由改造后的 disarm 承担(new → 登记后 disarm)
+            let mut g = TempFileGuard::new(p2.clone());
+            g.disarm();
+            let _g = g;
         }
-        assert!(p2.exists(), "TempFileGuard::keep 不应在 Drop 时删除文件");
+        assert!(p2.exists(), "disarm 后 Drop 不应删除文件(交给断点/成功收尾管理)");
         std::fs::remove_file(&p2).ok();
     }
 

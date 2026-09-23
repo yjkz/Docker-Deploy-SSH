@@ -190,7 +190,14 @@ impl SshClient {
         key_passphrase: Option<&str>,
         observed_host_key: Arc<OnceLock<String>>,
     ) -> Result<Self, String> {
-        let config = Arc::new(client::Config::default());
+        // 连接保活(第三十九批):打包/大镜像传输期间连接可能空置数分钟,服务器或
+        // 中间设备按空闲超时掐断会让「复用连接」的路径(增量预查询 → 步骤 3 上传、
+        // 打包 → 上传)在真正用到时报连接错误 —— keepalive 每 30s 发一次心跳
+        // (max 3 次无响应即断开,取 russh 默认),开销可忽略。
+        let config = Arc::new(client::Config {
+            keepalive_interval: Some(std::time::Duration::from_secs(30)),
+            ..client::Config::default()
+        });
         let handler = ClientHandler {
             expected: cfg.host_key_sha256.clone(),
             observed: observed_host_key,
