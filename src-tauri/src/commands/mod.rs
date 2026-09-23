@@ -291,6 +291,9 @@ pub struct DeployRequest {
     /// (仅 `use_date_tag = false` 时生效,日期标签是全新 tag 必然有变化;
     /// 缺省 = false,向后兼容)
     pub skip_unchanged: Option<bool>,
+    /// 层级增量传输(第三十七批):勾选才裁层,**不勾 = 与原来一样整包**。
+    /// 缺省(`None`)= 用设置里的全局开关(`AppSettings.incremental_transfer`)。
+    pub incremental: Option<bool>,
 }
 
 /// `deploy_stack` 命令的请求参数(整栈部署)。
@@ -305,6 +308,9 @@ pub struct StackDeployRequest {
     /// 智能传输:未变化(远端同标签且镜像 ID 一致)的服务跳过打包/上传/装载
     /// (缺省 = false,向后兼容)
     pub skip_unchanged: Option<bool>,
+    /// 层级增量传输(第三十七批):同 [`DeployRequest::incremental`]。
+    /// **整栈管线尚未接入**(见 UPGRADE-PLAN 第三十七批「未做」),该字段先收着不生效。
+    pub incremental: Option<bool>,
     /// 智能传输的强制留档:未变化的服务仍打包上传进 release 目录(供回滚
     /// `docker load`),仅跳过装载步骤(缺省 = false,向后兼容)
     pub force_archive: Option<bool>,

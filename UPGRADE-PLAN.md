@@ -4300,3 +4300,23 @@ containerd store)与经典 store 服务器之间,`same_image_id` 恒不成立 �
 
 - `cargo test` **543 passed / 0 failed**(534→543,+9 内核单测;ignored 15 不变)
 - 前端 `node --check` + `verify/static-integrity` + `verify/form-validation` 全绿
+
+## 追加:每次部署可勾选 + 措辞一致性(用户 2026-09-23 要求)
+
+**勾选框**(部署页,与「智能传输」并排):`deploy-incremental`(单镜像)/ `deploy-stack-incremental`(整栈),
+**勾选才裁层,不勾 = 与原来一样整包**;请求字段 `DeployRequest.incremental: Option<bool>`,
+缺省(None)才回落到设置里的全局开关 `AppSettings.incremental_transfer`。批量/定时/续传路径传 `None`(走全局)。
+
+**措辞一致性(待做,与回滚侧搭配)** —— 统一词表,三处surface 同一口径:
+
+| 场景 | 用语 | 落在哪里 |
+|---|---|---|
+| 传输方式 | **整包传输** / **增量传输(跳过 N 层,省 X MB)** | 部署日志 `deploy-log`(已实现单镜像) |
+| 兜底 | **增量装载失败 → 整包重传**(附原因原文) | 部署日志 + 失败时的错误文案(已实现) |
+| 归档 | **完整归档(自包含,回滚可直接装载)** / **增量归档(依赖服务器已有层)** | release manifest + 回滚预检 |
+| 回滚来源(既有四态) | 归档内有包 / 服务器仍持有镜像 ID / 标签待指回 / 回不去 | `rollback_precheck` 文案 |
+| 回滚来源(**新增第五态**) | **增量包待补层** —— 归档里的包是增量包且服务器缺其中的层 | `rollback_precheck` 必须显式列出并要求确认 |
+
+**不变式(必须守)**:`releases/` 里的包默认必须是**完整归档** —— 因此整栈接入裁剪时,
+必须在装载成功后由服务器 `docker save` **重建整包**再写归档;重建失败则该镜像的 manifest
+`file` 置 `None` 并在预检里落成「增量包待补层」态,**绝不能留一个缺层的包冒充可回滚归档**。

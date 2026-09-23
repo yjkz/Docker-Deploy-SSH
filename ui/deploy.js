@@ -1764,6 +1764,7 @@
   function startDeploy(img, server, project) {
     var dateTag = document.getElementById('deploy-date-tag');
     var skipChk = document.getElementById('deploy-skip-unchanged');
+    var incChk = document.getElementById('deploy-incremental');
     var useDateTag = !!(dateTag && dateTag.checked);
     var req = {
       image: String(img.repository) + ':' + String(img.tag),
@@ -1773,6 +1774,8 @@
       use_date_tag: useDateTag,
       // 智能传输(勾选框已随日期标签联动禁用,此处按条件再兜底一次)
       skip_unchanged: !!(skipChk && skipChk.checked && !useDateTag),
+      // 层级增量传输(第三十七批):勾选才裁层;不勾 = 与原来一样整包
+      incremental: !!(incChk && incChk.checked),
       password_plain: null
     };
 
@@ -1921,6 +1924,7 @@
     var services = Array.isArray(st.stack.services) ? st.stack.services : [];
     var skipChk = document.getElementById('deploy-stack-skip');
     var archChk = document.getElementById('deploy-stack-archive');
+    var incChk = document.getElementById('deploy-stack-incremental');
     // 版本标题/说明(第十一批):发起时快照输入(均可选,标题仅作展示备注,
     // 不影响归档时间戳命名);批量部署无逐台备注,恒不写
     var titleEl = document.getElementById('deploy-release-title');
@@ -1953,6 +1957,8 @@
       // 智能传输:未变化服务跳过打包/上传/装载;强制留档时仍打包进 release 供回滚
       skip_unchanged: !!(skipChk && skipChk.checked),
       force_archive: !!(archChk && archChk.checked),
+      // 层级增量传输(第三十七批):整栈同样按勾选;不勾 = 整包
+      incremental: !!(incChk && incChk.checked),
       password_plain: null
     };
 

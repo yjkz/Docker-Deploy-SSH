@@ -318,7 +318,10 @@ async fn run_deploy_steps(
     // 关闭 = 历史行为。开启时三件事:①导出前建连取远端已有层清单(连接留给步骤 3 复用)
     // ②导出阶段裁掉命中层(同时留整包兜底) ③装载阶段 rc+文本双判,失败改用整包重传。
     // 任何一步出意外都不阻断部署,只是退回整包(裁剪是优化,不是正确性依赖)。
-    let incremental_on = crate::config::load_app_settings().incremental_transfer;
+    // 勾选框优先:不勾 = 与原来一样整包(缺省才看设置里的全局开关)
+    let incremental_on = req
+        .incremental
+        .unwrap_or_else(|| crate::config::load_app_settings().incremental_transfer);
     let mut incremental_client: Option<SshClient> = None;
     let mut remote_layers: std::collections::HashSet<String> = std::collections::HashSet::new();
     // 兜底整包(仅裁剪时产生):成功即删;断点期与主 tar 同策略保留供续传

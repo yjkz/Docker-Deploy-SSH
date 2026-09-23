@@ -331,6 +331,8 @@ pub fn deploy_resume_start(
     match cp.mode.as_str() {
         MODE_SINGLE => {
             let req = DeployRequest {
+                // 续传:走全局开关(原始勾选未落断点;已有裁剪包与其兜底包仍按记录复用)
+                incremental: None,
                 image: ctx.single.origin_ref.clone(),
                 repository: ctx.single.repository.clone(),
                 server_id: cp.server_id.clone(),
@@ -347,6 +349,7 @@ pub fn deploy_resume_start(
         }
         MODE_STACK => {
             let req = StackDeployRequest {
+                incremental: None,
                 project_id: cp.project_id.clone(),
                 server_id: cp.server_id.clone(),
                 services: ctx.stack.services.clone(),

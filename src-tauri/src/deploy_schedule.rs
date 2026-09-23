@@ -475,6 +475,8 @@ async fn run_schedule_deploy(
     if sched.mode == "single" {
         let (repository, _tag) = crate::stack::split_image_ref(&sched.image_ref);
         let req = DeployRequest {
+            // 定时/延迟部署:增量开关走全局设置(前端勾选框不参与该路径)
+            incremental: None,
             image: sched.image_ref.clone(),
             repository,
             server_id: sched.server_id.clone(),
@@ -519,6 +521,7 @@ async fn run_schedule_deploy(
         );
     }
     let req = StackDeployRequest {
+        incremental: None,
         project_id: sched.project_id.clone(),
         server_id: sched.server_id.clone(),
         services,

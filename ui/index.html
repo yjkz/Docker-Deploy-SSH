@@ -294,6 +294,11 @@
                 <span>跳过未变化镜像(较快)</span>
               </label>
               <div class="form-hint">智能传输:远端同标签镜像 ID 一致时跳过导出/上传/装载(勾选「打日期标签」时自动禁用,日期标签每次均为全新标签)</div>
+              <label class="deploy-checkbox">
+                <input type="checkbox" id="deploy-incremental" checked>
+                <span>层级增量传输(只传服务器缺少的层)</span>
+              </label>
+              <div class="form-hint">开启后先问服务器「你已有哪些层」,把本地镜像包里这些层裁掉再传 —— 同一 Dockerfile 重建、层大量重叠时能省下绝大部分上传量;装载失败会自动改用整包重传,不会漏传。不勾选 = 与原来一样整包传输</div>
             </div>
           </div>
 
@@ -328,6 +333,10 @@
               <label class="deploy-checkbox">
                 <input type="checkbox" id="deploy-stack-skip" checked>
                 <span>跳过未变化镜像(较快)</span>
+              </label>
+              <label class="deploy-checkbox">
+                <input type="checkbox" id="deploy-stack-incremental" checked>
+                <span>层级增量传输(只传服务器缺少的层)</span>
               </label>
               <label class="deploy-checkbox">
                 <input type="checkbox" id="deploy-stack-archive">

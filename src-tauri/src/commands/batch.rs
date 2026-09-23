@@ -218,6 +218,8 @@ async fn run_batch_deploy(app: AppHandle, batch: BatchDeployRequest, server_ids:
         let result = match mode.as_str() {
             MODE_SINGLE => {
                 let req = DeployRequest {
+                    // 批量(死代码路径):增量开关走全局设置
+                    incremental: None,
                     image: batch.image.clone().unwrap_or_default(),
                     repository: batch.repository.clone().unwrap_or_default(),
                     server_id: server_id.clone(),
@@ -230,6 +232,7 @@ async fn run_batch_deploy(app: AppHandle, batch: BatchDeployRequest, server_ids:
             }
             MODE_STACK => {
                 let req = StackDeployRequest {
+                    incremental: None,
                     project_id: batch.project_id.clone(),
                     server_id: server_id.clone(),
                     services: batch.services.clone().unwrap_or_default(),
