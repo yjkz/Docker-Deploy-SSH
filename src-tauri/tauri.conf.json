@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "DockerDeploy SSH",
-  "version": "6.16.0",
+  "version": "6.17.0",
   "identifier": "com.dockerdeploy.ssh",
   "build": {
     "frontendDist": "../ui"
@@ -37,7 +37,9 @@
     "windows": {
       "nsis": {
         "languages": ["SimpChinese"],
-        "displayLanguageSelector": false
+        "displayLanguageSelector": false,
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico"
       }
     },
     "android": {

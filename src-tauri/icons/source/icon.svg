@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-label="DockerDeploy SSH">
+  <rect width="1024" height="1024" fill="#080a0b"/>
+  <rect x="266" y="422" width="492" height="396" fill="none" stroke="#f4f6f6" stroke-width="84"/>
+  <path d="M 328 308 L 512 164 L 696 308 L 568 308 L 568 780 L 456 780 L 456 308 Z" fill="#18d1ff"/>
+</svg>

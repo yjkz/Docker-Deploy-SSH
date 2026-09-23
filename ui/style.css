@@ -2949,7 +2949,8 @@ select.text-input option,
   border-right: 1px solid var(--ark-line-soft);
   overflow-y: auto;
 }
-.help-nav-item {
+.help-nav-item,
+.settings-nav-item {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -2966,9 +2967,11 @@ select.text-input option,
   cursor: pointer;
   transition: background var(--ark-dur-fast) var(--ark-ease-out), border-color var(--ark-dur-fast) var(--ark-ease-out);
 }
-.help-nav-item:hover { background: var(--ark-paper-dim); }
+.help-nav-item:hover,
+.settings-nav-item:hover { background: var(--ark-paper-dim); }
 /* 当前章节:左缘青条 + 青淡底(亮墨字/暗青字随 token 翻转) */
-.help-nav-item.active {
+.help-nav-item.active,
+.settings-nav-item.active {
   border-left-color: var(--ark-signal);
   background: var(--ark-signal-dim);
   color: var(--ark-on-signal-dim);
@@ -3513,21 +3516,79 @@ code {
 .dock-icon-btn:hover { color: var(--ark-dock-text-strong); background: var(--ink-on-paper-05); }
 .dock-icon-btn svg { width: 16px; height: 16px; flex: none; }
 
-/* 设置模态卡片:容纳左设置栏 + 右「关于」栏(第四批加宽) */
-.settings-modal-card { width: min(880px, 96vw); }
+/* 设置模态卡片(第三十五批:左分类导航 + 右内容区 + 底部常驻动作行)。
+   定高口径同 .help-modal-card —— 卡片不随内容长高,只有内容区滚动,导航与
+   「保存设置」永不滚走(此前卡片无 max-height,滚动落在遮罩层上,连标题栏
+   都跟着内容一起滚出去)。 */
+.settings-modal-card {
+  display: flex;
+  flex-direction: column;
+  width: min(880px, 96vw);
+  /* 96px = .modal-overlay 的上下 padding(48px×2);取 88vh 而非帮助模态的
+     80vh —— 设置分区最多的「部署 / 监控」有 5-6 项带长 hint,多出的几十像素
+     正好省掉一轮内滚,且仍留足遮罩边距 */
+  height: min(88vh, calc(100vh - 96px));
+}
+.settings-modal-card .modal-head { flex: none; }
 
-/* 两栏布局:左设置项(占满剩余宽度)/ 右关于栏(固定 200px);窄窗回退单列 */
+/* 正文改为纵向弹性容器:错误框 / 布局 / 动作行三段,中间段吃满剩余高度 */
+#settings-modal-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+/* 左导航(168px)+ 右内容区,两栏各自滚动 */
 .settings-layout {
+  flex: 1;
+  min-height: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 200px;
-  gap: 22px;
-  align-items: start;
+  grid-template-columns: 168px minmax(0, 1fr);
+  gap: 0 18px;
 }
+.settings-nav {
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+.settings-content {
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+/* 分区:由 selectSection 用 .hidden 互斥切换,任一时刻只显示一区 */
+.settings-section { min-width: 0; }
+/* 导航项微标签复用 .form-label-en;选中态随信号青淡底翻色 */
+.settings-nav-item.active .form-label-en { color: var(--ark-on-signal-dim); }
+
+/* 底部动作行:钉在卡片底部,不参与滚动 */
+.settings-actions {
+  flex: none;
+  flex-wrap: wrap;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--ark-line-soft);
+}
+
+/* 窄窗回退(桌面端最小宽 1200px,此为兜底):导航转为横向可滚一栏 */
 @media (max-width: 760px) {
-  .settings-layout { grid-template-columns: 1fr; }
+  .settings-layout {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
+    gap: 10px 0;
+  }
+  .settings-nav {
+    display: flex;
+    gap: 4px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding-right: 0;
+    padding-bottom: 6px;
+  }
+  .settings-nav-item { flex: none; width: auto; }
 }
-.settings-main { min-width: 0; }
-.settings-aside { min-width: 0; }
 
 /* ---- 关于栏:头像 → 名字 → 三行地址,竖直居中 ---- */
 .about-card {
@@ -3541,6 +3602,8 @@ code {
   border-radius: 4px;   /* 第六批:6px → 4px,收回 ark 契约允许的功能性圆角上限(默认 0,允许 2-4px) */
   background: var(--ark-paper-dim);
 }
+/* 第三十五批:「关于」从 200px 侧栏搬进全宽内容区,限宽免得被拉成一整条 */
+.settings-section[data-section="about"] .about-card { max-width: 360px; }
 .about-avatar-wrap { line-height: 0; }
 .about-avatar {
   width: 88px;
@@ -3628,8 +3691,8 @@ code {
 /* (「前往下载」按钮已随 v5.8.1 更新确认模态改造移除,原 #settings-download-btn 规则删除) */
 
 /* 底部按钮行:左侧「检查更新 / 测试连接」组(margin-right:auto 推开)+ 右侧「保存设置」 */
-.settings-actions { flex-wrap: wrap; }
-.settings-test-group { display: flex; gap: 8px; margin-right: auto; }
+/* 底部动作行:右侧「保存设置」(flex-wrap 见上方的 .settings-actions) */
+.settings-test-group { display: flex; gap: 8px; }
 
 /* ============================================================
    阶段五:栈 .env 查看 / 编辑(manage.js showStackEnv;

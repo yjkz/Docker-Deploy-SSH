@@ -21,9 +21,11 @@
  *     GitHub API 并回显成功/失败原文。
  *
  * 交互约定(参照 notify.js 先例):
- * - 三组:外观(主题单选,即时生效)/ 通用(关闭到托盘)/ 更新(代理 + 检查)。
- *   「外观」改动即时写 localStorage['dd_scheme'](与 app.js 同键)并应用;
- *   「通用 / 更新」改动需点「保存设置」(app_settings_set)。
+ * - 六分区(第三十五批):外观 / 通用 / 部署 / 监控 / 更新 / 关于,左侧导航切换,
+ *   任一时刻只显示一区(分区 DOM 一次性全建、靠 .hidden 切换,不重建 —— 未保存的
+ *   输入与 getElementById 契约都不受影响;卡片定高,只有内容区滚动,底部动作行
+ *   常驻)。「外观」改动即时写 localStorage['dd_scheme'](与 app.js 同键)并应用;
+ *   其余改动需点「保存设置」(app_settings_set)。
  * - 模态开合带会话序号(st.session,每次打开 +1):读取/保存/检查更新的
  *   异步收尾先校验会话未过期再回写,防止旧 promise 回写重开后的新模态;
  *   关闭模态时复位防重标志。Esc / 遮罩 / 关闭钮均可关闭。
@@ -202,6 +204,41 @@
     return row;
   }
 
+  /**
+   * 分区定义(第三十五批:左侧分类导航;数组顺序 = 导航顺序)。
+   *
+   * 拆区依据:原「通用」组独吞 17 项、单列约 3 屏,长模态没有导航也没有吸顶,
+   * 用户要滑半天才见底。六个分区任一时刻只显示一区(≤6 项),滚动基本消失;
+   * 「关于」从右侧常驻栏改为末位分区,正文因此拿到全宽(hint 换行更少)。
+   */
+  var SECTIONS = [
+    { key: 'appearance', zh: '外观', en: 'APPEARANCE' },
+    { key: 'general', zh: '通用', en: 'GENERAL' },
+    { key: 'deploy', zh: '部署', en: 'DEPLOY' },
+    { key: 'monitor', zh: '监控', en: 'MONITOR' },
+    { key: 'update', zh: '更新', en: 'UPDATE' },
+    { key: 'about', zh: '关于', en: 'ABOUT' }
+  ];
+
+  /**
+   * 切换分区:导航项 active + 分区 .hidden 互斥切换。
+   *
+   * 只切显示、不重建 DOM —— 未保存的输入与更新结果区内容都留在原处,
+   * fillSettings / onSave 的 getElementById 契约因此完全不受影响。
+   */
+  function selectSection(key) {
+    var items = document.querySelectorAll('#settings-modal .settings-nav-item');
+    for (var i = 0; i < items.length; i++) {
+      items[i].classList.toggle('active', items[i].getAttribute('data-section') === key);
+    }
+    var panels = document.querySelectorAll('#settings-modal .settings-section');
+    for (var j = 0; j < panels.length; j++) {
+      panels[j].classList.toggle('hidden', panels[j].getAttribute('data-section') !== key);
+    }
+    var content = document.querySelector('#settings-modal .settings-content');
+    if (content) content.scrollTop = 0; // 换区回到顶部(各区独立滚动)
+  }
+
   function buildBody(body) {
     body.textContent = '';
 
@@ -209,14 +246,39 @@
     // 保存失败只弹 toast 会一闪而过)
     body.appendChild(window.formErrorBox('settings-error'));
 
-    // 两栏布局(第四批):左侧设置项(外观/通用/更新),右侧「关于」栏。
-    // 窄窗口经 CSS 媒体查询回退为单列(关于栏落到下方)。
+    // 左分类导航 + 右内容区 + 底部常驻动作行(第三十五批)。
+    // 分区 DOM 一次性全建、靠 .hidden 切换;卡片定高(见 .settings-modal-card),
+    // 只有 .settings-content 滚动 —— 导航与「保存设置」永不滚走。
     var layout = el('div', 'settings-layout');
-    var main = el('div', 'settings-main');
-    var aside = el('div', 'settings-aside');
-    layout.appendChild(main);
-    layout.appendChild(aside);
+    var nav = el('nav', 'settings-nav');
+    nav.setAttribute('aria-label', '设置分类');
+    var content = el('div', 'settings-content');
+    layout.appendChild(nav);
+    layout.appendChild(content);
     body.appendChild(layout);
+
+    var sections = {};
+    SECTIONS.forEach(function (def, i) {
+      var btn = el('button', 'settings-nav-item');
+      btn.type = 'button';
+      btn.setAttribute('data-section', def.key);
+      btn.appendChild(el('span', 'settings-nav-zh', def.zh));
+      // 英文微标签复用 .form-label-en(cond 轨道 + 大写 + 字距),选中态由
+      // .settings-nav-item.active 翻色(见 style.css 设置段)
+      btn.appendChild(el('span', 'form-label-en', def.en));
+      btn.addEventListener('click', function () { selectSection(def.key); });
+      nav.appendChild(btn);
+
+      var panel = el('section', 'settings-section');
+      panel.setAttribute('data-section', def.key);
+      if (i > 0) panel.classList.add('hidden'); // 默认落在第一区(外观)
+      sections[def.key] = panel;
+      content.appendChild(panel);
+    });
+
+    // main = 当前分区游标:下方各字段块按归属改指 sections.<key>,
+    // 各分区内部保持原有先后顺序
+    var main = sections.appearance;
 
     // ── 外观 APPEARANCE(单选,即时生效)──
     main.appendChild(groupTitle('外观', 'APPEARANCE'));
@@ -240,7 +302,8 @@
       '「跟随系统」随操作系统的深色模式实时切换;点击 dock 主题按钮会写入' +
       '显式亮 / 暗并停用跟随'));
 
-    // ── 通用 GENERAL ──
+    // ── 通用 GENERAL(启动行为 / 日志)──
+    main = sections.general;
     main.appendChild(groupTitle('通用', 'GENERAL'));
     main.appendChild(checkboxRow('settings-close-tray', '关闭窗口时隐藏到托盘', false));
     main.appendChild(hint('开启后点关闭仅隐藏窗口(部署继续),托盘菜单「退出」才真正退出;保存后立即生效'));
@@ -253,6 +316,10 @@
     main.appendChild(hint(
       '开启后打开软件会延迟数秒检查一次新版本;有新版时仅在左下角版本号旁亮起圆点' +
       '(点击进本设置页),不弹窗打扰;检查失败(网络/代理不可达)静默忽略'));
+    // ── 监控 MONITOR(探活 / 资源告警 / 日报)──
+    main = sections.monitor;
+    main.appendChild(groupTitle('监控', 'MONITOR'));
+
     // 服务器定时探活(第十七批):间隔分钟数,0 = 关闭;保存即启停后端探活任务
     main.appendChild(buildField('服务器探活间隔(分钟)', 'PROBE',
       'settings-probe-interval-input', 'number', '0',
@@ -280,6 +347,10 @@
       'settings-alert-cpu-input', 'number', '90',
       null,
       '0 = 不告警该项'));
+
+    // ── 部署 DEPLOY(扫描识别 / 回滚 / 搬运)──
+    main = sections.deploy;
+    main.appendChild(groupTitle('部署', 'DEPLOY'));
 
     // 部署失败自动回滚(第二十五批):仅整栈 + 仅健康检查失败时触发;
     // 默认关(自动回滚会改线上状态,须显式开启)
@@ -310,21 +381,25 @@
       '项目迁移搬运数据卷时用哪个镜像执行 tar;服务器有私有 registry 或镜像白名单时填自备镜像' +
       '(如 registry.local/tools/tar:1)。该镜像需已存在于服务器且自带 tar'));
 
-    // 终端日志保留(第二十三批):天数,0 = 永久保留(默认 30)。
-    // hint 同时说明清理时机(打开终端 / 启动软件时 best-effort 清理)
-    // 部署日报(第二十八批 B2):留空 = 关闭;填 0-23 = 该整点后发一条汇总
-    // 开机自启(第二十九批 S1):真值在注册表(用户可能在任务管理器里禁用),
-    // 回填与保存都以读到的实况为准 —— 见后端 autostart::with_actual_state
+    // 开机自启归「通用」(第三十五批切区;第二十九批 S1):真值在注册表
+    // (用户可能在任务管理器里禁用),回填与保存都以读到的实况为准
+    // —— 见后端 autostart::with_actual_state
+    main = sections.general;
     main.appendChild(checkboxRow('settings-auto-start', '开机时自动启动', false));
     main.appendChild(hint(
       '登录 Windows 后自动启动本软件(仅当前用户,不需要管理员权限)。' +
       '若在「任务管理器 → 启动」里禁用过,这里的勾选状态会跟随系统实际设置'));
 
+    // 部署日报归「监控」(第三十五批):留空 = 关闭;填 0-23 = 该整点后发一条汇总
+    main = sections.monitor;
     main.appendChild(buildField('部署日报时刻', 'DIGEST HOUR',
       'settings-digest-hour', 'number', '',
       '留空 = 关闭;填 0-23 表示每天该整点后发一条当天部署汇总',
       '需在通知中心勾选「部署日报」订阅;当天无部署时不发空日报'));
 
+    // 终端日志保留归「通用」(第三十五批):天数,0 = 永久保留(默认 30)。
+    // hint 同时说明清理时机(打开终端 / 启动软件时 best-effort 清理)
+    main = sections.general;
     main.appendChild(buildField('终端日志保留(天)', 'TERM LOGS',
       'settings-term-keep-days', 'number', '30',
       '0 = 永久保留;例如 30 表示只保留最近 30 天',
@@ -344,7 +419,8 @@
       '运行日志按日期轮转写在应用目录 logs/ 下,部署 / 连接问题可在此排查'));
     main.appendChild(logRow);
 
-    // ── 宿主机可写目录(第三十四批(五))──
+    // ── 宿主机可写目录(第三十四批(五);归「部署」区,故先切回 deploy)──
+    main = sections.deploy;
     // 文件管理「部署目录」源的写权限白名单:留空 = 全只读(维持第三十三批口径)
     var wpRow = el('div', 'form-row');
     wpRow.appendChild(window.formLabel('宿主机可写目录', 'HOST WRITE', false, 'settings-host-write-paths'));
@@ -359,21 +435,15 @@
       '写入前会在服务器上解析真实路径(软链不能逃逸),最多 10 条'));
     main.appendChild(wpRow);
 
-    // ── 更新 UPDATE ──
+    // ── 更新 UPDATE(代理 + 连通性实测;两钮作用于本区输入框)──
+    main = sections.update;
     main.appendChild(groupTitle('更新', 'UPDATE'));
     main.appendChild(buildField('代理地址', 'PROXY', 'settings-proxy-input', 'text', '',
       '留空直连;支持 http:// 与 socks5://,例如 http://127.0.0.1:7890',
       '仅用于检查更新访问 GitHub;「检查更新 / 测试连接」使用上方输入框当前值,未保存也可测试'));
 
-    // 更新结果区(行内回显 + notes 截断 + 前往下载,内容见 showUpdate*)
-    var area = el('div', 'set-update-area');
-    area.id = 'settings-update-area';
-    main.appendChild(area);
-
-    // ── 底部按钮行:左侧更新组 + 右侧主保存按钮 ──
-    var actions = el('div', 'modal-actions settings-actions');
+    // 两钮紧跟代理字段(它们只作用于该字段);结果区排在它们下方
     var testGroup = el('div', 'settings-test-group');
-
     var checkBtn = el('button', 'btn', CHECK_LABEL);
     checkBtn.type = 'button';
     checkBtn.id = 'settings-check-btn';
@@ -385,28 +455,35 @@
     testBtn.id = 'settings-test-btn';
     testBtn.addEventListener('click', onTestConnection);
     testGroup.appendChild(testBtn);
+    main.appendChild(testGroup);
 
+    // 更新结果区(行内回显 + notes 截断 + 前往下载,内容见 showUpdate*)
+    var area = el('div', 'set-update-area');
+    area.id = 'settings-update-area';
+    main.appendChild(area);
+
+    // ── 底部常驻动作行(第三十五批:移出滚动区,钉在卡片底部)──
+    var actions = el('div', 'modal-actions settings-actions');
     var saveBtn = el('button', 'btn btn-primary', '保存设置');
     saveBtn.type = 'button';
     saveBtn.id = 'settings-save-btn';
     saveBtn.addEventListener('click', onSave);
-
-    actions.appendChild(testGroup);
     actions.appendChild(saveBtn);
-    main.appendChild(actions);
+    body.appendChild(actions);
 
-    // ── 关于 ABOUT(右栏):头像 → 名字 → 三行地址,竖直居中排列 ──
-    buildAboutPanel(aside);
+    // ── 关于 ABOUT:末位分区(原右侧常驻栏,正文因此获得全宽)──
+    buildAboutPanel(sections.about);
   }
 
   /**
-   * 「关于」栏(第四批):头像 → 名字 → 项目主页 / GitHub / 个人主页。
+   * 「关于」分区(第四批;第三十五批从右侧常驻栏改为末位分区)。
+   * 头像 → 名字 → 项目主页 / GitHub / 个人主页。
    *
    * 头像随应用内嵌(`ui/images/avatar.png`),不依赖联网抓取;三处地址经
    * `open_external` 交给系统浏览器(WebView 内直接跳外链会被拦)。
    */
-  function buildAboutPanel(aside) {
-    aside.appendChild(groupTitle('关于', 'ABOUT'));
+  function buildAboutPanel(panel) {
+    panel.appendChild(groupTitle('关于', 'ABOUT'));
 
     var card = el('div', 'about-card');
 
@@ -446,7 +523,7 @@
     });
     card.appendChild(links);
 
-    aside.appendChild(card);
+    panel.appendChild(card);
   }
 
   // ===== 更新结果区(行内回显;失败用 --ark-stat-hot 暗红)=====
@@ -734,7 +811,10 @@
       st.saving = false;
       setBusy('settings-save-btn', false, '保存设置');
       window.toast('设置已保存', 'ok');
-      showUpdateMessage('ok', '设置已保存,关闭到托盘、代理与探活间隔已立即生效');
+      // 结果区在「更新」分区内(第三十五批):保存时用户多半不在该区,行内回显
+      // 既看不见、事后重进该区又变成过期文案 —— 保存成功反馈统一由 toast 承担,
+      // 这里只清掉可能残留的旧结果
+      showUpdateMessage('info', '');
     }).catch(function (err) {
       if (!sessionAlive(session)) return;
       st.saving = false;
@@ -870,7 +950,9 @@
       })
       .catch(function (err) {
         if (!isModalVisible()) return;
-        showUpdateMessage('fail', '读取设置失败:' + (errText(err) || '未知错误'));
+        // 读取失败必须无条件可见(第三十五批):结果区在「更新」分区内,用它报错
+        // 会在默认显示的「外观」区里静默 —— 改走常驻模态顶部的错误框
+        window.formFailLoud('settings-error', '读取设置失败:' + (errText(err) || '未知错误'));
       });
   }
 
