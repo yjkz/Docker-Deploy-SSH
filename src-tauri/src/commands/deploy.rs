@@ -405,7 +405,7 @@ async fn run_deploy_steps(
                                 Ok(set) => {
                                     emit_log(
                                         app,
-                                        &format!("层级增量:服务器已有 {} 个镜像层", set.len()),
+                                        &format!("增量传输:服务器已有 {} 个镜像层", set.len()),
                                     );
                                     remote_layers = set;
                                     incremental_client = Some(c);
@@ -418,7 +418,7 @@ async fn run_deploy_steps(
                         }
                         Err(e) => emit_log(
                             app,
-                            &format!("警告:层级增量预查询建连失败({}),本次按整包传输", e),
+                            &format!("警告:增量传输预查询建连失败({}),本次按整包传输", e),
                         ),
                     }
                 }
@@ -441,7 +441,7 @@ async fn run_deploy_steps(
                             emit_log(
                                 app,
                                 &format!(
-                                    "层级增量:跳过 {} 个已有层(共 {} MB),增量包 {} MB(整包 {} MB)",
+                                    "增量传输:跳过 {} 层,省 {} MB(增量包 {} MB;整包 {} MB)",
                                     exp.dropped_layers,
                                     exp.dropped_bytes / 1024 / 1024,
                                     exp.trimmed_bytes / 1024 / 1024,
@@ -458,7 +458,7 @@ async fn run_deploy_steps(
                             exp.trimmed_bytes
                         }
                         None => {
-                            emit_log(app, "层级增量:本地层与服务器无交集,按整包传输");
+                            emit_log(app, "整包传输:与服务器无共享层(裁剪无增益)");
                             export_image(app, &image_ref, &out_path).await?
                         }
                     }
@@ -520,7 +520,7 @@ async fn run_deploy_steps(
             // 架构预检(第二十五批):只告警不阻断,把 exec format error 提前翻译
             arch_precheck(app, &mut client, crate::docker::image_arch(&image_ref)).await?;
             // 镜像包同名即同内容(uuid 命名),启用断点续传
-            upload_tar(app, &mut client, out_path, tar_name).await?;
+            upload_tar(app, &mut client, out_path, "/tmp", tar_name, "镜像上传进度").await?;
             emit_log(app, "镜像上传完成");
             if checkpoint {
                 checkpoint_save(&key, MODE_SINGLE, 4, &server, &project, artifacts_value(&art));
@@ -755,6 +755,28 @@ async fn run_export_trimmed(
     }
 }
 
+/// 静默层级增量导出(无逐块进度日志;整栈并发打包用,同 [`export_image_silent`] 口径):
+/// 进度由打包循环按「完成镜像数」汇报。
+async fn run_export_trimmed_silent(
+    image_ref: &str,
+    out_trimmed: &Path,
+    out_full: &Path,
+    raw_tar: &Path,
+    remote_layers: std::collections::HashSet<String>,
+) -> Result<Option<crate::docker::TrimmedExport>, String> {
+    let image = image_ref.to_string();
+    let trimmed = out_trimmed.to_path_buf();
+    let full = out_full.to_path_buf();
+    let raw = raw_tar.to_path_buf();
+    let handle = tauri::async_runtime::spawn_blocking(move || {
+        crate::docker::save_gzip_trimmed(&image, &trimmed, &full, &raw, &remote_layers, |_| {})
+    });
+    match handle.await {
+        Ok(r) => r,
+        Err(e) => Err(format!("导出任务异常终止: {}", e)),
+    }
+}
+
 /// 拼装「镜像包上传重试仍失败」的中文错误(纯函数,便于单测):
 /// 保留两次失败信息,便于对照首次中断点与重试失败原因。
 pub fn upload_retry_failure_msg(retry_err: &str, first_err: &str) -> String {
@@ -770,7 +792,10 @@ async fn upload_retry_wait(app: &AppHandle) -> Result<(), String> {
     ensure_not_cancelled(app)
 }
 
-/// 步骤 3:上传镜像 tar 到远端固定 `/tmp` 目录,按每 10% 进度 emit `deploy-log`。
+/// 上传镜像 tar 到远端目录,按每 10% 进度 emit `deploy-log`(前缀 `label`)。
+///
+/// `remote_dir` 由调用方给:单镜像主包传 `/tmp`,整栈(含其增量兜底重传)传发布
+/// 目录 `releases/<ts>` —— 断点续传的「远端大小比对」按同目录同名判定。
 ///
 /// 断点续传在「失败后同路径重试一次」时生效:每次部署 attempt 的 tar 名均为新
 /// uuid,attempt 之间无同名文件;同 attempt 内重试时 `sftp_upload(resume=true)`
@@ -779,11 +804,14 @@ async fn upload_tar(
     app: &AppHandle,
     client: &mut SshClient,
     tar_path: &Path,
+    remote_dir: &str,
     tar_name: &str,
+    label: &str,
 ) -> Result<(), String> {
     let last_pct = Arc::new(AtomicU64::new(0));
     let app_for_cb = app.clone();
     let last = Arc::clone(&last_pct);
+    let label = label.to_string();
     let on_progress = move |sent, total| {
         if total == 0 {
             return;
@@ -792,14 +820,14 @@ async fn upload_tar(
         let prev = last.load(Ordering::Relaxed);
         if step10 > prev {
             last.store(step10, Ordering::Relaxed);
-            emit_log(&app_for_cb, &format!("镜像上传进度 {}%", step10));
+            emit_log(&app_for_cb, &format!("{} {}%", label, step10));
         }
     };
 
     // 失败后同路径重试一次:重试时 stat 命中断点 → 续传生效;
     // 重试返回 AlreadyDone(远端已传 ≥ 本地)同样视为该包成功。
     let first_err = match client
-        .sftp_upload(tar_path, "/tmp", tar_name, true, &on_progress)
+        .sftp_upload(tar_path, remote_dir, tar_name, true, &on_progress)
         .await
     {
         Ok(()) => return Ok(()),
@@ -807,7 +835,7 @@ async fn upload_tar(
     };
     upload_retry_wait(app).await?;
     match client
-        .sftp_upload(tar_path, "/tmp", tar_name, true, &on_progress)
+        .sftp_upload(tar_path, remote_dir, tar_name, true, &on_progress)
         .await
     {
         Ok(()) => {
@@ -1026,7 +1054,7 @@ async fn server_deploy(
                     crate::incremental::detect_silent_load_failure(&tail.join("
 "), "")
                 {
-                    emit_log(app, &format!("警告:增量装载失败({})", reason));
+                    emit_log(app, &format!("增量装载失败 → 整包重传:{}", reason));
                     let (full_local, full_remote) = fallback.ok_or_else(|| {
                         format!("增量装载失败且本地没有整包可重传(可关闭「层级增量传输」后重试):{reason}")
                     })?;
@@ -1039,8 +1067,7 @@ async fn server_deploy(
                             emit_log(app, &format!("警告:清理半成品镜像失败({}),继续重传整包", e));
                         }
                     }
-                    emit_log(app, "层级增量:改用整包重传(本地整包保留策略:成功即删)");
-                    upload_tar(app, client, full_local, full_remote).await?;
+                    upload_tar(app, client, full_local, "/tmp", full_remote, "整包重传上传进度").await?;
                     let full_remote_path = remote_join("/tmp", full_remote);
                     let full_cmd =
                         format!("docker load -i {}", shell_single_quote(&full_remote_path));
@@ -1947,6 +1974,14 @@ async fn run_deploy_stack_steps(
         .collect();
 
     // ---- 步骤 2:打包 ----
+    // 层级增量(第三十八批:整栈接入):勾选(或全局开关开启)时先查一次
+    // 「服务器已有层」,并发打包时逐镜像裁剪;建连留给步骤 3 复用。
+    // 查询/建连失败一律退整包 —— 裁剪只是优化,任何不确定性都不该阻断部署。
+    let incremental_on = req
+        .incremental
+        .unwrap_or_else(|| crate::config::load_app_settings().incremental_transfer);
+    let mut incremental_client: Option<SshClient> = None;
+    let mut remote_layers: Option<std::collections::HashSet<String>> = None;
     let tars = if resume_step > 2 {
         emit_log(app, "断点续传:跳过步骤 2(打包),复用已打包的镜像包");
         // 断点打包产物与过滤结果一致性校验(损坏 → 明确报错,避免错位装载)
@@ -1959,6 +1994,7 @@ async fn run_deploy_stack_steps(
             );
         }
         // 复用的 tar 不挂 Drop 守卫:断点期保留,成功/放弃时显式清理
+        let n = art.files.len();
         LocalTars {
             files: art
                 .files
@@ -1967,11 +2003,51 @@ async fn run_deploy_stack_steps(
                 .zip(art.locals.iter().map(PathBuf::from))
                 .map(|(name, path)| (path, name))
                 .collect(),
+            // 裁剪信息(第三十八批;旧断点无该字段 → 视为全未裁剪)
+            fulls: resume_fulls(&art.full_locals, n),
+            dropped_layers: if art.dropped_layers.len() == n {
+                art.dropped_layers.clone()
+            } else {
+                vec![Vec::new(); n]
+            },
             _guards: Vec::new(),
         }
     } else {
         emit_progress(app, 2, 6, "打包");
         ensure_not_cancelled(app)?;
+        // 增量预查询:失败只降级(警告 + 整包),不阻断
+        if incremental_on && !pack_list.is_empty() {
+            match with_timeout(
+                SSH_CONNECT_TIMEOUT_SECS,
+                "连接超时",
+                "请检查服务器地址与网络",
+                SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default()),
+            )
+            .await
+            {
+                Ok(c) => {
+                    let mut c = c.with_cancel_probe(deploy_cancel_probe(app));
+                    match query_remote_layer_ids(&mut c).await {
+                        Ok(set) => {
+                            emit_log(app, &format!("增量传输:服务器已有 {} 个镜像层", set.len()));
+                            if !set.is_empty() {
+                                remote_layers = Some(set);
+                            }
+                            // 查询成功(即便清单为空)也保留连接给步骤 3 复用
+                            incremental_client = Some(c);
+                        }
+                        Err(e) => emit_log(
+                            app,
+                            &format!("警告:查询服务器已有层失败({}),本次按整包传输", e),
+                        ),
+                    }
+                }
+                Err(e) => emit_log(
+                    app,
+                    &format!("警告:增量传输预查询建连失败({}),本次按整包传输", e),
+                ),
+            }
+        }
         let tars = if pack_list.is_empty() {
             if local_choices.is_empty() {
                 emit_log(app, "所有服务均由服务器拉取镜像,跳过本地打包");
@@ -1980,11 +2056,13 @@ async fn run_deploy_stack_steps(
             }
             LocalTars {
                 files: Vec::new(),
+                fulls: Vec::new(),
+                dropped_layers: Vec::new(),
                 _guards: Vec::new(),
             }
         } else {
             // 断点续传开启时保留本地 tar 供失败后复用(成功/放弃时显式清理)
-            pack_local_images(app, &pack_list, checkpoint).await?
+            pack_local_images(app, &pack_list, checkpoint, remote_layers.as_ref()).await?
         };
         art.files = tars.files.iter().map(|(_, n)| n.clone()).collect();
         art.locals = tars
@@ -1993,19 +2071,17 @@ async fn run_deploy_stack_steps(
             .map(|(p, _)| p.to_string_lossy().to_string())
             .collect();
         art.images = pack_list.iter().map(|s| s.image.clone()).collect();
+        art.full_locals = tars
+            .fulls
+            .iter()
+            .map(|f| f.as_ref().map(|p| p.to_string_lossy().to_string()))
+            .collect();
+        art.dropped_layers = tars.dropped_layers.clone();
         if checkpoint {
             checkpoint_save(&key, MODE_STACK, 3, &server, &project, artifacts_value(&art));
         }
         tars
     };
-
-    // manifest 镜像条目(整栈成功收尾写入 manifest.json):逐个 Local 服务一条,
-    // 被跳过传输(未留档)的服务 file = null,其余按打包顺序携带镜像包文件名
-    // (断点续传时 unchanged 来自断点,结果与首次部署一致)
-    let skip_flags: Vec<bool> = unchanged.iter().map(|u| *u && !force_archive).collect();
-    let packed_files: Vec<String> = tars.files.iter().map(|(_, n)| n.clone()).collect();
-    let manifest_images =
-        build_manifest_images(&local_choices, &skip_flags, &packed_files, &local_ids);
 
     // ---- 步骤 3:上传 ----
     // 断点续传:步骤 3 已完成时不再推送本步进度(事件从 step_next 起)
@@ -2013,16 +2089,20 @@ async fn run_deploy_stack_steps(
         emit_progress(app, 3, 6, "上传");
     }
     ensure_not_cancelled(app)?;
-    let mut client = with_timeout(
-        SSH_CONNECT_TIMEOUT_SECS,
-        "连接超时",
-        "请检查服务器地址与网络",
-        SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default()),
-    )
-    .await?
-    // C1(第二十八批):挂传输级取消探针 —— 上传/下载在 64KB 块间检查取消位,
-    // 大镜像传输中可即时中止(此前只在步骤边界生效)
-    .with_cancel_probe(deploy_cancel_probe(app));
+    let mut client = match incremental_client.take() {
+        // 增量预查询已建连(第三十八批):直接复用,省一次握手(取消探针已挂)
+        Some(c) => c,
+        None => with_timeout(
+            SSH_CONNECT_TIMEOUT_SECS,
+            "连接超时",
+            "请检查服务器地址与网络",
+            SshClient::connect(&server, password.as_deref(), key_pass.as_deref(), Arc::default()),
+        )
+        .await?
+        // C1(第二十八批):挂传输级取消探针 —— 上传/下载在 64KB 块间检查取消位,
+        // 大镜像传输中可即时中止(此前只在步骤边界生效)
+        .with_cancel_probe(deploy_cancel_probe(app)),
+    };
 
     // 发布时间戳:断点续传复用断点记录的 ts(同一发布目录,已上传镜像包才能
     // 按名续传/按镜像幂等装载);正常部署每次新生成(旧行为)。续传且步骤 3
@@ -2116,8 +2196,21 @@ async fn run_deploy_stack_steps(
     }
 
     // ---- 步骤 4:装载 ----
+    // 归档最终结果(第三十八批;与 tars.files 同序):`Some(名)` = 归档里有该服务的
+    // 自包含包;`None` = 无(重建失败后已清理);`archive_needs[i]` 非空 = 该服务的
+    // 归档依赖服务器已有层(重建失败,回滚预检据此核对)。
+    let mut archive_files: Vec<Option<String>> =
+        tars.files.iter().map(|(_, n)| Some(n.clone())).collect();
+    let mut archive_needs: Vec<Vec<String>> = tars.dropped_layers.clone();
     if resume_step > 4 {
         emit_log(app, "断点续传:跳过步骤 4(装载)");
+        // 重建结果以上次运行为准(断点记录);缺失(旧断点)= 全视为未裁剪
+        if art.archive_files.len() == tars.files.len() {
+            archive_files = art.archive_files.clone();
+            archive_needs = art.archive_needs.clone();
+        } else {
+            archive_needs = vec![Vec::new(); tars.files.len()];
+        }
     } else {
         emit_progress(app, 4, 6, "装载");
         ensure_not_cancelled(app)?;
@@ -2127,13 +2220,13 @@ async fn run_deploy_stack_steps(
         }
         for (i, (_, name)) in tars.files.iter().enumerate() {
             ensure_not_cancelled(app)?;
-            // force_archive 留档的未变化镜像:ID 已在远端,仅归档进 release 目录,不装载
+            // 该包是裁剪包(带兜底整包)= 装载失败要重传、成功后要重建完整归档
+            let trimmed = tars.fulls[i].is_some();
+            let mut full_uploaded = false;
+            // ① 装载(两种跳过情形下镜像都已在服务器上,照常进入 ② 重建归档)
             if pack_unchanged[i] {
                 emit_log(app, &format!("镜像未变化,跳过装载(仅留档): {}", name));
-                continue;
-            }
-            // 断点续传:该包上次装载已成功(远端已有该镜像)→ 跳过,逐包幂等
-            if resume.is_some() && remote_has_image(&mut client, &art.images[i]).await? {
+            } else if resume.is_some() && remote_has_image(&mut client, &art.images[i]).await? {
                 emit_log(
                     app,
                     &format!(
@@ -2141,21 +2234,107 @@ async fn run_deploy_stack_steps(
                         art.images[i], name
                     ),
                 );
-                continue;
+            } else {
+                let remote_tar = remote_join(&release_dir, name);
+                emit_log(
+                    app,
+                    &format!(
+                        "装载镜像包 ({}/{}): docker load -i {}",
+                        i + 1,
+                        tar_count,
+                        remote_tar
+                    ),
+                );
+                let load_cmd = format!("docker load -i {}", shell_single_quote(&remote_tar));
+                let tail = exec_forwarded_tail(
+                    app,
+                    &mut client,
+                    &load_cmd,
+                    STACK_LOAD_TIMEOUT_SECS,
+                    LOAD_TAIL_LINES,
+                )
+                .await?;
+                // 增量装载失败 → 整包重传(0 期实测:containerd 侧缺层时 `docker load`
+                // 仍 rc=0,只打 `Error unpacking image …` 且留下带标签的坏镜像 ——
+                // 只看退出码会把失败报成成功,必须 rc+文本双判)
+                if let Some(reason) =
+                    crate::incremental::detect_silent_load_failure(&tail.join("\n"), "")
+                {
+                    emit_log(app, &format!("增量装载失败 → 整包重传:{}", reason));
+                    let full_local = tars.fulls[i].as_ref().ok_or_else(|| {
+                        format!(
+                            "增量装载失败且本地没有整包可重传(可关闭「层级增量传输」后重试):{reason}"
+                        )
+                    })?;
+                    // 半成品清理:坏镜像带着标签留在服务器上会让后续 compose up 报错难溯源
+                    let rmi = format!("docker rmi -f {}", shell_single_quote(&art.images[i]));
+                    if let Err(e) = exec_forwarded(app, &mut client, &rmi, 120).await {
+                        emit_log(app, &format!("警告:清理半成品镜像失败({}),继续重传整包", e));
+                    }
+                    // 兜底整包远端名必须带 `.full` 独立后缀 —— 与裁剪包同名会让
+                    // SFTP 的「远端大小比对」续传把整包续在裁剪包屁股后面而损坏
+                    let full_remote = format!("{}.full", name);
+                    upload_tar(
+                        app,
+                        &mut client,
+                        full_local,
+                        &release_dir,
+                        &full_remote,
+                        "整包重传上传进度",
+                    )
+                    .await?;
+                    full_uploaded = true;
+                    let full_path = remote_join(&release_dir, &full_remote);
+                    let full_cmd = format!("docker load -i {}", shell_single_quote(&full_path));
+                    let tail2 = exec_forwarded_tail(
+                        app,
+                        &mut client,
+                        &full_cmd,
+                        STACK_LOAD_TIMEOUT_SECS,
+                        LOAD_TAIL_LINES,
+                    )
+                    .await?;
+                    if let Some(reason2) =
+                        crate::incremental::detect_silent_load_failure(&tail2.join("\n"), "")
+                    {
+                        return Err(format!("整包重传后仍装载失败:{reason2}"));
+                    }
+                    emit_log(app, "整包重传装载成功");
+                }
             }
-            let remote_tar = remote_join(&release_dir, name);
-            emit_log(
-                app,
-                &format!(
-                    "装载镜像包 ({}/{}): docker load -i {}",
-                    i + 1,
-                    tar_count,
-                    remote_tar
-                ),
-            );
-            let load_cmd = format!("docker load -i {}", shell_single_quote(&remote_tar));
-            exec_forwarded(app, &mut client, &load_cmd, STACK_LOAD_TIMEOUT_SECS).await?;
+            // ② 完整归档重建(第三十八批;仅裁剪包):不变式 —— `releases/` 里的包
+            // 默认必须是**完整归档**(自包含,回滚可直接装载)。装载成功后服务器
+            // 上已有完整镜像,由它 `docker save` 重建(顺带验证「服务器真的有了
+            // 完整镜像」);重建失败则该服务 manifest 的 file 置 None + 记下依赖
+            // 层,绝不留一个缺层的包冒充可回滚归档。
+            if trimmed {
+                match rebuild_release_archive(app, &mut client, &release_dir, &art.images[i], name)
+                    .await
+                {
+                    Ok(()) => archive_needs[i].clear(),
+                    Err(e) => {
+                        emit_log(
+                            app,
+                            &format!(
+                                "警告:完整归档重建失败({}),该服务记为增量归档(依赖服务器已有层)—— 服务器层被清理后回滚将无法直接装载",
+                                e
+                            ),
+                        );
+                        archive_files[i] = None;
+                    }
+                }
+                // ③ 兜底整包不属于归档:重传过就删掉(未重传时远端无该文件)
+                if full_uploaded {
+                    let rm_cmd = format!(
+                        "rm -f {}",
+                        shell_single_quote(&remote_join(&release_dir, &format!("{}.full", name)))
+                    );
+                    let _ = exec_collect(&mut client, &rm_cmd).await;
+                }
+            }
         }
+        art.archive_files = archive_files.clone();
+        art.archive_needs = archive_needs.clone();
         if checkpoint {
             checkpoint_save(&key, MODE_STACK, 5, &server, &project, artifacts_value(&art));
         }
@@ -2392,6 +2571,17 @@ async fn run_deploy_stack_steps(
     // 尽力而为:失败仅告警(缺 manifest/副本时回滚命令会优雅降级),不推翻
     // 已成功的部署结果;须在清理旧 releases 之前写入,避免目录先被清掉
     ensure_not_cancelled(app)?;
+    // manifest 镜像条目(第三十八批:归档阶段结果在步骤 4 才定 —— 裁剪项要等
+    // 服务器重建整包;`file`/`needs_layers` 取自 archive_files/archive_needs):
+    // 逐个 Local 服务一条,被跳过传输(未留档)的服务 file = null。
+    let skip_flags: Vec<bool> = unchanged.iter().map(|u| *u && !force_archive).collect();
+    let manifest_images = build_manifest_images(
+        &local_choices,
+        &skip_flags,
+        &archive_files,
+        &archive_needs,
+        &local_ids,
+    );
     let manifest = ReleaseManifest::new(project.name.clone(), ts.clone(), manifest_images);
     write_release_artifacts(app, &mut client, &project, &release_dir, &manifest).await;
 
@@ -2410,7 +2600,9 @@ async fn run_deploy_stack_steps(
     // ---- 成功收尾:清除断点 + 删除断点期保留的本地临时 tar ----
     // (失败/取消不走这里:断点与临时 tar 都保留,供续传复用)
     if checkpoint {
-        let local_tars: Vec<PathBuf> = tars.files.iter().map(|(p, _)| p.clone()).collect();
+        let mut local_tars: Vec<PathBuf> = tars.files.iter().map(|(p, _)| p.clone()).collect();
+        // 兜底整包同样随成功收尾清理(第三十八批;非断点模式由 guard Drop 删除)
+        local_tars.extend(tars.fulls.iter().flatten().cloned());
         checkpoint_cleanup_on_success(&key, &local_tars);
     }
 
@@ -2424,10 +2616,29 @@ async fn run_deploy_stack_steps(
 struct LocalTars {
     /// `(本地路径, 远端文件名)`,按服务顺序排列(与串行打包时的顺序一致)
     files: Vec<(PathBuf, String)>,
+    /// 与 [`LocalTars::files`] 同序:兜底整包本地路径(`Some` = 该包是**裁剪包**,
+    /// 装载失败时改传它;第三十八批)。
+    fulls: Vec<Option<PathBuf>>,
+    /// 与 [`LocalTars::files`] 同序:被裁层的 diffID(空 = 未裁剪)。
+    /// 归档契约用:服务器重建自包含包失败时,manifest 据此记录「增量归档依赖
+    /// 服务器已有层」的层清单(回滚预检据此核对)。
+    dropped_layers: Vec<Vec<String>>,
     /// Drop 守卫:管线函数返回(成功或失败)时删除全部本地 tar
     /// (断点续传开启时以 keep 模式构造 —— 不删除,成功/放弃时显式清理;
     /// 断点续传复用的 tar 不挂守卫)
     _guards: Vec<TempFileGuard>,
+}
+
+/// 单个镜像的并发打包产物(第三十八批:裁剪信息随行,供日志与归档契约使用)。
+struct PackedOne {
+    /// 上传包(裁剪包或整包)的压缩后字节数。
+    bytes: u64,
+    /// 兜底整包本地路径(`Some` = 本次是裁剪包,装载失败时改传它)。
+    full: Option<PathBuf>,
+    /// 被跳过的层 diffID(增量归档依赖清单;未裁剪为空)。
+    dropped_layers: Vec<String>,
+    /// 被跳过层的字节数(日志用)。
+    dropped_bytes: u64,
 }
 
 /// 步骤 2:把 Local 类镜像并发导出为 gzip 压缩包(`temp_dir/<uuid>.tar.gz`)。
@@ -2451,11 +2662,14 @@ async fn pack_local_images(
     app: &AppHandle,
     local: &[&StackServiceChoice],
     keep_guards: bool,
+    remote_layers: Option<&std::collections::HashSet<String>>,
 ) -> Result<LocalTars, String> {
     if local.is_empty() {
         emit_log(app, "所有服务均由服务器拉取镜像,跳过本地打包");
         return Ok(LocalTars {
             files: Vec::new(),
+            fulls: Vec::new(),
+            dropped_layers: Vec::new(),
             _guards: Vec::new(),
         });
     }
@@ -2475,7 +2689,7 @@ async fn pack_local_images(
         let out_path = std::env::temp_dir().join(&tar_name);
         outputs.push((out_path, tar_name));
     }
-    let guards: Vec<TempFileGuard> = outputs
+    let mut guards: Vec<TempFileGuard> = outputs
         .iter()
         .map(|(p, _)| {
             if keep_guards {
@@ -2496,37 +2710,72 @@ async fn pack_local_images(
         &format!("并行打包 {} 个本地镜像包(并发 {})", n, concurrency),
     );
 
-    let mut set: tokio::task::JoinSet<(usize, Result<u64, String>)> = tokio::task::JoinSet::new();
+    let mut set: tokio::task::JoinSet<(usize, Result<PackedOne, String>)> =
+        tokio::task::JoinSet::new();
     // 启动第一批(至多 concurrency 个);此后每完成一个补位一个
     let mut next = 0usize;
     while next < n && set.len() < concurrency {
-        set.spawn(spawn_pack_job(next, images[next].clone(), outputs[next].0.clone()));
+        set.spawn(spawn_pack_job(
+            next,
+            images[next].clone(),
+            outputs[next].0.clone(),
+            remote_layers.cloned(),
+        ));
         next += 1;
     }
 
     let mut first_error: Option<String> = None;
     let mut cancelled = false;
     let mut done = 0usize;
+    // 增量汇总(日志口径:本次是增量还是整包写明白)
+    let mut trimmed_count = 0usize;
+    let mut trimmed_layers = 0usize;
+    let mut trimmed_saved = 0u64;
+    let mut results: Vec<Option<PackedOne>> = (0..n).map(|_| None).collect();
     while let Some(joined) = set.join_next().await {
         let (idx, res) = match joined {
             Ok(pair) => pair,
-            // 外层包装任务自身 panic(理论上不可能,防御性兜底)
+            // 外层包装任务自身 panic(理论上不可行,防御性兜底)
             Err(e) => (usize::MAX, Err(format!("打包任务异常终止: {}", e))),
         };
         match res {
-            Ok(bytes) => {
+            Ok(one) => {
                 done += 1;
                 if let Some(name) = images.get(idx) {
+                    let extra = if one.full.is_some() {
+                        trimmed_count += 1;
+                        trimmed_layers += one.dropped_layers.len();
+                        trimmed_saved += one.dropped_bytes;
+                        format!(
+                            " — 增量传输:跳过 {} 层,省 {} MB",
+                            one.dropped_layers.len(),
+                            one.dropped_bytes / 1024 / 1024
+                        )
+                    } else {
+                        String::new()
+                    };
                     emit_log(
                         app,
                         &format!(
-                            "打包完成 ({}/{}): {} (共 {} MB)",
+                            "打包完成 ({}/{}): {} (共 {} MB){}",
                             done,
                             n,
                             name,
-                            bytes / 1024 / 1024
+                            one.bytes / 1024 / 1024,
+                            extra
                         ),
                     );
+                }
+                // 兜底整包与主包同生命周期(keep = 断点期保留,成功/放弃时显式清理)
+                if let Some(full) = &one.full {
+                    guards.push(if keep_guards {
+                        TempFileGuard::keep(full.clone())
+                    } else {
+                        TempFileGuard::new(full.clone())
+                    });
+                }
+                if let Some(slot) = results.get_mut(idx) {
+                    *slot = Some(one);
                 }
             }
             Err(e) => {
@@ -2543,7 +2792,12 @@ async fn pack_local_images(
             continue;
         }
         if next < n {
-            set.spawn(spawn_pack_job(next, images[next].clone(), outputs[next].0.clone()));
+            set.spawn(spawn_pack_job(
+                next,
+                images[next].clone(),
+                outputs[next].0.clone(),
+                remote_layers.cloned(),
+            ));
             next += 1;
         }
     }
@@ -2554,8 +2808,38 @@ async fn pack_local_images(
     if let Some(e) = first_error {
         return Err(e);
     }
+    // 传输方式汇总(只在实际尝试过裁剪的口径下打印;未启用/查询失败不改日志)
+    if remote_layers.is_some() {
+        if trimmed_count > 0 {
+            emit_log(
+                app,
+                &format!(
+                    "本次传输:增量传输({}/{} 个镜像裁剪,跳过 {} 层,省 {} MB)",
+                    trimmed_count,
+                    n,
+                    trimmed_layers,
+                    trimmed_saved / 1024 / 1024
+                ),
+            );
+        } else {
+            emit_log(app, "本次传输:整包传输(无镜像可裁剪)");
+        }
+    }
+    let fulls: Vec<Option<PathBuf>> = (0..n)
+        .map(|i| results[i].as_ref().and_then(|o| o.full.clone()))
+        .collect();
+    let dropped_layers: Vec<Vec<String>> = (0..n)
+        .map(|i| {
+            results[i]
+                .as_ref()
+                .map(|o| o.dropped_layers.clone())
+                .unwrap_or_default()
+        })
+        .collect();
     Ok(LocalTars {
         files: outputs,
+        fulls,
+        dropped_layers,
         _guards: guards,
     })
 }
@@ -2563,13 +2847,39 @@ async fn pack_local_images(
 /// 启动一个静默打包任务:并发导出 `image` 到 `out_path`,返回 `(任务序号, 结果)`。
 /// (外层 async 任务包装保证内层 blocking 任务 panic 也带序号转为 `Err`,
 /// 便于定位失败的是哪个镜像。)
+///
+/// `remote_layers` 非空时先试层级增量裁剪(第三十八批):有增益 → 裁剪包 +
+/// 兜底整包;无增益/包解析不了 → 与历史行为**字节一致**的整包导出。
 fn spawn_pack_job(
     idx: usize,
     image: String,
     out_path: PathBuf,
-) -> impl std::future::Future<Output = (usize, Result<u64, String>)> + Send + 'static {
+    remote_layers: Option<std::collections::HashSet<String>>,
+) -> impl std::future::Future<Output = (usize, Result<PackedOne, String>)> + Send + 'static {
     async move {
-        let res = export_image_silent(&image, &out_path).await;
+        let plain = |bytes: u64| PackedOne {
+            bytes,
+            full: None,
+            dropped_layers: Vec::new(),
+            dropped_bytes: 0,
+        };
+        let res = match remote_layers.filter(|s| !s.is_empty()) {
+            Some(layers) => {
+                let full = PathBuf::from(format!("{}.full", out_path.display()));
+                let raw = PathBuf::from(format!("{}.raw", out_path.display()));
+                match run_export_trimmed_silent(&image, &out_path, &full, &raw, layers).await {
+                    Ok(Some(exp)) => Ok(PackedOne {
+                        bytes: exp.trimmed_bytes,
+                        full: Some(exp.full_path.clone()),
+                        dropped_layers: exp.dropped_diff_ids.clone(),
+                        dropped_bytes: exp.dropped_bytes,
+                    }),
+                    Ok(None) => export_image_silent(&image, &out_path).await.map(plain),
+                    Err(e) => Err(e),
+                }
+            }
+            None => export_image_silent(&image, &out_path).await.map(plain),
+        };
         (idx, res)
     }
 }
@@ -2712,6 +3022,79 @@ async fn upload_local_tars(
     }
     emit_log(app, &format!("镜像包上传完成,共 {} 个", n));
     Ok(())
+}
+
+/// 步骤 4 子步:把发布目录里的**裁剪包**替换为服务器重建的自包含整包
+/// (第三十八批;归档契约)。
+///
+/// **为什么必须重建**:上传进 releases 的是裁剪包(缺层),直接充当归档会让
+/// 回滚装载缺层失败 —— 不变式:`releases/` 里的包默认必须是**完整归档**
+/// (自包含,回滚可直接装载)。装载成功后服务器上已有完整镜像,由它
+/// `docker save` 重建最权威(顺带验证了服务器真的有了完整镜像)。
+///
+/// **为什么不用 `docker save | gzip` 管道**:管道退出码取决于最后一个命令,
+/// `docker save` 失败 + `gzip` 收到空输入会**产出合法空包且 rc=0**,重新打开
+/// 「静默失败」的口子;`set -o pipefail` 又依赖远端 shell(未必是 bash)。
+/// 故拆成 rc 可判的三段:落未压缩 tar → 压缩 → 原子替换(`mv -f` 同目录改名)。
+///
+/// 失败时清掉中转残留**与缺层裁剪包**(调用方随即把 manifest 的 `file` 置
+/// `None` 并记录依赖层 —— 绝不留下一个缺层的包冒充可回滚归档)。
+async fn rebuild_release_archive(
+    app: &AppHandle,
+    client: &mut SshClient,
+    release_dir: &str,
+    image_ref: &str,
+    name: &str,
+) -> Result<(), String> {
+    let final_path = remote_join(release_dir, name);
+    let tmp_tar = remote_join(release_dir, &format!("{}.rebuild-tar", name));
+    let tmp_gz = remote_join(release_dir, &format!("{}.rebuild-gz", name));
+    emit_log(
+        app,
+        &format!("完整归档:重建自包含镜像包(服务器 docker save){}", name),
+    );
+    let cmd = format!(
+        "docker save {} -o {} && gzip -c {} > {} && mv -f {} {} && rm -f {}",
+        shell_single_quote(image_ref),
+        shell_single_quote(&tmp_tar),
+        shell_single_quote(&tmp_tar),
+        shell_single_quote(&tmp_gz),
+        shell_single_quote(&tmp_gz),
+        shell_single_quote(&final_path),
+        shell_single_quote(&tmp_tar),
+    );
+    match exec_forwarded(app, client, &cmd, STACK_LOAD_TIMEOUT_SECS).await {
+        Ok(()) => {
+            emit_log(
+                app,
+                &format!("完整归档(自包含,回滚可直接装载): {}", name),
+            );
+            Ok(())
+        }
+        Err(e) => {
+            // 清理中转残留 + 缺层裁剪包(调用方不再保留它)
+            let clean = format!(
+                "rm -f {} {} {}",
+                shell_single_quote(&tmp_tar),
+                shell_single_quote(&tmp_gz),
+                shell_single_quote(&final_path),
+            );
+            if let Err(e2) = exec_forwarded(app, client, &clean, SSH_EXEC_TIMEOUT_SECS).await {
+                emit_log(app, &format!("警告:清理未完成的重建产物失败({})", e2));
+            }
+            Err(e)
+        }
+    }
+}
+
+/// 断点产物的兜底整包路径恢复(第三十八批):与 `files` 长度对齐;
+/// 缺失/旧断点 → 全 `None`(视为未裁剪,行为与接前一致)。
+fn resume_fulls(stored: &[Option<String>], n: usize) -> Vec<Option<PathBuf>> {
+    if stored.len() == n {
+        stored.iter().map(|s| s.as_ref().map(PathBuf::from)).collect()
+    } else {
+        vec![None; n]
+    }
 }
 
 // ===== 整栈部署纯逻辑(便于单测)=====

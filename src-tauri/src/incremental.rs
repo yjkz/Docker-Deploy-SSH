@@ -265,6 +265,19 @@ pub fn plan_drop(pkg: &SavePackage, remote_diff_ids: &HashSet<String>) -> (Vec<S
     (drop, saved)
 }
 
+/// 从包中提取**被裁掉**的层的 diffID(第三十八批:归档契约)。
+///
+/// 用途:整栈把裁剪包上传进 release 目录后,若服务器无法用 `docker save` 重建
+/// 自包含整包,manifest 必须记下「本次归档依赖服务器已有的哪些层」——
+/// 回滚预检据此核对服务器是否仍持有这些层,缺层时落「增量包待补层」态。
+pub fn dropped_diff_ids(pkg: &SavePackage, drop: &HashSet<String>) -> Vec<String> {
+    pkg.layers
+        .iter()
+        .filter(|l| drop.contains(&l.blob))
+        .map(|l| l.diff_id.clone())
+        .collect()
+}
+
 /// 写裁剪包:除 `drop` 里的 blob 外,其余条目**原样流式搬运**(含目录条目与 JSON)。
 ///
 /// 返回写入的字节数(压缩前)。
@@ -440,6 +453,25 @@ mod tests {
         let (drop_none, saved_none) = plan_drop(&pkg, &HashSet::new());
         assert!(drop_none.is_empty(), "无命中 → 不丢任何层(调用方走原路径)");
         assert_eq!(saved_none, 0);
+    }
+
+    #[test]
+    fn test_dropped_diff_ids_reports_only_dropped() {
+        let pkg = SavePackage {
+            config_digest: "c0ffee".into(),
+            layers: vec![
+                SaveLayer { blob: "bc914f20".into(), size: 10, diff_id: "1e8fb136".into() },
+                SaveLayer { blob: "5a796258".into(), size: 20, diff_id: "5d33d31d".into() },
+            ],
+        };
+        let mut drop = HashSet::new();
+        drop.insert("bc914f20".to_string());
+        assert_eq!(
+            dropped_diff_ids(&pkg, &drop),
+            vec!["1e8fb136".to_string()],
+            "只报被裁层的 diffID(归档依赖清单)"
+        );
+        assert!(dropped_diff_ids(&pkg, &HashSet::new()).is_empty(), "无裁剪 → 无依赖层");
     }
 
     /// 造一个最小 OCI 混合包(结构照 0 期实测的 docker save 产物:index.json → image index

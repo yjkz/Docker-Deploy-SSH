@@ -4320,3 +4320,80 @@ containerd store)与经典 store 服务器之间,`same_image_id` 恒不成立 �
 **不变式(必须守)**:`releases/` 里的包默认必须是**完整归档** —— 因此整栈接入裁剪时,
 必须在装载成功后由服务器 `docker save` **重建整包**再写归档;重建失败则该镜像的 manifest
 `file` 置 `None` 并在预检里落成「增量包待补层」态,**绝不能留一个缺层的包冒充可回滚归档**。
+
+---
+
+# 第三十八批:L1 整栈接入 + 归档契约 + 回滚第五态(2026-09-23)
+
+> **来源**:第三十七批「未做」节钉死的三个接入点(整栈逐包裁剪 / 装载双判 / 重建归档)+
+> 用户交付标准「整栈勾选后:上传量按共享层裁剪、归档仍是自包含整包、装载失败能自愈、
+> 回滚预检对『增量包待补层』有明确说法」。**版本**:v6.18.0(与第三十七批同版本,未发版)。
+
+## 做了什么
+
+- **整栈逐包裁剪**(`pack_local_images` / `spawn_pack_job`):打包前查一次服务器已有层
+  (`query_remote_layer_ids`;建连留给步骤 3 复用,查询/建连失败只告警退整包);每个镜像在
+  blocking 池里**独立**走 `save_gzip_trimmed`(零增益即整包,与历史字节一致),产出裁剪包 +
+  兜底整包(本地 `<uuid>.tar.gz.full`);兜底与主包同生命周期(guard / 断点保留 / 成功收尾
+  显式清理同策略)。断点产物新增 `fullLocals` / `droppedLayers`(旧断点缺字段 → 视为全未
+  裁剪,与接前行为一致),续传跳过打包时恢复。
+- **整栈装载循环**(与单镜像同款):`exec_forwarded_tail` 抓尾部 →
+  `detect_silent_load_failure` **rc+文本双判** → 命中即 `docker rmi -f` 清半成品 +
+  `upload_tar` 上传 `<name>.full` 整包重传 → 再判(仍失败才报错);兜底包远端名带 `.full`
+  独立后缀(SFTP「远端大小比对续传」防护)。`upload_tar` 泛化为「目标目录 + 进度前缀」
+  参数(单镜像 `/tmp` 语义不变)。
+- **归档契约(不变式)**:`releases/` 里的包默认必须是**完整归档** —— 裁剪包装载成功后
+  (含 force_archive 留档 / 断点幂等跳过装载两种追加情形),由服务器
+  `docker save '<镜像>' -o T && gzip -c T > T.gz && mv -f T.gz <归档名> && rm -f T` 重建。
+  **刻意不走 `docker save | gzip` 管道**:管道退出码取决于最后一条命令(`save` 失败 +
+  `gzip` 收空输入会产出**合法空包且 rc=0**,重新打开静默失败的口子),`set -o pipefail`
+  又依赖远端 shell(未必是 bash)。重建失败 → 清中转残留 + 删缺层裁剪包 + manifest
+  `file=null` + 记 `needs_layers`(被裁层 diffID;由 `TrimmedExport.dropped_diff_ids`
+  提供)。装载失败重传过的兜底包在重建后清理(不属于归档)。
+- **manifest 扩展**:`ManifestImage.needs_layers: Vec<String>`(`serde(default)` +
+  空值不序列化 —— 旧归档可读,旧版本读新 manifest 也不受影响)。`build_manifest_images`
+  改吃「归档阶段结果」(`archive_files` / `archive_needs`,与打包列表同序;未裁剪项恒
+  `Some(原名)` / 空),manifest 构建随之**移到步骤 4 之后**(归档结果步骤 4 才定)。
+- **回滚第五态「增量包待补层」**:`RollbackImageSource::NeedsLayers`(契约串
+  `needsLayers`,blocking)+ `RollbackPrecheckSummary.needs_layers` 计数 +
+  `plan_rollback_with_layers`(原 `plan_rollback_full` 拆为 `plan_rollback_core` + 层核对
+  后处理;`plan_rollback_full` 保持签名 = 不做层核对,既有测试与降级路径不受影响)。
+  判定:无归档包且 `needs_layers` 非空 → 与服务器层清单核对 —— **缺任一 → 阻断并逐条
+  列出**;全在 → 走既有 ID/标签判定且 detail 前缀「增量归档(依赖服务器已有层),服务器
+  仍持有全部依赖层;」;层清单不可得 → **不做**缺层断言(detail 注明「未能核对」——
+  查询失败 ≠ 层丢了)。层清单按需查(`query_rollback_remote_layers`:manifest 无增量归档
+  项时零额外远端往返),预检命令静默降级、两执行链告警降级。
+- **前端**:04 页(`deploy-rollback.js`)/ 06 页(`rollback.js`)预检渲染加第五态徽章
+  「增量包待补层」与计数(`res.needsLayers`);help.js 新增「层级增量传输(可选)」小节 +
+  回滚预检段落补第五态;settings.js hint 补整栈归档说明。
+- **词表统一**(用户给的表;三处 surface 同一口径):部署日志
+  `增量传输:跳过 N 层,省 X MB`(单镜像逐条 + 整栈逐条与「本次传输」汇总)/
+  `整包传输` / `增量装载失败 → 整包重传:<原因原文>`;归档
+  `完整归档(自包含,回滚可直接装载)` / `增量归档(依赖服务器已有层)`;回滚预检第五态
+  徽章与 detail。单镜像原「层级增量:…」日志一并换新词表。
+- **顺带修**:`resume_local_tars` 补收单镜像 `full_local`(第三十七批「放弃断点」清理漏了
+  兜底整包,会留孤儿文件)。
+
+## 未做(如实记录)
+
+- **端到端(真机整栈部署)未跑**:整栈部署需 GUI 交互(本机 Tauri 应用),本轮验证到
+  「编译 / 单测 / 静态校验 / 真机命令链冒烟」层;真机整栈部署按用户口径统一安排。
+- 迁移链(跨机搬归档)不动;镜像 ID 跨 store 口径(P5,第三十六批记账)不属本批。
+
+## 验证
+
+- `cargo test` **551 passed / 0 failed**(543→551,+8:`dropped_diff_ids` 纯函数、
+  manifest 归档契约与旧 JSON 兼容、回滚第五态 5 条)
+- `cargo clippy --lib` 11 条与基线逐条一致(仅行号位移,零新增)
+- `node --check` 改动 JS + verify 七脚本全 PASS
+- **真机冒烟**(tencent2 经典 store + kkhuawei containerd store;自建 `FROM scratch` 受控镜像,
+  用后镜像/容器/`/tmp` 全清归零):重建命令链
+  `docker save '<镜像>' -o T && gzip -c T > T.gz && mv -f T.gz <归档名> && rm -f T`
+  两台均 rc=0,产物 `gzip -t` 通过且为标准 OCI 布局(`blobs/` + `index.json`);**失败链**
+  (`docker save <不存在的引用>` 打头)两台均 rc=1,且**原归档文件内容未被破坏**(`mv -f`
+  只在 gzip 成功后才执行)—— 即「重建失败 → manifest `file` 置 None」的降级路径不会被
+  半成品污染。driver 特征复核:tencent2 = 经典(`overlay2`),kkhuawei = containerd
+  (`driver-type=io.containerd.snapshotter.v1`)。
+- `node verify/doc-consistency.js --write --tests=551` 刷新计数;wiki/README、ROADMAP、
+  AGENTS.md 计数同步;wiki/02、03、04、06 + help.js 随批次更新
+

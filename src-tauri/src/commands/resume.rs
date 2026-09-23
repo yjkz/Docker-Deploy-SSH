@@ -61,6 +61,20 @@ pub(crate) struct StackResumeArtifacts {
     pub(crate) locals: Vec<String>,
     /// 与 [`StackResumeArtifacts::files`] 对齐的镜像引用(装载幂等检查用)
     pub(crate) images: Vec<String>,
+    /// 步骤 2 产物(第三十八批,层级增量):与 `files` 对齐的**兜底整包**本地
+    /// 路径(`None` = 该包未裁剪);`files[i]` 对应项为 `Some` 即该包是裁剪包,
+    /// 装载失败时改传兜底整包。旧断点无该字段 → 视为全未裁剪。
+    pub(crate) full_locals: Vec<Option<String>>,
+    /// 步骤 2 产物(第三十八批):与 `files` 对齐的被裁层 diffID(空 = 未裁剪)。
+    /// 归档契约用:服务器重建自包含包失败时,manifest 据此记录增量归档的层依赖。
+    pub(crate) dropped_layers: Vec<Vec<String>>,
+    /// 步骤 4 产物(第三十八批):与 `files` 对齐的最终归档包名
+    /// (`None` = 归档里没有该服务的自包含包:重建失败后已清理)。
+    /// 仅当步骤 4 已跑过才有值;空 vec(旧断点)= 视为全未裁剪。
+    pub(crate) archive_files: Vec<Option<String>>,
+    /// 步骤 4 产物(第三十八批):与 `files` 对齐的增量归档依赖层
+    /// (非空 = 该服务是增量归档,回滚恢复依赖服务器仍持有这些层)
+    pub(crate) archive_needs: Vec<Vec<String>>,
 }
 
 /// 断点续传上下文:由 checkpoint 反序列化而来,驱动部署管线的跳步与幂等化。
@@ -119,12 +133,13 @@ pub(crate) fn resume_local_tars(cp: &ResumeCheckpoint) -> Vec<PathBuf> {
     match cp.mode.as_str() {
         MODE_SINGLE => parse_single_artifacts(&cp.artifacts)
             .into_iter()
-            .filter_map(|a| a.tar_local)
+            // 兜底整包同样随断点保留(第三十八批;清理是尽力而为)
+            .flat_map(|a| a.tar_local.into_iter().chain(a.full_local))
             .map(PathBuf::from)
             .collect(),
         MODE_STACK => parse_stack_artifacts(&cp.artifacts)
             .into_iter()
-            .flat_map(|a| a.locals.into_iter())
+            .flat_map(|a| a.locals.into_iter().chain(a.full_locals.into_iter().flatten()))
             .map(PathBuf::from)
             .collect(),
         _ => Vec::new(),

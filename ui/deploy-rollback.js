@@ -632,7 +632,8 @@
       ' · 服务器上按镜像 ID 命中 ' + (res.remoteById || 0) +
       (res.tagRestore ? ' · 标签待指回 ' + res.tagRestore : '') +
       (res.missing ? ' · 回不去 ' + res.missing : '') +
-      (res.unknown ? ' · 无法核对 ' + res.unknown : ''));
+      (res.unknown ? ' · 无法核对 ' + res.unknown : '') +
+      (res.needsLayers ? ' · 增量包待补层 ' + res.needsLayers : ''));
     box.appendChild(head);
     // 归档无 compose 副本(第三十二批 F6):本次沿用服务器现有 compose,
     // 服务构成可能与归档不一致 —— 必须在确认前让用户看到
@@ -649,7 +650,10 @@
     sorted.forEach(function (it) {
       var row = el('div', 'rb-precheck-row' + (it.blocking ? ' is-blocking' : ''));
       var kind = it.blocking ? 'fail' : (it.source === 'tagRestore' ? 'warn' : 'ok');
-      var label = it.blocking ? '回不去' : (it.source === 'tagRestore' ? '标签待指回' : '可用');
+      // 增量包待补层(第三十八批):增量归档依赖的服务器层已缺 —— 独立徽章文案
+      var label = it.blocking
+        ? (it.source === 'needsLayers' ? '增量包待补层' : '回不去')
+        : (it.source === 'tagRestore' ? '标签待指回' : '可用');
       row.appendChild(window.fillBadge(el('span'), kind, label));
       row.appendChild(el('span', 'rb-precheck-svc', String(it.service || '')));
       row.appendChild(el('span', 'rb-precheck-detail', String(it.detail || '')));

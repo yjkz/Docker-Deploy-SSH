@@ -605,6 +605,9 @@ pub struct TrimmedExport {
     /// 被丢掉的层数与字节数(日志用)。
     pub dropped_layers: usize,
     pub dropped_bytes: u64,
+    /// 被丢掉的层的 diffID(第三十八批:归档契约用 —— 增量归档要记录自己
+    /// 依赖服务器已持有的哪些层,回滚预检据此核对)。
+    pub dropped_diff_ids: Vec<String>,
 }
 
 /// 层级增量导出(第三十七批):`docker save` 落裸 tar → 按远端已有层裁剪 → 两趟 gzip。
@@ -653,6 +656,7 @@ pub fn save_gzip_trimmed(
     }
     let drop_set: std::collections::HashSet<String> = drop.into_iter().collect();
     let dropped_layers = drop_set.len();
+    let dropped_ids = crate::incremental::dropped_diff_ids(&pkg, &drop_set);
 
     // ③ 重打包 + 两趟 gzip(先裁剪包,后整包;进度累计上报,只增不减)
     let trimmed_tar = raw_tar.with_extension("trimmed.tar");
@@ -686,6 +690,7 @@ pub fn save_gzip_trimmed(
         full_bytes,
         dropped_layers,
         dropped_bytes,
+        dropped_diff_ids: dropped_ids,
     }))
 }
 

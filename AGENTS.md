@@ -7,7 +7,7 @@
 Windows 桌面客户端（Tauri 2）：把本地构建的 Docker 镜像一键部署到自己的服务器 —— `docker save → gzip → SFTP → docker load → compose up`，不依赖镜像仓库与 CI/CD。
 
 - 后端：纯 Rust（`src-tauri/src/`，全部业务逻辑）；前端：原生 HTML/CSS/JS（`ui/`，**无框架、无打包器、无 npm 运行时依赖**）。
-- 主分支 `main`；当前版本 v6.18.0，`cargo test` 基线 **543 passed / 15 ignored**，命令 **122** 个（实测口径 = 数 `lib.rs` 的 `generate_handler![]`）。**版本与计数真值以 `ROADMAP.md`「当前状态速览」为准**（本行曾长期漂移）。
+- 主分支 `main`；当前版本 v6.18.0，`cargo test` 基线 **551 passed / 15 ignored**，命令 **122** 个（实测口径 = 数 `lib.rs` 的 `generate_handler![]`）。**版本与计数真值以 `ROADMAP.md`「当前状态速览」为准**（本行曾长期漂移）。
 
 ## 目录导览
 
@@ -15,7 +15,7 @@ Windows 桌面客户端（Tauri 2）：把本地构建的 Docker 镜像一键部
 |---|---|
 | `src-tauri/src/lib.rs` | Builder 组装 + **命令注册唯一权威** |
 | `src-tauri/src/commands/` | 编排层（部署/回滚/清理/迁移/断点/批量/预览等 11 文件） |
-| `src-tauri/src/*.rs` | 功能模块：config / ssh / docker / stack / notify / update / manage* / migrate_project / probe / profiles / **deploy_schedule** / errors / tray_status |
+| `src-tauri/src/*.rs` | 功能模块：config / ssh / docker / stack / notify / update / manage* / migrate_project / probe / profiles / **deploy_schedule** / **incremental**（L1 层级增量内核）/ errors / tray_status |
 | `ui/` | 前端整目录即 Tauri frontendDist（**编译期内嵌**）；`index.html` 的 script 加载顺序有依赖 |
 | `wiki/` | 唯一权威文档（7 篇） |
 | `verify/` | 零依赖 Node 校验脚本（不参与构建） |

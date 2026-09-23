@@ -17,6 +17,12 @@ pub struct ManifestImage {
     /// 比较**:同名 tag 重新构建后 ID 不同,旧行为会误判「不变」。
     #[serde(default)]
     pub id: Option<String>,
+    /// 增量归档依赖的服务器层(第三十八批):**非空 = 本次部署该服务是增量
+    /// 传输且服务器重建自包含整包失败** —— 归档里没有它的完整包(`file`
+    /// 同时为 `None`),回滚恢复依赖服务器仍持有这些 diffID 的层。
+    /// 空(含旧归档)= 完整归档 / 智能传输跳过,无此情形。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs_layers: Vec<String>,
 }
 
 /// 回滚时某个服务的镜像来源(第二十九批 R1;纯判定,便于单测)。
@@ -33,6 +39,11 @@ pub enum RollbackImageSource {
     /// goodlaser-backend:latest 指向 265b2e14d9a6,归档 ID c313095267ee 仍在
     /// 服务器上挂于其它标签 —— 旧行为报「回不去」,用户毫无出路)。
     RemoteByIdTagMoved,
+    /// **增量包待补层**(第三十八批):该服务本次为增量传输且服务器重建自包含
+    /// 整包失败(manifest `file = null` + `needs_layers` 非空),而服务器**已缺**
+    /// 其中部分层 —— 归档里没有它的完整包,`docker load` 无从恢复,必须显式
+    /// 列出并要求确认(`needs_layers` 全在时走既有 ID/标签判定)。
+    NeedsLayers,
     /// 跳过且远端已无该 ID:旧镜像已被覆盖或清理 —— **回滚不了这个服务**,
     /// 必须让用户知道(此前是静默沿用当前镜像,界面还报「回滚完成」)
     Missing,
@@ -41,12 +52,13 @@ pub enum RollbackImageSource {
 }
 
 impl RollbackImageSource {
-    /// 契约串(camelCase 返回体里的 `source` 字段;前端据此渲染四态)。
+    /// 契约串(camelCase 返回体里的 `source` 字段;前端据此渲染五态)。
     pub fn as_str(self) -> &'static str {
         match self {
             RollbackImageSource::Archived => "archived",
             RollbackImageSource::RemoteById => "remoteById",
             RollbackImageSource::RemoteByIdTagMoved => "tagRestore",
+            RollbackImageSource::NeedsLayers => "needsLayers",
             RollbackImageSource::Missing => "missing",
             RollbackImageSource::Unknown => "unknown",
         }
@@ -77,13 +89,15 @@ pub struct RollbackPrecheckSummary {
     pub remote_by_id: usize,
     /// tag 被占、但 ID 仍在 → 执行时可自动指回(v6.12.0;不计入阻断)
     pub tag_restore: usize,
+    /// 增量包待补层(第三十八批):增量归档 + 服务器缺依赖层 —— 阻断项
+    pub needs_layers: usize,
     pub missing: usize,
     pub unknown: usize,
 }
 
 impl RollbackPrecheckSummary {
     pub fn has_blocking(&self) -> bool {
-        self.missing > 0 || self.unknown > 0
+        self.missing > 0 || self.unknown > 0 || self.needs_layers > 0
     }
 }
 
@@ -154,7 +168,97 @@ pub fn plan_rollback_with_files(
 /// 镜像列表失败**(daemon 异常/权限),此时不能把「查不到」说成「镜像丢了」——
 /// 两者的用户处置完全不同(前者重试即可,后者得重新部署)。都阻断(fail-closed),
 /// 但文案必须区分。
+///
+/// 第三十八批:新增[`plan_rollback_with_layers`]处理「增量归档」;本函数保持原
+/// 签名(层清单不可得 = 不做增量核对),供既有测试与降级路径使用。
 pub fn plan_rollback_full(
+    images: &[ManifestImage],
+    remote: &[(String, String)],
+    actual_files: &[String],
+    remote_available: bool,
+) -> Vec<RollbackImagePlan> {
+    plan_rollback_with_layers(images, remote, actual_files, remote_available, None)
+}
+
+/// [`plan_rollback_full`] 的第三十八批扩展:额外核对**增量归档依赖的服务器层**。
+///
+/// 背景:整栈接入 L1 增量传输后,若服务器重建自包含整包失败,该服务的归档
+/// 就是「增量归档」—— manifest `file = None` + `needs_layers` 记下它依赖
+/// 服务器已有的层。回滚能不能恢复,取决于**服务器是否还持有这些层**:
+/// 全在 → 走既有 ID/标签判定(可用);缺任一 → `NeedsLayers`(**必须显式列出
+/// 并要求确认**,不能静默尝试装载 —— 归档里没有它的自包含包)。
+///
+/// `remote_layers` = 服务器当前层清单(`query_remote_layer_ids` 得到;`None` =
+/// 未查询/查询失败)。不可得时**不做**缺层断言(查询失败 ≠ 层丢了),仅在说明
+/// 里注明未能核对 —— 与「查不到镜像列表 ≠ 镜像丢了」同款留有余地。
+pub fn plan_rollback_with_layers(
+    images: &[ManifestImage],
+    remote: &[(String, String)],
+    actual_files: &[String],
+    remote_available: bool,
+    remote_layers: Option<&std::collections::HashSet<String>>,
+) -> Vec<RollbackImagePlan> {
+    let mut plan = plan_rollback_core(images, remote, actual_files, remote_available);
+    // 增量归档修正:只在「无归档包且记了依赖层」的服务上生效(有包 = 完整归档,
+    // 不变式保证 —— 不参与此判定)
+    for (img, item) in images.iter().zip(plan.iter_mut()) {
+        if img.file.is_some() || img.needs_layers.is_empty() {
+            continue;
+        }
+        let (missing, checked) = match remote_layers {
+            Some(layers) => (
+                img.needs_layers
+                    .iter()
+                    .map(|d| crate::incremental::normalize_digest(d))
+                    .filter(|d| !layers.contains(d))
+                    .count(),
+                true,
+            ),
+            None => (0, false),
+        };
+        if missing > 0 {
+            *item = RollbackImagePlan {
+                service: img.service.clone(),
+                tag: img.tag.clone(),
+                source: RollbackImageSource::NeedsLayers,
+                blocking: true,
+                detail: format!(
+                    "{}:该服务为增量归档(依赖服务器已有层),但服务器已缺其中的 {} 层 —— 归档里没有它的自包含包(部署时完整归档重建失败),无法直接装载;确认继续则该服务沿用服务器当前镜像,精确回退请重新部署该版本",
+                    img.tag, missing
+                ),
+            };
+        } else if checked {
+            item.detail = format!(
+                "增量归档(依赖服务器已有层),服务器仍持有全部依赖层;{}",
+                item.detail
+            );
+        } else {
+            item.detail = format!(
+                "增量归档(依赖服务器已有层),本次未能核对服务器是否仍持有这些层;{}",
+                item.detail
+            );
+        }
+    }
+    plan
+}
+
+/// 按需查询服务器层清单(第三十八批):仅当 manifest 里存在「增量归档」项
+/// (`needs_layers` 非空)时才查一次 —— 无此类项时零额外远端往返。
+/// 返回 `Ok(None)` = 不需要核对;`Err` = 需要核对但查询失败(调用方决定
+/// 日志与降级:预检侧静默、执行侧告警,一律不做缺层断言)。
+async fn query_rollback_remote_layers(
+    client: &mut SshClient,
+    images: &[ManifestImage],
+) -> Result<Option<std::collections::HashSet<String>>, String> {
+    if !images.iter().any(|i| !i.needs_layers.is_empty()) {
+        return Ok(None);
+    }
+    query_remote_layer_ids(client).await.map(Some)
+}
+
+/// 回滚可用性判定核心(纯函数;不含增量归档的层核对 —— 见
+/// [`plan_rollback_with_layers`])。
+fn plan_rollback_core(
     images: &[ManifestImage],
     remote: &[(String, String)],
     actual_files: &[String],
@@ -293,6 +397,7 @@ pub fn rollback_precheck_summary(plan: &[RollbackImagePlan]) -> RollbackPrecheck
             RollbackImageSource::Archived => s.archived += 1,
             RollbackImageSource::RemoteById => s.remote_by_id += 1,
             RollbackImageSource::RemoteByIdTagMoved => s.tag_restore += 1,
+            RollbackImageSource::NeedsLayers => s.needs_layers += 1,
             RollbackImageSource::Missing => s.missing += 1,
             RollbackImageSource::Unknown => s.unknown += 1,
         }
@@ -308,11 +413,12 @@ pub fn rollback_precheck_block_message(
     sum: &RollbackPrecheckSummary,
 ) -> String {
     let mut lines = vec![format!(
-        "回滚可用性预检未通过:{} 个服务无法回退到该归档(归档内有包 {} 个、服务器上按镜像 ID 命中 {} 个、标签待指回 {} 个)",
-        sum.missing + sum.unknown,
+        "回滚可用性预检未通过:{} 个服务无法回退到该归档(归档内有包 {} 个、服务器上按镜像 ID 命中 {} 个、标签待指回 {} 个、增量包待补层 {} 个)",
+        sum.missing + sum.unknown + sum.needs_layers,
         sum.archived,
         sum.remote_by_id,
-        sum.tag_restore
+        sum.tag_restore,
+        sum.needs_layers
     )];
     for p in plan.iter().filter(|p| p.blocking) {
         lines.push(format!("· {}", p.detail));
@@ -806,35 +912,47 @@ impl ReleaseManifest {
 
 /// 组装 manifest 的镜像条目(纯函数,便于单测):逐个 Local 服务一条;
 /// `skip[i] == true` 表示该服务未打包(skip_unchanged 剔除且未留档),
-/// `file` 记 `None`,其余按顺序消费 `packed_files` 中的镜像包文件名。
+/// `file` 记 `None`,其余按顺序消费 `archive_files` 中的镜像包文件名。
 /// `tag` 存完整镜像引用(无标签时按 Docker 约定补 latest,见 [`split_image_ref`])。
 ///
 /// `ids[i]`(第二十一批补丁):该服务镜像的完整 ID(`sha256:` 前缀原样;
 /// 采集失败为 `None`)。写入 manifest 供两版本对比按内容(而非 tag 名)
 /// 判变化 —— 同名 tag 重新构建后 ID 不同,只比 tag 会把「镜像换了」
 /// 误报为「不变」(用户真机反馈)。
+///
+/// `archive_files` / `archive_needs`(第三十八批):步骤 4 归档阶段结果,
+/// 与打包列表(pack_list)同序 —— `archive_files[i]` = 该包最终归档名
+/// (`None` = 归档里没有自包含包:重建失败后已清理);`archive_needs[i]` =
+/// 该服务归档依赖服务器已有的层 diffID(空 = 完整归档)。未裁剪项两者恒为
+/// `Some(原名)` / 空(历史行为)。
 pub(crate) fn build_manifest_images(
     local: &[&StackServiceChoice],
     skip: &[bool],
-    packed_files: &[String],
+    archive_files: &[Option<String>],
+    archive_needs: &[Vec<String>],
     ids: &[Option<String>],
 ) -> Vec<ManifestImage> {
-    let mut files = packed_files.iter();
+    let mut files = archive_files.iter();
+    let mut needs = archive_needs.iter();
     local
         .iter()
         .enumerate()
         .map(|(i, svc)| {
             let (repo, tag) = split_image_ref(&svc.image);
-            let file = if skip.get(i).copied().unwrap_or(false) {
-                None
+            let (file, needs_layers) = if skip.get(i).copied().unwrap_or(false) {
+                (None, Vec::new())
             } else {
-                files.next().cloned()
+                (
+                    files.next().cloned().flatten(),
+                    needs.next().cloned().unwrap_or_default(),
+                )
             };
             ManifestImage {
                 service: svc.service.clone(),
                 tag: format!("{}:{}", repo, tag),
                 file,
                 id: ids.get(i).cloned().flatten(),
+                needs_layers,
             }
         })
         .collect()
@@ -1106,6 +1224,9 @@ pub struct RollbackPrecheck {
     pub tag_restore: usize,
     pub missing: usize,
     pub unknown: usize,
+    /// **增量包待补层**(第三十八批):增量归档依赖的服务器层已缺 → 该服务
+    /// 的归档恢复路径断了(须确认,与阻断同款处置)
+    pub needs_layers: usize,
     /// 存在阻断项(前端据此把「开始回滚」变为「仍要回滚(部分)」)
     pub has_blocking: bool,
     /// `.env` 插值漂移(v6.12.0;须确认,与阻断同款处置)
@@ -1196,6 +1317,7 @@ pub async fn rollback_precheck(
             tag_restore: 0,
             missing: 0,
             unknown: 0,
+            needs_layers: 0,
             has_blocking: false,
             env_drift: Vec::new(),
             no_manifest: true,
@@ -1228,7 +1350,18 @@ pub async fn rollback_precheck(
     )
     .await?;
     let actual_files = if code == 0 { parse_ls_lines(&ls_out) } else { Vec::new() };
-    let plan = plan_rollback_full(&m.images, &remote_pairs, &actual_files, remote_available);
+    // 增量归档的层核对(第三十八批;无此类项时零额外远端往返)。
+    // 预检侧查询失败静默降级(结果 detail 会注明「未能核对」,不误报缺层)。
+    let remote_layers = query_rollback_remote_layers(&mut client, &m.images)
+        .await
+        .unwrap_or(None);
+    let plan = plan_rollback_with_layers(
+        &m.images,
+        &remote_pairs,
+        &actual_files,
+        remote_available,
+        remote_layers.as_ref(),
+    );
     let sum = rollback_precheck_summary(&plan);
     let items = plan
         .iter()
@@ -1296,6 +1429,7 @@ pub async fn rollback_precheck(
         tag_restore: sum.tag_restore,
         missing: sum.missing,
         unknown: sum.unknown,
+        needs_layers: sum.needs_layers,
         has_blocking: sum.has_blocking(),
         env_drift,
         no_manifest: false,
@@ -1482,7 +1616,19 @@ pub(crate) async fn rollback_execute_stack_inner(
                     Vec::new()
                 }
             };
-            plan_rollback_with_files(&m.images, &remote, &files)
+            // 增量归档的层核对(第三十八批;无此类项零额外往返;失败仅告警,
+            // 不做缺层断言 —— 「查不到 ≠ 层丢了」)
+            let remote_layers = match query_rollback_remote_layers(&mut client, &m.images).await {
+                Ok(v) => v,
+                Err(e) => {
+                    emit_log(
+                        app,
+                        &format!("警告:查询服务器已有层失败({}),增量归档的层依赖未能核对", e),
+                    );
+                    None
+                }
+            };
+            plan_rollback_with_layers(&m.images, &remote, &files, true, remote_layers.as_ref())
         }
         None => Vec::new(),
     };
@@ -1491,8 +1637,13 @@ pub(crate) async fn rollback_execute_stack_inner(
         emit_log(
             app,
             &format!(
-                "回滚可用性预检:归档内有包 {} 个 / 服务器上按 ID 命中 {} 个 / 标签待指回 {} 个 / 回不去 {} 个 / 无法核对 {} 个",
-                sum.archived, sum.remote_by_id, sum.tag_restore, sum.missing, sum.unknown
+                "回滚可用性预检:归档内有包 {} 个 / 服务器上按 ID 命中 {} 个 / 标签待指回 {} 个 / 回不去 {} 个 / 无法核对 {} 个 / 增量包待补层 {} 个",
+                sum.archived,
+                sum.remote_by_id,
+                sum.tag_restore,
+                sum.missing,
+                sum.unknown,
+                sum.needs_layers
             ),
         );
         for p in plan.iter().filter(|p| p.blocking) {
@@ -2795,7 +2946,24 @@ async fn rollback_execute_stack_at_inner(
                     (Vec::new(), false)
                 }
             };
-            plan_rollback_full(&m.images, &remote, &files, remote_available)
+            // 增量归档的层核对(第三十八批;与 04 页同口径)
+            let remote_layers = match query_rollback_remote_layers(&mut client, &m.images).await {
+                Ok(v) => v,
+                Err(e) => {
+                    emit_log(
+                        app,
+                        &format!("警告:查询服务器已有层失败({}),增量归档的层依赖未能核对", e),
+                    );
+                    None
+                }
+            };
+            plan_rollback_with_layers(
+                &m.images,
+                &remote,
+                &files,
+                remote_available,
+                remote_layers.as_ref(),
+            )
         }
         None => Vec::new(),
     };
@@ -2804,8 +2972,13 @@ async fn rollback_execute_stack_at_inner(
         emit_log(
             app,
             &format!(
-                "回滚可用性预检:归档内有包 {} 个 / 服务器上按 ID 命中 {} 个 / 标签待指回 {} 个 / 回不去 {} 个 / 无法核对 {} 个",
-                sum.archived, sum.remote_by_id, sum.tag_restore, sum.missing, sum.unknown
+                "回滚可用性预检:归档内有包 {} 个 / 服务器上按 ID 命中 {} 个 / 标签待指回 {} 个 / 回不去 {} 个 / 无法核对 {} 个 / 增量包待补层 {} 个",
+                sum.archived,
+                sum.remote_by_id,
+                sum.tag_restore,
+                sum.missing,
+                sum.unknown,
+                sum.needs_layers
             ),
         );
         for p in plan.iter().filter(|p| p.blocking) {

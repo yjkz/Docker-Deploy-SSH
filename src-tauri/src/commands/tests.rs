@@ -1422,6 +1422,7 @@ services:
             tag: tag.to_string(),
             file: None,
             id: id.map(|s| s.to_string()),
+            needs_layers: Vec::new(),
         };
         let images = vec![
             mk("web", "nginx:1.27", Some("sha256:aaa")),
@@ -2354,6 +2355,10 @@ services:
             files: vec!["a.tar.gz".into()],
             locals: vec!["C:\\Temp\\a.tar.gz".into()],
             images: vec!["myapp:1".into()],
+            full_locals: vec![None],
+            dropped_layers: vec![Vec::new()],
+            archive_files: vec![Some("a.tar.gz".into())],
+            archive_needs: vec![Vec::new()],
         }
     }
 
@@ -2923,18 +2928,57 @@ services:
         ];
         let local: Vec<&StackServiceChoice> = owned.iter().collect();
         let ids = vec![Some("sha256:aaa".to_string()), None];
-        let files = vec!["web.tar.gz".to_string()];
-        let m = build_manifest_images(&local, &[false, true], &files, &ids);
+        let files = vec![Some("web.tar.gz".to_string())];
+        let needs: Vec<Vec<String>> = vec![Vec::new()];
+        let m = build_manifest_images(&local, &[false, true], &files, &needs, &ids);
         assert_eq!(m.len(), 2);
         // 打包项:id 记录 + 文件名按顺序消费
         assert_eq!(m[0].service, "web");
         assert_eq!(m[0].tag, "myapp:latest");
         assert_eq!(m[0].file.as_deref(), Some("web.tar.gz"));
         assert_eq!(m[0].id.as_deref(), Some("sha256:aaa"), "ID 应写入 manifest(对比按内容判变化)");
+        assert!(m[0].needs_layers.is_empty(), "完整归档不记依赖层");
         // 跳过项:file 无、id 无(采集失败回退按 tag 比较)
         assert_eq!(m[1].service, "db");
         assert_eq!(m[1].file, None);
         assert_eq!(m[1].id, None);
+    }
+
+    /// 第三十八批(归档契约):重建完整归档失败 → file 置 None + needs_layers
+    /// 记下依赖层(回滚预检据此核对服务器是否仍持有);成功 → 文件名保留、无依赖层。
+    #[test]
+    fn test_build_manifest_images_incremental_archive_contract() {
+        let owned = [
+            StackServiceChoice { service: "web".into(), image: "myapp:latest".into(), mode: TransferMode::Local },
+            StackServiceChoice { service: "api".into(), image: "api:1".into(), mode: TransferMode::Local },
+            StackServiceChoice { service: "db".into(), image: "postgres:16".into(), mode: TransferMode::Local },
+        ];
+        let local: Vec<&StackServiceChoice> = owned.iter().collect();
+        let ids = vec![None, None, None];
+        // web:重建失败(已清理裁剪包);api:重建成功(名字不变);db:未裁剪
+        let files = vec![None, Some("api.tar.gz".to_string()), Some("db.tar.gz".to_string())];
+        let needs: Vec<Vec<String>> = vec![
+            vec!["aa11".to_string(), "bb22".to_string()],
+            Vec::new(),
+            Vec::new(),
+        ];
+        let m = build_manifest_images(&local, &[false, false, false], &files, &needs, &ids);
+        assert_eq!(m[0].file, None, "重建失败的项:file 必须置 None(绝不留缺层包冒充归档)");
+        assert_eq!(m[0].needs_layers, vec!["aa11".to_string(), "bb22".to_string()]);
+        assert_eq!(m[1].file.as_deref(), Some("api.tar.gz"), "重建成功的项照常记名");
+        assert!(m[1].needs_layers.is_empty());
+        assert_eq!(m[2].file.as_deref(), Some("db.tar.gz"), "未裁剪项照常记名");
+    }
+
+    /// 旧归档兼容:manifest 条目没有 needs_layers 字段 → 反序列化为空(不阻断旧数据)。
+    #[test]
+    fn test_manifest_image_legacy_json_without_needs_layers() {
+        let json = r#"{"service":"web","tag":"myapp:latest","file":"a.tar.gz","id":"sha256:aaa"}"#;
+        let img: ManifestImage = serde_json::from_str(json).expect("旧归档 JSON 必须能解析");
+        assert!(img.needs_layers.is_empty(), "缺字段 → 空(视为完整归档)");
+        // 序列化时空依赖层不落字段(保持 manifest 形态精简、旧版本可读)
+        let out = serde_json::to_string(&img).unwrap();
+        assert!(!out.contains("needs_layers"), "空依赖层不序列化:{}", out);
     }
 
     // ===== 回滚可用性预检(第二十九批 R1)=====
@@ -2946,6 +2990,18 @@ services:
             tag: tag.into(),
             file: file.map(String::from),
             id: id.map(String::from),
+            needs_layers: Vec::new(),
+        }
+    }
+
+    /// 构造「增量归档」manifest 条目(第三十八批):无包(file = None)+ 依赖层。
+    fn mimg_inc(service: &str, tag: &str, id: Option<&str>, needs: &[&str]) -> ManifestImage {
+        ManifestImage {
+            service: service.into(),
+            tag: tag.into(),
+            file: None,
+            id: id.map(String::from),
+            needs_layers: needs.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -3212,6 +3268,111 @@ services:
         assert!(!s.has_blocking(), "可自动指回的服务不构成阻断");
         // 契约 source 串:前端按串渲染中间态
         assert_eq!(rollback_source_str(RollbackImageSource::RemoteByIdTagMoved), "tagRestore");
+    }
+
+    // ===== 第三十八批:增量归档 → 回滚预检第五态「增量包待补层」=====
+
+    fn layer_set(ids: &[&str]) -> std::collections::HashSet<String> {
+        ids.iter()
+            .map(|s| crate::incremental::normalize_digest(s))
+            .collect()
+    }
+
+    #[test]
+    fn test_rollback_precheck_needs_layers_when_layer_missing() {
+        // 增量归档(file = None + 依赖两层),服务器已缺其一 → 第五态,阻断
+        let images = vec![mimg_inc(
+            "web",
+            "myapp:latest",
+            Some("sha256:aaa"),
+            &["sha256:l1", "sha256:l2"],
+        )];
+        let remote = vec![("myapp:latest".to_string(), "sha256:aaa".to_string())];
+        let layers = layer_set(&["sha256:l1"]); // l2 缺
+        let plan = plan_rollback_with_layers(&images, &remote, &[], true, Some(&layers));
+        assert_eq!(plan[0].source, RollbackImageSource::NeedsLayers);
+        assert!(plan[0].blocking, "缺层必须显式列出并要求确认(不能静默尝试装载)");
+        assert!(
+            plan[0].detail.contains("增量归档") && plan[0].detail.contains("1 层"),
+            "文案要说清缺了几层:{}",
+            plan[0].detail
+        );
+        assert_eq!(plan[0].tag, "myapp:latest");
+        let sum = rollback_precheck_summary(&plan);
+        assert_eq!(sum.needs_layers, 1);
+        assert_eq!(sum.missing, 0, "第五态是独立计数的来源");
+        assert!(sum.has_blocking(), "needs_layers 计入阻断");
+        // 契约串(前端按它渲染第五态)
+        assert_eq!(rollback_source_str(RollbackImageSource::NeedsLayers), "needsLayers");
+        // 阻断文案逐条列出该服务
+        let msg = rollback_precheck_block_message(&plan, &sum);
+        assert!(msg.contains("增量包待补层 1 个"), "{}", msg);
+        assert!(msg.contains("myapp:latest"), "必须逐条列出:{}", msg);
+    }
+
+    #[test]
+    fn test_rollback_precheck_needs_layers_present_keeps_id_path() {
+        // 依赖层全在 + 服务器持有该镜像 → 既有判定(可用),detail 注明增量归档
+        let images = vec![mimg_inc("web", "myapp:latest", Some("sha256:aaa"), &["sha256:l1"])];
+        let remote = vec![("myapp:latest".to_string(), "sha256:aaa".to_string())];
+        let layers = layer_set(&["sha256:l1", "sha256:other"]);
+        let plan = plan_rollback_with_layers(&images, &remote, &[], true, Some(&layers));
+        assert_eq!(plan[0].source, RollbackImageSource::RemoteById);
+        assert!(!plan[0].blocking);
+        assert!(
+            plan[0].detail.starts_with("增量归档(依赖服务器已有层),服务器仍持有全部依赖层;"),
+            "{}",
+            plan[0].detail
+        );
+        assert!(!rollback_precheck_summary(&plan).has_blocking());
+    }
+
+    #[test]
+    fn test_rollback_precheck_needs_layers_without_inventory_not_asserted() {
+        // 层清单不可得(查询失败/未查询):不能断言「缺层」(查询失败 ≠ 层丢了)——
+        // 保持既有判定,detail 注明未能核对
+        let images = vec![mimg_inc("web", "myapp:latest", Some("sha256:aaa"), &["sha256:l1"])];
+        let remote = vec![("myapp:latest".to_string(), "sha256:aaa".to_string())];
+        let plan = plan_rollback_with_layers(&images, &remote, &[], true, None);
+        assert_eq!(plan[0].source, RollbackImageSource::RemoteById);
+        assert!(!plan[0].blocking);
+        assert!(plan[0].detail.contains("未能核对"), "{}", plan[0].detail);
+    }
+
+    #[test]
+    fn test_rollback_precheck_needs_layers_ignored_when_package_present() {
+        // 不变式:有包(file = Some)= 完整归档 —— 即便 needs_layers 非空也不参与
+        // 缺层判定(防线冗余;正常路径下两者不会同时出现)
+        let mut img = mimg("web", "myapp:latest", Some("web.tar.gz"), Some("sha256:aaa"));
+        img.needs_layers = vec!["sha256:l1".to_string()];
+        let empty = layer_set(&[]); // 什么层都没有
+        let plan = plan_rollback_with_layers(
+            &[img],
+            &[],
+            &["web.tar.gz".to_string()],
+            true,
+            Some(&empty),
+        );
+        assert_eq!(plan[0].source, RollbackImageSource::Archived);
+        assert!(!plan[0].blocking, "有完整包 → 不因增量字段阻断");
+    }
+
+    #[test]
+    fn test_rollback_precheck_needs_layers_missing_image_still_counts() {
+        // 第五态与既有 Missing 并存时的汇总口径(混合场景)
+        let images = vec![
+            mimg("a", "a:1", None, Some("sha256:aaa")),
+            mimg_inc("b", "b:1", Some("sha256:bbb"), &["sha256:l1"]),
+        ];
+        let remote: Vec<(String, String)> = vec![]; // a 的镜像也不在
+        let layers = layer_set(&[]);
+        let plan = plan_rollback_with_layers(&images, &remote, &[], true, Some(&layers));
+        let s = rollback_precheck_summary(&plan);
+        assert_eq!(s.needs_layers, 1);
+        assert_eq!(s.missing, 1);
+        assert!(s.has_blocking());
+        let msg = rollback_precheck_block_message(&plan, &s);
+        assert!(msg.contains("2 个服务无法回退"), "{}", msg);
     }
 
     // ===== v6.12.0:按镜像 ID 收敛(plan_tag_convergence)=====
