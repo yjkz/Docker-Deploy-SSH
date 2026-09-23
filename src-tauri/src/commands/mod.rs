@@ -876,37 +876,43 @@ async fn exec_forwarded(
     cmd: &str,
     timeout_secs: u64,
 ) -> Result<(), String> {
-    exec_forwarded_inner(app, client, cmd, timeout_secs, 0)
+    exec_forwarded_inner(app, client, cmd, timeout_secs, 0, false)
         .await
         .map(|_| ())
 }
 
-/// 与 [`exec_forwarded`] 同行为,额外**返回输出末尾 `tail_lines` 行**(第三十七批)。
+/// 与 [`exec_forwarded`] 同行为,额外**返回 `(退出码, 输出末尾 tail_lines 行)`**
+/// (**软失败**变体;第三十八批)。
 ///
-/// 为什么需要:层级增量裁剪后的 `docker load` 在 containerd 侧**缺层时仍返回 rc=0**,
-/// 只在输出里打 `Error unpacking image …`(0 期实测) —— 判定必须拿到输出文本,
-/// 不能只看退出码。转发/超时/取消语义与 [`exec_forwarded`] 完全一致。
-async fn exec_forwarded_tail(
+/// 为什么需要(第三十八批补):层级增量裁剪后的 `docker load` 失败形态**两种**——
+/// containerd 侧缺层 **rc=0** 只在输出里打 `Error unpacking image …`(0 期实测)、
+/// 经典 store 侧缺层 **rc≠0**。若沿用硬失败(rc≠0 即 Err),经典侧的裁剪包失败
+/// 就永远走不到「清半成品 + 整包重传」的兜底路径。本变体把 rc 交给调用方
+/// (统一走 [`crate::incremental::load_failure_reason`] 双判),判定与兜底的
+/// 责任收口在装载处;超时/取消/连接失败仍为 `Err`(那些情形无从判定镜像状态)。
+async fn exec_forwarded_tail_status(
     app: &AppHandle,
     client: &mut SshClient,
     cmd: &str,
     timeout_secs: u64,
     tail_lines: usize,
-) -> Result<Vec<String>, String> {
-    exec_forwarded_inner(app, client, cmd, timeout_secs, tail_lines).await
+) -> Result<(i32, Vec<String>), String> {
+    exec_forwarded_inner(app, client, cmd, timeout_secs, tail_lines, true).await
 }
 
-/// [`exec_forwarded`] 的实现:`tail_lines > 0` 时,非零退出的错误信息额外并入
-/// 远端输出末尾 `tail_lines` 行(供调用方依据输出内容做判定/提示,如
-/// [`augment_pull_error`]);其余行为(日志逐行转发、超时、取消)不变。
-/// 返回值为收集到的尾部行(`tail_lines == 0` 时为空)。
+/// [`exec_forwarded`] 的实现:`tail_lines > 0` 时收集输出末尾若干行随结果返回
+/// (硬失败时并入错误信息,供调用方依据输出内容做判定/提示,如 [`augment_pull_error`]);
+/// `soft_fail = true` 时非零退出**不**转 `Err`,把 `(退出码, 尾部行)` 交给调用方
+/// (装载步骤的双判需要,见 [`exec_forwarded_tail_status`])。其余行为
+/// (日志逐行转发、超时、取消)不变。
 async fn exec_forwarded_inner(
     app: &AppHandle,
     client: &mut SshClient,
     cmd: &str,
     timeout_secs: u64,
     tail_lines: usize,
-) -> Result<Vec<String>, String> {
+    soft_fail: bool,
+) -> Result<(i32, Vec<String>), String> {
     let saw_cancel = Arc::new(AtomicBool::new(false));
     let app_for_cb = app.clone();
     let cancel_flag = Arc::clone(&saw_cancel);
@@ -941,7 +947,7 @@ async fn exec_forwarded_inner(
     if saw_cancel.load(Ordering::SeqCst) {
         return Err(crate::errors::cancelled());
     }
-    if code != 0 {
+    if code != 0 && !soft_fail {
         let mut msg = format!("远端命令执行失败(退出码 {}): {}", code, cmd);
         if tail_lines > 0 {
             let buf = tail.lock().unwrap_or_else(|e| e.into_inner());
@@ -957,9 +963,9 @@ async fn exec_forwarded_inner(
     if is_cancelled(app) {
         return Err(crate::errors::cancelled());
     }
-    // 返回值 = 尾部行(第三十七批:调用方据此做 rc + 文本双判)
+    // 返回值 = (退出码, 尾部行):调用方据此做 rc + 文本双判(第三十七/三十八批)
     let tail_rows = tail.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    Ok(tail_rows)
+    Ok((code, tail_rows))
 }
 
 /// 拼装 `test -d '<path>'`(远端目录存在性检查,退出码 0 = 存在)。

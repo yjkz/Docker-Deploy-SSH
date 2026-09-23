@@ -1046,18 +1046,32 @@ async fn server_deploy(
                 let remote_tar = remote_join("/tmp", tar_name);
                 emit_log(app, &format!("加载镜像到服务器: docker load -i {}", remote_tar));
                 let load_cmd = format!("docker load -i {}", shell_single_quote(&remote_tar));
-                let tail = exec_forwarded_tail(app, client, &load_cmd, 600, LOAD_TAIL_LINES).await?;
-                // 层级增量兜底(第三十七批):containerd 侧缺层时 `docker load` 会
-                // **rc=0 + stdout 一句 Error unpacking image + 留下带标签的坏镜像** ——
-                // 只看退出码会把失败报成成功(0 期实测)。命中即清半成品 + 改传整包。
+                // 失败判定统一走 rc+文本双判(第三十八批):containerd 侧缺层 rc=0 只在
+                // stdout 打标志、经典 store 侧缺层 rc≠0 —— 两者都必须能走到兜底重传,
+                // 故用「软失败」变体拿 (退出码, 尾部),不在此提前 Err(0 期实测:
+                // 只看退出码会把静默失败报成成功,并把坏镜像留在服务器上)。
+                let (code, tail) =
+                    exec_forwarded_tail_status(app, client, &load_cmd, 600, LOAD_TAIL_LINES)
+                        .await?;
                 if let Some(reason) =
-                    crate::incremental::detect_silent_load_failure(&tail.join("
-"), "")
+                    crate::incremental::load_failure_reason(code, &tail.join("\n"))
                 {
+                    let Some((full_local, full_remote)) = fallback else {
+                        // 未裁剪(或旧断点无兜底):按既有形态报错 —— rc≠0 保留尾部全文,
+                        // rc=0 的静默失败给出「无可重传」指引
+                        return Err(if code != 0 {
+                            let mut msg =
+                                format!("远端命令执行失败(退出码 {}): {}", code, load_cmd);
+                            if !tail.is_empty() {
+                                msg.push_str("\n远端输出(末尾):\n");
+                                msg.push_str(&tail.join("\n"));
+                            }
+                            msg
+                        } else {
+                            format!("增量装载失败且本地没有整包可重传(可关闭「层级增量传输」后重试):{reason}")
+                        });
+                    };
                     emit_log(app, &format!("增量装载失败 → 整包重传:{}", reason));
-                    let (full_local, full_remote) = fallback.ok_or_else(|| {
-                        format!("增量装载失败且本地没有整包可重传(可关闭「层级增量传输」后重试):{reason}")
-                    })?;
                     // 半成品清理:坏镜像带着标签留在服务器上会让后续 compose up 报错难溯源
                     if let Some(clean_ref) =
                         idempotent_load_ref.or(deploy_expected_id.map(|(_, r)| r))
@@ -1071,11 +1085,11 @@ async fn server_deploy(
                     let full_remote_path = remote_join("/tmp", full_remote);
                     let full_cmd =
                         format!("docker load -i {}", shell_single_quote(&full_remote_path));
-                    let tail2 =
-                        exec_forwarded_tail(app, client, &full_cmd, 600, LOAD_TAIL_LINES).await?;
+                    let (code2, tail2) =
+                        exec_forwarded_tail_status(app, client, &full_cmd, 600, LOAD_TAIL_LINES)
+                            .await?;
                     if let Some(reason2) =
-                        crate::incremental::detect_silent_load_failure(&tail2.join("
-"), "")
+                        crate::incremental::load_failure_reason(code2, &tail2.join("\n"))
                     {
                         return Err(format!("整包重传后仍装载失败:{reason2}"));
                     }
@@ -2246,7 +2260,7 @@ async fn run_deploy_stack_steps(
                     ),
                 );
                 let load_cmd = format!("docker load -i {}", shell_single_quote(&remote_tar));
-                let tail = exec_forwarded_tail(
+                let (code, tail) = exec_forwarded_tail_status(
                     app,
                     &mut client,
                     &load_cmd,
@@ -2256,16 +2270,29 @@ async fn run_deploy_stack_steps(
                 .await?;
                 // 增量装载失败 → 整包重传(0 期实测:containerd 侧缺层时 `docker load`
                 // 仍 rc=0,只打 `Error unpacking image …` 且留下带标签的坏镜像 ——
-                // 只看退出码会把失败报成成功,必须 rc+文本双判)
+                // 只看退出码会把失败报成成功;经典 store 侧缺层是 rc≠0 —— 两种形态
+                // 都必须能走到兜底重传,故统一走 rc+文本双判)
                 if let Some(reason) =
-                    crate::incremental::detect_silent_load_failure(&tail.join("\n"), "")
+                    crate::incremental::load_failure_reason(code, &tail.join("\n"))
                 {
+                    let Some(full_local) = tars.fulls[i].as_ref() else {
+                        // 未裁剪(或旧断点无兜底):按既有形态报错 —— rc≠0 保留尾部全文,
+                        // rc=0 的静默失败给出「无可重传」指引
+                        return Err(if code != 0 {
+                            let mut msg =
+                                format!("远端命令执行失败(退出码 {}): {}", code, load_cmd);
+                            if !tail.is_empty() {
+                                msg.push_str("\n远端输出(末尾):\n");
+                                msg.push_str(&tail.join("\n"));
+                            }
+                            msg
+                        } else {
+                            format!(
+                                "增量装载失败且本地没有整包可重传(可关闭「层级增量传输」后重试):{reason}"
+                            )
+                        });
+                    };
                     emit_log(app, &format!("增量装载失败 → 整包重传:{}", reason));
-                    let full_local = tars.fulls[i].as_ref().ok_or_else(|| {
-                        format!(
-                            "增量装载失败且本地没有整包可重传(可关闭「层级增量传输」后重试):{reason}"
-                        )
-                    })?;
                     // 半成品清理:坏镜像带着标签留在服务器上会让后续 compose up 报错难溯源
                     let rmi = format!("docker rmi -f {}", shell_single_quote(&art.images[i]));
                     if let Err(e) = exec_forwarded(app, &mut client, &rmi, 120).await {
@@ -2286,7 +2313,7 @@ async fn run_deploy_stack_steps(
                     full_uploaded = true;
                     let full_path = remote_join(&release_dir, &full_remote);
                     let full_cmd = format!("docker load -i {}", shell_single_quote(&full_path));
-                    let tail2 = exec_forwarded_tail(
+                    let (code2, tail2) = exec_forwarded_tail_status(
                         app,
                         &mut client,
                         &full_cmd,
@@ -2295,7 +2322,7 @@ async fn run_deploy_stack_steps(
                     )
                     .await?;
                     if let Some(reason2) =
-                        crate::incremental::detect_silent_load_failure(&tail2.join("\n"), "")
+                        crate::incremental::load_failure_reason(code2, &tail2.join("\n"))
                     {
                         return Err(format!("整包重传后仍装载失败:{reason2}"));
                     }
@@ -2366,6 +2393,7 @@ async fn run_deploy_stack_steps(
                 &pull_cmd,
                 STACK_COMPOSE_TIMEOUT_SECS,
                 PULL_OUTPUT_TAIL_LINES,
+                false,
             )
             .await
             .map_err(|e| {

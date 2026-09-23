@@ -378,6 +378,31 @@ pub fn detect_silent_load_failure(stdout: &str, stderr: &str) -> Option<String> 
     None
 }
 
+/// 装载结果判定(rc + 文本双判的统一入口;第三十七批内核,第三十八批补 rc 显式失败)。
+///
+/// 两种 image store 的失败形态**相反**,单一判据必漏:
+/// - **containerd**:缺层时 `docker load` **rc=0**,只在 stdout 打
+///   `Error unpacking image …` 且留下带标签的坏镜像(rc 骗人,`detect_silent_load_failure` 覆盖);
+/// - **经典 store**:缺层时 **rc≠0** + stderr(`no such file or directory`)。
+///
+/// 返回 `Some(原因)` 即认定装载失败:先跑文本标志判定(rc 骗人的形态),再按退出码兜底。
+/// rc≠0 时取输出里**最后一条非空行**(最接近原因;如 `no such file or directory`),
+/// 无输出则给退出码文案。调用方据此决定「裁剪包失败 → 清半成品 + 整包重传」或直接报错。
+pub fn load_failure_reason(exit_code: i32, output_tail: &str) -> Option<String> {
+    if let Some(reason) = detect_silent_load_failure(output_tail, "") {
+        return Some(reason);
+    }
+    if exit_code == 0 {
+        return None;
+    }
+    output_tail
+        .lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .map(str::to_string)
+        .or_else(|| Some(format!("docker load 退出码 {}", exit_code)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,6 +437,30 @@ mod tests {
         assert!(detect_silent_load_failure(ok_stdout, "").is_none());
         // 正常日志里出现 "not found" 但无 blob 路径 → 不误判
         assert!(detect_silent_load_failure("Loaded image: x\n警告:标签 not found", "").is_none());
+    }
+
+    #[test]
+    fn test_load_failure_reason_covers_both_store_semantics() {
+        // containerd 形态:rc=0 + stdout 标志 —— rc 骗人,必须判失败
+        assert!(
+            load_failure_reason(0, GOLDEN_UNPACK_FAIL).is_some(),
+            "rc=0 的静默失败必须被抓住"
+        );
+        // 经典 store 形态:rc≠0 + stderr 原文 —— 原因取到具体行(自愈路径的日志/错误要用)
+        let r = load_failure_reason(1, GOLDEN_CLASSIC_FAIL).expect("rc≠0 必须判失败");
+        assert!(r.contains("no such file or directory"), "{}", r);
+        // 正常输出 + rc=0 → 成功
+        assert!(load_failure_reason(0, "Loaded image: dd-l1:v2\n").is_none());
+        // rc≠0 且无输出 → 退出码兜底(如连接被切断后的空尾部)
+        let r2 = load_failure_reason(125, "").expect("rc≠0 必须判失败");
+        assert!(r2.contains("125"), "{}", r2);
+        // rc≠0 且有输出 → 取最后一条非空行
+        let r3 = load_failure_reason(1, "step one\nError response from daemon: no space left on device\n")
+            .expect("rc≠0 必须判失败");
+        assert!(r3.contains("no space left on device"), "{}", r3);
+        // 空行结尾不干扰「最后一条非空行」
+        let r4 = load_failure_reason(1, "only line\n\n").unwrap();
+        assert_eq!(r4, "only line");
     }
 
     #[test]
