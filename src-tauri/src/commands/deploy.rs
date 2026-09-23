@@ -1068,10 +1068,20 @@ async fn server_deploy(
                             }
                             msg
                         } else {
-                            format!("增量装载失败且本地没有整包可重传(可关闭「层级增量传输」后重试):{reason}")
+                            format!(
+                                "装载失败且本地没有整包可自动重传:{reason}(如本次启用了「层级增量传输」,可关闭后重试)"
+                            )
                         });
                     };
                     emit_log(app, &format!("增量装载失败 → 整包重传:{}", reason));
+                    // 断点期兜底包可能已被清走(手工删/系统清临时目录):给明确指引,
+                    // 不要让上传阶段报「读取本地文件元数据失败」这种错位信息
+                    if !full_local.is_file() {
+                        return Err(format!(
+                            "增量装载失败,且本地兜底整包已丢失({}),无法自动重传;请放弃该断点后重新部署:{reason}",
+                            full_local.display()
+                        ));
+                    }
                     // 半成品清理:坏镜像带着标签留在服务器上会让后续 compose up 报错难溯源
                     if let Some(clean_ref) =
                         idempotent_load_ref.or(deploy_expected_id.map(|(_, r)| r))
@@ -2288,11 +2298,19 @@ async fn run_deploy_stack_steps(
                             msg
                         } else {
                             format!(
-                                "增量装载失败且本地没有整包可重传(可关闭「层级增量传输」后重试):{reason}"
+                                "装载失败且本地没有整包可自动重传:{reason}(如本次启用了「层级增量传输」,可关闭后重试)"
                             )
                         });
                     };
                     emit_log(app, &format!("增量装载失败 → 整包重传:{}", reason));
+                    // 断点期兜底包可能已被清走(手工删/系统清临时目录):给明确指引,
+                    // 不要让上传阶段报「读取本地文件元数据失败」这种错位信息
+                    if !full_local.is_file() {
+                        return Err(format!(
+                            "增量装载失败,且本地兜底整包已丢失({}),无法自动重传;请放弃该断点后重新部署:{reason}",
+                            full_local.display()
+                        ));
+                    }
                     // 半成品清理:坏镜像带着标签留在服务器上会让后续 compose up 报错难溯源
                     let rmi = format!("docker rmi -f {}", shell_single_quote(&art.images[i]));
                     if let Err(e) = exec_forwarded(app, &mut client, &rmi, 120).await {

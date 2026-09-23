@@ -1196,7 +1196,8 @@ pub async fn rollback_list_tags(
 pub struct RollbackPrecheckItem {
     pub service: String,
     pub tag: String,
-    /// `"archived"` | `"remoteById"` | `"missing"` | `"unknown"`
+    /// `"archived"` | `"remoteById"` | `"tagRestore"` | `"needsLayers"` | `"missing"` | `"unknown"`
+    /// (五态 + 第三十八批的 `needsLayers`;与 [`RollbackImageSource::as_str`] 同源)
     pub source: String,
     pub blocking: bool,
     pub detail: String,
@@ -1814,14 +1815,28 @@ pub(crate) async fn rollback_execute_stack_inner(
             ),
         );
         let load_cmd = format!("docker load -i {}", shell_single_quote(&remote_tar));
-        if let Err(e) = exec_forwarded(app, &mut client, &load_cmd, STACK_LOAD_TIMEOUT_SECS).await {
+        // 装载判定与部署链同一收口(rc+文本双判;第三十八批复审):无 manifest 的
+        // 归档目录按「目录内全部包」恢复,而失败/中断的部署**可能**在其中留下
+        // 缺层裁剪包(装载与重建之间被取消/中止)—— containerd 侧这类包 rc=0 静默
+        // 报「成功」并留下带标签的坏镜像,只看退出码会把它当装载成功继续 up。
+        let (code, tail) = exec_forwarded_tail_status(
+            app,
+            &mut client,
+            &load_cmd,
+            STACK_LOAD_TIMEOUT_SECS,
+            LOAD_TAIL_LINES,
+        )
+        .await?;
+        if let Some(reason) =
+            crate::incremental::load_failure_reason(code, &tail.join("\n"))
+        {
             // 部分失败提示:中止时点之前的包已装载成功(镜像标签已恢复),
             // 但容器尚未重建 —— 明确当前状态,避免误以为回滚未产生任何效果
             return Err(format!(
                 "装载镜像包 {}/{} 失败:{};已装载 {}/{} 个镜像包,这些包的镜像标签已恢复,容器未重建(可排除问题后重新发起回滚)",
                 i + 1,
                 n,
-                e,
+                reason,
                 i,
                 n
             ));
@@ -3132,10 +3147,22 @@ async fn rollback_execute_stack_at_inner(
             &format!("回滚装载镜像包 ({}/{}): docker load -i {}", i + 1, n, remote_tar),
         );
         let load_cmd = format!("docker load -i {}", shell_single_quote(&remote_tar));
-        if let Err(e) = exec_forwarded(app, &mut client, &load_cmd, STACK_LOAD_TIMEOUT_SECS).await {
+        // 与 04 页同口径(第三十八批复审):装载判定走 rc+文本双判,
+        // 无清单目录里的缺层裁剪包不得被 rc=0 的静默失败蒙混过关
+        let (code, tail) = exec_forwarded_tail_status(
+            app,
+            &mut client,
+            &load_cmd,
+            STACK_LOAD_TIMEOUT_SECS,
+            LOAD_TAIL_LINES,
+        )
+        .await?;
+        if let Some(reason) =
+            crate::incremental::load_failure_reason(code, &tail.join("\n"))
+        {
             return Err(format!(
                 "装载镜像包 {}/{} 失败:{};已装载 {}/{} 个镜像包,这些包的镜像标签已恢复,容器未重建(可排除问题后重新发起回滚)",
-                i + 1, n, e, i, n
+                i + 1, n, reason, i, n
             ));
         }
     }
