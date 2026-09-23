@@ -2329,6 +2329,7 @@ services:
     /// 构造单镜像断点产物(测试便捷函数)。
     fn single_art() -> SingleResumeArtifacts {
         SingleResumeArtifacts {
+            full_local: None,
             origin_ref: "myapp:latest".into(),
             repository: "myapp".into(),
             use_date_tag: true,

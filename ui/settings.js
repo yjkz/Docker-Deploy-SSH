@@ -435,6 +435,14 @@
       '写入前会在服务器上解析真实路径(软链不能逃逸),最多 10 条'));
     main.appendChild(wpRow);
 
+    // 层级增量传输(第三十七批):默认开;关掉即回到「一律整包」的历史行为
+    main.appendChild(checkboxRow('settings-incremental', '层级增量传输(只传服务器缺少的层)', true));
+    main.appendChild(hint(
+      '开启后部署会先问服务器「你已有哪些层」,把本地镜像包里这些层裁掉再传 —— ' +
+      '同一 Dockerfile 重建、层大量重叠时能省下绝大部分上传量。' +
+      '装载失败会自动改用整包重传(本地同时保留整份),不会因此漏传;' +
+      '首次部署某个镜像、或服务器上没有可复用的层时,与原来完全一致'));
+
     // ── 更新 UPDATE(代理 + 连通性实测;两钮作用于本区输入框)──
     main = sections.update;
     main.appendChild(groupTitle('更新', 'UPDATE'));
@@ -803,7 +811,8 @@
         tarImage: fieldVal('settings-tar-image-input').trim(),
         digestHour: digestHourArg(),
         autoStart: isChecked('settings-auto-start'),
-        hostWritePaths: hostWritePathsArg()
+        hostWritePaths: hostWritePathsArg(),
+        incrementalTransfer: isChecked('settings-incremental')
       }
     }).then(function () {
       // 过期会话(保存期间模态被关闭甚至重开)→ 静默丢弃,防旧 promise 回写新模态
@@ -938,6 +947,8 @@
         if (alertMem) alertMem.value = String(s.alertMemPercent == null ? 90 : s.alertMemPercent);
         var alertCpu = document.getElementById('settings-alert-cpu-input');
         if (alertCpu) alertCpu.value = String(s.alertCpuPercent == null ? 90 : s.alertCpuPercent);
+        // 层级增量传输(第三十七批):缺省视为开启(与后端 serde default 同口径)
+        setChecked('settings-incremental', s.incrementalTransfer !== false);
         // 代理字段预填 ''(非 '0'),保留 === '' 守卫即可满足「未改动不覆盖」
         var proxy = document.getElementById('settings-proxy-input');
         if (proxy && proxy.value === '') proxy.value = String(s.proxy || '');

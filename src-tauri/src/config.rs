@@ -752,6 +752,14 @@ pub struct AppSettings {
     /// [`normalize_host_write_paths`] 归一化(非法项丢弃)。
     #[serde(default)]
     pub host_write_paths: Vec<String>,
+    /// 层级增量传输(第三十七批;**缺省 true = 默认开启**)。
+    ///
+    /// 开启后部署会先问服务器「你已有哪些层」(`docker image inspect` 的 diffID 集合),
+    /// 把本地 `docker save` 包里这些层的 blob 丢掉再传 —— 只传增量;本地同时保留整份,
+    /// 装载失败自动改用整包重传(0 期实测:两种 image store 都接受裁剪包,判据只能
+    /// 用 diffID,失败判定必须 rc + 文本双判)。关闭 = 一律整包,与历史行为一致。
+    #[serde(default = "default_true")]
+    pub incremental_transfer: bool,
 }
 
 /// 「宿主机可写目录」白名单上限(条)。
@@ -824,6 +832,7 @@ impl Default for AppSettings {
             digest_hour: None,
             auto_start: false,
             host_write_paths: Vec::new(),
+            incremental_transfer: true,
         }
     }
 }
@@ -1494,6 +1503,7 @@ mod tests {
             digest_hour: None,
             auto_start: false,
             host_write_paths: Vec::new(),
+            incremental_transfer: true,
         };
         save_app_settings(&settings).unwrap();
         assert!(dir.join("config/settings.json").exists());
@@ -1552,6 +1562,7 @@ mod tests {
             digest_hour: None,
             auto_start: false,
             host_write_paths: Vec::new(),
+            incremental_transfer: true,
         };
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains("\"closeToTray\":true"));

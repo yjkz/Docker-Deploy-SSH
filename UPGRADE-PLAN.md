@@ -4263,3 +4263,40 @@ containerd store)与经典 store 服务器之间,`same_image_id` 恒不成立 �
   images/containers 计数回到基线(**tencent2 19/3**、**kkhuawei 12/1**),可用内存回基线。
 - 全程未碰:现有镜像、现有容器、卷、网络、compose 项目、daemon 配置;**未执行任何 prune**。
 - 本地:测试镜像已删,包与临时脚本留在系统 temp(不入库)。
+
+---
+
+# 第三十七批:层级增量传输(L1)落地(2026-09-23)
+
+> **来源**:0 期 spike(第三十六批)结论 + 用户裁决「全部一起做,整个 L1 做完」。**版本**:v6.18.0。
+
+## 做了什么
+
+- **纯函数内核** `src/incremental.rs`(9 单测):
+  - `parse_save_package`:解析 OCI 混合布局;`index.json` →(可能的 image index / attestation 下钻)→
+    平台 manifest → `config` + `layers[]`;`rootfs.diff_ids[]` 与 `layers[].digest[]` **按下标配对** ——
+    一条路径同时覆盖 containerd 产包(blob 名 = 压缩摘要)与经典 store 产包(blob 名 = diffID)。
+  - `plan_drop`:远端 diffID 命中即丢,返回可丢 blob 名与省下字节。
+  - `write_trimmed_tar`:除指定 blob 外**原样流式搬运**(进度挂读侧)。
+  - `detect_silent_load_failure`:**只看退出码不够** —— containerd 侧缺层时 `docker load` 仍 rc=0,
+    只在 stdout 打 `Error unpacking image …` 并留下带标签的坏镜像(0 期实测,已作为 golden 单测固化)。
+- **导出侧** `docker::save_gzip_trimmed`(配 `save_to_file` / `gzip_file` / `image_diff_ids`):
+  **零增益即零改动** —— 本地层与远端清单无交集时直接返回 `None`,调用方走原 `save_gzip`,
+  与历史**字节一致**(不落裸 tar、无额外磁盘与时间开销)。
+- **部署侧(单镜像)**:预查询复用连接(步骤 3 不再重连);装载抓输出尾部 → 命中失败标志即
+  `docker rmi -f` 清半成品 + 上传整包重传;兜底整包远端名 `<tar_name>.full`(**绝不能与裁剪包同名**
+  —— SFTP 的「远端大小比对」续传会把整包续在裁剪包屁股后面);断点产物新增 `full_local`,成功收尾同策略清理。
+- **设置**:`AppSettings.incremental_transfer`(默认 true,与 `auto_update_from_source` 同款 `default_true`)
+  + 设置中心「部署」区开关 + hint。
+
+## 未做(如实记录)
+
+- **整栈管线未接入**裁剪,含 2 期约定的「服务端 load 后重建整包归档」——整栈部署仍是整包上传,
+  归档仍是自包含整包,**行为与历史完全一致**。下批接入点已钉死:`pack_local_images`(逐包决策)、
+  装载循环(尾部双判 + 兜底)、`write_release_artifacts` 前重建归档。
+- 迁移链(跨机搬归档)不动。
+
+## 验证
+
+- `cargo test` **543 passed / 0 failed**(534→543,+9 内核单测;ignored 15 不变)
+- 前端 `node --check` + `verify/static-integrity` + `verify/form-validation` 全绿

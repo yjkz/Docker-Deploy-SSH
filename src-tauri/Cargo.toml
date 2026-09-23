@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "6.17.0"
+version = "6.18.0"
 description = "A Tauri App"
 authors = ["you"]
 license = ""
@@ -29,6 +29,9 @@ tauri-plugin-log = "2"
 # 表单路径「浏览」按钮:系统文件/目录选择对话框(前端经全局对象 __TAURI__.dialog 调用)
 tauri-plugin-dialog = "2"
 flate2 = "1"
+# 第三十七批(L1 层级增量传输):解析并重写 docker save 产物(OCI 布局 + 兼容 manifest.json)。
+# 只做「按 blob 名过滤 + 原样搬运」,不手写 tar 头 —— 用官方 tar crate 避免格式细节自研
+tar = "0.4"
 chrono = "0.4"
 # Task 3: SSH/SFTP(russh 0.46 起 re-export russh_keys 为 russh::keys)
 # v6.1.3:default-features=false 时必须显式带 "rsa" —— 默认集为

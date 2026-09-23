@@ -11,6 +11,7 @@ pub mod digest;
 pub mod docker;
 pub mod errors;
 pub mod history;
+pub mod incremental;
 pub mod manage;
 pub mod manage_exec;
 pub mod manage_files;

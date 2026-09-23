@@ -493,6 +493,202 @@ impl<W: Write> Write for CountingWriter<W> {
     }
 }
 
+/// 获取本地镜像的层摘要列表(`RootFS.Layers`,底 → 顶):
+/// `docker image inspect --format {{json .RootFS.Layers}}`。
+///
+/// 第三十七批(层级增量传输)用:本地 diffID 与远端清单同坐标系 —— 传输前先比一比,
+/// **没有任何交集时直接走原路径**(不落裸 tar、不动字节),只有真有增益才启用裁剪。
+/// 镜像不存在 / CLI 缺失 / 输出异常 → None(调用方按"不裁剪"处理)。
+pub fn image_diff_ids(image: &str) -> Option<Vec<String>> {
+    let output = new_command("docker")
+        .args([
+            "image",
+            "inspect",
+            "--format",
+            "{{json .RootFS.Layers}}",
+            image,
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let ids = crate::incremental::parse_layer_inventory(&stdout);
+    if ids.is_empty() {
+        return None;
+    }
+    // 保序(底→顶):JSON 数组顺序即层序,不能走 HashSet(会丢序)
+    let arr: Vec<String> = serde_json::from_str(stdout.trim()).ok()?;
+    Some(
+        arr.into_iter()
+            .map(|d| crate::incremental::normalize_digest(&d))
+            .collect(),
+    )
+}
+
+/// `docker save <image> -o <out>`:把镜像写成**未压缩** tar 落盘。
+///
+/// 与 [`save_gzip`] 的区别:那条是 `save | gzip` 流式(不落裸 tar);本函数为了「先看清
+/// 包里有什么再决定丢哪些」而落盘 —— 层裁剪需要随机访问 manifest/config。
+/// 代价(第三十七批记录在案):临时盘多占一份未压缩 tar,故调用方负责尽快删除。
+pub fn save_to_file(image: &str, out_path: &Path) -> Result<(), String> {
+    if let Some(parent) = out_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("无法创建输出目录 {}: {}", parent.display(), e))?;
+        }
+    }
+    let output = new_command("docker")
+        .args(["save", image, "-o"])
+        .arg(out_path)
+        .output()
+        .map_err(|e| {
+            let _ = std::fs::remove_file(out_path);
+            format!("无法启动 docker save {}: {}", image, e)
+        })?;
+    if !output.status.success() {
+        let _ = std::fs::remove_file(out_path);
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("docker save {} 失败: {}", image, err.trim()));
+    }
+    Ok(())
+}
+
+/// 把文件 gzip 到另一个文件(第三十七批;两趟导出复用同一实现)。
+fn gzip_file(src: &Path, out: &Path, progress_cb: &impl Fn(u64)) -> Result<u64, String> {
+    let mut reader = BufReader::with_capacity(64 * 1024, std::fs::File::open(src)
+        .map_err(|e| format!("打开 {} 失败: {}", src.display(), e))?);
+    let file = std::fs::File::create(out)
+        .map_err(|e| format!("创建 {} 失败: {}", out.display(), e))?;
+    let counter = Arc::new(AtomicU64::new(0));
+    let counting = CountingWriter {
+        inner: std::io::BufWriter::new(file),
+        counter: Arc::clone(&counter),
+    };
+    let mut encoder = GzEncoder::new(counting, Compression::default());
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                encoder
+                    .write_all(&buf[..n])
+                    .map_err(|e| format!("写入压缩数据失败: {}", e))?;
+                progress_cb(counter.load(Ordering::Relaxed));
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("读取 {} 失败: {}", src.display(), e)),
+        }
+    }
+    let mut counting = encoder
+        .finish()
+        .map_err(|e| format!("收尾压缩失败: {}", e))?;
+    counting
+        .inner
+        .flush()
+        .map_err(|e| format!("刷盘失败: {}", e))?;
+    let total = counter.load(Ordering::Relaxed);
+    progress_cb(total);
+    Ok(total)
+}
+
+/// 层级增量导出的结果(第三十七批)。
+#[derive(Debug, Clone)]
+pub struct TrimmedExport {
+    /// 上传用的裁剪包。
+    pub trimmed_path: std::path::PathBuf,
+    /// 兜底用的整包(装载失败时改传它)。
+    pub full_path: std::path::PathBuf,
+    pub trimmed_bytes: u64,
+    pub full_bytes: u64,
+    /// 被丢掉的层数与字节数(日志用)。
+    pub dropped_layers: usize,
+    pub dropped_bytes: u64,
+}
+
+/// 层级增量导出(第三十七批):`docker save` 落裸 tar → 按远端已有层裁剪 → 两趟 gzip。
+///
+/// 返回 `Ok(None)` 表示**没有增益、调用方应走原路径** —— 两种情形:
+/// ①本地层与远端无交集(预检直接返回,不落裸 tar);②包解析不了(老格式/异常包)。
+/// 这样「无重叠层」的部署与今天**字节一致**,不会因新特性引入回归。
+///
+/// 产出两个包:裁剪包(上传)与整包(兜底)。整包是刻意的冗余 —— 0 期实测里
+/// containerd 侧缺层时 `docker load` 会**静默成功**(rc=0 + 坏镜像),兜底必须能立刻重传,
+/// 不能指望"失败后再重新导出"(那时本地镜像可能已被覆盖)。
+pub fn save_gzip_trimmed(
+    image: &str,
+    out_trimmed: &Path,
+    out_full: &Path,
+    raw_tar: &Path,
+    remote_diff_ids: &std::collections::HashSet<String>,
+    progress_cb: impl Fn(u64),
+) -> Result<Option<TrimmedExport>, String> {
+    // ① 预检:本地层与远端清单无交集 → 不裁剪(也避免落裸 tar 的额外磁盘开销)
+    let local_ids = match image_diff_ids(image) {
+        Some(v) => v,
+        None => return Ok(None), // 拿不到层清单 → 保守走原路径
+    };
+    let hits = local_ids
+        .iter()
+        .filter(|d| remote_diff_ids.contains(*d))
+        .count();
+    if hits == 0 {
+        return Ok(None);
+    }
+
+    // ② 落裸 tar 并解析(权威层序以包内为准,不是 inspect 的口径)
+    save_to_file(image, raw_tar)?;
+    let pkg = match crate::incremental::parse_save_package(raw_tar) {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = std::fs::remove_file(raw_tar);
+            return Ok(None); // 解析不了就回退整包路径
+        }
+    };
+    let (drop, dropped_bytes) = crate::incremental::plan_drop(&pkg, remote_diff_ids);
+    if drop.is_empty() {
+        let _ = std::fs::remove_file(raw_tar);
+        return Ok(None);
+    }
+    let drop_set: std::collections::HashSet<String> = drop.into_iter().collect();
+    let dropped_layers = drop_set.len();
+
+    // ③ 重打包 + 两趟 gzip(先裁剪包,后整包;进度累计上报,只增不减)
+    let trimmed_tar = raw_tar.with_extension("trimmed.tar");
+    let base = Arc::new(AtomicU64::new(0));
+    let cb = &progress_cb; // 借用而非移入,两趟共用同一回调
+    let _ = crate::incremental::write_trimmed_tar(raw_tar, &trimmed_tar, &drop_set, |written| {
+        cb(base.load(Ordering::Relaxed) + written);
+    })?;
+    let trimmed_bytes = {
+        let b = Arc::clone(&base);
+        gzip_file(&trimmed_tar, out_trimmed, &move |bytes| {
+            cb(b.load(Ordering::Relaxed) + bytes)
+        })?
+    };
+    base.store(trimmed_bytes, Ordering::Relaxed);
+    let full_bytes = {
+        let b = Arc::clone(&base);
+        gzip_file(raw_tar, out_full, &move |bytes| {
+            cb(b.load(Ordering::Relaxed) + bytes)
+        })?
+    };
+
+    // ④ 清理中转文件(裁剪包与整包已落盘;裸 tar 与裁剪 tar 不再需要)
+    let _ = std::fs::remove_file(raw_tar);
+    let _ = std::fs::remove_file(&trimmed_tar);
+
+    Ok(Some(TrimmedExport {
+        trimmed_path: out_trimmed.to_path_buf(),
+        full_path: out_full.to_path_buf(),
+        trimmed_bytes,
+        full_bytes,
+        dropped_layers,
+        dropped_bytes,
+    }))
+}
+
 /// 将镜像导出为 gzip 压缩的 tar 文件:
 /// `docker save <image>` 子进程 stdout → flate2 流式压缩 → out_path,
 /// 不依赖系统 gzip 命令。

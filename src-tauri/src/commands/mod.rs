@@ -187,6 +187,24 @@ const REMOTE_IMAGES_CMD: &str = "docker images --format '{{json .}}'";
 /// 会导致跳过逻辑永不触发)。
 const REMOTE_IMAGES_CMD_FULL: &str = "docker images --no-trunc --format '{{json .}}'";
 
+/// 层级增量传输(第三十七批):远端**已有层**的 diffID 清单来源。
+///
+/// 逐镜像取 `RootFS.Layers`(`docker image inspect` 对多 ID 每个输出一行 JSON 数组);
+/// `$(docker images -q | sort -u)` 去重后展开,无镜像时该命令会因缺参数报错,故 `|| true`。
+/// 判据用 **diffID** 而非镜像 ID —— 0 期实测镜像 `.Id` 跨 store 口径不同
+/// (containerd = manifest 摘要,经典 = Config 摘要),diffID 才是两侧同坐标系的键。
+///
+/// 口径提醒:清单来自「当前有镜像的层」,**坏镜像(装载失败留下的悬空元数据)也会
+/// 报出自己的层** —— 这会让裁剪判定偏乐观,由装载阶段的 rc+文本双判 + 整包兜底兜住。
+const REMOTE_LAYERS_CMD: &str =
+    "docker image inspect --format '{{json .RootFS.Layers}}' $(docker images -q | sort -u) 2>/dev/null || true";
+
+/// 层级增量装载的**输出尾部抓取行数**(第三十七批)。
+///
+/// `docker load` 的失败标志出现在输出末尾(containerd 侧:先 `Loaded image` 再
+/// `Error unpacking image …`),抓 40 行足够覆盖且不占内存。
+pub(crate) const LOAD_TAIL_LINES: usize = 40;
+
 /// 部署运行状态:`cancel_deploy` 置位 `cancelled`,
 /// 部署管线在各步骤之间以及 exec 输出行回调中检查后中止。
 #[derive(Default)]
@@ -852,19 +870,37 @@ async fn exec_forwarded(
     cmd: &str,
     timeout_secs: u64,
 ) -> Result<(), String> {
-    exec_forwarded_inner(app, client, cmd, timeout_secs, 0).await
+    exec_forwarded_inner(app, client, cmd, timeout_secs, 0)
+        .await
+        .map(|_| ())
+}
+
+/// 与 [`exec_forwarded`] 同行为,额外**返回输出末尾 `tail_lines` 行**(第三十七批)。
+///
+/// 为什么需要:层级增量裁剪后的 `docker load` 在 containerd 侧**缺层时仍返回 rc=0**,
+/// 只在输出里打 `Error unpacking image …`(0 期实测) —— 判定必须拿到输出文本,
+/// 不能只看退出码。转发/超时/取消语义与 [`exec_forwarded`] 完全一致。
+async fn exec_forwarded_tail(
+    app: &AppHandle,
+    client: &mut SshClient,
+    cmd: &str,
+    timeout_secs: u64,
+    tail_lines: usize,
+) -> Result<Vec<String>, String> {
+    exec_forwarded_inner(app, client, cmd, timeout_secs, tail_lines).await
 }
 
 /// [`exec_forwarded`] 的实现:`tail_lines > 0` 时,非零退出的错误信息额外并入
 /// 远端输出末尾 `tail_lines` 行(供调用方依据输出内容做判定/提示,如
 /// [`augment_pull_error`]);其余行为(日志逐行转发、超时、取消)不变。
+/// 返回值为收集到的尾部行(`tail_lines == 0` 时为空)。
 async fn exec_forwarded_inner(
     app: &AppHandle,
     client: &mut SshClient,
     cmd: &str,
     timeout_secs: u64,
     tail_lines: usize,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let saw_cancel = Arc::new(AtomicBool::new(false));
     let app_for_cb = app.clone();
     let cancel_flag = Arc::clone(&saw_cancel);
@@ -915,7 +951,9 @@ async fn exec_forwarded_inner(
     if is_cancelled(app) {
         return Err(crate::errors::cancelled());
     }
-    Ok(())
+    // 返回值 = 尾部行(第三十七批:调用方据此做 rc + 文本双判)
+    let tail_rows = tail.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    Ok(tail_rows)
 }
 
 /// 拼装 `test -d '<path>'`(远端目录存在性检查,退出码 0 = 存在)。

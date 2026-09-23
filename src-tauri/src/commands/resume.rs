@@ -25,6 +25,9 @@ pub(crate) struct SingleResumeArtifacts {
     pub(crate) tar_local: Option<String>,
     /// 步骤 2 决定的远端 tar 文件名(步骤 3 上传到 `/tmp/<tar_name>`)
     pub(crate) tar_name: Option<String>,
+    /// 层级增量传输(第三十七批):兜底整包在本地的绝对路径。
+    /// `None` = 本次没裁剪(或旧断点记录)—— 装载失败时无整包可重传,须直接报错。
+    pub(crate) full_local: Option<String>,
     /// 回传字段:智能传输开关(部署请求的 `skip_unchanged`)
     pub(crate) skip_unchanged: bool,
 }
